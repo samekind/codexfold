@@ -158,6 +158,9 @@ func mountHost(ctx context.Context, options HostOptions) (result error) {
 	}()
 	mounted := host.Mount(options.MountPoint, arguments)
 	close(done)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if !mounted {
 		return errors.New("FUSE host exited without mounting")
 	}

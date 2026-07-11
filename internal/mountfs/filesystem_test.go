@@ -90,6 +90,54 @@ func TestFilesystemRandomWriteTruncateAndWriterExclusion(t *testing.T) {
 	}
 }
 
+func TestFilesystemWriteAtVisibleEOFUsesDeltaWithoutCopyOnWrite(t *testing.T) {
+	source := []byte("first\nsecond\nthird\n")
+	session := mountSessionFixture(t, "session", source)
+	filesystem := New()
+	if err := filesystem.AddSession("session", session); err != nil {
+		t.Fatal(err)
+	}
+	handle, errno := filesystem.Open("/session.jsonl", os.O_RDWR)
+	if errno != 0 {
+		t.Fatalf("Open writer errno=%v", errno)
+	}
+	t.Cleanup(func() { _ = filesystem.Release(handle) })
+	tail := []byte("tail\n")
+	if n, errno := filesystem.Write(handle, tail, int64(len(source))); errno != 0 || n != len(tail) {
+		t.Fatalf("Write at EOF = %d errno=%v", n, errno)
+	}
+	if state := session.State(); state.BackingPath != "" {
+		t.Fatalf("EOF write created copy-on-write backing %q", state.BackingPath)
+	} else if info, err := os.Stat(state.DeltaPath); err != nil || info.Size() != int64(len(tail)) {
+		t.Fatalf("delta after EOF write: info=%#v err=%v", info, err)
+	}
+	current := make([]byte, len(source)+len(tail))
+	if n, errno := filesystem.Read(handle, current, 0); errno != 0 || n != len(current) {
+		t.Fatalf("Read after EOF write = %d errno=%v", n, errno)
+	}
+	want := append(append([]byte(nil), source...), tail...)
+	if !bytes.Equal(current, want) {
+		t.Fatalf("visible bytes differ: got=%q want=%q", current, want)
+	}
+}
+
+func TestFilesystemPathTruncateUsesTheActiveWriter(t *testing.T) {
+	filesystem, source := mountFixture(t)
+	handle, errno := filesystem.Open("/session.jsonl", os.O_RDWR)
+	if errno != 0 {
+		t.Fatalf("Open writer errno=%v", errno)
+	}
+	t.Cleanup(func() { _ = filesystem.Release(handle) })
+	wantSize := int64(len(source) - 3)
+	if errno := filesystem.TruncatePath("/session.jsonl", wantSize); errno != 0 {
+		t.Fatalf("TruncatePath with active writer errno=%v", errno)
+	}
+	attribute, errno := filesystem.Getattr("/session.jsonl")
+	if errno != 0 || attribute.Size != wantSize {
+		t.Fatalf("Getattr after path truncate = %#v errno=%v", attribute, errno)
+	}
+}
+
 func TestFilesystemRejectsUnsafeAndManagementMutations(t *testing.T) {
 	filesystem, _ := mountFixture(t)
 	if _, errno := filesystem.Open("/../session.jsonl", os.O_RDONLY); errno != syscall.ENOENT {
@@ -135,7 +183,7 @@ func TestFilesystemUpsertChangesNewOpensWithoutInvalidatingExistingHandles(t *te
 
 func TestMountWithoutFuseBuildReturnsPrerequisiteError(t *testing.T) {
 	if Available() {
-		t.Fatal("default build should report the FUSE host as unavailable")
+		t.Skip("FUSE-enabled builds are covered by the gated real mount test")
 	}
 	err := Mount(context.Background(), HostOptions{MountPoint: t.TempDir(), Filesystem: New()})
 	if !errors.Is(err, ErrPrerequisite) {

@@ -159,7 +159,15 @@ func (f *Filesystem) Write(handleID uint64, data []byte, offset int64) (int, sys
 	if handle.append {
 		n, err = handle.write.Append(context.Background(), data)
 	} else {
-		n, err = handle.write.WriteAt(context.Background(), data, offset)
+		info, infoErr := handle.session.VisibleInfo()
+		if infoErr != nil {
+			return 0, errnoFor(infoErr)
+		}
+		if offset == info.Size {
+			n, err = handle.write.Append(context.Background(), data)
+		} else {
+			n, err = handle.write.WriteAt(context.Background(), data, offset)
+		}
 	}
 	if err != nil {
 		return n, errnoFor(err)
@@ -193,6 +201,16 @@ func (f *Filesystem) TruncatePath(name string, size int64) syscall.Errno {
 	if errno != 0 {
 		return errno
 	}
+	if handle := f.lockActiveWriter(session); handle != nil {
+		defer handle.mu.Unlock()
+		if err := handle.write.Truncate(context.Background(), size); err != nil {
+			return errnoFor(err)
+		}
+		if handle.read != nil {
+			return refreshReader(handle)
+		}
+		return 0
+	}
 	writer, err := session.OpenWriter()
 	if err != nil {
 		return errnoFor(err)
@@ -203,6 +221,18 @@ func (f *Filesystem) TruncatePath(name string, size int64) syscall.Errno {
 		return errnoFor(truncateErr)
 	}
 	return errnoFor(closeErr)
+}
+
+func (f *Filesystem) lockActiveWriter(session *vfs.Session) *fileHandle {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	for _, handle := range f.handles {
+		if handle.session == session && handle.write != nil {
+			handle.mu.Lock()
+			return handle
+		}
+	}
+	return nil
 }
 
 func (f *Filesystem) Fsync(handleID uint64) syscall.Errno {

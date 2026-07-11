@@ -14,6 +14,7 @@ import (
 	"github.com/jstar0/codexfold/internal/compat"
 	"github.com/jstar0/codexfold/internal/fold"
 	"github.com/jstar0/codexfold/internal/fsctl"
+	"github.com/jstar0/codexfold/internal/mountfs"
 	"github.com/jstar0/codexfold/internal/pack"
 	"github.com/jstar0/codexfold/internal/vfs"
 )
@@ -51,7 +52,15 @@ func TestFSServiceInstallIsDryRunByDefaultAndApplyRequiresFuseBuild(t *testing.T
 	root.SetOut(&bytes.Buffer{})
 	root.SetErr(&bytes.Buffer{})
 	root.SetArgs([]string{"fs", "service", "install", "--codex-home", home, "--store", storeDir, "--plist", plistPath, "--apply"})
-	if err := root.Execute(); err == nil {
+	err := root.Execute()
+	if mountfs.Available() {
+		if err != nil {
+			t.Fatalf("FUSE build should install the service definition: %v", err)
+		}
+		if _, statErr := os.Stat(plistPath); statErr != nil {
+			t.Fatalf("service definition was not written: %v", statErr)
+		}
+	} else if err == nil {
 		t.Fatal("default build should reject service installation without a FUSE host")
 	}
 }
@@ -397,12 +406,14 @@ func TestFSReadOnlyCommandsRunWithoutClaimingMountHealth(t *testing.T) {
 			t.Fatalf("%v overclaimed readiness: %s", args, output.String())
 		}
 	}
-	root := NewRootCommand()
-	root.SetOut(&bytes.Buffer{})
-	root.SetErr(&bytes.Buffer{})
-	root.SetArgs([]string{"fs", "serve", "--codex-home", home, "--store", storeDir, "--mount", filepath.Join(home, "mount"), "--apply"})
-	if err := root.Execute(); err == nil {
-		t.Fatal("default build should not claim the FUSE prerequisite is available")
+	if !mountfs.Available() {
+		root := NewRootCommand()
+		root.SetOut(&bytes.Buffer{})
+		root.SetErr(&bytes.Buffer{})
+		root.SetArgs([]string{"fs", "serve", "--codex-home", home, "--store", storeDir, "--mount", filepath.Join(home, "mount"), "--apply"})
+		if err := root.Execute(); err == nil {
+			t.Fatal("default build should not claim the FUSE prerequisite is available")
+		}
 	}
 	status, _ := fsctl.NewStatus(fsctl.StorageEngine, runtime.GOOS)
 	if status.Capability != fsctl.StorageEngine {
