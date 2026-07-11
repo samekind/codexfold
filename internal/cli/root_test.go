@@ -19,6 +19,15 @@ func TestRootExposesScanCommand(t *testing.T) {
 	}
 }
 
+func TestRootUsesExplicitBuildVersion(t *testing.T) {
+	previous := Version
+	Version = "v-test"
+	t.Cleanup(func() { Version = previous })
+	if got := NewRootCommand().Version; got != "v-test" {
+		t.Fatalf("root version = %q, want v-test", got)
+	}
+}
+
 func TestScanCommandRunsAgainstExplicitCodexHome(t *testing.T) {
 	home := t.TempDir()
 	rolloutPath := filepath.Join(home, "rollout.jsonl")

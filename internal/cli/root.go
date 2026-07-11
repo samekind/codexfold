@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"runtime/debug"
 	"strings"
 
 	"github.com/jstar0/codexfold/internal/codex"
@@ -19,10 +20,20 @@ func NewRootCommand() *cobra.Command {
 		Short:         "Local-first Codex session storage analysis",
 		SilenceErrors: true,
 		SilenceUsage:  true,
-		Version:       Version,
+		Version:       resolvedVersion(),
 	}
 	root.AddCommand(newScanCommand())
 	return root
+}
+
+func resolvedVersion() string {
+	if Version != "dev" {
+		return Version
+	}
+	if info, ok := debug.ReadBuildInfo(); ok && info.Main.Version != "" && info.Main.Version != "(devel)" {
+		return info.Main.Version
+	}
+	return Version
 }
 
 func newScanCommand() *cobra.Command {
