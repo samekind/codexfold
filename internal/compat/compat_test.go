@@ -12,16 +12,17 @@ import (
 
 func TestParseFSUsageProducesSanitizedOperationContract(t *testing.T) {
 	trace := strings.Join([]string{
-		"12:00:00.000 open F=3 (R_____) /Users/example/.codex/sessions/private.jsonl codex.123",
+		"12:00:00.000 open F=3 (R__________X___) /Users/example/.codex/sessions/private.jsonl codex.123",
 		"12:00:00.001 read F=3 B=4096 /Users/example/.codex/sessions/private.jsonl codex.123",
-		"12:00:00.002 fsync F=3 /Users/example/.codex/sessions/private.jsonl codex.123",
-		"12:00:00.003 read F=3 B=4096 /Users/example/.codex/sessions/private.jsonl codex.123",
+		"12:00:00.002 fcntl F=3 <SETLK> codex.123",
+		"12:00:00.003 fsync F=3 /Users/example/.codex/sessions/private.jsonl codex.123",
+		"12:00:00.004 read F=3 B=4096 /Users/example/.codex/sessions/private.jsonl codex.123",
 	}, "\n")
 	contract, err := ParseFSUsage(strings.NewReader(trace), ContractOptions{Platform: "darwin", ClientKind: "cli", ClientVersion: "0.1.0"})
 	if err != nil {
 		t.Fatalf("ParseFSUsage returned error: %v", err)
 	}
-	if contract.TraceSHA256 == "" || len(contract.Operations) != 3 {
+	if contract.TraceSHA256 == "" || len(contract.Operations) != 4 {
 		t.Fatalf("unexpected contract: %#v", contract)
 	}
 	encoded, err := json.Marshal(contract)
@@ -33,6 +34,15 @@ func TestParseFSUsageProducesSanitizedOperationContract(t *testing.T) {
 	}
 	if contract.Operations[1].Name != "read" || contract.Operations[1].Count != 2 {
 		t.Fatalf("operation aggregation differs: %#v", contract.Operations)
+	}
+	if got := contract.Operations[0].Signatures; len(got) != 1 || got[0].Value != "(R__________X___)" {
+		t.Fatalf("open signatures should contain only stable flags: %#v", got)
+	}
+	if got := contract.Operations[1].Signatures; len(got) != 0 {
+		t.Fatalf("read signatures leaked volatile descriptor or byte counts: %#v", got)
+	}
+	if got := contract.Operations[2].Signatures; len(got) != 1 || got[0].Value != "<SETLK>" {
+		t.Fatalf("fcntl signatures should preserve the stable command: %#v", got)
 	}
 }
 

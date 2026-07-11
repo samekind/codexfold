@@ -17,8 +17,8 @@ type ContractOptions struct {
 	ClientVersion string
 }
 
-var operationPattern = regexp.MustCompile(`(?i)\b(open|openat|close|read|pread|write|pwrite|fsync|fdatasync|stat|stat64|fstat|mmap|truncate|ftruncate|rename|unlink|flock|fcntl|clonefile)\b`)
-var signaturePattern = regexp.MustCompile(`\b(?:F|B|O|FLAGS)=[A-Za-z0-9_()+-]+`)
+var operationPattern = regexp.MustCompile(`(?i)\b(open|openat|close|read|pread|readv|write|pwrite|writev|fsync|fdatasync|stat|stat64|lstat|lstat64|fstat|fstat64|mmap|truncate|ftruncate|rename|renameat|unlink|unlinkat|flock|fcntl|clonefile|getattrlist)\b`)
+var signaturePattern = regexp.MustCompile(`\([A-Z_]{4,32}\)|<[A-Z0-9_=+-]+>`)
 
 func ParseFSUsage(reader io.Reader, options ContractOptions) (Contract, error) {
 	scanner := bufio.NewScanner(reader)
