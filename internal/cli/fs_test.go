@@ -193,6 +193,10 @@ func TestFSStatusDoesNotClaimTransparentReadiness(t *testing.T) {
 	if bytes.Contains(output.Bytes(), []byte("production-ready")) || bytes.Contains(output.Bytes(), []byte("platform-canary")) {
 		t.Fatalf("status overclaimed readiness: %s", output.String())
 	}
+	var status fsctl.Status
+	if err := json.Unmarshal(output.Bytes(), &status); err != nil || status.Capability != fsctl.FSEnginePreview {
+		t.Fatalf("status did not report the verified engine preview: %#v err=%v", status, err)
+	}
 }
 
 func TestFSCompatibilityApprovesOnlyExactInstalledClientContract(t *testing.T) {

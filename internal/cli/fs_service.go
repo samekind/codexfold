@@ -12,7 +12,6 @@ import (
 	"runtime"
 
 	"github.com/jstar0/codexfold/internal/codex"
-	"github.com/jstar0/codexfold/internal/fsctl"
 	"github.com/jstar0/codexfold/internal/mountfs"
 	"github.com/jstar0/codexfold/internal/service"
 	"github.com/jstar0/codexfold/internal/vfs"
@@ -194,7 +193,7 @@ func newFSServiceUpdatePreflightCommand() *cobra.Command {
 			if err != nil {
 				fallbackReady = false
 			}
-			decision := service.EvaluateUpdate(service.UpdateInput{Capability: fsctl.StorageEngine, DoctorHealthy: doctorErr == nil, Compatibility: compatibilityResult.Evaluation, NativeFallbackReady: fallbackReady, Automatic: automatic, ExplicitPromotion: promote})
+			decision := service.EvaluateUpdate(service.UpdateInput{Capability: verifiedCapability(), DoctorHealthy: doctorErr == nil, Compatibility: compatibilityResult.Evaluation, NativeFallbackReady: fallbackReady, Automatic: automatic, ExplicitPromotion: promote})
 			result := FSUpdatePreflightResult{DoctorHealthy: doctorErr == nil, Compatibility: compatibilityResult, Decision: decision}
 			if decision.Quarantine && decision.RequiresNativeFallback && applyQuarantine {
 				count, err := quarantineManagedRoutes(command.Context(), home, store)
@@ -202,7 +201,7 @@ func newFSServiceUpdatePreflightCommand() *cobra.Command {
 					return err
 				}
 				result.QuarantinedSessions = count
-				result.Decision = service.EvaluateUpdate(service.UpdateInput{Capability: fsctl.StorageEngine, DoctorHealthy: doctorErr == nil, Compatibility: compatibilityResult.Evaluation, NativeFallbackReady: true, Automatic: automatic, ExplicitPromotion: promote})
+				result.Decision = service.EvaluateUpdate(service.UpdateInput{Capability: verifiedCapability(), DoctorHealthy: doctorErr == nil, Compatibility: compatibilityResult.Evaluation, NativeFallbackReady: true, Automatic: automatic, ExplicitPromotion: promote})
 			}
 			if jsonOutput {
 				return writeJSON(command, result)

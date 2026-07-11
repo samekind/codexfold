@@ -98,7 +98,7 @@ func newFSStatusCommand() *cobra.Command {
 		Short: "Report the highest verified filesystem capability",
 		Args:  cobra.NoArgs,
 		RunE: func(command *cobra.Command, _ []string) error {
-			status, err := fsctl.NewStatus(fsctl.StorageEngine, runtime.GOOS)
+			status, err := fsctl.NewStatus(verifiedCapability(), runtime.GOOS)
 			if err != nil {
 				return err
 			}
@@ -852,6 +852,8 @@ func defaultMountPoint(home string, explicit string) string {
 	}
 	return filepath.Join(home, "fold-fs")
 }
+
+func verifiedCapability() fsctl.Capability { return fsctl.FSEnginePreview }
 
 func waitForTarget(ctx context.Context, target string, timeout time.Duration) (vfs.NativeFile, error) {
 	if timeout <= 0 {
