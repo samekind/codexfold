@@ -64,7 +64,7 @@ func Doctor(ctx context.Context, storeDir string) (DoctorResult, error) {
 }
 
 func verifyGeneration(ctx context.Context, directory string, index Index) error {
-	resolver, err := openGeneration(directory, 0)
+	resolver, err := openGeneration(directory, 0, false)
 	if err != nil {
 		return err
 	}

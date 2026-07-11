@@ -33,26 +33,30 @@ Passing these checks can justify only `fs-engine-preview`. The following remain 
 
 Run on 2026-07-12 using an Apple M4 Pro MacBook Pro with 12 CPU cores and 48 GiB RAM, macOS 26.5.1, and Go 1.26.4.
 
-The 758 MiB source was deliberately highly repetitive. The first benchmark followed Fold, Pack, and Shadow in the same process, so both native and packed data benefited from system caching. These values are a deterministic engine gate, not a claim about real Codex cold-cache workloads.
+The 758 MiB source was deliberately highly repetitive. The cold pass requested and successfully applied macOS `F_NOCACHE` to both the native rollout file and every opened pack file, with an empty process-level decompressed block cache. It is a cache-bypass gate, not a disk-power-cycle or root-level system-cache purge. These values are deterministic engine evidence, not a claim that every real Codex workload has the same compression or reuse ratio.
 
-| Metric | First pass | Warm pass |
+| Metric | Cold cache-bypass pass | Warm pass |
 | --- | ---: | ---: |
-| Native sequential throughput | 16.03 GB/s | 15.87 GB/s |
-| Virtual sequential throughput | 60.73 GB/s | 58.15 GB/s |
-| Virtual/native ratio | 3.79x | 3.66x |
-| Random read p50 | 0.584 us | 0.583 us |
-| Random read p95 | 0.959 us | 0.958 us |
-| Random read p99 | 1.625 us | 1.542 us |
+| Native sequential throughput | 14.58 GB/s | 16.46 GB/s |
+| Virtual sequential throughput | 34.56 GB/s | 54.69 GB/s |
+| Virtual/native ratio | 2.37x | 3.32x |
+| Random read p50 | 0.708 us | 0.625 us |
+| Random read p95 | 1.041 us | 0.958 us |
+| Random read p99 | 1.292 us | 1.250 us |
 
 Additional results:
 
-- Fold: 35.23 s.
-- Pack build: 0.055 s.
-- Complete SHA plus 10,000 random-range shadow: 3.31 s.
-- Go system memory: 160.04 MiB.
-- Maximum RSS: 160.02 MiB.
+- Fold: 44.69 s.
+- Pack build: 0.065 s.
+- Complete SHA plus 10,000 random-range shadow: 3.51 s.
+- Go system memory: 135.45 MiB.
+- Maximum RSS: 135.70 MiB.
+- User CPU for the complete heavy gate: 69.72 s.
+- System CPU for the complete heavy gate: 15.46 s.
 - Configured decompressed block cache: 128 MiB.
-- Loose-object directory offline during shadow and both benchmark passes: yes.
+- Native `F_NOCACHE` applied during the cold pass: yes.
+- Pack-file `F_NOCACHE` applied during the cold pass: yes.
+- Loose-object directory offline during cold benchmark, shadow, and warm benchmark: yes.
 - 100,000 one-byte append calls followed by `fsync`: 2.18 s in the normal test build.
 
 The platform-neutral gates pass and justify `fs-engine-preview`. This result does not satisfy any Task 11 real-adapter or real-Codex gate.

@@ -89,6 +89,21 @@ func TestBenchmarkMeasuresNativeAndVirtualReads(t *testing.T) {
 	}
 }
 
+func TestBenchmarkRecordsRequestedOSCacheBypass(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "native.jsonl")
+	data := []byte("cache-bypass")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	report, err := Benchmark(context.Background(), path, byteReader(data), BenchmarkOptions{BypassOSCache: true, RandomReads: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !report.OSCacheBypassRequested {
+		t.Fatalf("benchmark did not record cache-bypass request: %#v", report)
+	}
+}
+
 type byteReader []byte
 
 func (r byteReader) Size() int64 { return int64(len(r)) }

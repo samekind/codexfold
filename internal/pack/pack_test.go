@@ -70,6 +70,27 @@ func TestBuildAndResolverReadExactRandomRanges(t *testing.T) {
 	}
 }
 
+func TestResolverSupportsOSCacheBypassOption(t *testing.T) {
+	root := t.TempDir()
+	refs := putObjects(t, root, []byte("cache-bypass-object"))
+	writeManifest(t, root, "session", refs)
+	if _, err := Build(context.Background(), root, BuildOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	resolver, err := Open(root, OpenOptions{BypassOSCache: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resolver.Close()
+	buffer := make([]byte, refs[0].RawBytes)
+	if _, err := resolver.ReadAt(context.Background(), refs[0], buffer, 0); err != nil {
+		t.Fatal(err)
+	}
+	if string(buffer) != "cache-bypass-object" {
+		t.Fatalf("unexpected bytes: %q", buffer)
+	}
+}
+
 func TestBuildInterruptionKeepsPreviousGenerationCurrent(t *testing.T) {
 	root := t.TempDir()
 	refs := putObjects(t, root, []byte("first-generation"))

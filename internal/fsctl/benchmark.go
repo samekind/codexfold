@@ -18,6 +18,7 @@ type BenchmarkOptions struct {
 	RandomBlockBytes     int
 	RandomReads          int
 	Seed                 int64
+	BypassOSCache        bool
 }
 
 type SequentialMetric struct {
@@ -34,10 +35,12 @@ type RandomMetric struct {
 }
 
 type BenchmarkReport struct {
-	Native     SequentialMetric `json:"native"`
-	Virtual    SequentialMetric `json:"virtual"`
-	Random     RandomMetric     `json:"random"`
-	GoSysBytes uint64           `json:"go_sys_bytes"`
+	Native                 SequentialMetric `json:"native"`
+	Virtual                SequentialMetric `json:"virtual"`
+	Random                 RandomMetric     `json:"random"`
+	GoSysBytes             uint64           `json:"go_sys_bytes"`
+	OSCacheBypassRequested bool             `json:"os_cache_bypass_requested"`
+	OSCacheBypassApplied   bool             `json:"os_cache_bypass_applied"`
 }
 
 func Benchmark(ctx context.Context, nativePath string, virtual Readable, options BenchmarkOptions) (BenchmarkReport, error) {
@@ -55,6 +58,13 @@ func Benchmark(ctx context.Context, nativePath string, virtual Readable, options
 		return BenchmarkReport{}, err
 	}
 	defer native.Close()
+	bypassApplied := false
+	if options.BypassOSCache {
+		bypassApplied, err = configureNoCache(native)
+		if err != nil {
+			return BenchmarkReport{}, err
+		}
+	}
 	info, err := native.Stat()
 	if err != nil {
 		return BenchmarkReport{}, err
@@ -76,7 +86,7 @@ func Benchmark(ctx context.Context, nativePath string, virtual Readable, options
 	}
 	var memory runtime.MemStats
 	runtime.ReadMemStats(&memory)
-	return BenchmarkReport{Native: nativeMetric, Virtual: virtualMetric, Random: randomMetric, GoSysBytes: memory.Sys}, nil
+	return BenchmarkReport{Native: nativeMetric, Virtual: virtualMetric, Random: randomMetric, GoSysBytes: memory.Sys, OSCacheBypassRequested: options.BypassOSCache, OSCacheBypassApplied: bypassApplied}, nil
 }
 
 func benchmarkNativeSequential(ctx context.Context, file *os.File, size int64, blockBytes int) (SequentialMetric, error) {

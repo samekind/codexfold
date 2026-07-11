@@ -2,12 +2,16 @@
 
 package testfs
 
-import "golang.org/x/sys/unix"
+import (
+	"time"
 
-func maxRSSBytes() uint64 {
+	"golang.org/x/sys/unix"
+)
+
+func processResourceUsage() resourceUsage {
 	var usage unix.Rusage
 	if err := unix.Getrusage(unix.RUSAGE_SELF, &usage); err != nil || usage.Maxrss < 0 {
-		return 0
+		return resourceUsage{}
 	}
-	return uint64(usage.Maxrss) * 1024
+	return resourceUsage{MaxRSSBytes: uint64(usage.Maxrss) * 1024, UserCPU: time.Duration(unix.TimevalToNsec(usage.Utime)), SystemCPU: time.Duration(unix.TimevalToNsec(usage.Stime))}
 }

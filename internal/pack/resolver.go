@@ -19,16 +19,18 @@ import (
 )
 
 type OpenOptions struct {
-	CacheBytes int64
+	CacheBytes    int64
+	BypassOSCache bool
 }
 
 type Resolver struct {
-	directory string
-	index     Index
-	objects   map[string]Object
-	packs     map[string]*os.File
-	cache     *blockCache
-	closeOnce sync.Once
+	directory            string
+	index                Index
+	objects              map[string]Object
+	packs                map[string]*os.File
+	cache                *blockCache
+	bypassOSCacheApplied bool
+	closeOnce            sync.Once
 }
 
 func Open(storeDir string, options OpenOptions) (*Resolver, error) {
@@ -43,10 +45,10 @@ func Open(storeDir string, options OpenOptions) (*Resolver, error) {
 	if options.CacheBytes == 0 {
 		options.CacheBytes = defaultCacheBytes
 	}
-	return openGeneration(filepath.Join(storeDir, "packs", generation), options.CacheBytes)
+	return openGeneration(filepath.Join(storeDir, "packs", generation), options.CacheBytes, options.BypassOSCache)
 }
 
-func openGeneration(directory string, cacheBytes int64) (*Resolver, error) {
+func openGeneration(directory string, cacheBytes int64, bypassOSCache bool) (*Resolver, error) {
 	data, err := os.ReadFile(filepath.Join(directory, "index.json"))
 	if err != nil {
 		return nil, fmt.Errorf("read pack index: %w", err)
@@ -74,6 +76,15 @@ func openGeneration(directory string, cacheBytes int64) (*Resolver, error) {
 				_ = resolver.Close()
 				return nil, fmt.Errorf("open pack %s: %w", block.Pack, err)
 			}
+			if bypassOSCache {
+				applied, err := configureNoCache(file)
+				if err != nil {
+					_ = file.Close()
+					_ = resolver.Close()
+					return nil, fmt.Errorf("disable OS cache for pack %s: %w", block.Pack, err)
+				}
+				resolver.bypassOSCacheApplied = resolver.bypassOSCacheApplied || applied
+			}
 			resolver.packs[block.Pack] = file
 		}
 	}
@@ -92,6 +103,8 @@ func openGeneration(directory string, cacheBytes int64) (*Resolver, error) {
 	}
 	return resolver, nil
 }
+
+func (r *Resolver) OSCacheBypassApplied() bool { return r.bypassOSCacheApplied }
 
 func (r *Resolver) ReadAt(ctx context.Context, ref fold.ObjectRef, destination []byte, offset int64) (int, error) {
 	if offset < 0 {
