@@ -6,6 +6,12 @@ It finds exact duplicate raw JSON string tokens, complete JSONL records, and con
 
 > CodexFold is an independent community project and is not affiliated with or endorsed by OpenAI.
 
+## Current Status
+
+`v0.2.1` is `storage-engine`: exact deduplicated storage, byte-identical recovery, incremental analysis, containment, and guarded removal are available. It is not a transparent virtual-filesystem release. Codex cannot directly open a folded manifest without materialization in this version.
+
+The requirements and release gates for normal JSONL paths backed transparently by shared storage are defined in [the transparent filesystem product contract](docs/superpowers/specs/2026-07-11-transparent-session-filesystem-design.md). No release may claim `随点随开`, transparent session access, or production-ready virtual sessions before the platform-specific gates in that contract pass.
+
 ## Install
 
 ```bash
@@ -111,4 +117,4 @@ go vet ./...
 go build ./cmd/codexfold
 ```
 
-See [the architecture](docs/design.md), [Fold V1 format](docs/fold-v1.md), and [v0.2 validation](docs/validation-v0.2.md).
+See [the architecture](docs/design.md), [Fold V1 format](docs/fold-v1.md), [v0.2 validation](docs/validation-v0.2.md), and [the transparent filesystem product contract](docs/superpowers/specs/2026-07-11-transparent-session-filesystem-design.md).

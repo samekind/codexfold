@@ -4,6 +4,8 @@
 
 Fold V1 represents a Codex rollout as an ordered list of immutable content-addressed byte objects. Concatenating the decompressed objects must reproduce the original JSONL byte-for-byte and match its recorded SHA-256.
 
+Fold V1 belongs to the `storage-engine` capability level. It does not make folded manifests directly readable by an unmodified Codex client. Transparent normal-path access is governed separately by the virtual-filesystem product contract.
+
 ## Segmentation
 
 Large JSON string values are identified from their exact raw token spans, including quotes and escape spelling. Each large field becomes a standalone object. Bytes between fields are fed through content-defined chunking and become residual objects. Both object classes share one object store and one hash namespace.
@@ -74,4 +76,4 @@ Unknown manifest versions or kinds are rejected.
 
 ## Lifecycle
 
-Active Codex rollouts remain materialized. Fold V1 initially targets archived or explicitly selected stable sessions. `materialize` is an alias for verified restore and is the basis for later transparent resume integration.
+Active Codex rollouts remain materialized. Fold V1 initially targets archived or explicitly selected stable sessions. `materialize` is an alias for verified restore; it is not transparent session access and must not be described as `随点随开`.

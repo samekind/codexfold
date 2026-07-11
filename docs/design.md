@@ -4,6 +4,8 @@
 
 CodexFold is an unofficial, local-first tool for measuring, deduplicating, storing, and recovering Codex session rollouts. The public project is standalone and has no private control-plane dependency.
 
+The current release capability is `storage-engine`. Transparent normal-path session access is a separate product stage defined by `docs/superpowers/specs/2026-07-11-transparent-session-filesystem-design.md`.
+
 ## Safety
 
 - No network calls, telemetry, uploads, or model requests.
