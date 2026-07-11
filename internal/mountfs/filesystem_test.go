@@ -103,6 +103,36 @@ func TestFilesystemRejectsUnsafeAndManagementMutations(t *testing.T) {
 	}
 }
 
+func TestFilesystemUpsertChangesNewOpensWithoutInvalidatingExistingHandles(t *testing.T) {
+	first := mountSessionFixture(t, "first-session", []byte("first"))
+	second := mountSessionFixture(t, "second-session", []byte("second"))
+	filesystem := New()
+	if err := filesystem.AddSession("session", first); err != nil {
+		t.Fatal(err)
+	}
+	oldHandle, errno := filesystem.Open("/session.jsonl", os.O_RDONLY)
+	if errno != 0 {
+		t.Fatalf("open old handle: %v", errno)
+	}
+	if err := filesystem.UpsertSession("session", second); err != nil {
+		t.Fatalf("UpsertSession: %v", err)
+	}
+	newHandle, errno := filesystem.Open("/session.jsonl", os.O_RDONLY)
+	if errno != 0 {
+		t.Fatalf("open new handle: %v", errno)
+	}
+	oldBytes := make([]byte, 5)
+	if n, errno := filesystem.Read(oldHandle, oldBytes, 0); errno != 0 || n != 5 || string(oldBytes) != "first" {
+		t.Fatalf("old handle changed: n=%d errno=%v bytes=%q", n, errno, oldBytes)
+	}
+	newBytes := make([]byte, 6)
+	if n, errno := filesystem.Read(newHandle, newBytes, 0); errno != 0 || n != 6 || string(newBytes) != "second" {
+		t.Fatalf("new handle did not use replacement: n=%d errno=%v bytes=%q", n, errno, newBytes)
+	}
+	_ = filesystem.Release(oldHandle)
+	_ = filesystem.Release(newHandle)
+}
+
 func TestMountWithoutFuseBuildReturnsPrerequisiteError(t *testing.T) {
 	err := Mount(context.Background(), HostOptions{MountPoint: t.TempDir(), Filesystem: New()})
 	if !errors.Is(err, ErrPrerequisite) {
@@ -144,4 +174,21 @@ func mountFixture(t *testing.T) (*Filesystem, []byte) {
 		t.Fatalf("AddSession: %v", err)
 	}
 	return filesystem, source
+}
+
+func mountSessionFixture(t *testing.T, sessionID string, source []byte) *vfs.Session {
+	t.Helper()
+	root := t.TempDir()
+	digest := sha256.Sum256(source)
+	hexDigest := hex.EncodeToString(digest[:])
+	nativePath := filepath.Join(root, "native.jsonl")
+	if err := os.WriteFile(nativePath, source, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manifest := fold.Manifest{Version: fold.ManifestVersion, Kind: fold.ManifestKind, Session: fold.ManifestSession{ID: sessionID, RolloutPath: nativePath}, Source: fold.ManifestSource{Bytes: int64(len(source)), SHA256: hexDigest}, Parts: []fold.Part{{Kind: fold.PartResidual, Object: fold.ObjectRef{SHA256: hexDigest, RawBytes: int64(len(source))}}}}
+	session, err := vfs.OpenSession(context.Background(), vfs.SessionOptions{Root: root, ManifestPath: filepath.Join(root, "manifest.json"), Manifest: manifest, Reader: mountReader{hexDigest: source}, NativeSnapshot: vfs.NativeFile{Path: nativePath, Bytes: int64(len(source)), SHA256: hexDigest}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return session
 }

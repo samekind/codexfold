@@ -28,8 +28,8 @@ func GC(ctx context.Context, storeDir string, apply bool) (GCResult, error) {
 		return GCResult{}, fmt.Errorf("refusing GC with %d invalid manifest(s)", len(issues))
 	}
 	referenced := make(map[string]struct{})
-	for _, manifest := range manifests {
-		for _, part := range manifest.Parts {
+	for _, loaded := range manifests {
+		for _, part := range loaded.Manifest.Parts {
 			referenced[part.Object.SHA256] = struct{}{}
 		}
 	}

@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -45,6 +46,45 @@ func loadSessionState(path string) (SessionState, error) {
 		return SessionState{}, errors.New("invalid virtual session state")
 	}
 	return state, nil
+}
+
+func LoadSessionState(path string) (SessionState, error) {
+	state, err := loadSessionState(path)
+	if err != nil {
+		return SessionState{}, err
+	}
+	directory := filepath.Dir(filepath.Clean(path))
+	if filepath.Base(directory) != state.SessionID || filepath.Base(filepath.Dir(directory)) != "sessions" {
+		return SessionState{}, errors.New("session state path does not match its session ID")
+	}
+	if !pathWithin(directory, state.DeltaPath) || (state.BackingPath != "" && !pathWithin(directory, state.BackingPath)) {
+		return SessionState{}, errors.New("session state contains an unsafe data path")
+	}
+	return state, nil
+}
+
+func DiscoverSessionStates(root string) ([]SessionState, error) {
+	directory := filepath.Join(root, "fs", "sessions")
+	entries, err := os.ReadDir(directory)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read managed session states: %w", err)
+	}
+	states := make([]SessionState, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		state, err := LoadSessionState(filepath.Join(directory, entry.Name(), "state.json"))
+		if err != nil {
+			return nil, fmt.Errorf("load managed session %s: %w", entry.Name(), err)
+		}
+		states = append(states, state)
+	}
+	sort.Slice(states, func(i, j int) bool { return states[i].SessionID < states[j].SessionID })
+	return states, nil
 }
 
 func writeSessionState(path string, state SessionState) error {

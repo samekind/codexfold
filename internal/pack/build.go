@@ -153,26 +153,28 @@ func Build(ctx context.Context, storeDir string, options BuildOptions) (BuildRes
 }
 
 func referencedObjects(storeDir string) ([]fold.ObjectRef, error) {
-	entries, err := os.ReadDir(filepath.Join(storeDir, "manifests"))
-	if err != nil {
-		return nil, fmt.Errorf("read manifests for pack build: %w", err)
-	}
 	refs := make(map[string]fold.ObjectRef)
-	for _, entry := range entries {
-		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
-			continue
+	err := filepath.WalkDir(filepath.Join(storeDir, "manifests"), func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
 		}
-		sessionID := strings.TrimSuffix(entry.Name(), ".json")
-		manifest, err := fold.LoadManifest(storeDir, sessionID)
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			return nil
+		}
+		manifest, err := fold.LoadManifestPath(path)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		for _, part := range manifest.Parts {
 			if existing, ok := refs[part.Object.SHA256]; ok && existing.RawBytes != part.Object.RawBytes {
-				return nil, fmt.Errorf("object %s has conflicting raw lengths", part.Object.SHA256)
+				return fmt.Errorf("object %s has conflicting raw lengths", part.Object.SHA256)
 			}
 			refs[part.Object.SHA256] = part.Object
 		}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("read manifests for pack build: %w", err)
 	}
 	digests := make([]string, 0, len(refs))
 	for digest := range refs {

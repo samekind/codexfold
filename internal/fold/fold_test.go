@@ -162,6 +162,38 @@ func TestFoldDryRunDoesNotCreateStore(t *testing.T) {
 	}
 }
 
+func TestFoldWritesToExplicitGenerationManifestWithoutReplacingPrimary(t *testing.T) {
+	root := t.TempDir()
+	storeDir := filepath.Join(root, "store")
+	sourcePath := filepath.Join(root, "session.jsonl")
+	data := []byte("{\"value\":\"generation-manifest\"}\n")
+	if err := os.WriteFile(sourcePath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	primary := ManifestPath(storeDir, "session")
+	if err := os.MkdirAll(filepath.Dir(primary), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(primary, []byte("primary-sentinel"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	generationPath := filepath.Join(storeDir, "manifests", "generations", "session", "2.json")
+	result, err := Fold(context.Background(), codex.Session{ID: "session", RolloutPath: sourcePath, Archived: true}, FoldOptions{StoreDir: storeDir, Apply: true, FieldThreshold: 8, ManifestPathOverride: generationPath})
+	if err != nil {
+		t.Fatalf("Fold generation manifest: %v", err)
+	}
+	if result.ManifestPath != generationPath {
+		t.Fatalf("manifest path = %q, want %q", result.ManifestPath, generationPath)
+	}
+	if primaryData, err := os.ReadFile(primary); err != nil || string(primaryData) != "primary-sentinel" {
+		t.Fatalf("primary manifest changed: %q err=%v", primaryData, err)
+	}
+	manifest, err := LoadManifestPath(generationPath)
+	if err != nil || manifest.Source.Bytes != int64(len(data)) {
+		t.Fatalf("load generation manifest: %#v err=%v", manifest, err)
+	}
+}
+
 func TestFoldRoundTripsEmptyInvalidAndOversizedRollouts(t *testing.T) {
 	for _, test := range []struct {
 		name          string

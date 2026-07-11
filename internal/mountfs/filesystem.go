@@ -53,6 +53,16 @@ func (f *Filesystem) AddSession(sessionID string, session *vfs.Session) error {
 	return nil
 }
 
+func (f *Filesystem) UpsertSession(sessionID string, session *vfs.Session) error {
+	if sessionID == "" || strings.ContainsAny(sessionID, "/\\\x00") || session == nil {
+		return errors.New("safe session ID and session are required")
+	}
+	f.mu.Lock()
+	f.sessions[sessionID] = session
+	f.mu.Unlock()
+	return nil
+}
+
 func (f *Filesystem) ReadDir(name string) ([]string, syscall.Errno) {
 	if cleanPath(name) != "/" {
 		return nil, syscall.ENOTDIR

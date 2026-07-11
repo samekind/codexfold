@@ -30,6 +30,8 @@ func NewRootCommand() *cobra.Command {
 	root.AddCommand(newUnfoldCommand("materialize"))
 	root.AddCommand(newDoctorCommand())
 	root.AddCommand(newGCCommand())
+	root.AddCommand(newPackCommand())
+	root.AddCommand(newFSCommand())
 	return root
 }
 

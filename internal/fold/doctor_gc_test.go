@@ -90,6 +90,27 @@ func TestGCDryRunAndApplyRemoveOnlyUnreferencedObjects(t *testing.T) {
 	}
 }
 
+func TestDoctorAndGCKeepGenerationManifestObjects(t *testing.T) {
+	root := t.TempDir()
+	storeDir := filepath.Join(root, "store")
+	sourcePath := filepath.Join(root, "generation.jsonl")
+	if err := os.WriteFile(sourcePath, []byte("{\"value\":\"generation-only-field\"}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manifestPath := filepath.Join(storeDir, "manifests", "generations", "session", "2.json")
+	if _, err := Fold(context.Background(), codex.Session{ID: "session", RolloutPath: sourcePath, Archived: true}, FoldOptions{StoreDir: storeDir, ManifestPathOverride: manifestPath, Apply: true, FieldThreshold: 4}); err != nil {
+		t.Fatalf("Fold generation: %v", err)
+	}
+	doctor, err := Doctor(context.Background(), storeDir)
+	if err != nil || doctor.ManifestCount != 1 || doctor.IssueCount != 0 {
+		t.Fatalf("generation manifest not covered by doctor: %#v err=%v", doctor, err)
+	}
+	gc, err := GC(context.Background(), storeDir, true)
+	if err != nil || gc.OrphanCount != 0 || gc.Referenced == 0 {
+		t.Fatalf("generation object treated as orphan: %#v err=%v", gc, err)
+	}
+}
+
 func TestRemoveSourceRequiresGuardAndCanMaterializeAgain(t *testing.T) {
 	root := t.TempDir()
 	storeDir := filepath.Join(root, "store")

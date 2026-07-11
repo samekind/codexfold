@@ -140,6 +140,43 @@ func TestResolverAndDoctorDetectPackCorruption(t *testing.T) {
 	}
 }
 
+func TestBuildIncludesObjectsReferencedByGenerationManifests(t *testing.T) {
+	root := t.TempDir()
+	data := []byte("generation-only-object")
+	store := fold.NewObjectStore(root)
+	ref, _, err := store.Put(data, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SyncPending(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	manifest := fold.Manifest{
+		Version: fold.ManifestVersion, Kind: fold.ManifestKind,
+		Session: fold.ManifestSession{ID: "session", RolloutPath: "session.jsonl", Archived: true},
+		Source:  fold.ManifestSource{Bytes: int64(len(data)), SHA256: ref.SHA256},
+		Parts:   []fold.Part{{Kind: fold.PartResidual, Object: ref}},
+	}
+	manifestPath := filepath.Join(root, "manifests", "generations", "session", "2.json")
+	if err := os.MkdirAll(filepath.Dir(manifestPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(manifestPath, encoded, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result, err := Build(context.Background(), root, BuildOptions{})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if result.ObjectCount != 1 {
+		t.Fatalf("object count = %d, want 1", result.ObjectCount)
+	}
+}
+
 func putObjects(t *testing.T, root string, values ...[]byte) []fold.ObjectRef {
 	t.Helper()
 	store := fold.NewObjectStore(root)

@@ -11,6 +11,8 @@ import (
 	"hash"
 	"io"
 	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/jstar0/codexfold/internal/cdc"
 	"github.com/jstar0/codexfold/internal/codex"
@@ -18,15 +20,16 @@ import (
 )
 
 type FoldOptions struct {
-	StoreDir         string
-	Apply            bool
-	Overwrite        bool
-	RemoveSource     bool
-	AllowActive      bool
-	FieldThreshold   int64
-	MaxJSONLineBytes int64
-	CDC              cdc.Options
-	beforeCommit     func() error
+	StoreDir             string
+	ManifestPathOverride string
+	Apply                bool
+	Overwrite            bool
+	RemoveSource         bool
+	AllowActive          bool
+	FieldThreshold       int64
+	MaxJSONLineBytes     int64
+	CDC                  cdc.Options
+	beforeCommit         func() error
 }
 
 type FoldResult struct {
@@ -68,6 +71,14 @@ func Fold(ctx context.Context, session codex.Session, options FoldOptions) (Fold
 		options.CDC = cdc.Options{MinBytes: 4 * 1024, AverageBytes: 16 * 1024, MaxBytes: 64 * 1024}
 	}
 	manifestPath := ManifestPath(options.StoreDir, session.ID)
+	if options.ManifestPathOverride != "" {
+		manifestPath = filepath.Clean(options.ManifestPathOverride)
+		manifestRoot := filepath.Join(options.StoreDir, "manifests")
+		relative, err := filepath.Rel(manifestRoot, manifestPath)
+		if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+			return FoldResult{}, errors.New("manifest override must remain inside the fold manifest directory")
+		}
+	}
 	if options.Apply && !options.Overwrite {
 		if _, err := os.Stat(manifestPath); err == nil {
 			return FoldResult{}, fmt.Errorf("fold manifest already exists: %s", manifestPath)
@@ -260,7 +271,7 @@ complete:
 	if err := store.SyncPending(ctx); err != nil {
 		return FoldResult{}, err
 	}
-	if err := writeManifest(options.StoreDir, manifest, options.Overwrite); err != nil {
+	if err := writeManifestPath(manifestPath, manifest, options.Overwrite); err != nil {
 		return FoldResult{}, err
 	}
 	if options.RemoveSource {
