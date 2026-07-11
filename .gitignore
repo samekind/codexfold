@@ -1,0 +1,7 @@
+/codexfold
+/*.sqlite
+/*.sqlite-shm
+/*.sqlite-wal
+*.prof
+*.test
+.DS_Store
