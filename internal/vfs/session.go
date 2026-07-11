@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/jstar0/codexfold/internal/fold"
 )
@@ -33,6 +34,14 @@ type Session struct {
 	writerOpen     bool
 	beforeCOWPhase func(string) error
 }
+
+type VisibleInfo struct {
+	Size       int64
+	ModTime    time.Time
+	Generation uint64
+}
+
+var ErrWriterBusy = errors.New("session writer lease is already held")
 
 func OpenSession(ctx context.Context, options SessionOptions) (*Session, error) {
 	if err := ctx.Err(); err != nil {
@@ -108,6 +117,25 @@ func (s *Session) State() SessionState {
 	return s.state
 }
 
+func (s *Session) VisibleInfo() (VisibleInfo, error) {
+	s.mu.Lock()
+	state := s.state
+	s.mu.Unlock()
+	path := state.DeltaPath
+	if state.BackingPath != "" {
+		path = state.BackingPath
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return VisibleInfo{}, err
+	}
+	size := info.Size()
+	if state.BackingPath == "" {
+		size += state.BaseBytes
+	}
+	return VisibleInfo{Size: size, ModTime: info.ModTime(), Generation: state.Generation}, nil
+}
+
 func (s *Session) OpenReader() (*ReadHandle, error) {
 	s.mu.Lock()
 	state := s.state
@@ -158,7 +186,7 @@ func (s *Session) OpenWriter() (*WriteHandle, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.writerOpen {
-		return nil, errors.New("session writer lease is already held")
+		return nil, ErrWriterBusy
 	}
 	leasePath := filepath.Join(s.directory, "writer.lease")
 	lease, err := os.OpenFile(leasePath, os.O_CREATE|os.O_RDWR, 0o600)
@@ -172,7 +200,7 @@ func (s *Session) OpenWriter() (*WriteHandle, error) {
 	}
 	if !locked {
 		_ = lease.Close()
-		return nil, errors.New("session writer lease is held by another process")
+		return nil, ErrWriterBusy
 	}
 	if err := lease.Truncate(0); err != nil {
 		_ = unlockWriterFile(lease)

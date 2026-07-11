@@ -5,6 +5,7 @@ go 1.26
 require (
 	github.com/klauspost/compress v1.19.0
 	github.com/spf13/cobra v1.10.2
+	github.com/winfsp/cgofuse v1.6.0
 	golang.org/x/sys v0.36.0
 	modernc.org/sqlite v1.40.1
 )
