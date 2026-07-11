@@ -105,6 +105,7 @@ func (h *ReadHandle) Close() error {
 type WriteHandle struct {
 	session   *Session
 	leasePath string
+	lease     *os.File
 	mu        sync.Mutex
 	closed    bool
 }
@@ -208,12 +209,16 @@ func (h *WriteHandle) Close() error {
 		return nil
 	}
 	h.closed = true
-	removeErr := os.Remove(h.leasePath)
+	unlockErr := unlockWriterFile(h.lease)
+	closeErr := h.lease.Close()
 	h.session.mu.Lock()
 	h.session.writerOpen = false
 	h.session.mu.Unlock()
-	if removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
-		return removeErr
+	if unlockErr != nil {
+		return unlockErr
+	}
+	if closeErr != nil {
+		return closeErr
 	}
 	return nil
 }

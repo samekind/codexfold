@@ -50,6 +50,9 @@ func OpenSession(ctx context.Context, options SessionOptions) (*Session, error) 
 		return nil, fmt.Errorf("create virtual session directory: %w", err)
 	}
 	statePath := filepath.Join(directory, "state.json")
+	if err := cleanupStaleWriterLease(filepath.Join(directory, "writer.lease")); err != nil {
+		return nil, err
+	}
 	state, err := loadSessionState(statePath)
 	if errors.Is(err, os.ErrNotExist) {
 		if err := verifyNativeFile(options.NativeSnapshot); err != nil {
@@ -89,7 +92,14 @@ func OpenSession(ctx context.Context, options SessionOptions) (*Session, error) 
 			}
 		}
 	}
-	return &Session{state: state, statePath: statePath, directory: directory, view: view, readerLeases: make(map[uint64]int), beforeCOWPhase: options.BeforeCOWPhase}, nil
+	session := &Session{state: state, statePath: statePath, directory: directory, view: view, readerLeases: make(map[uint64]int), beforeCOWPhase: options.BeforeCOWPhase}
+	if err := session.recover(ctx); err != nil {
+		return nil, err
+	}
+	if recovered, err := loadSessionState(statePath); err == nil {
+		session.state = recovered
+	}
+	return session, nil
 }
 
 func (s *Session) State() SessionState {
@@ -101,10 +111,11 @@ func (s *Session) State() SessionState {
 func (s *Session) OpenReader() (*ReadHandle, error) {
 	s.mu.Lock()
 	state := s.state
+	view := s.view
 	s.readerLeases[state.Generation]++
 	s.mu.Unlock()
 
-	handle := &ReadHandle{session: s, generation: state.Generation, base: s.view, baseBytes: state.BaseBytes}
+	handle := &ReadHandle{session: s, generation: state.Generation, base: view, baseBytes: state.BaseBytes}
 	var path string
 	if state.BackingPath != "" {
 		path = state.BackingPath
@@ -150,29 +161,36 @@ func (s *Session) OpenWriter() (*WriteHandle, error) {
 		return nil, errors.New("session writer lease is already held")
 	}
 	leasePath := filepath.Join(s.directory, "writer.lease")
-	lease, err := os.OpenFile(leasePath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	lease, err := os.OpenFile(leasePath, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
-		if errors.Is(err, os.ErrExist) {
-			return nil, errors.New("session writer lease file already exists")
-		}
 		return nil, fmt.Errorf("create writer lease: %w", err)
 	}
-	if _, err := fmt.Fprintf(lease, "%d\n", os.Getpid()); err != nil {
+	locked, err := tryLockWriterFile(lease)
+	if err != nil {
 		_ = lease.Close()
-		_ = os.Remove(leasePath)
+		return nil, err
+	}
+	if !locked {
+		_ = lease.Close()
+		return nil, errors.New("session writer lease is held by another process")
+	}
+	if err := lease.Truncate(0); err != nil {
+		_ = unlockWriterFile(lease)
+		_ = lease.Close()
+		return nil, err
+	}
+	if _, err := fmt.Fprintf(lease, "%d\n", os.Getpid()); err != nil {
+		_ = unlockWriterFile(lease)
+		_ = lease.Close()
 		return nil, fmt.Errorf("write writer lease: %w", err)
 	}
 	if err := lease.Sync(); err != nil {
+		_ = unlockWriterFile(lease)
 		_ = lease.Close()
-		_ = os.Remove(leasePath)
 		return nil, fmt.Errorf("sync writer lease: %w", err)
 	}
-	if err := lease.Close(); err != nil {
-		_ = os.Remove(leasePath)
-		return nil, fmt.Errorf("close writer lease: %w", err)
-	}
 	s.writerOpen = true
-	return &WriteHandle{session: s, leasePath: leasePath}, nil
+	return &WriteHandle{session: s, leasePath: leasePath, lease: lease}, nil
 }
 
 func (s *Session) ensureBacking(ctx context.Context) (string, error) {
@@ -247,6 +265,10 @@ func (s *Session) ensureBacking(ctx context.Context) (string, error) {
 	if verified.Bytes != reader.Size() || verified.SHA256 != hex.EncodeToString(sourceHash.Sum(nil)) {
 		return "", errors.New("temporary backing verification failed")
 	}
+	operationID := fmt.Sprintf("cow-%020d", currentGeneration)
+	if err := appendJournal(s.directory, JournalRecord{OperationID: operationID, SessionID: s.state.SessionID, Kind: "copy-on-write", Phase: "data-synced", TempPath: temporaryPath, Native: verified}); err != nil {
+		return "", err
+	}
 	if s.beforeCOWPhase != nil {
 		if err := s.beforeCOWPhase("before-publish"); err != nil {
 			return "", err
@@ -258,6 +280,17 @@ func (s *Session) ensureBacking(ctx context.Context) (string, error) {
 	}
 	if err := syncStateDirectory(s.directory); err != nil {
 		return "", err
+	}
+	candidate := s.state
+	candidate.Generation = currentGeneration + 1
+	candidate.BackingPath = backingPath
+	if err := appendJournal(s.directory, JournalRecord{OperationID: operationID, SessionID: s.state.SessionID, Kind: "copy-on-write", Phase: "after-file-publish", Candidate: candidate, FinalPath: backingPath, Native: verified}); err != nil {
+		return "", err
+	}
+	if s.beforeCOWPhase != nil {
+		if err := s.beforeCOWPhase("after-file-publish"); err != nil {
+			return "", err
+		}
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -271,6 +304,12 @@ func (s *Session) ensureBacking(ctx context.Context) (string, error) {
 		return "", err
 	}
 	s.state = next
+	if err := appendJournal(s.directory, JournalRecord{OperationID: operationID, SessionID: next.SessionID, Kind: "copy-on-write", Phase: "state-published", Candidate: next, FinalPath: backingPath, Native: verified}); err != nil {
+		return "", err
+	}
+	if err := appendJournal(s.directory, JournalRecord{OperationID: operationID, SessionID: next.SessionID, Kind: "copy-on-write", Phase: "complete", Candidate: next, FinalPath: backingPath, Native: verified}); err != nil {
+		return "", err
+	}
 	return backingPath, nil
 }
 
