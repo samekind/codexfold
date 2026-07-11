@@ -18,6 +18,8 @@ type fuseFilesystem struct {
 	core *Filesystem
 }
 
+func Available() bool { return true }
+
 func (f *fuseFilesystem) Getattr(name string, stat *fuse.Stat_t, _ uint64) int {
 	attribute, errno := f.core.Getattr(name)
 	if errno != 0 {

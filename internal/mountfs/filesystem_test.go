@@ -134,6 +134,9 @@ func TestFilesystemUpsertChangesNewOpensWithoutInvalidatingExistingHandles(t *te
 }
 
 func TestMountWithoutFuseBuildReturnsPrerequisiteError(t *testing.T) {
+	if Available() {
+		t.Fatal("default build should report the FUSE host as unavailable")
+	}
 	err := Mount(context.Background(), HostOptions{MountPoint: t.TempDir(), Filesystem: New()})
 	if !errors.Is(err, ErrPrerequisite) {
 		t.Fatalf("Mount error = %v, want ErrPrerequisite", err)

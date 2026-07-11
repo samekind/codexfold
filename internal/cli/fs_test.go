@@ -24,10 +24,96 @@ func TestRootExposesPackAndFilesystemCommands(t *testing.T) {
 		{"pack", "build"}, {"pack", "doctor"},
 		{"fs", "status"}, {"fs", "doctor"}, {"fs", "compatibility"}, {"fs", "benchmark"},
 		{"fs", "serve"}, {"fs", "migrate"}, {"fs", "rollback"}, {"fs", "compact"}, {"fs", "recover"},
+		{"fs", "service", "install"}, {"fs", "service", "start"}, {"fs", "service", "stop"},
+		{"fs", "service", "status"}, {"fs", "service", "update-preflight"},
 	} {
 		if _, _, err := root.Find(commandPath); err != nil {
 			t.Fatalf("command %v should be exposed: %v", commandPath, err)
 		}
+	}
+}
+
+func TestFSServiceInstallIsDryRunByDefaultAndApplyRequiresFuseBuild(t *testing.T) {
+	home, storeDir, _ := fsFixture(t, true)
+	plistPath := filepath.Join(home, "LaunchAgents", "com.codexfold.fs.plist")
+	root := NewRootCommand()
+	var output bytes.Buffer
+	root.SetOut(&output)
+	root.SetErr(&bytes.Buffer{})
+	root.SetArgs([]string{"fs", "service", "install", "--codex-home", home, "--store", storeDir, "--plist", plistPath, "--json"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("service install dry-run: %v", err)
+	}
+	if _, err := os.Stat(plistPath); !os.IsNotExist(err) {
+		t.Fatalf("dry-run wrote plist: %v", err)
+	}
+	root = NewRootCommand()
+	root.SetOut(&bytes.Buffer{})
+	root.SetErr(&bytes.Buffer{})
+	root.SetArgs([]string{"fs", "service", "install", "--codex-home", home, "--store", storeDir, "--plist", plistPath, "--apply"})
+	if err := root.Execute(); err == nil {
+		t.Fatal("default build should reject service installation without a FUSE host")
+	}
+}
+
+func TestFSUpdatePreflightQuarantineRoutesLatestVisibleBytesNative(t *testing.T) {
+	home, storeDir, nativePath := fsFixture(t, true)
+	approvedCLI := approvedCLIContract(t, storeDir, "1.2.3")
+	mount := filepath.Join(home, "mount")
+	if err := os.MkdirAll(mount, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(mount, "session.jsonl")
+	original, _ := os.ReadFile(nativePath)
+	if err := os.WriteFile(target, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	executeFS(t, []string{"fs", "migrate", "session", "--codex-home", home, "--store", storeDir, "--mount", mount, "--cli", approvedCLI, "--desktop-app", "none", "--apply"})
+	state, err := managedState(storeDir, "session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	managed, resolver, err := openManagedSession(context.Background(), storeDir, state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer, err := managed.OpenWriter()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tail := []byte("{\"after_upgrade\":true}\n")
+	if _, err := writer.Append(context.Background(), tail); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	_ = writer.Close()
+	_ = resolver.Close()
+	unknownCLI := fakeCLI(t, "9.9.9")
+	root := NewRootCommand()
+	var output bytes.Buffer
+	root.SetOut(&output)
+	root.SetErr(&bytes.Buffer{})
+	root.SetArgs([]string{"fs", "service", "update-preflight", "--codex-home", home, "--store", storeDir, "--cli", unknownCLI, "--desktop-app", "none", "--apply-quarantine", "--json"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("update preflight: %v", err)
+	}
+	var result FSUpdatePreflightResult
+	if err := json.Unmarshal(output.Bytes(), &result); err != nil || !result.Decision.Quarantine || result.Decision.RequiresNativeFallback || result.QuarantinedSessions != 1 {
+		t.Fatalf("unexpected quarantine result: %#v err=%v output=%s", result, err, output.String())
+	}
+	sessions, err := codex.LoadSessions(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	quarantineBytes, err := os.ReadFile(sessions[0].RolloutPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := append(append([]byte(nil), original...), tail...)
+	if !bytes.Equal(quarantineBytes, want) {
+		t.Fatalf("quarantine route is stale: got=%q want=%q", quarantineBytes, want)
 	}
 }
 
@@ -324,17 +410,23 @@ func fsFixture(t *testing.T, archived bool) (string, string, string) {
 
 func approvedCLIContract(t *testing.T, storeDir string, version string) string {
 	t.Helper()
-	cliPath := filepath.Join(t.TempDir(), "codex")
-	script := "#!/bin/sh\necho 'codex-cli " + version + "'\n"
-	if err := os.WriteFile(cliPath, []byte(script), 0o700); err != nil {
-		t.Fatal(err)
-	}
+	cliPath := fakeCLI(t, version)
 	_, err := compat.Save(filepath.Join(storeDir, "compatibility"), compat.Contract{
 		Version: compat.ContractVersion, Platform: runtime.GOOS, ClientKind: "cli", ClientVersion: version,
 		Operations:  []compat.Operation{{Name: "read", Count: 1}},
 		TraceSHA256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 	})
 	if err != nil {
+		t.Fatal(err)
+	}
+	return cliPath
+}
+
+func fakeCLI(t *testing.T, version string) string {
+	t.Helper()
+	cliPath := filepath.Join(t.TempDir(), "codex")
+	script := "#!/bin/sh\necho 'codex-cli " + version + "'\n"
+	if err := os.WriteFile(cliPath, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	return cliPath

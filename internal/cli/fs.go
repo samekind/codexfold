@@ -87,6 +87,7 @@ func newFSCommand() *cobra.Command {
 	command.AddCommand(newFSRollbackCommand())
 	command.AddCommand(newFSCompactCommand())
 	command.AddCommand(newFSRecoverCommand())
+	command.AddCommand(newFSServiceCommand())
 	return command
 }
 
