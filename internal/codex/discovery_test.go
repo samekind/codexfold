@@ -58,7 +58,15 @@ func TestResolveHomeUsesExplicitPathBeforeEnvironment(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ResolveHome returned error: %v", err)
 	}
-	if got != "/explicit/codex" {
+	if got != filepath.Clean("/explicit/codex") {
 		t.Fatalf("resolved home = %q, want explicit path", got)
+	}
+}
+
+func TestSQLiteReadOnlyDSNUsesWindowsFileURI(t *testing.T) {
+	got := sqliteReadOnlyDSNForOS(`C:\Users\demo\Codex Data\state_5.sqlite`, "windows")
+	want := "file:///C:/Users/demo/Codex%20Data/state_5.sqlite?mode=ro"
+	if got != want {
+		t.Fatalf("Windows SQLite DSN = %q, want %q", got, want)
 	}
 }

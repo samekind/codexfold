@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	_ "modernc.org/sqlite"
@@ -42,16 +43,15 @@ func LoadSessions(home string) ([]Session, error) {
 	if _, err := os.Stat(dbPath); err != nil {
 		return nil, fmt.Errorf("locate Codex state database %s: %w", dbPath, err)
 	}
-	dsn := (&url.URL{
-		Scheme:   "file",
-		Path:     dbPath,
-		RawQuery: "mode=ro&_pragma=busy_timeout%285000%29",
-	}).String()
+	dsn := sqliteReadOnlyDSN(dbPath)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open Codex state database: %w", err)
 	}
 	defer func() { _ = db.Close() }()
+	if _, err := db.Exec(`pragma busy_timeout = 5000`); err != nil {
+		return nil, fmt.Errorf("configure Codex state database: %w", err)
+	}
 
 	rows, err := db.Query(`
 		select id, title, cwd, rollout_path, model_provider, coalesce(model, ''),
@@ -88,4 +88,23 @@ func LoadSessions(home string) ([]Session, error) {
 		return nil, fmt.Errorf("iterate Codex sessions: %w", err)
 	}
 	return sessions, nil
+}
+
+func sqliteReadOnlyDSN(path string) string {
+	return sqliteReadOnlyDSNForOS(path, runtime.GOOS)
+}
+
+func sqliteReadOnlyDSNForOS(path string, goos string) string {
+	slashPath := filepath.ToSlash(path)
+	if goos == "windows" {
+		slashPath = strings.ReplaceAll(path, "\\", "/")
+	}
+	if goos == "windows" && !strings.HasPrefix(slashPath, "/") {
+		slashPath = "/" + slashPath
+	}
+	uri := &url.URL{Scheme: "file", Path: slashPath}
+	query := uri.Query()
+	query.Set("mode", "ro")
+	uri.RawQuery = query.Encode()
+	return uri.String()
 }
