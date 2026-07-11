@@ -3,6 +3,7 @@ module github.com/jstar0/codexfold
 go 1.26
 
 require (
+	github.com/klauspost/compress v1.19.0
 	github.com/spf13/cobra v1.10.2
 	modernc.org/sqlite v1.40.1
 )

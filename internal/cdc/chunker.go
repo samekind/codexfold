@@ -1,29 +1,32 @@
-package scan
+package cdc
 
 import (
 	"crypto/sha256"
 	"fmt"
 )
 
-const dedupLayerCDC = "cdc"
-
-type DedupCDCOptions struct {
+type Options struct {
 	MinBytes     int64
 	AverageBytes int64
 	MaxBytes     int64
 }
 
-type dedupCDCChunker struct {
-	options DedupCDCOptions
+type Chunk struct {
+	Data   []byte
+	Digest [sha256.Size]byte
+}
+
+type Chunker struct {
+	options Options
 	mask    uint64
 	gear    uint64
 	chunk   []byte
-	emit    func([sha256.Size]byte, int64) error
+	emit    func(Chunk) error
 }
 
 var dedupGearTable = buildDedupGearTable()
 
-func newDedupCDCChunker(options DedupCDCOptions, emit func([sha256.Size]byte, int64) error) (*dedupCDCChunker, error) {
+func New(options Options, emit func(Chunk) error) (*Chunker, error) {
 	if options.MinBytes <= 0 {
 		options.MinBytes = 64 * 1024
 	}
@@ -42,7 +45,7 @@ func newDedupCDCChunker(options DedupCDCOptions, emit func([sha256.Size]byte, in
 	if emit == nil {
 		return nil, fmt.Errorf("CDC emit callback is required")
 	}
-	return &dedupCDCChunker{
+	return &Chunker{
 		options: options,
 		mask:    uint64(options.AverageBytes - 1),
 		chunk:   make([]byte, 0, options.MaxBytes),
@@ -50,7 +53,7 @@ func newDedupCDCChunker(options DedupCDCOptions, emit func([sha256.Size]byte, in
 	}, nil
 }
 
-func (c *dedupCDCChunker) Write(data []byte) error {
+func (c *Chunker) Write(data []byte) error {
 	for _, value := range data {
 		c.chunk = append(c.chunk, value)
 		c.gear = (c.gear << 1) + dedupGearTable[value]
@@ -64,16 +67,16 @@ func (c *dedupCDCChunker) Write(data []byte) error {
 	return nil
 }
 
-func (c *dedupCDCChunker) Finish() error {
+func (c *Chunker) Finish() error {
 	if len(c.chunk) == 0 {
 		return nil
 	}
 	return c.emitChunk()
 }
 
-func (c *dedupCDCChunker) emitChunk() error {
+func (c *Chunker) emitChunk() error {
 	digest := sha256.Sum256(c.chunk)
-	if err := c.emit(digest, int64(len(c.chunk))); err != nil {
+	if err := c.emit(Chunk{Data: c.chunk, Digest: digest}); err != nil {
 		return err
 	}
 	c.chunk = c.chunk[:0]

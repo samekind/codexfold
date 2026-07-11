@@ -23,6 +23,12 @@ func NewRootCommand() *cobra.Command {
 		Version:       resolvedVersion(),
 	}
 	root.AddCommand(newScanCommand())
+	root.AddCommand(newContainsCommand())
+	root.AddCommand(newFoldCommand())
+	root.AddCommand(newUnfoldCommand("unfold"))
+	root.AddCommand(newUnfoldCommand("materialize"))
+	root.AddCommand(newDoctorCommand())
+	root.AddCommand(newGCCommand())
 	return root
 }
 
@@ -83,6 +89,7 @@ func newScanCommand() *cobra.Command {
 	command.Flags().Int64Var(&options.MaxBytes, "max-bytes", 0, "Maximum selected source bytes; 0 means unlimited")
 	command.Flags().StringVar(&options.IndexPath, "index", "", "SQLite index path; omitted uses and removes a temporary index")
 	command.Flags().BoolVar(&options.OverwriteIndex, "overwrite-index", false, "Replace an existing disposable scan index")
+	command.Flags().BoolVar(&options.Incremental, "incremental", false, "Reuse a persistent index, skipping unchanged files and scanning append-only tails")
 	command.Flags().StringVar(&layers, "layers", scan.LayerField, "Comma-separated layers: field, record, cdc")
 	command.Flags().Int64Var(&options.MinFieldBytes, "min-field-bytes", 4*1024, "Minimum raw JSON string token bytes to index")
 	command.Flags().Int64Var(&options.MaxJSONLineBytes, "max-json-line-bytes", 32*1024*1024, "Maximum JSONL record bytes parsed for fields")
@@ -96,9 +103,12 @@ func newScanCommand() *cobra.Command {
 
 func renderResult(writer io.Writer, result scan.Result) error {
 	if _, err := fmt.Fprintf(writer,
-		"sessions=%d scanned=%s duration=%s index=%s missing=%d changed=%d\n",
+		"sessions=%d corpus=%s processed=%s skipped=%d appended=%d duration=%s index=%s missing=%d changed=%d\n",
 		result.SessionCount,
 		formatBytes(result.Scan.ScannedBytes),
+		formatBytes(result.ProcessedBytes),
+		result.SkippedSessionCount,
+		result.AppendedSessionCount,
 		formatDuration(result.DurationMillis),
 		formatBytes(result.IndexBytes),
 		result.MissingSessionCount,

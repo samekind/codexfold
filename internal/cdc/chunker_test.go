@@ -1,4 +1,4 @@
-package scan
+package cdc
 
 import (
 	"bytes"
@@ -13,7 +13,7 @@ func TestContentDefinedChunksRealignAfterInsertion(t *testing.T) {
 	inserted = append(inserted, bytes.Repeat([]byte{0x5a}, 137)...)
 	inserted = append(inserted, original[170000:]...)
 
-	options := DedupCDCOptions{MinBytes: 4 * 1024, AverageBytes: 16 * 1024, MaxBytes: 64 * 1024}
+	options := Options{MinBytes: 4 * 1024, AverageBytes: 16 * 1024, MaxBytes: 64 * 1024}
 	originalChunks := collectCDCChunks(t, original, options)
 	insertedChunks := collectCDCChunks(t, inserted, options)
 	shared := 0
@@ -32,7 +32,7 @@ func TestContentDefinedChunksRealignAfterInsertion(t *testing.T) {
 }
 
 func TestContentDefinedChunkBounds(t *testing.T) {
-	options := DedupCDCOptions{MinBytes: 64, AverageBytes: 128, MaxBytes: 256}
+	options := Options{MinBytes: 64, AverageBytes: 128, MaxBytes: 256}
 	chunks := collectCDCChunks(t, deterministicBytes(32*1024+17), options)
 	if len(chunks) < 2 {
 		t.Fatalf("chunk count = %d, want multiple chunks", len(chunks))
@@ -52,11 +52,11 @@ type testCDCChunk struct {
 	Size   int64
 }
 
-func collectCDCChunks(t *testing.T, data []byte, options DedupCDCOptions) []testCDCChunk {
+func collectCDCChunks(t *testing.T, data []byte, options Options) []testCDCChunk {
 	t.Helper()
 	chunks := make([]testCDCChunk, 0)
-	chunker, err := newDedupCDCChunker(options, func(digest [sha256.Size]byte, size int64) error {
-		chunks = append(chunks, testCDCChunk{Digest: digest, Size: size})
+	chunker, err := New(options, func(chunk Chunk) error {
+		chunks = append(chunks, testCDCChunk{Digest: chunk.Digest, Size: int64(len(chunk.Data))})
 		return nil
 	})
 	if err != nil {

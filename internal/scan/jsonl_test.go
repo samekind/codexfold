@@ -209,3 +209,15 @@ func TestDedupScanDoesNotMisclassifyIndexFailureAsInvalidJSON(t *testing.T) {
 		t.Fatalf("scan should return the closed-index failure")
 	}
 }
+
+func deterministicBytes(size int) []byte {
+	data := make([]byte, size)
+	state := uint64(0x123456789abcdef0)
+	for index := range data {
+		state ^= state << 13
+		state ^= state >> 7
+		state ^= state << 17
+		data[index] = byte(state)
+	}
+	return data
+}

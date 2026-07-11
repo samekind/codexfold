@@ -2,23 +2,26 @@ package scan
 
 import (
 	"bufio"
-	"bytes"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"hash"
 	"io"
-	"strconv"
-	"strings"
+
+	"github.com/jstar0/codexfold/internal/cdc"
+	"github.com/jstar0/codexfold/internal/jsonraw"
 )
 
 const (
 	dedupLayerRecord             = "record"
 	dedupLayerField              = "field"
+	dedupLayerCDC                = "cdc"
 	defaultDedupMinFieldBytes    = int64(4 * 1024)
 	defaultDedupMaxJSONLineBytes = int64(32 * 1024 * 1024)
 )
+
+type DedupCDCOptions = cdc.Options
 
 type DedupScanOptions struct {
 	RecordLayer      bool
@@ -50,11 +53,12 @@ func scanDedupStream(r io.Reader, options DedupScanOptions, index *dedupIndex) (
 	}
 
 	var stats DedupFileStats
-	var cdc *dedupCDCChunker
+	var chunker *cdc.Chunker
 	if options.CDCLayer {
 		var err error
-		cdc, err = newDedupCDCChunker(options.CDC, func(digest [sha256.Size]byte, size int64) error {
-			if err := index.Observe(dedupLayerCDC, digest, size); err != nil {
+		chunker, err = cdc.New(options.CDC, func(chunk cdc.Chunk) error {
+			size := int64(len(chunk.Data))
+			if err := index.Observe(dedupLayerCDC, chunk.Digest, size); err != nil {
 				return err
 			}
 			stats.CDCChunkCount++
@@ -83,8 +87,8 @@ func scanDedupStream(r io.Reader, options DedupScanOptions, index *dedupIndex) (
 			fragment, err := reader.ReadSlice('\n')
 			if len(fragment) > 0 {
 				hasData = true
-				if cdc != nil {
-					if err := cdc.Write(fragment); err != nil {
+				if chunker != nil {
+					if err := chunker.Write(fragment); err != nil {
 						return DedupFileStats{}, err
 					}
 				}
@@ -149,8 +153,8 @@ func scanDedupStream(r io.Reader, options DedupScanOptions, index *dedupIndex) (
 			break
 		}
 	}
-	if cdc != nil {
-		if err := cdc.Finish(); err != nil {
+	if chunker != nil {
+		if err := chunker.Finish(); err != nil {
 			return DedupFileStats{}, err
 		}
 	}
@@ -163,119 +167,18 @@ func isDedupJSONParseError(err error) bool {
 }
 
 func observeLargeJSONStrings(data []byte, minBytes int64, index *dedupIndex, stats *DedupFileStats) error {
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.UseNumber()
-	if err := scanDedupJSONValue(decoder, data, "", minBytes, index, stats); err != nil {
-		return err
-	}
-	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
-		if err == nil {
-			return fmt.Errorf("multiple JSON values in one JSONL record")
-		}
-		return err
-	}
-	return nil
-}
-
-func scanDedupJSONValue(decoder *json.Decoder, rawJSON []byte, path string, minBytes int64, index *dedupIndex, stats *DedupFileStats) error {
-	startOffset := decoder.InputOffset()
-	token, err := decoder.Token()
+	spans, err := jsonraw.FindStringSpans(data, minBytes)
 	if err != nil {
 		return err
 	}
-	switch typed := token.(type) {
-	case string:
-		rawToken, ok := rawJSONStringToken(rawJSON, startOffset, decoder.InputOffset())
-		if !ok {
-			return fmt.Errorf("locate raw JSON string token at offset %d", startOffset)
-		}
-		if int64(len(rawToken)) < minBytes {
-			return nil
-		}
+	for _, span := range spans {
+		rawToken := data[span.Start:span.End]
 		digest := sha256.Sum256(rawToken)
-		if err := index.ObserveAt(dedupLayerField, digest, int64(len(rawToken)), path); err != nil {
+		if err := index.ObserveAt(dedupLayerField, digest, int64(len(rawToken)), span.Path); err != nil {
 			return err
 		}
 		stats.FieldCount++
 		stats.FieldBytes += int64(len(rawToken))
-	case json.Delim:
-		switch typed {
-		case '{':
-			for decoder.More() {
-				keyToken, err := decoder.Token()
-				if err != nil {
-					return err
-				}
-				key, ok := keyToken.(string)
-				if !ok {
-					return fmt.Errorf("JSON object key is %T, want string", keyToken)
-				}
-				if err := scanDedupJSONValue(decoder, rawJSON, path+"/"+escapeJSONPointerToken(key), minBytes, index, stats); err != nil {
-					return err
-				}
-			}
-			end, err := decoder.Token()
-			if err != nil {
-				return err
-			}
-			if end != json.Delim('}') {
-				return fmt.Errorf("JSON object ended with %v", end)
-			}
-		case '[':
-			for indexValue := 0; decoder.More(); indexValue++ {
-				if err := scanDedupJSONValue(decoder, rawJSON, path+"/"+strconv.Itoa(indexValue), minBytes, index, stats); err != nil {
-					return err
-				}
-			}
-			end, err := decoder.Token()
-			if err != nil {
-				return err
-			}
-			if end != json.Delim(']') {
-				return fmt.Errorf("JSON array ended with %v", end)
-			}
-		default:
-			return fmt.Errorf("unexpected JSON delimiter %q", typed)
-		}
 	}
 	return nil
-}
-
-func rawJSONStringToken(data []byte, startOffset int64, endOffset int64) ([]byte, bool) {
-	if startOffset < 0 || endOffset < startOffset || endOffset > int64(len(data)) {
-		return nil, false
-	}
-	window := data[startOffset:endOffset]
-	relativeStart := bytes.IndexByte(window, '"')
-	if relativeStart < 0 {
-		return nil, false
-	}
-	absoluteStart := int(startOffset) + relativeStart
-	absoluteEnd, ok := scanJSONStringToken(data, absoluteStart)
-	if !ok || int64(absoluteEnd) > endOffset {
-		return nil, false
-	}
-	return data[absoluteStart:absoluteEnd], true
-}
-
-func scanJSONStringToken(data []byte, start int) (int, bool) {
-	if start >= len(data) || data[start] != '"' {
-		return 0, false
-	}
-	escaped := false
-	for cursor := start + 1; cursor < len(data); cursor++ {
-		switch {
-		case escaped:
-			escaped = false
-		case data[cursor] == '\\':
-			escaped = true
-		case data[cursor] == '"':
-			return cursor + 1, true
-		}
-	}
-	return 0, false
-}
-
-func escapeJSONPointerToken(value string) string {
-	return strings.NewReplacer("~", "~0", "/", "~1").Replace(value)
 }
