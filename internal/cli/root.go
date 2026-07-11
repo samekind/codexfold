@@ -24,6 +24,7 @@ func NewRootCommand() *cobra.Command {
 	}
 	root.AddCommand(newScanCommand())
 	root.AddCommand(newContainsCommand())
+	root.AddCommand(newRemoveContainedCommand())
 	root.AddCommand(newFoldCommand())
 	root.AddCommand(newUnfoldCommand("unfold"))
 	root.AddCommand(newUnfoldCommand("materialize"))

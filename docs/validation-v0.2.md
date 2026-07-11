@@ -10,6 +10,7 @@
 - Object reuse, batched durability synchronization, doctor, and GC.
 - Incremental unchanged skip, append tail, rewrite/truncate rejection, configuration mismatch, and CDC equivalence with full scan.
 - Exact record-sequence containment, non-contiguous rejection, escape-spelling distinction, and multi-megabyte records.
+- Dry-run and apply contained-session removal, recovery proof, associated-state cleanup, and rollback after database failure.
 - macOS, Linux, and Windows CI builds and tests.
 
 ## Real Rollout Validation
@@ -37,3 +38,13 @@ The largest fold initially took 324 seconds with one synchronous flush per objec
 A restored rollout and copied state database were placed in an isolated Codex home. The official Codex CLI found the original session ID, resumed it, and completed a turn. The live Codex home and source rollout were not modified.
 
 Real fork chains were also checked with exact containment. Several ancestry-linked sessions correctly returned `contained=false` because Codex had regenerated or inserted records. This confirms that fork ancestry must not be used as deletion evidence.
+
+## Contained Removal
+
+The complete CLI flow was run against an isolated copy of the current Codex SQLite schema:
+
+1. Fold an archived contained rollout.
+2. Run proof-only removal and confirm the thread, source, associations, and global-state references remain.
+3. Run apply removal and confirm the archived thread, dynamic tools, spawn edges, exact global-state references, and source rollout are gone while the container remains.
+4. Run doctor against the retained fold store with zero issues.
+5. Restore the removed rollout from its retained manifest and verify the original byte count and SHA-256.

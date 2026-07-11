@@ -14,7 +14,7 @@ import (
 
 func TestRootExposesScanCommand(t *testing.T) {
 	root := NewRootCommand()
-	for _, name := range []string{"scan", "contains", "fold", "unfold", "materialize", "doctor", "gc"} {
+	for _, name := range []string{"scan", "contains", "remove-contained", "fold", "unfold", "materialize", "doctor", "gc"} {
 		if _, _, err := root.Find([]string{name}); err != nil {
 			t.Fatalf("%s command should be exposed: %v", name, err)
 		}

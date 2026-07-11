@@ -51,4 +51,15 @@ SQLite stores observations by rollout path instead of only maintaining global co
 
 Containment is a complete contiguous sequence of exact raw JSONL records. The first `session_meta` can be ignored because a fork receives different metadata. Record SHA-256 and size drive a KMP sequence search; every match is then checked with direct byte-range comparison.
 
-This deliberately does not infer containment from titles, fork ancestry, semantic similarity, or shared fields. The public command is report-only because deleting a Codex thread also requires transactional state-database and associated-state cleanup.
+This deliberately does not infer containment from titles, fork ancestry, semantic similarity, or shared fields.
+
+`remove-contained` is a separate, dry-run-first operation. It requires exact containment, an archived contained session, a verified fold, a current source digest match, and an unfold proof. Apply mode:
+
+1. Writes recovery provenance to the fold store.
+2. Revalidates the archived thread in a SQLite transaction.
+3. Renames the source to a same-directory pending path.
+4. Removes exact thread-ID references from Codex global state with an optimistic concurrent-change check.
+5. Cleans dynamic tools, spawn edges, agent assignment references, and the thread row.
+6. Commits the database transaction, then deletes the pending source.
+
+Failures before commit restore the original global state and rollout path. The fold manifest remains after success, so byte-level recovery is still possible even though the Codex thread row is gone.

@@ -66,6 +66,15 @@ codexfold contains <contained-session-id> <container-session-id>
 
 The first `session_meta` record is ignored by default because fork metadata differs. A candidate hash match is verified again with a direct byte-range comparison. This command reports evidence only; it does not delete either session. Fork ancestry alone is not containment evidence.
 
+Remove an archived session only after containment and recovery proofs pass:
+
+```bash
+codexfold remove-contained <contained-session-id> <container-session-id>
+codexfold remove-contained <contained-session-id> <container-session-id> --apply
+```
+
+The first command is proof-only. `--apply` additionally requires an existing verified fold, a current source SHA-256 match, and a successful temporary unfold. It then isolates the source file, removes the archived thread and associated local state in one SQLite transaction, cleans exact thread-ID references from Codex global state, and finally deletes the isolated source. A tombstone and fold manifest remain for byte-level recovery. Concurrent global-state changes abort the operation instead of being overwritten.
+
 ## Maintenance
 
 Verify every manifest and referenced object:
@@ -91,6 +100,7 @@ codexfold gc --apply
 - Objects and manifests are written through temporary files and committed atomically.
 - Restore writes to a temporary file, verifies the complete SHA-256, then atomically replaces the target.
 - Existing indexes, manifests, and restore targets are never replaced without an explicit overwrite flag.
+- Contained-session removal is archived-only, proof-first, transaction-guarded, and retains recovery evidence.
 
 ## Development
 

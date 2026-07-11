@@ -316,6 +316,17 @@ func verifyStoredManifest(ctx context.Context, store *ObjectStore, manifest Mani
 	return verifySourceDigest(hasher, bytesWritten, manifest.Source)
 }
 
+func VerifySession(ctx context.Context, storeDir string, sessionID string) (Manifest, error) {
+	manifest, err := LoadManifest(storeDir, sessionID)
+	if err != nil {
+		return Manifest{}, err
+	}
+	if err := verifyStoredManifest(ctx, NewObjectStore(storeDir), manifest); err != nil {
+		return Manifest{}, err
+	}
+	return manifest, nil
+}
+
 func verifySourceDigest(hasher hash.Hash, bytesWritten int64, source ManifestSource) error {
 	if bytesWritten != source.Bytes {
 		return fmt.Errorf("reconstructed bytes %d, want %d", bytesWritten, source.Bytes)
