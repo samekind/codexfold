@@ -8,6 +8,38 @@ The user must not run `materialize` before opening a managed session. The Codex 
 
 `v0.2.1` is the storage-engine baseline. It is not a transparent filesystem release and must never be described as "transparent", "随点随开", or production-ready for virtual sessions.
 
+## Non-Negotiable Requirements
+
+Every implementation plan, task, test report, release note, and control-plane status must reference the applicable requirement IDs. A requirement may only be changed by editing this product contract and recording the reason; implementation plans cannot weaken or reinterpret it.
+
+| ID | Requirement |
+| --- | --- |
+| `TF-001` | Opening or resuming a managed session requires no manual materialization or preparation command. |
+| `TF-002` | Unmodified Codex Desktop and Codex CLI access a normal regular-file JSONL path and do not know that storage is virtual. |
+| `TF-003` | Every byte and every file operation Codex actually uses has native-equivalent observable behavior. Platform readiness is blocked by any unsupported operation used by Codex. |
+| `TF-004` | Identical content across sessions and forks is stored once in the shared object store; session histories remain independently writable. |
+| `TF-005` | Normal append writes go to a durable delta without complete base materialization. |
+| `TF-006` | Truncate, random write, and every non-append mutation that can be represented safely must transition to copy-on-write before success. A mutating operation used by Codex may not be silently rejected in a production-ready adapter. |
+| `TF-007` | Packed reads do not open loose object files per manifest part and do not query SQLite per object. |
+| `TF-008` | Performance and memory must satisfy the platform gates in this contract; functional correctness alone is insufficient. |
+| `TF-009` | Daemon termination, host restart, interrupted commit, interrupted migration, and interrupted compaction recover without byte loss or generation ambiguity. |
+| `TF-010` | Real session routing is unchanged until shadow verification passes; canary sessions retain native fallbacks. |
+| `TF-011` | Production operation requires no per-session setup: existing sessions are bulk-enrolled under policy, new sessions and forks are discovered automatically, and all sessions remain directly openable during enrollment. |
+| `TF-012` | Core pack, read, append, copy-on-write, generation, journal, and recovery logic is platform-neutral; macOS, Linux, and Windows use separate adapters and independent readiness gates. |
+| `TF-013` | Capability claims use only the canonical status terms in this contract. |
+| `TF-014` | Native fallback deletion is disabled until platform production readiness and per-session retention gates pass. |
+| `TF-015` | An unknown Codex client version pauses destructive automation until compatibility tests pass. |
+| `TF-016` | Platform filesystem prerequisites requiring elevated or system-extension approval are installed only after explicit user authorization. |
+
+### Drift Control
+
+- Each implementation-plan task lists the requirement IDs it implements or verifies.
+- Each plan starts with a complete requirement-to-task coverage table for `TF-001` through `TF-016`.
+- A requirement with no implementation or verification task blocks plan approval.
+- Completion reports list fresh evidence by requirement ID and state any unmet ID explicitly.
+- Mock, fixture, or synthetic evidence cannot satisfy a requirement that names real Codex, a real platform adapter, a client upgrade, a host restart, or a canary period.
+- Later plans may add stricter gates but may not replace an exact requirement with a weaker proxy.
+
 ## Canonical Status Terms
 
 These terms are the only allowed product-status claims:
@@ -92,6 +124,8 @@ Pack V1 uses:
 
 Each immutable pack contains concatenated independent zstd frames. `index.sqlite` maps an object SHA-256 to pack ID, offset, stored length, raw length, and frame checksum. The daemon loads the resolver index into an in-memory map at startup; normal reads do not query SQLite per object.
 
+`objects.idx` from the earlier architecture discussion is represented concretely by `packs/index.sqlite` as the durable index plus the daemon's in-memory digest map as the runtime index. This decision is fixed for Pack V1. A normal virtual read performs no SQLite lookup and opens no loose object file.
+
 Pack creation is transactional:
 
 1. Write and synchronize a temporary pack.
@@ -149,11 +183,11 @@ The engine must implement and test:
 | `flush/release` | Release handle state without triggering unsafe inline compaction |
 | `truncate` | Transition to writable backing before changing visible size |
 | random `write/pwrite` | Transition to writable backing before mutation |
-| `rename/unlink` | Disabled for normal Codex access unless native tracing proves the client requires them; management operations use explicit APIs |
+| `rename/unlink` | Implement native-equivalent behavior when Codex tracing shows that the client uses it; otherwise management operations use explicit APIs |
 | `mmap` | Supported when the platform adapter can provide coherent read pages; otherwise platform readiness is blocked |
 | file locks | Preserve the lock behavior observed in the native Codex trace |
 
-An unrecognized mutating operation must fail closed or trigger copy-on-write. It must never modify a manifest or pack in place.
+Every non-append mutating operation that can be represented safely must trigger copy-on-write before success. A genuinely unsupported operation fails closed during preview or canary, records compatibility evidence, and blocks platform production readiness when Codex uses it. It must never modify a manifest or pack in place.
 
 ## Append And Copy-On-Write
 
@@ -242,6 +276,14 @@ A session migration is a two-phase state change:
 Rollback restores the database path to the retained native source. Native fallback deletion is disabled until the platform reaches `production-ready` and the individual session passes the configured retention period without compatibility or recovery failures.
 
 The first production release defaults to canary-only migration. Bulk migration requires a separate explicit command and a clean doctor result.
+
+After platform production readiness, enrollment is policy-driven rather than manual:
+
+- Existing eligible sessions are discovered from Codex state and bulk-enrolled in bounded batches.
+- Newly created sessions and forks remain normal native files while actively written, are discovered automatically, and enter shadow verification when stable.
+- A session remains directly openable from its native path until the virtual route transaction commits.
+- No user action is required to enroll, open, resume, fork, compact, or re-enroll a normal session.
+- Enrollment failure leaves the native database route and source file unchanged.
 
 ## Failure Semantics
 
