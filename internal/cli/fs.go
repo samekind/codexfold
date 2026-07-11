@@ -21,6 +21,7 @@ import (
 	"github.com/jstar0/codexfold/internal/fsctl"
 	"github.com/jstar0/codexfold/internal/mountfs"
 	"github.com/jstar0/codexfold/internal/pack"
+	"github.com/jstar0/codexfold/internal/service"
 	"github.com/jstar0/codexfold/internal/vfs"
 	"github.com/spf13/cobra"
 )
@@ -75,6 +76,8 @@ type compatibilityFlags struct {
 	cliPath       string
 	desktopPath   string
 }
+
+var mountHealthProbe = service.ProbeMount
 
 func newFSCommand() *cobra.Command {
 	command := &cobra.Command{Use: "fs", Short: "Operate the transparent session filesystem"}
@@ -369,8 +372,8 @@ func newFSMigrateCommand() *cobra.Command {
 				if len(compatibilityResult.DetectionErrors) != 0 || !compatibilityResult.Evaluation.Approved {
 					return errors.New("installed Codex client versions are not covered by compatibility contracts")
 				}
-				if info, err := os.Stat(mount); err != nil || !info.IsDir() {
-					return errors.New("filesystem mount point is not available")
+				if err := mountHealthProbe(mount); err != nil {
+					return fmt.Errorf("filesystem mount point is not healthy: %w", err)
 				}
 				if _, err := vfs.OpenSession(command.Context(), vfs.SessionOptions{Root: store, ManifestPath: fold.ManifestPath(store, session.ID), Manifest: manifest, Reader: resolver, NativeSnapshot: native}); err != nil {
 					return err
@@ -621,13 +624,18 @@ func newFSRecoverCommand() *cobra.Command {
 }
 
 func addCompatibilityFlags(command *cobra.Command, flags *compatibilityFlags) {
+	defaults := defaultCompatibilityFlags()
 	command.Flags().StringVar(&flags.contractsPath, "contracts", "", "Compatibility contract directory; defaults to <store>/compatibility")
-	command.Flags().StringVar(&flags.cliPath, "cli", "codex", "Codex CLI path, or 'none' to skip CLI evaluation")
-	defaultDesktop := "none"
+	command.Flags().StringVar(&flags.cliPath, "cli", defaults.cliPath, "Codex CLI path, or 'none' to skip CLI evaluation")
+	command.Flags().StringVar(&flags.desktopPath, "desktop-app", defaults.desktopPath, "Codex desktop application path, or 'none' to skip desktop evaluation")
+}
+
+func defaultCompatibilityFlags() compatibilityFlags {
+	desktop := "none"
 	if runtime.GOOS == "darwin" {
-		defaultDesktop = "/Applications/ChatGPT.app"
+		desktop = "/Applications/ChatGPT.app"
 	}
-	command.Flags().StringVar(&flags.desktopPath, "desktop-app", defaultDesktop, "Codex desktop application path, or 'none' to skip desktop evaluation")
+	return compatibilityFlags{cliPath: "codex", desktopPath: desktop}
 }
 
 func evaluateCompatibility(ctx context.Context, store string, flags compatibilityFlags) (FSCompatibilityResult, error) {
@@ -752,12 +760,17 @@ func requireStorageHealth(ctx context.Context, store string) error {
 }
 
 func fsDoctor(ctx context.Context, home string, store string, mount string) fsctl.DoctorReport {
+	serviceStatus := service.Manager{}.Status(ctx, serviceLabel, mount)
 	checks := []fsctl.Check{
-		{Component: fsctl.ComponentDaemon, Run: func(context.Context) error { return errors.New("managed service lifecycle is not installed") }},
+		{Component: fsctl.ComponentDaemon, Run: func(context.Context) error {
+			if !serviceStatus.DaemonRunning {
+				return errors.New(serviceStatus.DaemonError)
+			}
+			return nil
+		}},
 		{Component: fsctl.ComponentMount, Run: func(context.Context) error {
-			info, err := os.Stat(mount)
-			if err != nil || !info.IsDir() {
-				return errors.New("filesystem mount point is unavailable")
+			if !serviceStatus.MountHealthy {
+				return errors.New(serviceStatus.MountError)
 			}
 			return nil
 		}},
@@ -841,7 +854,16 @@ func fsDoctor(ctx context.Context, home string, store string, mount string) fsct
 			}
 			return nil
 		}},
-		fsctl.Check{Component: fsctl.ComponentClient, Run: func(context.Context) error { return errors.New("run fs compatibility with explicit client contracts") }},
+		fsctl.Check{Component: fsctl.ComponentClient, Run: func(ctx context.Context) error {
+			result, err := evaluateCompatibility(ctx, store, defaultCompatibilityFlags())
+			if err != nil {
+				return err
+			}
+			if len(result.DetectionErrors) != 0 || !result.Evaluation.Approved {
+				return errors.New("installed Codex clients are not covered by exact compatibility contracts")
+			}
+			return nil
+		}},
 	)
 	return fsctl.Doctor(ctx, checks)
 }

@@ -57,6 +57,7 @@ func TestFSServiceInstallIsDryRunByDefaultAndApplyRequiresFuseBuild(t *testing.T
 }
 
 func TestFSUpdatePreflightQuarantineRoutesLatestVisibleBytesNative(t *testing.T) {
+	allowFixtureMount(t)
 	home, storeDir, nativePath := fsFixture(t, true)
 	approvedCLI := approvedCLIContract(t, storeDir, "1.2.3")
 	mount := filepath.Join(home, "mount")
@@ -181,6 +182,33 @@ func TestFSMigrateApplyFailsClosedWithoutMountedTarget(t *testing.T) {
 	}
 }
 
+func TestFSMigrateApplyRejectsPlainDirectoryThatOnlyLooksLikeMount(t *testing.T) {
+	home, storeDir, nativePath := fsFixture(t, true)
+	cliPath := approvedCLIContract(t, storeDir, "1.2.3")
+	mount := filepath.Join(home, "plain-directory")
+	if err := os.MkdirAll(mount, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(nativePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(mount, "session.jsonl"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	root := NewRootCommand()
+	root.SetOut(&bytes.Buffer{})
+	root.SetErr(&bytes.Buffer{})
+	root.SetArgs([]string{"fs", "migrate", "session", "--codex-home", home, "--store", storeDir, "--mount", mount, "--cli", cliPath, "--desktop-app", "none", "--apply"})
+	if err := root.Execute(); err == nil {
+		t.Fatal("plain directory should not satisfy the FUSE mount health gate")
+	}
+	sessions, _ := codex.LoadSessions(home)
+	if sessions[0].RolloutPath != nativePath {
+		t.Fatalf("failed mount gate changed route to %q", sessions[0].RolloutPath)
+	}
+}
+
 func TestFSStatusDoesNotClaimTransparentReadiness(t *testing.T) {
 	root := NewRootCommand()
 	var output bytes.Buffer
@@ -217,6 +245,7 @@ func TestFSCompatibilityApprovesOnlyExactInstalledClientContract(t *testing.T) {
 }
 
 func TestFSMigrateApplyInitializesManagedStateAndRoutesVerifiedTarget(t *testing.T) {
+	allowFixtureMount(t)
 	home, storeDir, nativePath := fsFixture(t, true)
 	cliPath := approvedCLIContract(t, storeDir, "1.2.3")
 	mount := filepath.Join(home, "mount")
@@ -249,6 +278,7 @@ func TestFSMigrateApplyInitializesManagedStateAndRoutesVerifiedTarget(t *testing
 }
 
 func TestFSRollbackUsesLatestVisibleBytesAfterVirtualAppend(t *testing.T) {
+	allowFixtureMount(t)
 	home, storeDir, nativePath := fsFixture(t, true)
 	cliPath := approvedCLIContract(t, storeDir, "1.2.3")
 	mount := filepath.Join(home, "mount")
@@ -445,4 +475,11 @@ func executeFS(t *testing.T, args []string) {
 	if err := root.Execute(); err != nil {
 		t.Fatalf("execute %v: %v", args, err)
 	}
+}
+
+func allowFixtureMount(t *testing.T) {
+	t.Helper()
+	previous := mountHealthProbe
+	mountHealthProbe = func(string) error { return nil }
+	t.Cleanup(func() { mountHealthProbe = previous })
 }

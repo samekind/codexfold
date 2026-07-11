@@ -170,7 +170,7 @@ func (m Manager) Status(ctx context.Context, label string, mountPoint string) St
 	}
 	probe := m.MountProbe
 	if probe == nil {
-		probe = defaultMountProbe
+		probe = ProbeMount
 	}
 	if err := probe(mountPoint); err != nil {
 		result.MountError = err.Error()
@@ -179,6 +179,8 @@ func (m Manager) Status(ctx context.Context, label string, mountPoint string) St
 	}
 	return result
 }
+
+func ProbeMount(path string) error { return defaultMountProbe(path) }
 
 func EvaluateUpdate(input UpdateInput) UpdateDecision {
 	if !input.DoctorHealthy {
