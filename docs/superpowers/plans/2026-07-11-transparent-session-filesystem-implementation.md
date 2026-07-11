@@ -476,8 +476,8 @@ Run:
 ```bash
 go test ./internal/mountfs -count=1
 go test -race ./internal/mountfs -count=1
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test ./internal/mountfs -count=1
-CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go test ./internal/mountfs -count=1
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test -c -o /tmp/codexfold-mountfs-linux.test ./internal/mountfs
+CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go test -c -o /tmp/codexfold-mountfs-windows.test.exe ./internal/mountfs
 go test ./... -count=1
 ```
 
@@ -625,8 +625,8 @@ go test ./... -count=1
 go test -race ./... -count=1
 go vet ./...
 go build ./cmd/codexfold
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test ./... -count=1
-CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go test ./... -count=1
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ./cmd/codexfold
+CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build ./cmd/codexfold
 ```
 
 Expected: all PASS.
