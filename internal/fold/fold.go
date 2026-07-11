@@ -80,7 +80,12 @@ func Fold(ctx context.Context, session codex.Session, options FoldOptions) (Fold
 	if err != nil {
 		return FoldResult{}, fmt.Errorf("open rollout: %w", err)
 	}
-	defer func() { _ = file.Close() }()
+	fileClosed := false
+	defer func() {
+		if !fileClosed {
+			_ = file.Close()
+		}
+	}()
 	before, err := file.Stat()
 	if err != nil {
 		return FoldResult{}, fmt.Errorf("stat rollout: %w", err)
@@ -219,6 +224,10 @@ func Fold(ctx context.Context, session codex.Session, options FoldOptions) (Fold
 	}
 
 complete:
+	if err := file.Close(); err != nil {
+		return FoldResult{}, fmt.Errorf("close rollout after fold: %w", err)
+	}
+	fileClosed = true
 	result.SourceSHA256 = hex.EncodeToString(sourceHash.Sum(nil))
 	manifest.Source = ManifestSource{Bytes: result.SourceBytes, SHA256: result.SourceSHA256}
 	result.PartCount = len(manifest.Parts)
