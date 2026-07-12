@@ -2,7 +2,7 @@
 
 ## Current Status
 
-The FUSE-T macOS adapter and an isolated real Codex CLI canary have passed. The project remains at `fs-engine-preview`; it has not earned `platform-canary` or production status.
+The FUSE-T macOS adapter and an isolated real Codex CLI canary have passed for read, append, resume, fork, and child-session enrollment. The project remains at `fs-engine-preview`; it has not earned `platform-canary` or production status.
 
 Observed on 2026-07-12:
 
@@ -14,6 +14,9 @@ Observed on 2026-07-12:
 - The real FUSE-T fixture test passed mount, list, stat, exact reads, reopen, EOF append, fsync, random-write copy-on-write, truncate, rejected rename, unmount, and remount.
 - A session added to the store after mount became readable through on-demand loading without remounting.
 - An equal-length truncate from real Codex remained a no-op and did not hydrate a writable backing file.
+- A real fork from a virtual parent created a native child session; parent and child then resumed independently without cross-contamination.
+- The child was archived while native, folded and packed, then enrolled through the mounted filesystem after remount.
+- After an isolated database-only archive-flag reset, the enrolled child resumed through its virtual path and appended successfully.
 
 ## Real Shadow Evidence
 
@@ -43,6 +46,15 @@ The validated sequence was:
 7. Roll back to a verified ordinary JSONL containing the latest visible bytes.
 8. Resume and append successfully from that native fallback.
 
+The additional fork sequence was:
+
+1. Route the parent to the mounted virtual JSONL.
+2. Run the unmodified CLI `fork` command with a real prompt.
+3. Confirm the child was created as an ordinary native rollout while the parent stayed virtual.
+4. Resume the native child and the virtual parent separately.
+5. Archive the native child, fold and pack it, remount, and migrate the child through the real CLI route.
+6. Resume the migrated child through the virtual path after an isolated database-only archive-flag reset.
+
 The rollback safety regression also covers a native fallback that becomes newer than managed state. Unknown-version quarantine must preserve that current native route and must not overwrite it with stale managed bytes.
 
 A direct `SIGTERM` stopped the foreground service and removed the mount cleanly. A PTY `Ctrl-C` experiment left a reparented process once; this was a test-harness behavior and is not used as lifecycle evidence.
@@ -54,7 +66,9 @@ The following gates are still open:
 - Complete native syscall contract for the `PATH` CLI after its launcher re-exec.
 - Complete native syscall contract for Codex Desktop.
 - Direct Desktop click and continued conversation against a virtual session.
-- A real Codex fork created and continued while the source session is virtual.
+- A real Codex fork created and continued while the source session is virtual: the CLI path passes; Desktop remains open.
+- Transparent archive/unarchive for virtual routes. The current flat `/<session-id>.jsonl` mount fails official `unarchive` because Codex requires canonical `sessions/YYYY/MM/DD/...` and `archived_sessions/...` paths and moves the rollout between them. A database-only archive-flag reset is test-only evidence and is not an implementation.
+- A directory-level virtual namespace that keeps active and archived canonical paths inside one filesystem, or an equivalent native-compatible mechanism.
 - Sleep/wake and host-restart recovery.
 - Unknown-version quarantine in the retained-source real canary path, beyond the isolated regression.
 - Retained-source canary routes in the real Codex home.

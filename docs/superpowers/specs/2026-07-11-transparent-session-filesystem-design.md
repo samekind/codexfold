@@ -200,7 +200,7 @@ The engine must implement and test:
 | `flush/release` | Release handle state without triggering unsafe inline compaction |
 | `truncate` | Transition to writable backing before changing visible size |
 | random `write/pwrite` | Transition to writable backing before mutation |
-| `rename/unlink` | Implement native-equivalent behavior when Codex tracing shows that the client uses it; otherwise management operations use explicit APIs |
+| `rename/unlink` | Implement native-equivalent behavior when Codex tracing shows that the client uses it; Codex archive/unarchive currently requires canonical active/archive directories inside one virtual namespace |
 | `mmap` | Supported when the platform adapter can provide coherent read pages; otherwise platform readiness is blocked |
 | file locks | Preserve the lock behavior observed in the native Codex trace |
 
@@ -259,10 +259,11 @@ The trace suite covers listing, opening, scrolling old history, resume, sending 
 
 ### macOS
 
-- Current reference adapter: macFUSE.
+- Current reference adapter: FUSE-T `1.2.7`.
 - Service: user launch service with keep-alive and mount health monitoring.
-- Required tests: APFS native baseline, Apple Silicon, Codex Desktop, Codex CLI, sleep/wake, network changes, user logout/login, daemon kill, mount restart, and Codex upgrade.
-- If macFUSE remains the selected adapter, its installation and system-extension approval are separate user-authorized deployment steps. Development before that approval uses the platform-neutral engine and adapter mocks.
+- Required tests: APFS native baseline, Apple Silicon, Codex Desktop, Codex CLI, canonical `sessions` and `archived_sessions` namespace moves, sleep/wake, network changes, user logout/login, daemon kill, mount restart, and Codex upgrade.
+- FUSE-T is the validated userspace host for this project; macFUSE is not a prerequisite for the current macOS route.
+- The current flat mount is insufficient for production because Codex moves archived rollouts between canonical directories. Platform readiness requires a directory-level namespace or an equivalent mechanism that keeps those moves native-compatible.
 
 ### Linux
 
