@@ -138,6 +138,29 @@ func TestFilesystemPathTruncateUsesTheActiveWriter(t *testing.T) {
 	}
 }
 
+func TestFilesystemLoadsAMissingSessionOnceOnFirstAccess(t *testing.T) {
+	source := []byte("loaded")
+	session := mountSessionFixture(t, "loaded", source)
+	filesystem := New()
+	loads := 0
+	filesystem.SetSessionLoader(func(sessionID string) (*vfs.Session, error) {
+		loads++
+		if sessionID != "loaded" {
+			return nil, os.ErrNotExist
+		}
+		return session, nil
+	})
+	for attempt := 0; attempt < 2; attempt++ {
+		attribute, errno := filesystem.Getattr("/loaded.jsonl")
+		if errno != 0 || attribute.Size != int64(len(source)) {
+			t.Fatalf("Getattr attempt %d = %#v errno=%v", attempt, attribute, errno)
+		}
+	}
+	if loads != 1 {
+		t.Fatalf("session loader calls = %d, want 1", loads)
+	}
+}
+
 func TestFilesystemRejectsUnsafeAndManagementMutations(t *testing.T) {
 	filesystem, _ := mountFixture(t)
 	if _, errno := filesystem.Open("/../session.jsonl", os.O_RDONLY); errno != syscall.ENOENT {

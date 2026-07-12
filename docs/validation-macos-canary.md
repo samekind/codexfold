@@ -2,27 +2,73 @@
 
 ## Current Status
 
-Blocked before adapter compilation and real Codex routing. No real session route has been changed.
+The FUSE-T macOS adapter and an isolated real Codex CLI canary have passed. The project remains at `fs-engine-preview`; it has not earned `platform-canary` or production status.
 
 Observed on 2026-07-12:
 
 - Codex desktop bundle: `26.707.41301` build `5103`.
 - Desktop-bundled CLI: `codex-cli 0.144.0-alpha.4`.
 - CLI resolved from `PATH`: `codex-cli 0.142.5`.
-- macFUSE or osxfuse package receipt: not present.
-- macFUSE or osxfuse filesystem bundle: not present.
-- `go build -tags fuse ./cmd/codexfold`: blocked by missing `fuse.h`.
-- Root `fs_usage` trace: not attempted because elevation has not been explicitly authorized.
+- FUSE adapter: FUSE-T `1.2.7`; macFUSE is not required or supported by this validation route.
+- `CGO_ENABLED=1 go test -tags fuse ./...`: passed.
+- The real FUSE-T fixture test passed mount, list, stat, exact reads, reopen, EOF append, fsync, random-write copy-on-write, truncate, rejected rename, unmount, and remount.
+- A session added to the store after mount became readable through on-demand loading without remounting.
+- An equal-length truncate from real Codex remained a no-op and did not hydrate a writable backing file.
 
-## Required Authorization Sequence
+## Real Shadow Evidence
 
-1. Explicitly authorize a root `fs_usage` capture for the installed desktop-bundled CLI, the `PATH` CLI, and Codex Desktop workflows. The captured contract stores only sanitized operation names, counts, safe flags, and the trace digest.
-2. Reconcile every observed operation with the platform-neutral filesystem. Unsupported rename, unlink, lock, mapping, watcher, or open-mode behavior blocks the adapter.
-3. Explicitly authorize macFUSE installation and its system extension. The project must not self-elevate or install it implicitly.
-4. Build with `-tags fuse`, mount only a generated fixture namespace, and pass the exact-byte, random-read, append, random-write, truncate, fsync, rename/unlink-policy, daemon-kill, and remount tests.
-5. Shadow 5 to 10 archived real sessions without changing routes or removing native files.
-6. Route retained-source canaries only after trace, adapter, doctor, shadow, compatibility, and explicit apply gates pass.
-7. Exercise desktop click, CLI resume, send, tool use, fork, archive, unarchive, daemon termination, remount, sleep/wake, host restart, rollback, and unknown-version quarantine.
-8. Keep status at `platform-canary` for seven incident-free days before considering `production-ready:macos`.
+Nine archived real sessions were copied into an isolated validation store without changing their Codex routes or deleting their source files. The set covered small and medium sessions, one session around 23 MiB, and one real fork parent/child pair.
 
-Fixture tests and `fs-engine-preview` evidence do not satisfy any item above.
+Results:
+
+- 9 of 9 complete-file SHA-256 comparisons passed.
+- 90,000 of 90,000 random-range comparisons passed.
+- The generated pack contained 1,182 objects.
+- Pack doctor reported zero issues.
+
+These results validate exact reconstruction and random reads. They do not validate Desktop behavior or long-running service reliability.
+
+## Isolated Real Codex Canary
+
+The canary used an isolated Codex home and state database. It did not modify the user's real Codex routes.
+
+The validated sequence was:
+
+1. Start the real FUSE-T filesystem service.
+2. Migrate one retained-source session through the product command.
+3. Verify the complete mounted file and 10,000 random ranges.
+4. Route only the isolated SQLite record to the mounted JSONL.
+5. Resume with the unmodified desktop-bundled Codex CLI and append through `append.delta` without creating a complete backing file.
+6. Stop, remount, resume again, run a shell tool, and append again without creating a complete backing file.
+7. Roll back to a verified ordinary JSONL containing the latest visible bytes.
+8. Resume and append successfully from that native fallback.
+
+The rollback safety regression also covers a native fallback that becomes newer than managed state. Unknown-version quarantine must preserve that current native route and must not overwrite it with stale managed bytes.
+
+A direct `SIGTERM` stopped the foreground service and removed the mount cleanly. A PTY `Ctrl-C` experiment left a reparented process once; this was a test-harness behavior and is not used as lifecycle evidence.
+
+## Remaining Gates
+
+The following gates are still open:
+
+- Complete native syscall contract for the `PATH` CLI after its launcher re-exec.
+- Complete native syscall contract for Codex Desktop.
+- Direct Desktop click and continued conversation against a virtual session.
+- A real Codex fork created and continued while the source session is virtual.
+- Sleep/wake and host-restart recovery.
+- Unknown-version quarantine in the retained-source real canary path, beyond the isolated regression.
+- Retained-source canary routes in the real Codex home.
+- Seven incident-free days after reaching `platform-canary`.
+
+Until every applicable gate passes, the project must keep the capability at `fs-engine-preview`, retain original JSONL files, and avoid changing real Codex routes.
+
+## Reproducible Test Commands
+
+```sh
+go test ./...
+CGO_ENABLED=1 go test -tags fuse ./... -count=1 -timeout 5m
+go test -race ./internal/mountfs ./internal/vfs ./internal/cli ./internal/service
+CODEXFOLD_RUN_FUSE_TEST=1 CGO_ENABLED=1 \
+  go test -tags fuse ./internal/mountfs \
+  -run '^TestRealFuseMountNativeFileOperations$' -count=1 -v
+```

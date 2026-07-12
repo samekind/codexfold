@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jstar0/codexfold/internal/cdc"
@@ -261,7 +262,33 @@ func newFSServeCommand() *cobra.Command {
 			defer cancel()
 			closers := make([]io.Closer, 0)
 			known := make(map[string]uint64)
+			var loadMu sync.Mutex
+			openState := func(state vfs.SessionState) (*vfs.Session, error) {
+				managed, resolver, err := openManagedSession(ctx, store, state)
+				if err != nil {
+					return nil, err
+				}
+				closers = append(closers, resolver)
+				known[state.SessionID] = state.Generation
+				return managed, nil
+			}
+			filesystem.SetSessionLoader(func(sessionID string) (*vfs.Session, error) {
+				loadMu.Lock()
+				defer loadMu.Unlock()
+				states, err := vfs.DiscoverSessionStates(store)
+				if err != nil {
+					return nil, err
+				}
+				for _, state := range states {
+					if state.SessionID == sessionID {
+						return openState(state)
+					}
+				}
+				return nil, os.ErrNotExist
+			})
 			load := func() error {
+				loadMu.Lock()
+				defer loadMu.Unlock()
 				states, err := vfs.DiscoverSessionStates(store)
 				if err != nil {
 					return err
@@ -270,15 +297,13 @@ func newFSServeCommand() *cobra.Command {
 					if known[state.SessionID] == state.Generation {
 						continue
 					}
-					managed, resolver, err := openManagedSession(ctx, store, state)
+					managed, err := openState(state)
 					if err != nil {
 						return err
 					}
-					closers = append(closers, resolver)
 					if err := filesystem.UpsertSession(state.SessionID, managed); err != nil {
 						return err
 					}
-					known[state.SessionID] = state.Generation
 				}
 				return nil
 			}

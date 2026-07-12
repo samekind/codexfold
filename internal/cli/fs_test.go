@@ -336,6 +336,112 @@ func TestFSRollbackUsesLatestVisibleBytesAfterVirtualAppend(t *testing.T) {
 	}
 }
 
+func TestFSUpdatePreflightPreservesNewerNativeFallbackAfterRollback(t *testing.T) {
+	allowFixtureMount(t)
+	home, storeDir, nativePath := fsFixture(t, true)
+	cliPath := approvedCLIContract(t, storeDir, "1.2.3")
+	mount := filepath.Join(home, "mount")
+	if err := os.MkdirAll(mount, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(mount, "session.jsonl")
+	original, err := os.ReadFile(nativePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	executeFS(t, []string{"fs", "migrate", "session", "--codex-home", home, "--store", storeDir, "--mount", mount, "--cli", cliPath, "--desktop-app", "none", "--apply"})
+
+	state, err := managedState(storeDir, "session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	managed, resolver, err := openManagedSession(context.Background(), storeDir, state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer, err := managed.OpenWriter()
+	if err != nil {
+		_ = resolver.Close()
+		t.Fatal(err)
+	}
+	managedTail := []byte("{\"managed_tail\":true}\n")
+	if _, err := writer.Append(context.Background(), managedTail); err != nil {
+		_ = writer.Close()
+		_ = resolver.Close()
+		t.Fatal(err)
+	}
+	if err := writer.Sync(); err != nil {
+		_ = writer.Close()
+		_ = resolver.Close()
+		t.Fatal(err)
+	}
+	_ = writer.Close()
+	_ = resolver.Close()
+
+	executeFS(t, []string{"fs", "rollback", "session", "--codex-home", home, "--store", storeDir, "--apply"})
+	sessions, err := codex.LoadSessions(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fallbackPath := sessions[0].RolloutPath
+	if filepath.Base(fallbackPath) != "fallback-current.jsonl" {
+		t.Fatalf("rollback did not use the generated fallback: %s", fallbackPath)
+	}
+
+	nativeTail := []byte("{\"native_tail\":true}\n")
+	fallback, err := os.OpenFile(fallbackPath, os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fallback.Write(nativeTail); err != nil {
+		_ = fallback.Close()
+		t.Fatal(err)
+	}
+	if err := fallback.Sync(); err != nil {
+		_ = fallback.Close()
+		t.Fatal(err)
+	}
+	if err := fallback.Close(); err != nil {
+		t.Fatal(err)
+	}
+	want := append(append(append([]byte(nil), original...), managedTail...), nativeTail...)
+	beforeRoute := fallbackPath
+
+	unknownCLI := fakeCLI(t, "9.9.9")
+	root := NewRootCommand()
+	var output bytes.Buffer
+	root.SetOut(&output)
+	root.SetErr(&bytes.Buffer{})
+	root.SetArgs([]string{"fs", "service", "update-preflight", "--codex-home", home, "--store", storeDir, "--cli", unknownCLI, "--desktop-app", "none", "--apply-quarantine", "--json"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("update preflight: %v", err)
+	}
+	var result FSUpdatePreflightResult
+	if err := json.Unmarshal(output.Bytes(), &result); err != nil {
+		t.Fatalf("decode preflight result: %v output=%s", err, output.String())
+	}
+	if !result.Decision.Quarantine || result.Decision.RequiresNativeFallback || result.QuarantinedSessions != 0 {
+		t.Fatalf("unexpected fallback preflight result: %#v output=%s", result, output.String())
+	}
+	sessions, err = codex.LoadSessions(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sessions[0].RolloutPath != beforeRoute {
+		t.Fatalf("preflight replaced newer native fallback: got=%s want=%s", sessions[0].RolloutPath, beforeRoute)
+	}
+	got, err := os.ReadFile(fallbackPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("preflight changed newer native fallback: got=%q want=%q", got, want)
+	}
+}
+
 func TestFSCompactCommitsNewExactGeneration(t *testing.T) {
 	home, storeDir, nativePath := fsFixture(t, true)
 	manifest, err := fold.LoadManifest(storeDir, "session")

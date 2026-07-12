@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -67,6 +68,18 @@ func TestRealFuseMountNativeFileOperations(t *testing.T) {
 	if err != nil || string(read) != string(source) {
 		t.Fatalf("native read differs: %q err=%v", read, err)
 	}
+	hotSource := []byte("hot\n")
+	hotSession := mountSessionFixture(t, "hot", hotSource)
+	var hotAvailable atomic.Bool
+	filesystem.SetSessionLoader(func(sessionID string) (*vfs.Session, error) {
+		if sessionID != "hot" || !hotAvailable.Load() {
+			return nil, os.ErrNotExist
+		}
+		return hotSession, nil
+	})
+	hotAvailable.Store(true)
+	hotTarget := filepath.Join(mountPoint, "hot.jsonl")
+	waitForRealFile(t, hotTarget, hotSource)
 	appendFile, err := os.OpenFile(target, os.O_RDWR|os.O_APPEND, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -185,6 +198,25 @@ func waitForRealUnmount(t *testing.T, mountPoint string) {
 		time.Sleep(100 * time.Millisecond)
 	}
 	t.Fatal("FUSE mount remained active after shutdown")
+}
+
+func waitForRealFile(t *testing.T, path string, want []byte) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		data, err := os.ReadFile(path)
+		if err == nil {
+			if !bytes.Equal(data, want) {
+				t.Fatalf("hot-loaded file differs: got=%q want=%q", data, want)
+			}
+			return
+		}
+		if !os.IsNotExist(err) {
+			t.Fatalf("read hot-loaded file: %v", err)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatal("hot-loaded file did not become visible")
 }
 
 type fuseFixtureReader map[string][]byte

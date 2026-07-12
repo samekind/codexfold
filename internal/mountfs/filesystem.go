@@ -31,9 +31,11 @@ type fileHandle struct {
 
 type Filesystem struct {
 	mu       sync.RWMutex
+	loadMu   sync.Mutex
 	sessions map[string]*vfs.Session
 	handles  map[uint64]*fileHandle
 	next     uint64
+	loader   func(string) (*vfs.Session, error)
 }
 
 func New() *Filesystem {
@@ -45,11 +47,12 @@ func (f *Filesystem) AddSession(sessionID string, session *vfs.Session) error {
 		return errors.New("safe session ID and session are required")
 	}
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	if _, exists := f.sessions[sessionID]; exists {
+		f.mu.Unlock()
 		return errors.New("session is already mounted")
 	}
 	f.sessions[sessionID] = session
+	f.mu.Unlock()
 	return nil
 }
 
@@ -61,6 +64,12 @@ func (f *Filesystem) UpsertSession(sessionID string, session *vfs.Session) error
 	f.sessions[sessionID] = session
 	f.mu.Unlock()
 	return nil
+}
+
+func (f *Filesystem) SetSessionLoader(loader func(string) (*vfs.Session, error)) {
+	f.mu.Lock()
+	f.loader = loader
+	f.mu.Unlock()
 }
 
 func (f *Filesystem) ReadDir(name string) ([]string, syscall.Errno) {
@@ -305,10 +314,39 @@ func (f *Filesystem) sessionForPath(name string) (*vfs.Session, syscall.Errno) {
 	sessionID := strings.TrimSuffix(strings.TrimPrefix(cleaned, "/"), ".jsonl")
 	f.mu.RLock()
 	session := f.sessions[sessionID]
+	loader := f.loader
 	f.mu.RUnlock()
-	if session == nil {
+	if session != nil {
+		return session, 0
+	}
+	if loader == nil {
 		return nil, syscall.ENOENT
 	}
+	f.loadMu.Lock()
+	defer f.loadMu.Unlock()
+	f.mu.RLock()
+	session = f.sessions[sessionID]
+	loader = f.loader
+	f.mu.RUnlock()
+	if session != nil {
+		return session, 0
+	}
+	if loader == nil {
+		return nil, syscall.ENOENT
+	}
+	loaded, err := loader(sessionID)
+	if err != nil {
+		return nil, errnoFor(err)
+	}
+	if loaded == nil {
+		return nil, syscall.EIO
+	}
+	f.mu.Lock()
+	if session = f.sessions[sessionID]; session == nil {
+		f.sessions[sessionID] = loaded
+		session = loaded
+	}
+	f.mu.Unlock()
 	return session, 0
 }
 

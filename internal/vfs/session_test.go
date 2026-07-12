@@ -152,6 +152,28 @@ func TestSessionTruncateTransitionsToBacking(t *testing.T) {
 	}
 }
 
+func TestSessionEqualLengthTruncateDoesNotCreateBacking(t *testing.T) {
+	root := t.TempDir()
+	manifest, reader, source := sessionFixture(t, root)
+	session := openFixtureSession(t, root, manifest, reader, nil)
+	writer, err := session.OpenWriter()
+	if err != nil {
+		t.Fatalf("OpenWriter: %v", err)
+	}
+	if err := writer.Truncate(context.Background(), int64(len(source))); err != nil {
+		t.Fatalf("equal-length Truncate: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Close writer: %v", err)
+	}
+	if state := session.State(); state.BackingPath != "" {
+		t.Fatalf("equal-length truncate created backing: %#v", state)
+	}
+	if info, err := os.Stat(session.State().DeltaPath); err != nil || info.Size() != 0 {
+		t.Fatalf("equal-length truncate changed delta: info=%#v err=%v", info, err)
+	}
+}
+
 func TestSessionInterruptedCopyOnWriteKeepsPreviousGeneration(t *testing.T) {
 	root := t.TempDir()
 	manifest, reader, source := sessionFixture(t, root)

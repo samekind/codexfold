@@ -173,6 +173,13 @@ func (h *WriteHandle) Truncate(ctx context.Context, size int64) error {
 	if size < 0 {
 		return errors.New("negative truncate size")
 	}
+	visible, err := h.session.VisibleInfo()
+	if err != nil {
+		return err
+	}
+	if size == visible.Size {
+		return nil
+	}
 	path, err := h.session.ensureBacking(ctx)
 	if err != nil {
 		return err

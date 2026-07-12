@@ -238,6 +238,12 @@ func managedRoutesMatchCurrentBytes(ctx context.Context, home string, store stri
 		if !ok {
 			return false, fmt.Errorf("Codex route missing for managed session %s", state.SessionID)
 		}
+		if isGeneratedNativeFallbackPath(current.RolloutPath, store, state.SessionID) {
+			if _, err := hashPath(current.RolloutPath); err != nil {
+				return false, err
+			}
+			continue
+		}
 		managed, resolver, err := openManagedSession(ctx, store, state)
 		if err != nil {
 			return false, err
@@ -274,6 +280,12 @@ func quarantineManagedRoutes(ctx context.Context, home string, store string) (in
 		if !ok {
 			return count, fmt.Errorf("Codex route missing for managed session %s", state.SessionID)
 		}
+		if isGeneratedNativeFallbackPath(current.RolloutPath, store, state.SessionID) {
+			if _, err := hashPath(current.RolloutPath); err != nil {
+				return count, err
+			}
+			continue
+		}
 		managed, resolver, err := openManagedSession(ctx, store, state)
 		if err != nil {
 			return count, err
@@ -293,6 +305,21 @@ func quarantineManagedRoutes(ctx context.Context, home string, store string) (in
 		count++
 	}
 	return count, nil
+}
+
+func isGeneratedNativeFallbackPath(path string, store string, sessionID string) bool {
+	if path == "" || store == "" || sessionID == "" {
+		return false
+	}
+	if filepath.Clean(filepath.Dir(path)) != filepath.Join(filepath.Clean(store), "fs", "sessions", sessionID) {
+		return false
+	}
+	switch filepath.Base(path) {
+	case "fallback-current.jsonl", "quarantine-current.jsonl":
+		return true
+	default:
+		return false
+	}
 }
 
 func hashManagedSession(ctx context.Context, session *vfs.Session) (vfs.NativeFile, error) {
