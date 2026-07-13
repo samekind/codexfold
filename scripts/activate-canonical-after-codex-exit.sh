@@ -65,7 +65,7 @@ snapshot_tree() {
   output="$1"
   (
     cd "${CODEX_HOME}"
-    find sessions archived_sessions -type f ! -name '._*' -print0 | sort -z | xargs -0 stat -f '%N\t%z'
+    find -H sessions archived_sessions -type f ! -name '._*' -print0 | sort -z | xargs -0 stat -f '%N\t%z'
   ) >"${output}"
 }
 
@@ -77,7 +77,7 @@ snapshot_critical() {
   while IFS= read -r id || [[ -n "${id}" ]]; do
     [[ -z "${id}" || "${id}" == \#* ]] && continue
     grep -Eq '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' <<<"${id}"
-    rollout="$(find "${CODEX_HOME}/sessions" "${CODEX_HOME}/archived_sessions" -type f -name "rollout-*-${id}.jsonl" ! -name '._*' -print -quit)"
+    rollout="$(find -H "${CODEX_HOME}/sessions" "${CODEX_HOME}/archived_sessions" -type f -name "rollout-*-${id}.jsonl" ! -name '._*' -print -quit)"
     [[ -n "${rollout}" ]]
     digest="$(shasum -a 256 "${rollout}" | awk '{print $1}')"
     printf '%s\t%s\n' "${id}" "${digest}" >>"${output}"
