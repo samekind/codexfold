@@ -20,8 +20,12 @@ finish() {
   status=$?
   if (( status != 0 )); then
     if (( activated == 1 )); then
-      "${BIN}" fs namespace deactivate --apply \
-        --codex-home "${CODEX_HOME}" --mount "${MOUNT}" --native-root "${NATIVE_ROOT}" || true
+      "${BIN}" fs service stop --apply || true
+      if "${BIN}" fs namespace deactivate --apply \
+        --codex-home "${CODEX_HOME}" --mount "${MOUNT}" --native-root "${NATIVE_ROOT}"; then
+        "${BIN}" fs service start --apply \
+          --codex-home "${CODEX_HOME}" --mount "${MOUNT}" || true
+      fi
     fi
     date '+%Y-%m-%dT%H:%M:%S%z' >"${RUN_ROOT}/FAILED"
   fi
@@ -37,6 +41,20 @@ codex_running() {
     pgrep -f '/opt/homebrew/(Cellar/codex/[^/]+/bin|bin)/codex($| )' >/dev/null 2>&1
 }
 
+app_servers_running() {
+  local pid command_line app_home
+  while IFS= read -r pid; do
+    [[ -z "${pid}" ]] && continue
+    command_line="$(ps eww -p "${pid}" -o command= 2>/dev/null || true)"
+    [[ -z "${command_line}" ]] && continue
+    app_home="$(sed -n 's/.* CODEX_HOME=\([^ ]*\).*/\1/p' <<<"${command_line}")"
+    if [[ -z "${app_home}" || "${app_home}" == "${CODEX_HOME}" ]]; then
+      return 0
+    fi
+  done < <(pgrep -f '/Applications/ChatGPT.app/Contents/Resources/codex .*app-server' 2>/dev/null || true)
+  return 1
+}
+
 echo "waiting for Codex Desktop and CLI to exit"
 while codex_running; do
   sleep 2
@@ -49,6 +67,18 @@ for _ in 1 2 3; do
     done
   fi
 done
+drained=0
+for _ in {1..30}; do
+  if ! app_servers_running; then
+    drained=1
+    break
+  fi
+  sleep 1
+done
+if (( drained == 0 )); then
+  echo "real-home Codex app servers did not drain"
+  exit 1
+fi
 
 service_status="$(${BIN} fs service status --json)"
 jq -e '.daemon_running == true and .mount_healthy == true' <<<"${service_status}" >/dev/null

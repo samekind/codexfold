@@ -6,10 +6,14 @@ script="$repo_root/scripts/activate-canonical-after-codex-exit.sh"
 
 grep -Fq 'find -H sessions archived_sessions' "$script"
 grep -Fq 'find -H "${CODEX_HOME}/sessions" "${CODEX_HOME}/archived_sessions"' "$script"
-if grep -Fq '/Applications/ChatGPT.app/Contents/Resources/codex .*app-server' "$script"; then
-  echo "activation must not wait forever on orphaned Desktop app-server processes" >&2
-  exit 1
-fi
+grep -Fq 'app_servers_running()' "$script"
+grep -Fq 'real-home Codex app servers did not drain' "$script"
+
+stop_line=$(grep -n 'fs service stop --apply' "$script" | head -n 1 | cut -d: -f1)
+deactivate_line=$(grep -n 'fs namespace deactivate --apply' "$script" | head -n 1 | cut -d: -f1)
+start_line=$(grep -n 'fs service start --apply' "$script" | head -n 1 | cut -d: -f1)
+[[ -n "$stop_line" && -n "$deactivate_line" && -n "$start_line" ]]
+(( stop_line < deactivate_line && deactivate_line < start_line ))
 
 root=$(mktemp -d)
 trap 'rm -rf "$root"' EXIT
