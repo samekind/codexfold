@@ -34,7 +34,6 @@ trap finish EXIT
 
 codex_running() {
   pgrep -f '/Applications/ChatGPT.app/Contents/MacOS/ChatGPT($| )' >/dev/null 2>&1 ||
-    pgrep -f '/Applications/ChatGPT.app/Contents/Resources/codex .*app-server' >/dev/null 2>&1 ||
     pgrep -f '/opt/homebrew/(Cellar/codex/[^/]+/bin|bin)/codex($| )' >/dev/null 2>&1
 }
 
