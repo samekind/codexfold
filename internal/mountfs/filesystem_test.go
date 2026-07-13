@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 
@@ -174,6 +175,374 @@ func TestFilesystemRejectsUnsafeAndManagementMutations(t *testing.T) {
 	}
 }
 
+func TestCanonicalFilesystemMovesManagedSessionBetweenArchiveAndActivePaths(t *testing.T) {
+	source := []byte("canonical-session\n")
+	session := mountSessionFixture(t, "session", source)
+	filesystem := NewCanonical()
+	filename := "rollout-2026-07-12T14-28-28-session.jsonl"
+	archivedPath := "/archived_sessions/" + filename
+	if err := filesystem.AddSessionAt("session", archivedPath, session); err != nil {
+		t.Fatal(err)
+	}
+	for _, directory := range []string{"/sessions/2026", "/sessions/2026/07", "/sessions/2026/07/12"} {
+		if errno := filesystem.Mkdir(directory, 0o700); errno != 0 {
+			t.Fatalf("Mkdir %s errno=%v", directory, errno)
+		}
+	}
+	activePath := "/sessions/2026/07/12/" + filename
+	if errno := filesystem.Rename(archivedPath, activePath); errno != 0 {
+		t.Fatalf("Rename errno=%v", errno)
+	}
+	if _, errno := filesystem.Getattr(archivedPath); errno != syscall.ENOENT {
+		t.Fatalf("archived path errno=%v, want ENOENT", errno)
+	}
+	attribute, errno := filesystem.Getattr(activePath)
+	if errno != 0 || attribute.Mode&syscall.S_IFREG == 0 || attribute.Size != int64(len(source)) {
+		t.Fatalf("active Getattr = %#v errno=%v", attribute, errno)
+	}
+	entries, errno := filesystem.ReadDir("/sessions/2026/07/12")
+	if errno != 0 || len(entries) != 1 || entries[0] != filename {
+		t.Fatalf("active ReadDir = %#v errno=%v", entries, errno)
+	}
+	handle, errno := filesystem.Open(activePath, os.O_RDONLY)
+	if errno != 0 {
+		t.Fatalf("Open active errno=%v", errno)
+	}
+	defer filesystem.Release(handle)
+	got := make([]byte, len(source))
+	if n, errno := filesystem.Read(handle, got, 0); errno != 0 || n != len(source) || !bytes.Equal(got, source) {
+		t.Fatalf("Read active = %d errno=%v bytes=%q", n, errno, got)
+	}
+}
+
+func TestCanonicalFilesystemManagedSessionMasksRetainedSnapshotAtCurrentRoute(t *testing.T) {
+	root := t.TempDir()
+	filename := "rollout-2026-07-12T14-28-28-session.jsonl"
+	archivedPath := "/archived_sessions/" + filename
+	nativePath := filepath.Join(root, "archived_sessions", filename)
+	if err := os.MkdirAll(filepath.Dir(nativePath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "sessions"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	base := []byte("native-base\n")
+	if err := os.WriteFile(nativePath, base, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	session := mountSessionWithNativeSnapshot(t, "session", base, nativePath)
+	writer, err := session.OpenWriter()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tail := []byte("managed-tail\n")
+	if _, err := writer.Append(context.Background(), tail); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	filesystem := NewCanonical()
+	filesystem.SetNativeRoot(root)
+	if err := filesystem.AddSessionAt("session", archivedPath, session); err != nil {
+		t.Fatal(err)
+	}
+	want := append(append([]byte(nil), base...), tail...)
+	attribute, errno := filesystem.Getattr(archivedPath)
+	if errno != 0 || attribute.Size != int64(len(want)) {
+		t.Fatalf("managed Getattr = %#v errno=%v, want size %d", attribute, errno, len(want))
+	}
+	handle, errno := filesystem.Open(archivedPath, os.O_RDONLY)
+	if errno != 0 {
+		t.Fatalf("managed Open errno=%v", errno)
+	}
+	defer filesystem.Release(handle)
+	got := make([]byte, len(want))
+	if n, errno := filesystem.Read(handle, got, 0); errno != 0 || n != len(want) || !bytes.Equal(got, want) {
+		t.Fatalf("managed Read = %d errno=%v bytes=%q want=%q", n, errno, got, want)
+	}
+}
+
+func TestCanonicalFilesystemHidesRetainedSnapshotAfterManagedRouteMoves(t *testing.T) {
+	root := t.TempDir()
+	filename := "rollout-2026-07-12T14-28-28-session.jsonl"
+	archivedPath := "/archived_sessions/" + filename
+	activePath := "/sessions/2026/07/12/" + filename
+	nativePath := filepath.Join(root, "archived_sessions", filename)
+	if err := os.MkdirAll(filepath.Dir(nativePath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "sessions"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	base := []byte("retained-base\n")
+	if err := os.WriteFile(nativePath, base, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	session := mountSessionWithNativeSnapshot(t, "session", base, nativePath)
+	filesystem := NewCanonical()
+	filesystem.SetNativeRoot(root)
+	if err := filesystem.AddSessionAt("session", archivedPath, session); err != nil {
+		t.Fatal(err)
+	}
+	for _, directory := range []string{"/sessions/2026", "/sessions/2026/07", "/sessions/2026/07/12"} {
+		if errno := filesystem.Mkdir(directory, 0o700); errno != 0 {
+			t.Fatalf("Mkdir %s errno=%v", directory, errno)
+		}
+	}
+	if errno := filesystem.Rename(archivedPath, activePath); errno != 0 {
+		t.Fatalf("Rename errno=%v", errno)
+	}
+	if _, errno := filesystem.Getattr(archivedPath); errno != syscall.ENOENT {
+		t.Fatalf("retained archived Getattr errno=%v, want ENOENT", errno)
+	}
+	if _, errno := filesystem.Open(archivedPath, os.O_RDONLY); errno != syscall.ENOENT {
+		t.Fatalf("retained archived Open errno=%v, want ENOENT", errno)
+	}
+	entries, errno := filesystem.ReadDir("/archived_sessions")
+	if errno != 0 {
+		t.Fatalf("archived ReadDir errno=%v", errno)
+	}
+	for _, entry := range entries {
+		if entry == filename {
+			t.Fatalf("retained snapshot leaked into archived directory: %#v", entries)
+		}
+	}
+}
+
+func TestCanonicalFilesystemMovesManagedSessionIntoExistingNativeDirectoryAfterRestart(t *testing.T) {
+	root := t.TempDir()
+	activeDirectory := filepath.Join(root, "sessions", "2026", "07", "12")
+	if err := os.MkdirAll(activeDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "archived_sessions"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	session := mountSessionFixture(t, "session", []byte("restart-route\n"))
+	filesystem := NewCanonical()
+	filesystem.SetNativeRoot(root)
+	filename := "rollout-2026-07-12T14-28-28-session.jsonl"
+	archivedPath := "/archived_sessions/" + filename
+	activePath := "/sessions/2026/07/12/" + filename
+	if err := filesystem.AddSessionAt("session", archivedPath, session); err != nil {
+		t.Fatal(err)
+	}
+	if errno := filesystem.Rename(archivedPath, activePath); errno != 0 {
+		t.Fatalf("Rename into existing native directory errno=%v", errno)
+	}
+	if _, errno := filesystem.Getattr(archivedPath); errno != syscall.ENOENT {
+		t.Fatalf("archived path errno=%v, want ENOENT", errno)
+	}
+	if _, errno := filesystem.Getattr(activePath); errno != 0 {
+		t.Fatalf("active path errno=%v", errno)
+	}
+	if len(filesystem.paths) != 1 || filesystem.paths[activePath] != "session" {
+		t.Fatalf("managed routes after rename = %#v", filesystem.paths)
+	}
+	for _, nativePath := range []string{
+		nativePathFromRoot(root, archivedPath),
+		nativePathFromRoot(root, activePath),
+	} {
+		if _, err := os.Stat(nativePath); !os.IsNotExist(err) {
+			t.Fatalf("managed session was duplicated into native root: path=%s err=%v", nativePath, err)
+		}
+	}
+}
+
+func TestCanonicalFilesystemKeepsEmptyNativeRootDisabled(t *testing.T) {
+	filesystem := NewCanonical()
+	filesystem.SetNativeRoot("")
+	if filesystem.nativeRoot != "" {
+		t.Fatalf("empty native root became %q", filesystem.nativeRoot)
+	}
+	if _, ok := filesystem.nativePath("/sessions/2026/07/12/rollout.jsonl"); ok {
+		t.Fatal("empty native root should not resolve a backing path")
+	}
+}
+
+func TestCanonicalFilesystemHidesNativeFilesOutsideSessionNamespace(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "sessions"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "archived_sessions"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "outside.txt"), []byte("outside"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	filesystem := NewCanonical()
+	filesystem.SetNativeRoot(root)
+	entries, errno := filesystem.ReadDir("/")
+	if errno != 0 || len(entries) != 2 || entries[0] != "archived_sessions" || entries[1] != "sessions" {
+		t.Fatalf("canonical root entries = %#v errno=%v", entries, errno)
+	}
+	if _, errno := filesystem.Getattr("/outside.txt"); errno != syscall.ENOENT {
+		t.Fatalf("outside Getattr errno=%v, want ENOENT", errno)
+	}
+	if _, errno := filesystem.Open("/outside.txt", os.O_RDONLY); errno != syscall.ENOENT {
+		t.Fatalf("outside Open errno=%v, want ENOENT", errno)
+	}
+	if errno := filesystem.Mkdir("/outside", 0o700); errno != syscall.EPERM {
+		t.Fatalf("outside Mkdir errno=%v, want EPERM", errno)
+	}
+}
+
+func TestCanonicalFilesystemMovesAppleDoubleSidecarWithManagedRoute(t *testing.T) {
+	root := t.TempDir()
+	oldDirectory := filepath.Join(root, "archived_sessions")
+	newDirectory := filepath.Join(root, "sessions", "2026", "07", "12")
+	if err := os.MkdirAll(oldDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(newDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	filename := "rollout-session.jsonl"
+	oldPath := "/archived_sessions/" + filename
+	newPath := "/sessions/2026/07/12/" + filename
+	oldSidecar := filepath.Join(oldDirectory, "._"+filename)
+	if err := os.WriteFile(oldSidecar, []byte("appledouble-metadata"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	filesystem := NewCanonical()
+	filesystem.SetNativeRoot(root)
+	if err := filesystem.AddSessionAt("session", oldPath, mountSessionFixture(t, "session", []byte("session\n"))); err != nil {
+		t.Fatal(err)
+	}
+	if errno := filesystem.MoveSessionAt("session", newPath); errno != nil {
+		t.Fatalf("MoveSessionAt errno=%v", errno)
+	}
+	if _, err := os.Stat(oldSidecar); !os.IsNotExist(err) {
+		t.Fatalf("old AppleDouble sidecar remained: %v", err)
+	}
+	newSidecar := filepath.Join(newDirectory, "._"+filename)
+	if got, err := os.ReadFile(newSidecar); err != nil || string(got) != "appledouble-metadata" {
+		t.Fatalf("new AppleDouble sidecar = %q err=%v", got, err)
+	}
+	entries, errno := filesystem.ReadDir(filepath.Dir(newPath))
+	if errno != 0 || len(entries) != 2 || entries[0] != "._"+filename || entries[1] != filename {
+		t.Fatalf("session directory entries = %#v errno=%v", entries, errno)
+	}
+}
+
+func TestCanonicalFilesystemUpsertMovesExistingSessionRoute(t *testing.T) {
+	session := mountSessionFixture(t, "session", []byte("route-update\n"))
+	filesystem := NewCanonical()
+	oldPath := "/archived_sessions/rollout-session.jsonl"
+	newPath := "/sessions/2026/07/12/rollout-session.jsonl"
+	if err := filesystem.AddSessionAt("session", oldPath, session); err != nil {
+		t.Fatal(err)
+	}
+	if err := filesystem.UpsertSessionAt("session", newPath, session); err != nil {
+		t.Fatal(err)
+	}
+	if _, errno := filesystem.Getattr(oldPath); errno != syscall.ENOENT {
+		t.Fatalf("old route errno=%v, want ENOENT", errno)
+	}
+	if _, errno := filesystem.Getattr(newPath); errno != 0 {
+		t.Fatalf("new route errno=%v", errno)
+	}
+}
+
+func TestCanonicalFilesystemRemoveSessionRevealsNativeFile(t *testing.T) {
+	root := t.TempDir()
+	route := "/archived_sessions/rollout-session.jsonl"
+	nativePath := nativePathFromRoot(root, route)
+	if err := os.MkdirAll(filepath.Dir(nativePath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(nativePath, []byte("native\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	filesystem := NewCanonical()
+	filesystem.SetNativeRoot(root)
+	if err := filesystem.AddSessionAt("session", route, mountSessionFixture(t, "managed", []byte("managed\n"))); err != nil {
+		t.Fatal(err)
+	}
+	if err := filesystem.RemoveSession("session"); err != nil {
+		t.Fatal(err)
+	}
+	handle, errno := filesystem.Open(route, os.O_RDONLY)
+	if errno != 0 {
+		t.Fatalf("open native after removal errno=%v", errno)
+	}
+	defer filesystem.Release(handle)
+	got := make([]byte, len("native\n"))
+	if n, errno := filesystem.Read(handle, got, 0); errno != 0 || n != len(got) || string(got) != "native\n" {
+		t.Fatalf("native after removal = %q n=%d errno=%v", got, n, errno)
+	}
+}
+
+func TestCanonicalFilesystemPassesThroughNativeSessionFiles(t *testing.T) {
+	root := t.TempDir()
+	nativeDirectory := filepath.Join(root, "sessions", "2026", "07", "12")
+	if err := os.MkdirAll(nativeDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "archived_sessions"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	nativePath := filepath.Join(nativeDirectory, "native.jsonl")
+	source := []byte("native-session\n")
+	if err := os.WriteFile(nativePath, source, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	filesystem := NewCanonical()
+	filesystem.SetNativeRoot(root)
+	entries, errno := filesystem.ReadDir("/sessions/2026/07/12")
+	if errno != 0 || len(entries) != 1 || entries[0] != "native.jsonl" {
+		t.Fatalf("native ReadDir = %#v errno=%v", entries, errno)
+	}
+	handle, errno := filesystem.Open("/sessions/2026/07/12/native.jsonl", os.O_RDONLY)
+	if errno != 0 {
+		t.Fatalf("native Open errno=%v", errno)
+	}
+	got := make([]byte, len(source))
+	if n, errno := filesystem.Read(handle, got, 0); errno != 0 || n != len(source) || !bytes.Equal(got, source) {
+		t.Fatalf("native Read = %d errno=%v bytes=%q", n, errno, got)
+	}
+	if errno := filesystem.Release(handle); errno != 0 {
+		t.Fatalf("native Release errno=%v", errno)
+	}
+
+	createdPath := "/sessions/2026/07/12/created.jsonl"
+	created, errno := filesystem.Open(createdPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL)
+	if errno != 0 {
+		t.Fatalf("native create Open errno=%v", errno)
+	}
+	createdBytes := []byte("created-session\n")
+	if n, errno := filesystem.Write(created, createdBytes, 0); errno != 0 || n != len(createdBytes) {
+		t.Fatalf("native create Write = %d errno=%v", n, errno)
+	}
+	if errno := filesystem.Release(created); errno != 0 {
+		t.Fatalf("native create Release errno=%v", errno)
+	}
+	if got, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(strings.TrimPrefix(createdPath, "/")))); err != nil || !bytes.Equal(got, createdBytes) {
+		t.Fatalf("native created bytes = %q err=%v", got, err)
+	}
+
+	renamedPath := "/archived_sessions/created.jsonl"
+	if errno := filesystem.Rename(createdPath, renamedPath); errno != 0 {
+		t.Fatalf("native Rename errno=%v", errno)
+	}
+	if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(strings.TrimPrefix(createdPath, "/")))); !os.IsNotExist(err) {
+		t.Fatalf("native source remained after rename: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(strings.TrimPrefix(renamedPath, "/")))); err != nil {
+		t.Fatalf("native destination missing after rename: %v", err)
+	}
+	if errno := filesystem.Unlink(renamedPath); errno != 0 {
+		t.Fatalf("native Unlink errno=%v", errno)
+	}
+	if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(strings.TrimPrefix(renamedPath, "/")))); !os.IsNotExist(err) {
+		t.Fatalf("native destination remained after unlink: %v", err)
+	}
+}
+
 func TestFilesystemUpsertChangesNewOpensWithoutInvalidatingExistingHandles(t *testing.T) {
 	first := mountSessionFixture(t, "first-session", []byte("first"))
 	second := mountSessionFixture(t, "second-session", []byte("second"))
@@ -259,6 +628,19 @@ func mountSessionFixture(t *testing.T, sessionID string, source []byte) *vfs.Ses
 	if err := os.WriteFile(nativePath, source, 0o600); err != nil {
 		t.Fatal(err)
 	}
+	manifest := fold.Manifest{Version: fold.ManifestVersion, Kind: fold.ManifestKind, Session: fold.ManifestSession{ID: sessionID, RolloutPath: nativePath}, Source: fold.ManifestSource{Bytes: int64(len(source)), SHA256: hexDigest}, Parts: []fold.Part{{Kind: fold.PartResidual, Object: fold.ObjectRef{SHA256: hexDigest, RawBytes: int64(len(source))}}}}
+	session, err := vfs.OpenSession(context.Background(), vfs.SessionOptions{Root: root, ManifestPath: filepath.Join(root, "manifest.json"), Manifest: manifest, Reader: mountReader{hexDigest: source}, NativeSnapshot: vfs.NativeFile{Path: nativePath, Bytes: int64(len(source)), SHA256: hexDigest}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return session
+}
+
+func mountSessionWithNativeSnapshot(t *testing.T, sessionID string, source []byte, nativePath string) *vfs.Session {
+	t.Helper()
+	root := t.TempDir()
+	digest := sha256.Sum256(source)
+	hexDigest := hex.EncodeToString(digest[:])
 	manifest := fold.Manifest{Version: fold.ManifestVersion, Kind: fold.ManifestKind, Session: fold.ManifestSession{ID: sessionID, RolloutPath: nativePath}, Source: fold.ManifestSource{Bytes: int64(len(source)), SHA256: hexDigest}, Parts: []fold.Part{{Kind: fold.PartResidual, Object: fold.ObjectRef{SHA256: hexDigest, RawBytes: int64(len(source))}}}}
 	session, err := vfs.OpenSession(context.Background(), vfs.SessionOptions{Root: root, ManifestPath: filepath.Join(root, "manifest.json"), Manifest: manifest, Reader: mountReader{hexDigest: source}, NativeSnapshot: vfs.NativeFile{Path: nativePath, Bytes: int64(len(source)), SHA256: hexDigest}})
 	if err != nil {

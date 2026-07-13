@@ -17,7 +17,7 @@ type ContractOptions struct {
 	ClientVersion string
 }
 
-var operationPattern = regexp.MustCompile(`(?i)\b(open|openat|close|read|pread|readv|write|pwrite|writev|fsync|fdatasync|stat|stat64|lstat|lstat64|fstat|fstat64|mmap|truncate|ftruncate|rename|renameat|unlink|unlinkat|flock|fcntl|clonefile|getattrlist)\b`)
+var operationPattern = regexp.MustCompile(`(?i)\b(open|openat|close|release|read|pread|readv|write|pwrite|writev|flush|fsync|fdatasync|stat|stat64|lstat|lstat64|fstat|fstat64|statfs|getattr|readdir|access|chmod|chown|utimens|mmap|truncate|ftruncate|create|mknod|mkdir|rmdir|link|symlink|readlink|rename|renameat|unlink|unlinkat|flock|fcntl|clonefile|getattrlist|setxattr|getxattr|listxattr|removexattr)\b`)
 var signaturePattern = regexp.MustCompile(`\([A-Z_]{4,32}\)|<[A-Z0-9_=+-]+>`)
 
 func ParseFSUsage(reader io.Reader, options ContractOptions) (Contract, error) {

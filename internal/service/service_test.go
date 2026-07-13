@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jstar0/codexfold/internal/compat"
 	"github.com/jstar0/codexfold/internal/fsctl"
@@ -20,13 +21,19 @@ func TestRenderLaunchdUsesAbsoluteArgumentsAndContainsNoSessionContent(t *testin
 		Label: "com.codexfold.fs", BinaryPath: filepath.Join(root, "bin", "codexfold"),
 		CodexHome: filepath.Join(root, "codex"), StoreDir: filepath.Join(root, "store"),
 		MountPoint: filepath.Join(root, "mount"), StdoutPath: filepath.Join(root, "logs", "stdout.log"),
-		StderrPath: filepath.Join(root, "logs", "stderr.log"),
+		StderrPath: filepath.Join(root, "logs", "stderr.log"), CanonicalNamespace: true,
+		NativeRoot: filepath.Join(root, "native"), OperationTrace: filepath.Join(root, "logs", "operations.log"),
 	})
 	if err != nil {
 		t.Fatalf("RenderLaunchd: %v", err)
 	}
 	text := string(definition)
-	for _, required := range []string{"<string>fs</string>", "<string>serve</string>", "<string>--apply</string>", filepath.Join(root, "store"), filepath.Join(root, "mount")} {
+	for _, required := range []string{
+		"<string>fs</string>", "<string>serve</string>", "<string>--apply</string>",
+		"<string>--canonical-namespace</string>", "<string>--native-root</string>",
+		"<string>--operation-trace</string>", filepath.Join(root, "logs", "operations.log"),
+		filepath.Join(root, "store"), filepath.Join(root, "mount"), filepath.Join(root, "native"),
+	} {
 		if !strings.Contains(text, required) {
 			t.Fatalf("definition missing %q:\n%s", required, text)
 		}
@@ -50,7 +57,7 @@ func TestRenderLaunchdUsesAbsoluteArgumentsAndContainsNoSessionContent(t *testin
 
 func TestManagerUsesOnlyPerUserLaunchctlAndSeparatesDaemonFromMount(t *testing.T) {
 	root := t.TempDir()
-	runner := &recordingRunner{outputs: map[string][]byte{"launchctl print gui/501/com.codexfold.fs": []byte("running")}}
+	runner := &recordingRunner{outputs: map[string][]byte{"launchctl print gui/501/com.codexfold.fs": []byte("state = running\npid = 123\n")}}
 	manager := Manager{UID: 501, Runner: runner, MountProbe: func(string) error { return errors.New("mount unavailable") }}
 	plist := filepath.Join(root, "com.codexfold.fs.plist")
 	if err := os.WriteFile(plist, []byte("plist"), 0o600); err != nil {
@@ -67,8 +74,38 @@ func TestManagerUsesOnlyPerUserLaunchctlAndSeparatesDaemonFromMount(t *testing.T
 		t.Fatalf("status did not separate daemon and mount: %#v", status)
 	}
 	joined := strings.Join(runner.calls, "\n")
-	if strings.Contains(joined, "sudo") || !strings.Contains(joined, "launchctl bootstrap gui/501") || !strings.Contains(joined, "launchctl kickstart -k gui/501/com.codexfold.fs") {
+	if strings.Contains(joined, "sudo") || !strings.Contains(joined, "launchctl bootstrap gui/501") || !strings.Contains(joined, "launchctl kickstart gui/501/com.codexfold.fs") {
 		t.Fatalf("unexpected lifecycle commands:\n%s", joined)
+	}
+}
+
+func TestStatusDoesNotTreatLoadedExitedJobAsRunning(t *testing.T) {
+	runner := &recordingRunner{outputs: map[string][]byte{
+		"launchctl print gui/501/com.codexfold.fs": []byte("state = exited\nlast exit code = 1\n"),
+	}}
+	status := (Manager{UID: 501, Runner: runner, MountProbe: func(string) error { return errors.New("not mounted") }}).Status(
+		context.Background(), "com.codexfold.fs", filepath.Join(t.TempDir(), "mount"),
+	)
+	if status.DaemonRunning || status.DaemonError == "" {
+		t.Fatalf("loaded exited job was reported as running: %#v", status)
+	}
+}
+
+func TestWaitHealthyRequiresRunningDaemonAndLiveMount(t *testing.T) {
+	runner := &recordingRunner{outputs: map[string][]byte{
+		"launchctl print gui/501/com.codexfold.fs": []byte("state = running\npid = 123\n"),
+	}}
+	probes := 0
+	manager := Manager{UID: 501, Runner: runner, MountProbe: func(string) error {
+		probes++
+		if probes < 3 {
+			return errors.New("mount starting")
+		}
+		return nil
+	}}
+	status, err := manager.WaitHealthy(context.Background(), "com.codexfold.fs", filepath.Join(t.TempDir(), "mount"), time.Second)
+	if err != nil || !status.DaemonRunning || !status.MountHealthy || probes != 3 {
+		t.Fatalf("WaitHealthy status=%#v probes=%d err=%v", status, probes, err)
 	}
 }
 
@@ -88,6 +125,29 @@ func TestEvaluateUpdateQuarantinesUnknownVersionsAndRejectsPreviewAutomation(t *
 	manual := EvaluateUpdate(UpdateInput{Capability: fsctl.FSEnginePreview, DoctorHealthy: true, Compatibility: compat.Evaluation{Approved: true}, ExplicitPromotion: true})
 	if !manual.Allowed {
 		t.Fatalf("explicit preview promotion should pass: %#v", manual)
+	}
+}
+
+func TestProcessLockAllowsOnlyOneFilesystemHost(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "service.lock")
+	first, err := AcquireProcessLock(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+
+	if _, err := AcquireProcessLock(path); err == nil {
+		t.Fatal("a second filesystem host acquired the same process lock")
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	second, err := AcquireProcessLock(path)
+	if err != nil {
+		t.Fatalf("lock was not released after the first host exited: %v", err)
+	}
+	if err := second.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 

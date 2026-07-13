@@ -50,11 +50,12 @@ type FSServeResult struct {
 }
 
 type FSRollbackResult struct {
-	SessionID string         `json:"session_id"`
-	From      string         `json:"from"`
-	Target    vfs.NativeFile `json:"target"`
-	DryRun    bool           `json:"dry_run"`
-	Routed    bool           `json:"routed"`
+	SessionID    string         `json:"session_id"`
+	From         string         `json:"from"`
+	Target       vfs.NativeFile `json:"target"`
+	RetiredState string         `json:"retired_state,omitempty"`
+	DryRun       bool           `json:"dry_run"`
+	Routed       bool           `json:"routed"`
 }
 
 type FSCompactResult struct {
@@ -85,12 +86,16 @@ func newFSCommand() *cobra.Command {
 	command.AddCommand(newFSStatusCommand())
 	command.AddCommand(newFSDoctorCommand())
 	command.AddCommand(newFSCompatibilityCommand())
+	command.AddCommand(newFSCompatibilityImportCommand())
 	command.AddCommand(newFSBenchmarkCommand())
 	command.AddCommand(newFSServeCommand())
 	command.AddCommand(newFSMigrateCommand())
 	command.AddCommand(newFSRollbackCommand())
 	command.AddCommand(newFSCompactCommand())
 	command.AddCommand(newFSRecoverCommand())
+	command.AddCommand(newFSRepairRolloutCommand())
+	command.AddCommand(newFSReconcileRolloutCommand())
+	command.AddCommand(newFSNamespaceCommand())
 	command.AddCommand(newFSServiceCommand())
 	return command
 }
@@ -230,6 +235,9 @@ func newFSServeCommand() *cobra.Command {
 	var mountPoint string
 	var apply bool
 	var foreground bool
+	var canonicalNamespace bool
+	var nativeRoot string
+	var operationTracePath string
 	var jsonOutput bool
 	command := &cobra.Command{
 		Use:   "serve",
@@ -239,6 +247,12 @@ func newFSServeCommand() *cobra.Command {
 			home, err := codex.ResolveHome(codexHome)
 			if err != nil {
 				return err
+			}
+			if canonicalNamespace {
+				if nativeRoot == "" || !filepath.IsAbs(nativeRoot) {
+					return errors.New("canonical namespace requires an absolute native root")
+				}
+				nativeRoot = filepath.Clean(nativeRoot)
 			}
 			store := resolveFoldStore(home, storeDir)
 			mount := defaultMountPoint(home, mountPoint)
@@ -254,14 +268,40 @@ func newFSServeCommand() *cobra.Command {
 				_, err = fmt.Fprintf(command.OutOrStdout(), "dry_run=true mount=%s sessions=%d\n", mount, len(states))
 				return err
 			}
+			processLock, err := service.AcquireProcessLock(filepath.Join(store, "fs", "service.lock"))
+			if err != nil {
+				return err
+			}
+			defer processLock.Close()
 			if err := os.MkdirAll(mount, 0o700); err != nil {
 				return err
 			}
+			var operationRecorder func(string)
+			if operationTracePath != "" {
+				recorder, closer, err := newOperationRecorder(operationTracePath)
+				if err != nil {
+					return err
+				}
+				operationRecorder = recorder
+				defer closer.Close()
+			}
+			if canonicalNamespace {
+				for _, directory := range []string{"sessions", "archived_sessions"} {
+					if err := os.MkdirAll(filepath.Join(nativeRoot, directory), 0o700); err != nil {
+						return err
+					}
+				}
+			}
 			filesystem := mountfs.New()
+			if canonicalNamespace {
+				filesystem = mountfs.NewCanonical()
+				filesystem.SetNativeRoot(nativeRoot)
+			}
 			ctx, cancel := context.WithCancel(command.Context())
 			defer cancel()
 			closers := make([]io.Closer, 0)
 			known := make(map[string]uint64)
+			knownRoutes := make(map[string]string)
 			var loadMu sync.Mutex
 			openState := func(state vfs.SessionState) (*vfs.Session, error) {
 				managed, resolver, err := openManagedSession(ctx, store, state)
@@ -269,7 +309,6 @@ func newFSServeCommand() *cobra.Command {
 					return nil, err
 				}
 				closers = append(closers, resolver)
-				known[state.SessionID] = state.Generation
 				return managed, nil
 			}
 			filesystem.SetSessionLoader(func(sessionID string) (*vfs.Session, error) {
@@ -281,7 +320,11 @@ func newFSServeCommand() *cobra.Command {
 				}
 				for _, state := range states {
 					if state.SessionID == sessionID {
-						return openState(state)
+						managed, err := openState(state)
+						if err == nil {
+							known[state.SessionID] = state.Generation
+						}
+						return managed, err
 					}
 				}
 				return nil, os.ErrNotExist
@@ -293,7 +336,56 @@ func newFSServeCommand() *cobra.Command {
 				if err != nil {
 					return err
 				}
+				routes := make(map[string]string)
+				if canonicalNamespace {
+					routes, err = discoverCanonicalRoutes(home, mount, store, states, codex.LoadSessions)
+					if err != nil {
+						return err
+					}
+				}
+				seen := make(map[string]struct{}, len(states))
 				for _, state := range states {
+					seen[state.SessionID] = struct{}{}
+					if canonicalNamespace {
+						route, exists := routes[state.SessionID]
+						if !exists {
+							if _, mounted := known[state.SessionID]; mounted {
+								if err := filesystem.RemoveSession(state.SessionID); err != nil && !errors.Is(err, os.ErrNotExist) {
+									return err
+								}
+								delete(known, state.SessionID)
+								delete(knownRoutes, state.SessionID)
+							}
+							continue
+						}
+						generation, generationKnown := known[state.SessionID]
+						if generationKnown && generation == state.Generation {
+							if knownRoutes[state.SessionID] == route {
+								continue
+							}
+							if err := filesystem.MoveSessionAt(state.SessionID, route); err != nil {
+								return err
+							}
+							knownRoutes[state.SessionID] = route
+							if err := writeMountAcknowledgement(store, state.SessionID, state.Generation, route); err != nil {
+								return err
+							}
+							continue
+						}
+						managed, err := openState(state)
+						if err != nil {
+							return err
+						}
+						if err := filesystem.UpsertSessionAt(state.SessionID, route, managed); err != nil {
+							return err
+						}
+						known[state.SessionID] = state.Generation
+						knownRoutes[state.SessionID] = route
+						if err := writeMountAcknowledgement(store, state.SessionID, state.Generation, route); err != nil {
+							return err
+						}
+						continue
+					}
 					if known[state.SessionID] == state.Generation {
 						continue
 					}
@@ -304,6 +396,17 @@ func newFSServeCommand() *cobra.Command {
 					if err := filesystem.UpsertSession(state.SessionID, managed); err != nil {
 						return err
 					}
+					known[state.SessionID] = state.Generation
+				}
+				for sessionID := range known {
+					if _, exists := seen[sessionID]; exists {
+						continue
+					}
+					if err := filesystem.RemoveSession(sessionID); err != nil && !errors.Is(err, os.ErrNotExist) {
+						return err
+					}
+					delete(known, sessionID)
+					delete(knownRoutes, sessionID)
 				}
 				return nil
 			}
@@ -329,7 +432,7 @@ func newFSServeCommand() *cobra.Command {
 					}
 				}
 			}()
-			mountErr := mountfs.Mount(ctx, mountfs.HostOptions{MountPoint: mount, Filesystem: filesystem, Foreground: foreground})
+			mountErr := mountfs.Mount(ctx, mountfs.HostOptions{MountPoint: mount, Filesystem: filesystem, Foreground: foreground, OperationRecorder: operationRecorder})
 			cancel()
 			<-watcherDone
 			for _, closer := range closers {
@@ -348,6 +451,9 @@ func newFSServeCommand() *cobra.Command {
 	command.Flags().StringVar(&mountPoint, "mount", "", "Mounted CodexFold filesystem path; defaults to <codex-home>/fold-fs")
 	command.Flags().BoolVar(&apply, "apply", false, "Start the filesystem host")
 	command.Flags().BoolVar(&foreground, "foreground", true, "Keep the FUSE host in the foreground")
+	command.Flags().BoolVar(&canonicalNamespace, "canonical-namespace", false, "Expose sessions and archived_sessions as a shared virtual namespace")
+	command.Flags().StringVar(&nativeRoot, "native-root", "", "Backing root for unmanaged canonical session files")
+	command.Flags().StringVar(&operationTracePath, "operation-trace", "", "Absolute path for sanitized FUSE operation names")
 	command.Flags().BoolVar(&jsonOutput, "json", false, "Emit JSON output for dry-run")
 	return command
 }
@@ -356,8 +462,9 @@ func newFSMigrateCommand() *cobra.Command {
 	var codexHome string
 	var storeDir string
 	var mountPoint string
+	var nativeRoot string
 	var mountWait time.Duration
-	var apply bool
+	var apply, canonicalNamespace, compatibilityCanary bool
 	var jsonOutput bool
 	var compatibility compatibilityFlags
 	command := &cobra.Command{
@@ -378,40 +485,126 @@ func newFSMigrateCommand() *cobra.Command {
 			if !session.Archived {
 				return errors.New("only archived sessions are eligible for filesystem migration")
 			}
-			shadow, err := fsctl.Shadow(command.Context(), session.RolloutPath, view, fsctl.ShadowOptions{RandomReads: 10000, Seed: 1})
+			mount := defaultMountPoint(home, mountPoint)
+			sourcePath := session.RolloutPath
+			target := filepath.Join(mount, session.ID+".jsonl")
+			if canonicalNamespace {
+				if nativeRoot == "" {
+					nativeRoot = filepath.Join(home, "fold-native")
+				}
+				sourcePath, err = canonicalNativeRoute(home, nativeRoot, session.RolloutPath)
+				if err != nil {
+					return err
+				}
+				target, err = canonicalMountRoute(home, mount, session.RolloutPath)
+				if err != nil {
+					return err
+				}
+			}
+			shadow, err := fsctl.Shadow(command.Context(), sourcePath, view, fsctl.ShadowOptions{RandomReads: 10000, Seed: 1})
 			if err != nil {
 				return err
 			}
-			mount := defaultMountPoint(home, mountPoint)
-			target := filepath.Join(mount, session.ID+".jsonl")
-			native := vfs.NativeFile{Path: session.RolloutPath, Bytes: shadow.Bytes, SHA256: shadow.SHA256}
+			native := vfs.NativeFile{Path: sourcePath, Bytes: shadow.Bytes, SHA256: shadow.SHA256}
 			result := FSMigrateResult{SessionID: session.ID, Native: native, Target: target, Shadow: shadow, DryRun: !apply}
 			if apply {
 				if err := requireStorageHealth(command.Context(), store); err != nil {
 					return err
 				}
-				compatibilityResult, err := evaluateCompatibility(command.Context(), store, compatibility)
-				if err != nil {
-					return err
-				}
-				if len(compatibilityResult.DetectionErrors) != 0 || !compatibilityResult.Evaluation.Approved {
-					return errors.New("installed Codex client versions are not covered by compatibility contracts")
+				if compatibilityCanary {
+					userHome, err := os.UserHomeDir()
+					if err != nil {
+						return err
+					}
+					if err := validateCompatibilityCanary(home, filepath.Join(userHome, ".codex"), store, canonicalNamespace, compatibility); err != nil {
+						return err
+					}
+				} else {
+					compatibilityResult, err := evaluateCompatibility(command.Context(), store, compatibility)
+					if err != nil {
+						return err
+					}
+					if len(compatibilityResult.DetectionErrors) != 0 || !compatibilityResult.Evaluation.Approved {
+						return errors.New("installed Codex client versions are not covered by compatibility contracts")
+					}
 				}
 				if err := mountHealthProbe(mount); err != nil {
 					return fmt.Errorf("filesystem mount point is not healthy: %w", err)
 				}
-				if _, err := vfs.OpenSession(command.Context(), vfs.SessionOptions{Root: store, ManifestPath: fold.ManifestPath(store, session.ID), Manifest: manifest, Reader: resolver, NativeSnapshot: native}); err != nil {
-					return err
+				canonicalSource := ""
+				canonicalRoute := ""
+				if canonicalNamespace {
+					if _, err := os.Stat(filepath.Join(store, "fs", "sessions", session.ID, "state.json")); err == nil {
+						return errors.New("session is already managed")
+					} else if !errors.Is(err, os.ErrNotExist) {
+						return err
+					}
+					canonicalSource = native.Path
+					canonicalRoute, err = canonicalNamespaceRoute(home, mount, session.RolloutPath)
+					if err != nil {
+						return err
+					}
+					retained, err := retainCanonicalSnapshot(store, session.ID, native)
+					if err != nil {
+						return err
+					}
+					native = retained
+					result.Native = retained
+				}
+				rollbackCanonicalMigration := func(cause error) error {
+					if !canonicalNamespace {
+						return cause
+					}
+					if _, err := os.Stat(filepath.Join(store, "fs", "sessions", session.ID)); err == nil {
+						if _, retireErr := retireManagedState(store, session.ID); retireErr != nil {
+							return errors.Join(cause, retireErr)
+						}
+					}
+					if err := restoreCanonicalSnapshotSource(canonicalSource, native.Path); err != nil {
+						return errors.Join(cause, err)
+					}
+					return cause
+				}
+				managed, err := vfs.OpenSession(command.Context(), vfs.SessionOptions{Root: store, ManifestPath: fold.ManifestPath(store, session.ID), Manifest: manifest, Reader: resolver, NativeSnapshot: native})
+				if err != nil {
+					return rollbackCanonicalMigration(err)
+				}
+				if canonicalNamespace {
+					if err := waitForMountAcknowledgement(command.Context(), store, session.ID, managed.State().Generation, canonicalRoute, mountWait); err != nil {
+						return rollbackCanonicalMigration(fmt.Errorf("wait for canonical mount acknowledgement: %w", err))
+					}
+					sessions, err := codex.LoadSessions(home)
+					if err != nil {
+						return rollbackCanonicalMigration(err)
+					}
+					current, err := findSession(sessions, session.ID)
+					if err != nil || filepath.Clean(current.RolloutPath) != filepath.Clean(session.RolloutPath) {
+						return rollbackCanonicalMigration(errors.New("canonical Codex route changed during migration"))
+					}
+					if err := finalizeCanonicalSnapshotSource(canonicalSource, native); err != nil {
+						return rollbackCanonicalMigration(err)
+					}
 				}
 				targetFile, err := waitForTarget(command.Context(), target, mountWait)
 				if err != nil {
-					return fmt.Errorf("verify mounted target: %w", err)
+					return rollbackCanonicalMigration(fmt.Errorf("verify mounted target: %w", err))
 				}
 				if targetFile.Bytes != shadow.Bytes || targetFile.SHA256 != shadow.SHA256 {
-					return errors.New("mounted target differs from the shadow-verified native session")
+					return rollbackCanonicalMigration(errors.New("mounted target differs from the shadow-verified native session"))
 				}
-				if _, err := codex.RouteSession(command.Context(), codex.RouteOptions{CodexHome: home, SessionID: session.ID, ExpectedPath: session.RolloutPath, Target: codex.RouteTarget{Path: target, Bytes: targetFile.Bytes, SHA256: targetFile.SHA256}}); err != nil {
-					return err
+				if !canonicalNamespace {
+					if _, err := codex.RouteSession(command.Context(), codex.RouteOptions{CodexHome: home, SessionID: session.ID, ExpectedPath: session.RolloutPath, Target: codex.RouteTarget{Path: target, Bytes: targetFile.Bytes, SHA256: targetFile.SHA256}}); err != nil {
+						return err
+					}
+				} else {
+					sessions, err := codex.LoadSessions(home)
+					if err != nil {
+						return err
+					}
+					current, err := findSession(sessions, session.ID)
+					if err != nil || filepath.Clean(current.RolloutPath) != filepath.Clean(session.RolloutPath) {
+						return rollbackCanonicalMigration(errors.New("canonical Codex route changed during migration"))
+					}
 				}
 				result.Routed = true
 				result.DryRun = false
@@ -426,8 +619,11 @@ func newFSMigrateCommand() *cobra.Command {
 	command.Flags().StringVar(&codexHome, "codex-home", "", "Codex home directory; defaults to CODEX_HOME or ~/.codex")
 	command.Flags().StringVar(&storeDir, "store", "", "Fold store directory; defaults to <codex-home>/fold-store")
 	command.Flags().StringVar(&mountPoint, "mount", "", "Mounted CodexFold filesystem path; defaults to <codex-home>/fold-fs")
-	command.Flags().DurationVar(&mountWait, "mount-wait", 5*time.Second, "Maximum wait for the mounted session target")
+	command.Flags().BoolVar(&canonicalNamespace, "canonical-namespace", false, "Enroll the session at its canonical Codex path without changing SQLite routing")
+	command.Flags().StringVar(&nativeRoot, "native-root", "", "Canonical native snapshot root; defaults to <codex-home>/fold-native")
+	command.Flags().DurationVar(&mountWait, "mount-wait", 15*time.Second, "Maximum wait for the mounted session target")
 	command.Flags().BoolVar(&apply, "apply", false, "Enroll and route the session after all gates pass")
+	command.Flags().BoolVar(&compatibilityCanary, "compatibility-canary", false, "Allow an isolated canonical canary with both client checks explicitly skipped")
 	addCompatibilityFlags(command, &compatibility)
 	command.Flags().BoolVar(&jsonOutput, "json", false, "Emit JSON output")
 	return command
@@ -436,8 +632,11 @@ func newFSMigrateCommand() *cobra.Command {
 func newFSRollbackCommand() *cobra.Command {
 	var codexHome string
 	var storeDir string
+	var mountPoint string
+	var nativeRoot string
 	var targetPath string
-	var apply bool
+	var mountWait time.Duration
+	var apply, canonicalNamespace bool
 	var jsonOutput bool
 	command := &cobra.Command{
 		Use:   "rollback <session-id>",
@@ -461,11 +660,49 @@ func newFSRollbackCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if targetPath == "" {
-				targetPath = filepath.Join(store, "fs", "sessions", state.SessionID, "fallback-current.jsonl")
+			currentNativeFallback := !canonicalNamespace && isGeneratedNativeFallbackPath(current.RolloutPath, store, state.SessionID)
+			mount := defaultMountPoint(home, mountPoint)
+			if canonicalNamespace {
+				if nativeRoot == "" {
+					nativeRoot = filepath.Join(home, "fold-native")
+				}
+				canonicalTarget, err := canonicalNativeRoute(home, nativeRoot, current.RolloutPath)
+				if err != nil {
+					return err
+				}
+				if targetPath != "" && filepath.Clean(targetPath) != filepath.Clean(canonicalTarget) {
+					return errors.New("canonical rollback target must remain inside the retained native namespace")
+				}
+				targetPath = canonicalTarget
+			} else if targetPath == "" {
+				targetPath = filepath.Join(store, "fs", "fallbacks", state.SessionID, "fallback-current.jsonl")
 			}
 			result := FSRollbackResult{SessionID: state.SessionID, From: current.RolloutPath, Target: vfs.NativeFile{Path: filepath.Clean(targetPath)}, DryRun: !apply}
 			if apply {
+				if currentNativeFallback {
+					target, err := hashPath(current.RolloutPath)
+					if err != nil {
+						return err
+					}
+					retiredState, err := retireManagedState(store, state.SessionID)
+					if err != nil {
+						return err
+					}
+					result.Target = target
+					result.RetiredState = retiredState
+					result.Routed = true
+					result.DryRun = false
+					if jsonOutput {
+						return writeJSON(command, result)
+					}
+					_, err = fmt.Fprintf(command.OutOrStdout(), "session=%s dry_run=%t routed=%t from=%s target=%s\n", result.SessionID, result.DryRun, result.Routed, result.From, result.Target.Path)
+					return err
+				}
+				if canonicalNamespace {
+					if err := mountHealthProbe(mount); err != nil {
+						return fmt.Errorf("canonical filesystem mount is not healthy: %w", err)
+					}
+				}
 				managed, resolver, err := openManagedSession(command.Context(), store, state)
 				if err != nil {
 					return err
@@ -475,8 +712,35 @@ func newFSRollbackCommand() *cobra.Command {
 				if err != nil {
 					return err
 				}
-				if _, err := codex.RouteSession(command.Context(), codex.RouteOptions{CodexHome: home, SessionID: state.SessionID, ExpectedPath: current.RolloutPath, Target: codex.RouteTarget{Path: target.Path, Bytes: target.Bytes, SHA256: target.SHA256}}); err != nil {
-					return err
+				if canonicalNamespace {
+					retiredState, err := retireManagedState(store, state.SessionID)
+					if err != nil {
+						return err
+					}
+					retiredSnapshot, err := retireCanonicalNativeSnapshot(store, nativeRoot, state.SessionID, state.NativeSnapshot.Path, target.Path, retiredState)
+					if err != nil {
+						_ = restoreManagedState(store, state.SessionID, retiredState)
+						return err
+					}
+					mountedTarget, err := canonicalMountRoute(home, mount, current.RolloutPath)
+					if err == nil {
+						_, err = waitForTargetMatch(command.Context(), mountedTarget, target, mountWait)
+					}
+					if err != nil {
+						_ = restoreCanonicalNativeSnapshot(state.NativeSnapshot.Path, retiredSnapshot)
+						_ = restoreManagedState(store, state.SessionID, retiredState)
+						return fmt.Errorf("verify canonical native rollback: %w", err)
+					}
+					result.RetiredState = retiredState
+				} else {
+					if _, err := codex.RouteSession(command.Context(), codex.RouteOptions{CodexHome: home, SessionID: state.SessionID, ExpectedPath: current.RolloutPath, Target: codex.RouteTarget{Path: target.Path, Bytes: target.Bytes, SHA256: target.SHA256}}); err != nil {
+						return err
+					}
+					retiredState, err := retireManagedState(store, state.SessionID)
+					if err != nil {
+						return err
+					}
+					result.RetiredState = retiredState
 				}
 				result.Target = target
 				result.Routed = true
@@ -491,6 +755,10 @@ func newFSRollbackCommand() *cobra.Command {
 	}
 	command.Flags().StringVar(&codexHome, "codex-home", "", "Codex home directory; defaults to CODEX_HOME or ~/.codex")
 	command.Flags().StringVar(&storeDir, "store", "", "Fold store directory; defaults to <codex-home>/fold-store")
+	command.Flags().StringVar(&mountPoint, "mount", "", "Mounted CodexFold filesystem path; defaults to <codex-home>/fold-fs")
+	command.Flags().BoolVar(&canonicalNamespace, "canonical-namespace", false, "Restore current bytes to canonical native backing without changing SQLite routing")
+	command.Flags().StringVar(&nativeRoot, "native-root", "", "Canonical native rollback root; defaults to <codex-home>/fold-native")
+	command.Flags().DurationVar(&mountWait, "mount-wait", 15*time.Second, "Maximum wait for native passthrough after state retirement")
 	command.Flags().StringVar(&targetPath, "to", "", "Native rollback target; defaults to the managed session directory")
 	command.Flags().BoolVar(&apply, "apply", false, "Materialize current bytes and update the Codex route")
 	command.Flags().BoolVar(&jsonOutput, "json", false, "Emit JSON output")
@@ -711,6 +979,26 @@ func evaluateCompatibility(ctx context.Context, store string, flags compatibilit
 	return result, nil
 }
 
+func validateCompatibilityCanary(home string, defaultHome string, store string, canonical bool, flags compatibilityFlags) error {
+	home = filepath.Clean(home)
+	defaultHome = filepath.Clean(defaultHome)
+	store = filepath.Clean(store)
+	if !canonical {
+		return errors.New("compatibility canary requires canonical namespace mode")
+	}
+	if home == defaultHome {
+		return errors.New("compatibility canary is forbidden for the real Codex home")
+	}
+	relative, err := filepath.Rel(home, store)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.IsAbs(relative) {
+		return errors.New("compatibility canary store must be inside the isolated Codex home")
+	}
+	if flags.cliPath != "none" || flags.desktopPath != "none" {
+		return errors.New("compatibility canary requires --cli none and --desktop-app none")
+	}
+	return nil
+}
+
 func openFoldView(home string, store string, sessionID string) (codex.Session, fold.Manifest, *pack.Resolver, *vfs.View, error) {
 	sessions, err := codex.LoadSessions(home)
 	if err != nil {
@@ -922,6 +1210,30 @@ func waitForTarget(ctx context.Context, target string, timeout time.Duration) (v
 		case <-ctx.Done():
 			return vfs.NativeFile{}, ctx.Err()
 		case <-time.After(50 * time.Millisecond):
+		}
+	}
+}
+
+func waitForTargetMatch(ctx context.Context, target string, expected vfs.NativeFile, timeout time.Duration) (vfs.NativeFile, error) {
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	deadline := time.Now().Add(timeout)
+	for {
+		file, err := hashPath(target)
+		if err == nil && file.Bytes == expected.Bytes && file.SHA256 == expected.SHA256 {
+			return file, nil
+		}
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return vfs.NativeFile{}, err
+		}
+		if time.Now().After(deadline) {
+			return vfs.NativeFile{}, errors.New("timed out waiting for matching mounted session")
+		}
+		select {
+		case <-ctx.Done():
+			return vfs.NativeFile{}, ctx.Err()
+		case <-time.After(25 * time.Millisecond):
 		}
 	}
 }

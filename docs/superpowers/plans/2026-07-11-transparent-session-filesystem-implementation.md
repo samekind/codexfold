@@ -6,7 +6,7 @@
 
 **Architecture:** Extend Fold V1 with a block-addressable packed resolver, then place a platform-neutral exact-byte session engine above it. The engine composes an immutable manifest base with an append delta or verified writable backing; platform adapters only translate native file operations. Migration, compatibility quarantine, fallback, and promotion remain explicit journaled transactions, with real Codex routing disabled until shadow and platform gates pass.
 
-**Tech Stack:** Go 1.26, zstd, Cobra, modernc SQLite, `cgofuse` v1.6.0 behind platform/build tags, macFUSE as the initial macOS adapter candidate.
+**Tech Stack:** Go 1.26, zstd, Cobra, modernc SQLite, `cgofuse` v1.6.0 behind platform/build tags, and FUSE-T 1.2.7 as the validated macOS host.
 
 ## Global Constraints
 
@@ -25,7 +25,8 @@
 - `TF-013`: status output uses only `storage-engine`, `fs-engine-preview`, `platform-canary`, `production-ready:<platform>`, and `cross-platform-ready`.
 - `TF-014`: a migration snapshot is not deleted before `production-ready:<platform>` and the per-session retention gate.
 - `TF-015`: unknown client versions enter compatibility quarantine and cannot write a virtual route before current bytes are automatically routed to verified native backing.
-- `TF-016`: macFUSE or another privileged prerequisite is not installed without explicit user authorization.
+- `TF-016`: FUSE-T or another privileged prerequisite is not installed without explicit user authorization.
+- `TF-017`: canonical namespace activation requires a verified CodexFold mount identity, write-sealed unmounted backing, route normalization, and a watcher that tolerates canonical and mount-alias spellings.
 - Mock and fixture evidence never satisfies a gate that names real Codex, a real adapter, client upgrade, host restart, or canary retention.
 - Public code and documentation contain no private paths, domains, credentials, real session IDs, or private control-plane dependency.
 
@@ -49,6 +50,7 @@
 | `TF-014` | 4, 6 | 10, 11 |
 | `TF-015` | 4, 6 | 10, 11 |
 | `TF-016` | 7, 9 | 11 |
+| `TF-017` | 7, 9 | 10, 11 |
 
 ---
 
@@ -467,7 +469,7 @@ Keep all path validation, handle ownership, session lookups, and error mapping i
 
 - [ ] **Step 4: Add `cgofuse` v1.6.0 behind explicit build constraints**
 
-`host_cgofuse.go` uses `//go:build fuse && cgo` and translates cgofuse callbacks to the neutral filesystem. `host_stub.go` uses `//go:build !fuse || !cgo` and returns a typed prerequisite error. Default `go test ./...` and cross-compilation must not require macFUSE headers.
+`host_cgofuse.go` uses `//go:build fuse && cgo` and translates cgofuse callbacks to the neutral filesystem. `host_stub.go` uses `//go:build !fuse || !cgo` and returns a typed prerequisite error. Default `go test ./...` and cross-compilation must not require an installed FUSE host.
 
 - [ ] **Step 5: Run default, race, and cross-platform compile tests**
 
@@ -481,7 +483,7 @@ CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go test -c -o /tmp/codexfold-mountfs-win
 go test ./... -count=1
 ```
 
-Expected: all PASS without installed macFUSE.
+Expected: all PASS without an installed FUSE host.
 
 - [ ] **Step 6: Commit**
 
@@ -571,7 +573,7 @@ Expected: FAIL because service APIs are absent.
 
 - [ ] **Step 3: Implement service lifecycle without self-elevation**
 
-Render a per-user launchd plist and use `launchctl bootstrap/bootout/kickstart` only after an explicit apply command. Detect prerequisites but never install macFUSE or request elevation from library code.
+Render a per-user launchd plist and use `launchctl bootstrap/bootout/kickstart` only after an explicit apply command. Detect prerequisites but never install FUSE-T or request elevation from library code.
 
 - [ ] **Step 4: Implement update compatibility guard**
 
@@ -650,7 +652,7 @@ git commit -m "test: validate transparent filesystem engine preview"
 
 **Files:**
 - Create: `docs/validation-macos-canary.md`
-- Modify only after approval: local macFUSE prerequisite and user launch service outside the public repository.
+- Modify only after approval: local FUSE-T prerequisite and user launch service outside the public repository.
 - Modify only after all gates pass: selected Codex state rows through `codexfold fs migrate --apply`.
 
 **Interfaces:**
@@ -665,7 +667,7 @@ With explicit elevation approval, run sanitized `fs_usage` tracing for list/open
 
 Add or correct platform operation tests before changing adapter code. Any unsupported observed operation blocks installation and migration.
 
-- [ ] **Step 3: Request and apply macFUSE authorization**
+- [ ] **Step 3: Request and apply the selected FUSE host authorization**
 
 Install the selected prerequisite only after explicit approval, build with `-tags fuse`, mount a temporary fixture namespace, and run fstest/fsx-equivalent plus the project operation suite. A mount alone is not success.
 
@@ -692,9 +694,9 @@ No private path, session ID, trace content, credential, or control-plane name ma
 
 ## Plan Self-Review
 
-- `TF-001` through `TF-016` each map to implementation and verification tasks.
+- `TF-001` through `TF-017` each map to implementation and verification tasks.
 - Real-client, real-adapter, restart, upgrade, and retention gates remain in Task 11 and cannot be satisfied by Task 10 fixtures.
-- macFUSE is a candidate and explicit authorization boundary, not a baked-in product promise.
+- FUSE-T is the validated macOS host and remains an explicit authorization boundary; Linux and Windows adapters are certified independently.
 - The stale migration snapshot is never used as current fallback after virtual writes diverge.
 - The default build remains portable and does not require installed FUSE headers.
 - No task changes a real Codex route before shadow, compatibility, doctor, and explicit apply gates pass.

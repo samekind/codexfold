@@ -30,6 +30,7 @@ Every implementation plan, task, test report, release note, and control-plane st
 | `TF-014` | Native fallback deletion is disabled until platform production readiness and per-session retention gates pass. |
 | `TF-015` | A Codex client version without passing compatibility evidence enters compatibility quarantine: enrollment and destructive automation pause, and an already-routed session is automatically switched to a byte-verified current native writable backing before that client version may write. Routine client upgrades require no manual session preparation. |
 | `TF-016` | Platform filesystem prerequisites requiring elevated or system-extension approval are installed only after explicit user authorization. |
+| `TF-017` | A canonical mount may never degrade into a writable ordinary directory or expose stale session files. The unmounted backing directory is empty and write-sealed, activation requires a live CodexFold mount identity, and service start succeeds only after the daemon and operational mount probe are both healthy. Desktop realpath rewrites from `CODEX_HOME/sessions` or `archived_sessions` into the mount alias are synchronously normalized in the Codex state database, and the route watcher accepts either spelling without exiting. |
 
 ### Decision Hierarchy
 
@@ -46,7 +47,7 @@ An implementation change is therefore acceptable only when its requirement cover
 ### Drift Control
 
 - Each implementation-plan task lists the requirement IDs it implements or verifies.
-- Each plan starts with a complete requirement-to-task coverage table for `TF-001` through `TF-016`.
+- Each plan starts with a complete requirement-to-task coverage table for `TF-001` through `TF-017`.
 - A requirement with no implementation or verification task blocks plan approval.
 - Completion reports list fresh evidence by requirement ID and state any unmet ID explicitly.
 - Mock, fixture, or synthetic evidence cannot satisfy a requirement that names real Codex, a real platform adapter, a client upgrade, a host restart, or a canary period.
@@ -332,6 +333,10 @@ After platform production readiness, enrollment is policy-driven rather than man
 - Startup recovery resolves every pending journal entry before accepting mounts.
 - A corrupt object, pack frame, manifest, or index blocks the affected session and preserves its native fallback.
 - Mount health failure blocks new migration and compaction.
+- The ordinary directory underneath a canonical mount is empty, is never used as session storage, and remains non-writable whenever the mount is absent.
+- Every mount instance exposes a process-generated identity through an operational read; provider type or `statfs` alone is not mount-health evidence.
+- Namespace activation requires the live mount identity and may not accept a plain directory containing look-alike `sessions` trees.
+- A store has one filesystem-host process lock. Service installation and restart return success only after launchd reports a running process and the mount identity is readable.
 - Database and global-state changes use optimistic revalidation and rollback.
 - A session with an active writer is never folded, removed, migrated, or rolled back.
 - A detected Codex Desktop or CLI version change immediately enters compatibility quarantine and schedules the native-operation compatibility suite.
@@ -403,6 +408,7 @@ A single SHA-256 mismatch, unexpected Codex file operation, unresolved crash-rec
 
 - Daemon process health and mount health as separate states.
 - Mount path ownership, adapter version, and mounted-generation identity.
+- Empty and write-sealed ordinary mount backing state whenever the adapter is not mounted.
 - Active pack generation, every resolver entry, object boundaries, stored checksum, raw length, and object SHA-256.
 - Manifest generation validity and complete virtual reconstruction.
 - Delta path, size, mtime, digest, synchronization state, and writer lease.

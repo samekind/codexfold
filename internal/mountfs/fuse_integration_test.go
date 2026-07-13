@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -19,6 +20,7 @@ import (
 	"github.com/jstar0/codexfold/internal/fold"
 	"github.com/jstar0/codexfold/internal/service"
 	"github.com/jstar0/codexfold/internal/vfs"
+	"golang.org/x/sys/unix"
 )
 
 func TestRealFuseMountNativeFileOperations(t *testing.T) {
@@ -55,6 +57,10 @@ func TestRealFuseMountNativeFileOperations(t *testing.T) {
 		t.Fatal(err)
 	}
 	stopMount := startRealMount(t, mountPoint, filesystem)
+	identity, err := os.ReadFile(filepath.Join(mountPoint, ".codexfold-health"))
+	if err != nil || len(identity) < 16 {
+		t.Fatalf("mount identity file is unavailable: size=%d err=%v", len(identity), err)
+	}
 	target := filepath.Join(mountPoint, "fixture.jsonl")
 	entries, err := os.ReadDir(mountPoint)
 	if err != nil || len(entries) != 1 || entries[0].Name() != "fixture.jsonl" {
@@ -146,12 +152,107 @@ func TestRealFuseMountNativeFileOperations(t *testing.T) {
 	waitForRealUnmount(t, mountPoint)
 }
 
+func TestRealFuseMountCanonicalManagedRename(t *testing.T) {
+	if os.Getenv("CODEXFOLD_RUN_FUSE_TEST") != "1" {
+		t.Skip("set CODEXFOLD_RUN_FUSE_TEST=1 to run the real FUSE-T adapter test")
+	}
+	root := t.TempDir()
+	source := []byte("canonical-session\n")
+	managed := mountSessionFixture(t, "fixture", source)
+	nativeRoot := filepath.Join(root, "native")
+	nativeActiveDirectory := filepath.Join(nativeRoot, "sessions", "2026", "07", "12")
+	if err := os.MkdirAll(nativeActiveDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(nativeRoot, "archived_sessions"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	filesystem := NewCanonical()
+	filesystem.SetNativeRoot(nativeRoot)
+	filename := "rollout-2026-07-12T14-28-28-fixture.jsonl"
+	archivedPath := "/archived_sessions/" + filename
+	if err := filesystem.AddSessionAt("fixture", archivedPath, managed); err != nil {
+		t.Fatal(err)
+	}
+	mountPoint := filepath.Join(root, "mount")
+	if err := os.MkdirAll(mountPoint, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var recordedMu sync.Mutex
+	var recorded []string
+	stopMount := startRealMountWithOptions(t, HostOptions{
+		MountPoint: mountPoint, Filesystem: filesystem, Foreground: true,
+		OperationRecorder: func(operation string) {
+			recordedMu.Lock()
+			recorded = append(recorded, operation)
+			recordedMu.Unlock()
+		},
+	})
+	archivedTarget := filepath.Join(mountPoint, "archived_sessions", filename)
+	activeTarget := filepath.Join(mountPoint, "sessions", "2026", "07", "12", filename)
+	attributeName := "com.codexfold.test"
+	attributeValue := []byte("persistent-metadata")
+	if err := unix.Setxattr(archivedTarget, attributeName, attributeValue, 0); err != nil {
+		t.Fatalf("set managed xattr: %v", err)
+	}
+	archivedSidecar := filepath.Join(nativeRoot, "archived_sessions", "._"+filename)
+	activeSidecar := filepath.Join(nativeActiveDirectory, "._"+filename)
+	sidecar, err := os.ReadFile(archivedSidecar)
+	if err != nil || !bytes.Contains(sidecar, []byte(attributeName)) || !bytes.Contains(sidecar, attributeValue) {
+		t.Fatalf("AppleDouble sidecar did not preserve xattr: bytes=%d err=%v", len(sidecar), err)
+	}
+	if err := os.Rename(archivedTarget, activeTarget); err != nil {
+		t.Fatalf("rename canonical managed session: %v", err)
+	}
+	if _, err := os.Stat(archivedTarget); !os.IsNotExist(err) {
+		t.Fatalf("archived path remained after rename: %v", err)
+	}
+	got, err := os.ReadFile(activeTarget)
+	if err != nil || !bytes.Equal(got, source) {
+		t.Fatalf("active managed bytes differ: got=%q err=%v", got, err)
+	}
+	if _, err := os.Stat(archivedSidecar); !os.IsNotExist(err) {
+		t.Fatalf("archived AppleDouble sidecar remained after rename: %v", err)
+	}
+	movedSidecar, err := os.ReadFile(activeSidecar)
+	if err != nil || !bytes.Contains(movedSidecar, []byte(attributeName)) || !bytes.Contains(movedSidecar, attributeValue) {
+		t.Fatalf("active AppleDouble sidecar lost xattr: bytes=%d err=%v", len(movedSidecar), err)
+	}
+	if err := os.Rename(activeTarget, archivedTarget); err != nil {
+		t.Fatalf("rename canonical managed session back: %v", err)
+	}
+	if _, err := os.Stat(activeTarget); !os.IsNotExist(err) {
+		t.Fatalf("active path remained after reverse rename: %v", err)
+	}
+	if _, err := os.Stat(activeSidecar); !os.IsNotExist(err) {
+		t.Fatalf("active AppleDouble sidecar remained after reverse rename: %v", err)
+	}
+	restoredSidecar, err := os.ReadFile(archivedSidecar)
+	if err != nil || !bytes.Contains(restoredSidecar, []byte(attributeName)) || !bytes.Contains(restoredSidecar, attributeValue) {
+		t.Fatalf("restored AppleDouble sidecar lost xattr: bytes=%d err=%v", len(restoredSidecar), err)
+	}
+	recordedMu.Lock()
+	joined := strings.Join(recorded, ",")
+	recordedMu.Unlock()
+	for _, operation := range []string{"getattr", "rename", "open", "read", "release"} {
+		if !strings.Contains(joined, operation) {
+			t.Fatalf("operation trace missing %q: %s", operation, joined)
+		}
+	}
+	stopMount()
+	waitForRealUnmount(t, mountPoint)
+}
+
 func startRealMount(t *testing.T, mountPoint string, filesystem *Filesystem) func() {
+	return startRealMountWithOptions(t, HostOptions{MountPoint: mountPoint, Filesystem: filesystem, Foreground: true})
+}
+
+func startRealMountWithOptions(t *testing.T, options HostOptions) func() {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	mountDone := make(chan error, 1)
 	go func() {
-		mountDone <- Mount(ctx, HostOptions{MountPoint: mountPoint, Filesystem: filesystem, Foreground: true})
+		mountDone <- Mount(ctx, options)
 	}()
 	var stopOnce sync.Once
 	stopMount := func() {
@@ -168,16 +269,19 @@ func startRealMount(t *testing.T, mountPoint string, filesystem *Filesystem) fun
 		})
 	}
 	t.Cleanup(stopMount)
-	waitForRealMount(t, mountPoint, mountDone)
+	waitForRealMount(t, options.MountPoint, mountDone)
 	return stopMount
 }
 
 func waitForRealMount(t *testing.T, mountPoint string, mountDone <-chan error) {
 	t.Helper()
 	deadline := time.Now().Add(20 * time.Second)
+	var lastProbeErr error
 	for time.Now().Before(deadline) {
 		if err := service.ProbeMount(mountPoint); err == nil {
 			return
+		} else {
+			lastProbeErr = err
 		}
 		select {
 		case err := <-mountDone:
@@ -185,7 +289,7 @@ func waitForRealMount(t *testing.T, mountPoint string, mountDone <-chan error) {
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
-	t.Fatal("FUSE mount did not become healthy")
+	t.Fatalf("FUSE mount did not become healthy: %v", lastProbeErr)
 }
 
 func waitForRealUnmount(t *testing.T, mountPoint string) {

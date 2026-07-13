@@ -46,6 +46,17 @@ func TestParseFSUsageProducesSanitizedOperationContract(t *testing.T) {
 	}
 }
 
+func TestParseFSUsageRecognizesSanitizedFuseAdapterOperations(t *testing.T) {
+	trace := "1 getattr\n2 readdir\n3 open\n4 read\n5 release\n6 rename\n7 fsync\n"
+	contract, err := ParseFSUsage(strings.NewReader(trace), ContractOptions{Platform: "darwin", ClientKind: "cli", ClientVersion: "1.2.3"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(contract.Operations) != 7 {
+		t.Fatalf("adapter operations = %#v", contract.Operations)
+	}
+}
+
 func TestEvaluateQuarantinesUnknownClientVersion(t *testing.T) {
 	contracts := []Contract{{Version: ContractVersion, Platform: "darwin", ClientKind: "cli", ClientVersion: "1.0.0", TraceSHA256: strings.Repeat("a", 64)}}
 	approved := Evaluate([]ClientVersion{{Platform: "darwin", Kind: "cli", Version: "1.0.0"}}, contracts)

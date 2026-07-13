@@ -10,19 +10,23 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/jstar0/codexfold/internal/compat"
 	"github.com/jstar0/codexfold/internal/fsctl"
 )
 
 type Options struct {
-	Label      string
-	BinaryPath string
-	CodexHome  string
-	StoreDir   string
-	MountPoint string
-	StdoutPath string
-	StderrPath string
+	Label              string
+	BinaryPath         string
+	CodexHome          string
+	StoreDir           string
+	MountPoint         string
+	StdoutPath         string
+	StderrPath         string
+	CanonicalNamespace bool
+	NativeRoot         string
+	OperationTrace     string
 }
 
 type InstallResult struct {
@@ -77,6 +81,12 @@ func RenderLaunchd(options Options) ([]byte, error) {
 	arguments := []string{
 		options.BinaryPath, "fs", "serve", "--apply", "--foreground=true",
 		"--codex-home", options.CodexHome, "--store", options.StoreDir, "--mount", options.MountPoint,
+	}
+	if options.CanonicalNamespace {
+		arguments = append(arguments, "--canonical-namespace", "--native-root", options.NativeRoot)
+	}
+	if options.OperationTrace != "" {
+		arguments = append(arguments, "--operation-trace", options.OperationTrace)
 	}
 	var output bytes.Buffer
 	output.WriteString("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n")
@@ -157,16 +167,19 @@ func (m Manager) Kickstart(ctx context.Context, label string) error {
 	if !safeLabel(label) {
 		return errors.New("safe launchd label is required")
 	}
-	_, err := m.runner().Run(ctx, "launchctl", "kickstart", "-k", m.domain()+"/"+label)
+	_, err := m.runner().Run(ctx, "launchctl", "kickstart", m.domain()+"/"+label)
 	return err
 }
 
 func (m Manager) Status(ctx context.Context, label string, mountPoint string) Status {
 	result := Status{}
-	if _, err := m.runner().Run(ctx, "launchctl", "print", m.domain()+"/"+label); err != nil {
+	output, err := m.runner().Run(ctx, "launchctl", "print", m.domain()+"/"+label)
+	if err != nil {
 		result.DaemonError = err.Error()
-	} else {
+	} else if strings.Contains(string(output), "state = running") {
 		result.DaemonRunning = true
+	} else {
+		result.DaemonError = "launchd job is loaded but not running"
 	}
 	probe := m.MountProbe
 	if probe == nil {
@@ -178,6 +191,30 @@ func (m Manager) Status(ctx context.Context, label string, mountPoint string) St
 		result.MountHealthy = true
 	}
 	return result
+}
+
+func (m Manager) WaitHealthy(ctx context.Context, label string, mountPoint string, timeout time.Duration) (Status, error) {
+	if timeout <= 0 {
+		timeout = 15 * time.Second
+	}
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	var last Status
+	for {
+		last = m.Status(ctx, label, mountPoint)
+		if last.DaemonRunning && last.MountHealthy {
+			return last, nil
+		}
+		select {
+		case <-ctx.Done():
+			return last, ctx.Err()
+		case <-deadline.C:
+			return last, fmt.Errorf("filesystem service did not become healthy: daemon=%t mount=%t daemon_error=%q mount_error=%q", last.DaemonRunning, last.MountHealthy, last.DaemonError, last.MountError)
+		case <-ticker.C:
+		}
+	}
 }
 
 func ProbeMount(path string) error { return defaultMountProbe(path) }
@@ -224,6 +261,12 @@ func validateOptions(options Options) error {
 		if !filepath.IsAbs(path) {
 			return fmt.Errorf("%s path must be absolute", name)
 		}
+	}
+	if options.CanonicalNamespace && !filepath.IsAbs(options.NativeRoot) {
+		return errors.New("canonical namespace requires an absolute native root")
+	}
+	if options.OperationTrace != "" && !filepath.IsAbs(options.OperationTrace) {
+		return errors.New("operation trace path must be absolute")
 	}
 	return nil
 }
