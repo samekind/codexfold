@@ -2,7 +2,20 @@
 
 ## Current Status
 
-The FUSE-T macOS adapter and isolated real Codex CLI and Desktop canaries have passed for read, append, resume, fork, child-session enrollment, canonical archive/unarchive moves, launchd restart, rollback, namespace deactivation, and unknown-version quarantine. An actual host reboot has now recovered the standalone launchd service and healthy empty mount, but no managed session was present during that reboot. The project remains at `fs-engine-preview` because the user Codex home is intentionally not enrolled, managed-session sleep/wake and full-host restart have not been exercised, the currently installed client versions are not covered by exact contracts, and canary retention has not started.
+The FUSE-T macOS adapter and isolated real Codex CLI and Desktop canaries have passed for read, append, resume, fork, child-session enrollment, canonical archive/unarchive moves, launchd restart, rollback, namespace deactivation, and unknown-version quarantine. A retained-source CLI canary also survived an actual host reboot while its parent session was managed, then resumed through the recovered mount and rolled back to an exact native JSONL. The project remains at `fs-engine-preview` because the user Codex home is intentionally not enrolled, managed-session sleep/wake and interruption during append, compaction, migration, or rollback have not been exercised, the currently installed Desktop version is not covered by an exact contract, and canary retention has not started.
+
+Additional host-restart evidence on 2026-07-15:
+
+- The isolated canary used PATH `codex-cli 0.144.3` with a real Responses model turn. Its current version contract was exact and approved before migration. The installed Desktop `26.707.72221+5307` was not used in this run and remains outside this evidence.
+- A native parent was created and resumed before folding. Its 85,776-byte, 49-record baseline was folded, packed, and reconstructed with an exact SHA-256 plus 10,000 successful random-range comparisons while the source was retained.
+- The managed parent resumed and appended through `append.delta` without a writable backing. After a standalone daemon restart, another real turn recalled the prior managed turn and appended again. The complete base prefix remained byte-identical.
+- A real CLI fork created an ordinary native child while the parent remained managed. The child and parent then resumed independently; marker checks and complete-file hashes showed no cross-branch writes.
+- The first rollback restored the exact 107,091-byte managed view to an ordinary JSONL. A native resume recalled the managed history and appended successfully, producing 111,271 bytes and 97 valid JSONL records.
+- The updated parent was folded and migrated again before an actual macOS reboot. After login, launchd recreated both the standalone process and FUSE-T mount. Before any new turn, the recovered managed view was exactly 111,271 bytes, 97 records, and SHA-256 `98369563df4766c50d4d8886c8dff8163471e19d670325a2ef1190537064cbba`, with an empty delta and no writable backing.
+- A real post-reboot resume recalled the latest native turn and appended 4,255 bytes through the managed delta. The 111,271-byte base prefix kept the same SHA-256, the complete visible file became 115,526 bytes and 106 valid records, and no writable backing appeared.
+- Post-reboot rollback materialized the exact 115,526-byte visible view. A final native resume recalled the managed post-reboot turn and appended successfully. The parent ended at 119,678 bytes and 115 valid records with SHA-256 `e891263cbdfcbe9f149138eb94bfb4371afee0424b20d4afa1d261954dde5144`; the child remained unchanged at SHA-256 `76b19d4c5b0d1b41b312dadfee3b9b871165da2dac58ba47b1e60c1e1cb102bd`.
+- Namespace deactivation restored ordinary `sessions` and `archived_sessions` directories. Both SQLite routes point to native JSONL files, every record parses, all expected parent markers remain in order, and parent/child marker isolation still passes.
+- This proves idle retained-source managed-session recovery across one actual host reboot. It does not cover a reboot or power loss during an active append, compaction, migration, or rollback transaction, and it does not authorize enrollment of the real Codex home.
 
 Additional failure-containment evidence on 2026-07-14:
 
@@ -72,7 +85,7 @@ These results validate exact reconstruction and random reads. They do not valida
 
 ## Isolated Real Codex Canary
 
-The canary used an isolated Codex home and state database. It did not modify the user's real Codex routes. The final full-flow run used the desktop-bundled `codex-cli 0.144.0-alpha.4` and a clean isolated root; the later focused route-guard run used Desktop `26.707.61608+5200` and PATH `codex-cli 0.144.1`. `scripts/prepare-isolated-codex-home.sh` copies the current `config.toml`, `auth.json`, and optional `models_cache.json` byte-for-byte and uses APFS clones for static plugin assets, so the canary uses the current provider configuration without allowing canary writes to modify the source home.
+The canary used an isolated Codex home and state database. It did not modify the user's real Codex routes. The final full-flow run used the desktop-bundled `codex-cli 0.144.0-alpha.4` and a clean isolated root; the later focused route-guard run used Desktop `26.707.61608+5200` and PATH `codex-cli 0.144.1`; the host-restart run used PATH `codex-cli 0.144.3`. `scripts/prepare-isolated-codex-home.sh` copies the current `config.toml`, `auth.json`, and optional `models_cache.json` byte-for-byte and uses APFS clones for static plugin assets, so the canary uses the current provider configuration without allowing canary writes to modify the source home.
 
 The validated sequence was:
 
@@ -131,8 +144,8 @@ A direct `SIGTERM` stopped the foreground service and removed the mount cleanly.
 The following gates are still open:
 
 - Managed-session sleep/wake recovery.
-- Managed-session full host-restart recovery, including the append, compaction, migration, and rollback interruption cases required by the product contract. The successful empty-mount host boot above does not satisfy this gate.
-- Exact compatibility contracts for the currently installed Codex Desktop and CLI versions.
+- Managed-session host-interruption recovery during append, compaction, migration, and rollback. One idle retained-source managed session has passed a full host restart, but that result does not cover interruption inside those transactions.
+- Exact compatibility contract and retained-source canary for the currently installed Codex Desktop `26.707.72221+5307`; PATH `codex-cli 0.144.3` passed this run.
 - Retained-source canary routes in the real Codex home.
 - Seven incident-free days after reaching `platform-canary`.
 

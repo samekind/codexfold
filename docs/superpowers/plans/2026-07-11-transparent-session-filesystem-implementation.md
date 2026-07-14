@@ -10,7 +10,7 @@
 
 ## Alignment Snapshot
 
-Current public status remains `fs-engine-preview`. Tasks 1 through 7 and 9 through 10 are implemented. Task 8 lacks bounded automatic enrollment. Task 11 has substantial isolated macOS evidence but has not passed managed-session host restart, sleep/wake, current-client compatibility, real-home retained-source canaries, or seven-day retention.
+Current public status remains `fs-engine-preview`. Tasks 1 through 7 and 9 through 10 are implemented. Task 8 lacks bounded automatic enrollment. Task 11 has substantial isolated macOS evidence, including one idle retained-source managed CLI session surviving an actual host reboot, but has not passed managed-session sleep/wake, transaction-interruption restart cases, current Desktop compatibility, real-home retained-source canaries, or seven-day retention.
 
 | Task | Status | Current evidence | Remaining work |
 | --- | --- | --- | --- |
@@ -24,7 +24,7 @@ Current public status remains `fs-engine-preview`. Tasks 1 through 7 and 9 throu
 | 8 | Partial | Commit `3352b87`; standalone CLI and guarded lifecycle commands | Implement bounded automatic discovery and enrollment |
 | 9 | Complete | Commit `4589ffa`; launchd lifecycle and update preflight tests | Production update promotion remains gated by platform readiness |
 | 10 | Complete | Commit `a1ac76e`; synthetic, crash, race, cross-compile, and 758 MiB evidence | This task proves only the shared engine preview |
-| 11 | Partial | Real macOS CLI/Desktop, FUSE-T, rollback, restart, and quarantine evidence | Complete the remaining disruptive and retention gates |
+| 11 | Partial | Real macOS CLI/Desktop, FUSE-T, rollback, daemon restart, idle managed-session host reboot, and quarantine evidence | Complete the remaining disruptive and retention gates |
 
 ## Global Constraints
 
@@ -709,7 +709,7 @@ Select 5–10 archived sessions, fold and pack without source removal, compare e
 
 - [ ] **Step 5: Route retained-source canaries**
 
-Current state: isolated retained-source CLI and Desktop canaries passed direct open, resume, append, tool use, fork, archive/unarchive, daemon restart, rollback, re-migration, and quarantine. This step remains open because managed-session sleep/wake, full host restart, current installed-client compatibility, and real-home retained-source canaries are not complete.
+Current state: isolated retained-source CLI and Desktop canaries passed direct open, resume, append, tool use, fork, archive/unarchive, daemon restart, rollback, re-migration, and quarantine. One idle retained-source managed CLI session also passed an actual host reboot, post-boot managed resume, exact rollback, and native resume. This step remains open because managed-session sleep/wake, host interruption during append/compaction/migration/rollback, current Desktop compatibility, and real-home retained-source canaries are not complete.
 
 After clean shadow and compatibility, migrate only the selected archived sessions. Verify Desktop direct click, CLI resume, history, message send, tool use, fork, archive, unarchive, daemon termination, mount restart, sleep/wake, host restart, rollback, and compatibility quarantine. Never delete native snapshots.
 
