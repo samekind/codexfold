@@ -459,6 +459,43 @@ func TestFSMigrateApplyFailsClosedWithoutMountedTarget(t *testing.T) {
 	}
 }
 
+func TestFSMigrateApplyRetiresManagedStateWhenMountedTargetNeverAppears(t *testing.T) {
+	allowFixtureMount(t)
+	home, storeDir, nativePath := fsFixture(t, true)
+	cliPath := approvedCLIContract(t, storeDir, "1.2.3")
+	mount := filepath.Join(home, "mount")
+	if err := os.MkdirAll(mount, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	original, err := os.ReadFile(nativePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := NewRootCommand()
+	root.SetOut(&bytes.Buffer{})
+	root.SetErr(&bytes.Buffer{})
+	root.SetArgs([]string{
+		"fs", "migrate", "session", "--codex-home", home, "--store", storeDir,
+		"--mount", mount, "--mount-wait", "50ms", "--cli", cliPath,
+		"--desktop-app", "none", "--apply",
+	})
+	if err := root.Execute(); err == nil {
+		t.Fatal("fs migrate --apply should fail when the mounted target never appears")
+	}
+	sessions, err := codex.LoadSessions(home)
+	if err != nil || sessions[0].RolloutPath != nativePath {
+		t.Fatalf("failed apply changed route: sessions=%#v err=%v", sessions, err)
+	}
+	got, err := os.ReadFile(nativePath)
+	if err != nil || !bytes.Equal(got, original) {
+		t.Fatalf("failed apply changed source: got=%q err=%v", got, err)
+	}
+	states, err := vfs.DiscoverSessionStates(storeDir)
+	if err != nil || len(states) != 0 {
+		t.Fatalf("failed apply left managed state: states=%#v err=%v", states, err)
+	}
+}
+
 func TestFSMigrateApplyRejectsPlainDirectoryThatOnlyLooksLikeMount(t *testing.T) {
 	home, storeDir, nativePath := fsFixture(t, true)
 	cliPath := approvedCLIContract(t, storeDir, "1.2.3")
@@ -670,6 +707,167 @@ func TestFSMigrateCanonicalKeepsCodexRouteAndHidesRetainedSnapshot(t *testing.T)
 	}
 	if got, err := os.ReadFile(retainedPath); err != nil || !bytes.Equal(got, source) {
 		t.Fatalf("hidden retained snapshot = %q err=%v", got, err)
+	}
+}
+
+func TestFSRecoverRetiresInterruptedCanonicalMigrationWithUnchangedSource(t *testing.T) {
+	fixture := interruptedCanonicalMigrationFixture(t)
+	_ = fixture.resolver.Close()
+
+	executeFS(t, []string{"fs", "recover", "session", "--apply", "--codex-home", fixture.home, "--store", fixture.store})
+	if _, err := os.Stat(filepath.Join(fixture.store, "fs", "sessions", "session")); !os.IsNotExist(err) {
+		t.Fatalf("interrupted migration state remained: %v", err)
+	}
+	got, err := os.ReadFile(fixture.nativePath)
+	if err != nil || !bytes.Equal(got, fixture.source) {
+		t.Fatalf("recovery changed canonical source: got=%q err=%v", got, err)
+	}
+}
+
+func TestFSRecoverLeavesPendingCanonicalRollbackManaged(t *testing.T) {
+	fixture := interruptedCanonicalMigrationFixture(t)
+	defer fixture.resolver.Close()
+	tail := []byte("{\"pending_rollback\":true}\n")
+	writer, err := fixture.managed.OpenWriter()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.Append(context.Background(), tail); err != nil {
+		_ = writer.Close()
+		t.Fatal(err)
+	}
+	if err := writer.Sync(); err != nil {
+		_ = writer.Close()
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	target, err := fixture.managed.MaterializeCurrent(context.Background(), fixture.nativePath, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := fixture.managed.State()
+	if _, err := createRetirementRequest(fixture.store, "session", state.Generation, "/archived_sessions/rollout-session.jsonl", target); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := recoverInterruptedCanonicalMigration(fixture.home, fixture.store, fixture.nativeRoot, state)
+	if err != nil || recovered {
+		t.Fatalf("pending rollback recovery = %t, %v", recovered, err)
+	}
+	if _, err := managedState(fixture.store, "session"); err != nil {
+		t.Fatalf("pending rollback state was retired: %v", err)
+	}
+	if err := clearRetirementControl(filepath.Join(fixture.store, "fs", "sessions", "session")); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err = recoverInterruptedCanonicalMigration(fixture.home, fixture.store, fixture.nativeRoot, state)
+	if err != nil || recovered {
+		t.Fatalf("pre-request rollback recovery = %t, %v", recovered, err)
+	}
+	want := append(append([]byte(nil), fixture.source...), tail...)
+	if got, err := os.ReadFile(fixture.nativePath); err != nil || !bytes.Equal(got, want) {
+		t.Fatalf("pending rollback target changed: got=%q err=%v", got, err)
+	}
+}
+
+func TestCreateRetirementRequestResumesOnlyExactPendingRequest(t *testing.T) {
+	storeDir := t.TempDir()
+	directory := filepath.Join(storeDir, "fs", "sessions", "session")
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	target := vfs.NativeFile{Path: filepath.Join(t.TempDir(), "current.jsonl"), Bytes: 42, SHA256: strings.Repeat("a", 64)}
+	first, err := createRetirementRequest(storeDir, "session", 3, "/archived_sessions/rollout.jsonl", target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resumed, err := createRetirementRequest(storeDir, "session", 3, "/archived_sessions/rollout.jsonl", target)
+	if err != nil {
+		t.Fatalf("resume exact retirement request: %v", err)
+	}
+	if resumed != first {
+		t.Fatalf("resumed request changed token or metadata: first=%#v resumed=%#v", first, resumed)
+	}
+	target.SHA256 = strings.Repeat("b", 64)
+	if _, err := createRetirementRequest(storeDir, "session", 3, "/archived_sessions/rollout.jsonl", target); err == nil {
+		t.Fatal("mismatched pending retirement request should fail closed")
+	}
+}
+
+type interruptedCanonicalFixture struct {
+	home       string
+	store      string
+	nativeRoot string
+	nativePath string
+	source     []byte
+	managed    *vfs.Session
+	resolver   *pack.Resolver
+}
+
+func interruptedCanonicalMigrationFixture(t *testing.T) interruptedCanonicalFixture {
+	t.Helper()
+	home := t.TempDir()
+	storeDir := filepath.Join(home, "fold-store")
+	route := filepath.Join(home, "archived_sessions", "rollout-session.jsonl")
+	if err := os.MkdirAll(filepath.Dir(route), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	source := []byte("{\"type\":\"session_meta\"}\n{\"interrupted_migration\":true}\n")
+	if err := os.WriteFile(route, source, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeStateFixture(t, home, route)
+	db, err := sql.Open("sqlite", filepath.Join(home, "state_5.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`update threads set archived = 1, id = 'session' where id = 'fixture'`); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	_ = db.Close()
+	if _, err := fold.Fold(context.Background(), codex.Session{ID: "session", RolloutPath: route, Archived: true}, fold.FoldOptions{StoreDir: storeDir, Apply: true, FieldThreshold: 8}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pack.Build(context.Background(), storeDir, pack.BuildOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	nativeRoot := filepath.Join(home, "fold-native")
+	nativePath := filepath.Join(nativeRoot, "archived_sessions", filepath.Base(route))
+	if err := os.MkdirAll(filepath.Dir(nativePath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(route, nativePath); err != nil {
+		t.Fatal(err)
+	}
+	native, err := hashPath(nativePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retained, err := retainCanonicalSnapshot(storeDir, "session", native)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := fold.LoadManifest(storeDir, "session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolver, err := pack.Open(storeDir, pack.OpenOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	managed, err := vfs.OpenSession(context.Background(), vfs.SessionOptions{
+		Root: storeDir, ManifestPath: fold.ManifestPath(storeDir, "session"), Manifest: manifest,
+		Reader: resolver, NativeSnapshot: retained,
+	})
+	if err != nil {
+		_ = resolver.Close()
+		t.Fatal(err)
+	}
+	return interruptedCanonicalFixture{
+		home: home, store: storeDir, nativeRoot: nativeRoot, nativePath: nativePath,
+		source: source, managed: managed, resolver: resolver,
 	}
 }
 

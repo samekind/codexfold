@@ -103,16 +103,45 @@ func DiscoverSessionStates(root string) ([]SessionState, error) {
 }
 
 func writeSessionState(path string, state SessionState) error {
-	data, err := json.MarshalIndent(state, "", "  ")
+	data, err := encodeSessionState(state)
 	if err != nil {
-		return fmt.Errorf("encode session state: %w", err)
+		return err
 	}
-	data = append(data, '\n')
 	directory := filepath.Dir(path)
 	temporary, err := os.CreateTemp(directory, ".state-*.tmp")
 	if err != nil {
 		return fmt.Errorf("create temporary session state: %w", err)
 	}
+	return commitSessionState(path, data, temporary)
+}
+
+func writeSessionStateWithTemporary(path string, temporaryPath string, state SessionState) error {
+	directory := filepath.Clean(filepath.Dir(path))
+	temporaryPath = filepath.Clean(temporaryPath)
+	if filepath.Dir(temporaryPath) != directory {
+		return errors.New("temporary session state must be in the state directory")
+	}
+	data, err := encodeSessionState(state)
+	if err != nil {
+		return err
+	}
+	temporary, err := os.OpenFile(temporaryPath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
+	if err != nil {
+		return fmt.Errorf("create temporary session state: %w", err)
+	}
+	return commitSessionState(path, data, temporary)
+}
+
+func encodeSessionState(state SessionState) ([]byte, error) {
+	data, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("encode session state: %w", err)
+	}
+	return append(data, '\n'), nil
+}
+
+func commitSessionState(path string, data []byte, temporary *os.File) error {
+	directory := filepath.Dir(path)
 	temporaryPath := temporary.Name()
 	defer func() { _ = os.Remove(temporaryPath) }()
 	if err := temporary.Chmod(0o600); err != nil {

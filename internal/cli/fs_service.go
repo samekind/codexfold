@@ -566,11 +566,13 @@ func createRetirementRequest(store string, sessionID string, generation uint64, 
 		return retirementControl{}, errors.New("complete retirement request metadata is required")
 	}
 	directory := filepath.Join(filepath.Clean(store), "fs", "sessions", sessionID)
-	requestPath := filepath.Join(directory, retirementRequestFilename)
-	if _, err := os.Lstat(requestPath); err == nil {
-		return retirementControl{}, errors.New("session retirement is already pending")
-	} else if !errors.Is(err, os.ErrNotExist) {
+	if pending, exists, err := readRetirementRequest(store, sessionID); err != nil {
 		return retirementControl{}, err
+	} else if exists {
+		if pending.Generation != generation || pending.Route != route || pending.Bytes != target.Bytes || pending.SHA256 != target.SHA256 {
+			return retirementControl{}, errors.New("pending session retirement does not match the requested generation and target")
+		}
+		return pending, nil
 	}
 	if err := removeIfExists(filepath.Join(directory, retirementAcknowledgementFilename)); err != nil {
 		return retirementControl{}, err

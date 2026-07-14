@@ -166,6 +166,107 @@ func TestCompactRejectsDeltaChangedDuringPreparation(t *testing.T) {
 	}
 }
 
+func TestCompactRejectsWriterLeaseHeldByAnotherSession(t *testing.T) {
+	root := t.TempDir()
+	manifest, reader, _ := sessionFixture(t, root)
+	serving := openFixtureSession(t, root, manifest, reader, nil)
+	writer, err := serving.OpenWriter()
+	if err != nil {
+		t.Fatalf("OpenWriter: %v", err)
+	}
+	defer writer.Close()
+
+	maintenance := openFixtureSession(t, root, manifest, reader, nil)
+	_, err = maintenance.Compact(context.Background(), CompactOptions{
+		Prepare: func(context.Context, NativeFile, uint64) (PreparedGeneration, error) {
+			t.Fatal("compact preparation ran while another process held the writer lease")
+			return PreparedGeneration{}, nil
+		},
+	})
+	if !errors.Is(err, ErrWriterBusy) {
+		t.Fatalf("Compact error = %v, want %v", err, ErrWriterBusy)
+	}
+}
+
+func TestCompactHoldsAndReleasesInProcessWriterState(t *testing.T) {
+	root := t.TempDir()
+	manifest, reader, _ := sessionFixture(t, root)
+	session := openFixtureSession(t, root, manifest, reader, nil)
+	stop := errors.New("stop during preparation")
+	_, err := session.Compact(context.Background(), CompactOptions{
+		Prepare: func(context.Context, NativeFile, uint64) (PreparedGeneration, error) {
+			session.mu.Lock()
+			held := session.writerOpen
+			session.mu.Unlock()
+			if !held {
+				t.Fatal("compact did not publish its in-process writer state")
+			}
+			if writer, writerErr := session.OpenWriter(); !errors.Is(writerErr, ErrWriterBusy) {
+				if writer != nil {
+					_ = writer.Close()
+				}
+				t.Fatalf("OpenWriter during compact = %v, want %v", writerErr, ErrWriterBusy)
+			}
+			return PreparedGeneration{}, stop
+		},
+	})
+	if !errors.Is(err, stop) {
+		t.Fatalf("Compact error = %v, want %v", err, stop)
+	}
+	writer, err := session.OpenWriter()
+	if err != nil {
+		t.Fatalf("OpenWriter after compact failure: %v", err)
+	}
+	_ = writer.Close()
+}
+
+func TestRecoverInterruptedCompactRemovesJournalOwnedScratch(t *testing.T) {
+	root := t.TempDir()
+	manifest, reader, source := sessionFixture(t, root)
+	session := openFixtureSession(t, root, manifest, reader, nil)
+	state := session.State()
+	next := state
+	next.Generation++
+	next.DeltaPath = filepath.Join(session.directory, "delta-00000000000000000002.jsonl")
+	scratch := filepath.Join(session.directory, ".compact-00000000000000000001.jsonl")
+	stateTemporary := filepath.Join(session.directory, ".state-compact-00000000000000000002.tmp")
+	for path, data := range map[string][]byte{
+		next.DeltaPath: nil,
+		scratch:        source,
+		stateTemporary: []byte("partial state"),
+	} {
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			t.Fatalf("write interrupted compact artifact %s: %v", path, err)
+		}
+	}
+	if err := appendJournal(session.directory, JournalRecord{
+		OperationID: "compact-00000000000000000001", SessionID: state.SessionID,
+		Kind: "compact", Phase: "state-publishing", Candidate: next,
+		TempPath: stateTemporary, FinalPath: next.DeltaPath,
+		Native: NativeFile{Path: scratch, Bytes: int64(len(source)), SHA256: digestBytes(source)},
+	}); err != nil {
+		t.Fatalf("append interrupted compact journal: %v", err)
+	}
+
+	reopened := openFixtureSession(t, root, manifest, reader, nil)
+	if reopened.State().Generation != state.Generation || reopened.State().DeltaPath != state.DeltaPath {
+		t.Fatalf("recovery changed committed state: %#v", reopened.State())
+	}
+	for _, path := range []string{next.DeltaPath, scratch, stateTemporary} {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("recovery left interrupted compact artifact %s: %v", path, err)
+		}
+	}
+	records, err := readJournal(session.directory)
+	if err != nil {
+		t.Fatalf("read recovered journal: %v", err)
+	}
+	latest := records[len(records)-1]
+	if latest.Phase != "rolled-back" || latest.TempPath != stateTemporary || latest.Native.Path != scratch {
+		t.Fatalf("recovery did not preserve cleanup ownership: %#v", latest)
+	}
+}
+
 func TestOpenSessionCleansUnlockedStaleWriterLease(t *testing.T) {
 	root := t.TempDir()
 	manifest, reader, _ := sessionFixture(t, root)

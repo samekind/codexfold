@@ -41,8 +41,23 @@ func (s *Session) Compact(ctx context.Context, options CompactOptions) (CompactR
 		s.mu.Unlock()
 		return CompactResult{}, errors.New("cannot compact while a writer lease is held")
 	}
+	s.writerOpen = true
 	state := s.state
 	s.mu.Unlock()
+	lease, err := acquireWriterLease(filepath.Join(s.directory, "writer.lease"))
+	if err != nil {
+		s.mu.Lock()
+		s.writerOpen = false
+		s.mu.Unlock()
+		return CompactResult{}, err
+	}
+	defer func() {
+		_ = unlockWriterFile(lease)
+		_ = lease.Close()
+		s.mu.Lock()
+		s.writerOpen = false
+		s.mu.Unlock()
+	}()
 	activePath := state.DeltaPath
 	if state.BackingPath != "" {
 		activePath = state.BackingPath
@@ -99,7 +114,8 @@ func (s *Session) Compact(ctx context.Context, options CompactOptions) (CompactR
 	next.DeltaPath = newDelta
 	next.BackingPath = ""
 	operationID := fmt.Sprintf("compact-%020d", state.Generation)
-	if err := appendJournal(s.directory, JournalRecord{OperationID: operationID, SessionID: state.SessionID, Kind: "compact", Phase: "prepared", Candidate: next, FinalPath: newDelta, Native: current}); err != nil {
+	stateTemporary := filepath.Join(s.directory, fmt.Sprintf(".state-compact-%020d.tmp", next.Generation))
+	if err := appendJournal(s.directory, JournalRecord{OperationID: operationID, SessionID: state.SessionID, Kind: "compact", Phase: "prepared", Candidate: next, TempPath: stateTemporary, FinalPath: newDelta, Native: current}); err != nil {
 		return CompactResult{}, err
 	}
 	if options.BeforePhase != nil {
@@ -107,7 +123,7 @@ func (s *Session) Compact(ctx context.Context, options CompactOptions) (CompactR
 			return CompactResult{}, err
 		}
 	}
-	if err := appendJournal(s.directory, JournalRecord{OperationID: operationID, SessionID: state.SessionID, Kind: "compact", Phase: "state-publishing", Candidate: next, FinalPath: newDelta, Native: current}); err != nil {
+	if err := appendJournal(s.directory, JournalRecord{OperationID: operationID, SessionID: state.SessionID, Kind: "compact", Phase: "state-publishing", Candidate: next, TempPath: stateTemporary, FinalPath: newDelta, Native: current}); err != nil {
 		return CompactResult{}, err
 	}
 	if options.BeforePhase != nil {
@@ -115,14 +131,14 @@ func (s *Session) Compact(ctx context.Context, options CompactOptions) (CompactR
 			return CompactResult{}, err
 		}
 	}
-	if err := writeSessionState(s.statePath, next); err != nil {
+	if err := writeSessionStateWithTemporary(s.statePath, stateTemporary, next); err != nil {
 		return CompactResult{}, err
 	}
 	s.mu.Lock()
 	s.state = next
 	s.view = prepared.View
 	s.mu.Unlock()
-	if err := appendJournal(s.directory, JournalRecord{OperationID: operationID, SessionID: state.SessionID, Kind: "compact", Phase: "state-published", Candidate: next, FinalPath: newDelta, Native: current}); err != nil {
+	if err := appendJournal(s.directory, JournalRecord{OperationID: operationID, SessionID: state.SessionID, Kind: "compact", Phase: "state-published", Candidate: next, TempPath: stateTemporary, FinalPath: newDelta, Native: current}); err != nil {
 		return CompactResult{}, err
 	}
 	if options.BeforePhase != nil {
@@ -130,7 +146,7 @@ func (s *Session) Compact(ctx context.Context, options CompactOptions) (CompactR
 			return CompactResult{}, err
 		}
 	}
-	if err := appendJournal(s.directory, JournalRecord{OperationID: operationID, SessionID: state.SessionID, Kind: "compact", Phase: "complete", Candidate: next, FinalPath: newDelta, Native: current}); err != nil {
+	if err := appendJournal(s.directory, JournalRecord{OperationID: operationID, SessionID: state.SessionID, Kind: "compact", Phase: "complete", Candidate: next, TempPath: stateTemporary, FinalPath: newDelta, Native: current}); err != nil {
 		return CompactResult{}, err
 	}
 	return CompactResult{Generation: next.Generation, Bytes: current.Bytes, SHA256: current.SHA256}, nil

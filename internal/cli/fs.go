@@ -273,6 +273,18 @@ func newFSServeCommand() *cobra.Command {
 				return err
 			}
 			defer processLock.Close()
+			if canonicalNamespace {
+				for _, state := range states {
+					if _, err := recoverInterruptedCanonicalMigration(home, store, nativeRoot, state); err != nil {
+						return err
+					}
+				}
+				states, err = vfs.DiscoverSessionStates(store)
+				if err != nil {
+					return err
+				}
+				result.ManagedSessions = len(states)
+			}
 			if err := os.MkdirAll(mount, 0o700); err != nil {
 				return err
 			}
@@ -618,8 +630,16 @@ func newFSMigrateCommand() *cobra.Command {
 					native = retained
 					result.Native = retained
 				}
-				rollbackCanonicalMigration := func(cause error) error {
+				rollbackMigration := func(cause error) error {
 					if !canonicalNamespace {
+						if _, err := os.Stat(filepath.Join(store, "fs", "sessions", session.ID)); errors.Is(err, os.ErrNotExist) {
+							return cause
+						} else if err != nil {
+							return errors.Join(cause, err)
+						}
+						if _, err := retireManagedState(store, session.ID); err != nil {
+							return errors.Join(cause, err)
+						}
 						return cause
 					}
 					if _, err := os.Stat(filepath.Join(store, "fs", "sessions", session.ID)); err == nil {
@@ -634,34 +654,34 @@ func newFSMigrateCommand() *cobra.Command {
 				}
 				managed, migrationLease, err := vfs.OpenSessionWithWriter(command.Context(), vfs.SessionOptions{Root: store, ManifestPath: fold.ManifestPath(store, session.ID), Manifest: manifest, Reader: resolver, NativeSnapshot: native})
 				if err != nil {
-					return rollbackCanonicalMigration(err)
+					return rollbackMigration(err)
 				}
 				defer migrationLease.Close()
 				if canonicalNamespace {
 					if err := waitForMountAcknowledgement(command.Context(), store, session.ID, managed.State().Generation, canonicalRoute, mountWait); err != nil {
-						return rollbackCanonicalMigration(fmt.Errorf("wait for canonical mount acknowledgement: %w", err))
+						return rollbackMigration(fmt.Errorf("wait for canonical mount acknowledgement: %w", err))
 					}
 					sessions, err := codex.LoadSessions(home)
 					if err != nil {
-						return rollbackCanonicalMigration(err)
+						return rollbackMigration(err)
 					}
 					current, err := findSession(sessions, session.ID)
 					if err != nil || filepath.Clean(current.RolloutPath) != filepath.Clean(session.RolloutPath) {
-						return rollbackCanonicalMigration(errors.New("canonical Codex route changed during migration"))
+						return rollbackMigration(errors.New("canonical Codex route changed during migration"))
 					}
 					if _, err := waitForTargetMatch(command.Context(), target, vfs.NativeFile{Bytes: shadow.Bytes, SHA256: shadow.SHA256}, mountWait); err != nil {
-						return rollbackCanonicalMigration(fmt.Errorf("verify managed target before canonical cutover: %w", err))
+						return rollbackMigration(fmt.Errorf("verify managed target before canonical cutover: %w", err))
 					}
 					if err := finalizeCanonicalSnapshotSource(canonicalSource, native); err != nil {
-						return rollbackCanonicalMigration(err)
+						return rollbackMigration(err)
 					}
 				}
 				targetFile, err := waitForTarget(command.Context(), target, mountWait)
 				if err != nil {
-					return rollbackCanonicalMigration(fmt.Errorf("verify mounted target: %w", err))
+					return rollbackMigration(fmt.Errorf("verify mounted target: %w", err))
 				}
 				if targetFile.Bytes != shadow.Bytes || targetFile.SHA256 != shadow.SHA256 {
-					return rollbackCanonicalMigration(errors.New("mounted target differs from the shadow-verified native session"))
+					return rollbackMigration(errors.New("mounted target differs from the shadow-verified native session"))
 				}
 				if !canonicalNamespace {
 					if _, err := codex.RouteSession(command.Context(), codex.RouteOptions{CodexHome: home, SessionID: session.ID, ExpectedPath: session.RolloutPath, Target: codex.RouteTarget{Path: target, Bytes: targetFile.Bytes, SHA256: targetFile.SHA256}}); err != nil {
@@ -674,7 +694,7 @@ func newFSMigrateCommand() *cobra.Command {
 					}
 					current, err := findSession(sessions, session.ID)
 					if err != nil || filepath.Clean(current.RolloutPath) != filepath.Clean(session.RolloutPath) {
-						return rollbackCanonicalMigration(errors.New("canonical Codex route changed during migration"))
+						return rollbackMigration(errors.New("canonical Codex route changed during migration"))
 					}
 				}
 				result.Routed = true
@@ -1037,7 +1057,11 @@ func newFSRecoverCommand() *cobra.Command {
 					_ = resolver.Close()
 					return err
 				}
+				recoveredState := managed.State()
 				_ = resolver.Close()
+				if _, err := recoverInterruptedCanonicalMigration(home, store, filepath.Join(home, "fold-native"), recoveredState); err != nil {
+					return err
+				}
 				result.Recovered++
 			}
 			if jsonOutput {
@@ -1053,6 +1077,61 @@ func newFSRecoverCommand() *cobra.Command {
 	command.Flags().BoolVar(&apply, "apply", false, "Apply deterministic journal recovery")
 	command.Flags().BoolVar(&jsonOutput, "json", false, "Emit JSON output")
 	return command
+}
+
+func recoverInterruptedCanonicalMigration(home string, store string, nativeRoot string, state vfs.SessionState) (bool, error) {
+	retainedPath := filepath.Join(store, "fs", "snapshots", state.SessionID, "native.jsonl")
+	if filepath.Clean(state.NativeSnapshot.Path) != filepath.Clean(retainedPath) {
+		return false, nil
+	}
+	if _, pending, err := readRetirementRequest(store, state.SessionID); err != nil {
+		return false, err
+	} else if pending {
+		return false, nil
+	}
+	sessions, err := codex.LoadSessions(home)
+	if err != nil {
+		return false, err
+	}
+	current, err := findSession(sessions, state.SessionID)
+	if err != nil {
+		return false, err
+	}
+	sourcePath, err := canonicalNativeRoute(home, nativeRoot, current.RolloutPath)
+	if err != nil {
+		return false, err
+	}
+	source, err := hashPath(sourcePath)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if state.BackingPath != "" {
+		return false, nil
+	}
+	delta, err := os.Stat(state.DeltaPath)
+	if err != nil {
+		return false, err
+	}
+	if delta.Size() != 0 {
+		return false, nil
+	}
+	if source.Bytes != state.BaseBytes || source.SHA256 != state.BaseSHA256 || source.Bytes != state.NativeSnapshot.Bytes || source.SHA256 != state.NativeSnapshot.SHA256 {
+		return false, errors.New("interrupted canonical migration source no longer matches the managed base")
+	}
+	retiredState, err := retireManagedState(store, state.SessionID)
+	if err != nil {
+		return false, err
+	}
+	if _, err := retireCanonicalNativeSnapshot(store, nativeRoot, state.SessionID, state.NativeSnapshot.Path, sourcePath, retiredState); err != nil {
+		if restoreErr := restoreManagedState(store, state.SessionID, retiredState); restoreErr != nil {
+			return false, errors.Join(err, restoreErr)
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 func addCompatibilityFlags(command *cobra.Command, flags *compatibilityFlags) {

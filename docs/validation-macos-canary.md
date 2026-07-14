@@ -2,7 +2,17 @@
 
 ## Current Status
 
-The FUSE-T macOS adapter and isolated real Codex CLI and Desktop canaries have passed for read, append, resume, fork, child-session enrollment, canonical archive/unarchive moves, launchd restart, rollback, namespace deactivation, and unknown-version quarantine. A retained-source CLI canary also survived an actual host reboot while its parent session was managed, then resumed through the recovered mount and rolled back to an exact native JSONL. The project remains at `fs-engine-preview` because the user Codex home is intentionally not enrolled, managed-session sleep/wake and interruption during append, compaction, migration, or rollback have not been exercised, the currently installed Desktop version is not covered by an exact contract, and canary retention has not started.
+The FUSE-T macOS adapter and isolated real Codex CLI and Desktop canaries have passed for read, append, resume, fork, child-session enrollment, canonical archive/unarchive moves, launchd restart, rollback, namespace deactivation, and unknown-version quarantine. A retained-source CLI canary survived an actual host reboot while managed, then resumed through the recovered mount and rolled back to an exact native JSONL. The currently installed CLI and Desktop versions also passed exact compatibility and isolated retained-source canaries. Process-level interruption recovery now covers append, compaction, migration, and rollback, and a managed session passed an actual Deep Idle sleep/wake cycle followed by a real model turn. The project remains at `fs-engine-preview` because the user Codex home is intentionally not enrolled, in-flight transaction evidence does not claim an actual power-loss test, and canary retention has not started.
+
+Additional current-client, interruption, and sleep/wake evidence on 2026-07-15:
+
+- Exact contracts were imported and approved for PATH `codex-cli 0.144.3`, Desktop `26.707.72221+5307`, and the Desktop-bundled app server `0.144.2`. The current Desktop opened an isolated managed task, displayed the complete native and managed history, completed a real model turn, survived forced termination and restart, rolled back exactly, and resumed natively.
+- A canonical migration process and the FUSE daemon were both terminated immediately after managed state became durable but before cutover. Launchd started a fresh daemon, startup recovery retired the incomplete state, and both the retained native file and mounted native view retained the same complete SHA-256. A separate regression proves that a noncanonical migration failure also retires state created by that failed attempt.
+- During a real CLI append, the FUSE daemon was terminated after a 9,291-byte delta prefix was durable. Codex observed one `EIO`, reopened its rollout writer, retried, and completed the turn. The durable prefix remained byte-identical, the complete 86-record JSONL parsed, no writable backing appeared, and a later real resume recalled the interrupted turn.
+- Compaction now acquires the cross-process writer lease in addition to the in-process writer state. A termination before state publication recovered by rolling back the candidate generation and removing the journal-owned candidate delta, scratch file, and state temporary. A second termination after atomic state publication recovered by completing the candidate generation. Both sides preserved the same exact 132,510-byte visible SHA-256, and a later real resume recalled pre-compaction history and appended through the new delta.
+- Canonical rollback was paused after the daemon acknowledged a verified native target, then both rollback and daemon processes were terminated. A fresh daemon preserved a complete readable route and the pending request. Re-running the same rollback reused the exact token only because generation, route, byte count, and SHA-256 still matched; it then retired managed state and cleared the control files. The resulting 136,514-byte, 104-record native JSONL resumed successfully.
+- macOS power logs recorded entry into Software Sleep and wake from Deep Idle. Across that cycle, the same daemon PID and FUSE mount remained healthy, and the managed view stayed exactly 144,580 bytes, 122 valid records, a 4,018-byte delta, and the same SHA-256. A real post-wake resume recalled the pre-sleep turn and produced a 148,547-byte, 131-record view with a 7,985-byte delta and no writable backing.
+- These interruption runs used real FUSE-T, real launchd restarts, and unmodified Codex clients. They validate deterministic recovery from simultaneous client/control-process and daemon termination. They do not represent an actual power loss during an in-flight transaction.
 
 Additional host-restart evidence on 2026-07-15:
 
@@ -143,10 +153,8 @@ A direct `SIGTERM` stopped the foreground service and removed the mount cleanly.
 
 The following gates are still open:
 
-- Managed-session sleep/wake recovery.
-- Managed-session host-interruption recovery during append, compaction, migration, and rollback. One idle retained-source managed session has passed a full host restart, but that result does not cover interruption inside those transactions.
-- Exact compatibility contract and retained-source canary for the currently installed Codex Desktop `26.707.72221+5307`; PATH `codex-cli 0.144.3` passed this run.
 - Retained-source canary routes in the real Codex home.
+- An actual power-loss or host-restart interruption while a transaction is in flight; simultaneous process termination and a separate idle managed-session host reboot have passed, but they are recorded as distinct evidence.
 - Seven incident-free days after reaching `platform-canary`.
 
 Until every applicable gate passes, the project must keep the capability at `fs-engine-preview`, retain original JSONL files, and avoid changing real Codex routes.

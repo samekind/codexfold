@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
+	"strings"
 )
 
 func (s *Session) recover(ctx context.Context) error {
@@ -35,6 +37,11 @@ func (s *Session) recover(ctx context.Context) error {
 	for _, record := range ordered {
 		switch record.Phase {
 		case "complete", "rolled-back":
+			if record.Kind == "compact" {
+				if err := s.cleanupCompactArtifacts(record, record.Phase == "rolled-back"); err != nil {
+					return err
+				}
+			}
 			continue
 		case "after-file-publish", "state-publishing", "state-published":
 			if record.Candidate.SessionID != s.state.SessionID || record.Candidate.Generation == 0 || !pathWithin(s.directory, record.Candidate.DeltaPath) || (record.Candidate.BackingPath != "" && !pathWithin(s.directory, record.Candidate.BackingPath)) {
@@ -46,8 +53,12 @@ func (s *Session) recover(ctx context.Context) error {
 			}
 			if record.Kind == "compact" {
 				if state.Generation < record.Candidate.Generation {
-					_ = os.Remove(record.Candidate.DeltaPath)
-					if err := appendJournal(s.directory, JournalRecord{OperationID: record.OperationID, SessionID: record.SessionID, Kind: record.Kind, Phase: "rolled-back", Candidate: record.Candidate, FinalPath: record.FinalPath}); err != nil {
+					resolved := record
+					resolved.Phase = "rolled-back"
+					if err := appendJournal(s.directory, resolved); err != nil {
+						return err
+					}
+					if err := s.cleanupCompactArtifacts(resolved, true); err != nil {
 						return err
 					}
 					continue
@@ -71,21 +82,60 @@ func (s *Session) recover(ctx context.Context) error {
 					s.state = record.Candidate
 				}
 			}
-			if err := appendJournal(s.directory, JournalRecord{OperationID: record.OperationID, SessionID: record.SessionID, Kind: record.Kind, Phase: "complete", Candidate: record.Candidate, FinalPath: record.FinalPath, Native: record.Native}); err != nil {
+			resolved := record
+			resolved.Phase = "complete"
+			if err := appendJournal(s.directory, resolved); err != nil {
 				return err
+			}
+			if record.Kind == "compact" {
+				if err := s.cleanupCompactArtifacts(resolved, false); err != nil {
+					return err
+				}
 			}
 		case "prepared", "data-synced":
-			if record.TempPath != "" {
-				_ = os.Remove(record.TempPath)
-			}
-			if record.Kind == "compact" && record.FinalPath != "" {
-				_ = os.Remove(record.FinalPath)
-			}
-			if err := appendJournal(s.directory, JournalRecord{OperationID: record.OperationID, SessionID: record.SessionID, Kind: record.Kind, Phase: "rolled-back", Candidate: record.Candidate, TempPath: record.TempPath}); err != nil {
+			resolved := record
+			resolved.Phase = "rolled-back"
+			if err := appendJournal(s.directory, resolved); err != nil {
 				return err
+			}
+			if record.Kind == "compact" {
+				if err := s.cleanupCompactArtifacts(resolved, true); err != nil {
+					return err
+				}
+			} else if record.TempPath != "" {
+				_ = os.Remove(record.TempPath)
 			}
 		default:
 			return fmt.Errorf("journal operation %s has unknown phase %q", record.OperationID, record.Phase)
+		}
+	}
+	return nil
+}
+
+func (s *Session) cleanupCompactArtifacts(record JournalRecord, rollback bool) error {
+	removeOwned := func(candidate string, prefix string, suffix string) error {
+		if candidate == "" {
+			return nil
+		}
+		candidate = filepath.Clean(candidate)
+		name := filepath.Base(candidate)
+		if filepath.Dir(candidate) != filepath.Clean(s.directory) || !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, suffix) {
+			return fmt.Errorf("journal operation %s has unsafe compact artifact %q", record.OperationID, candidate)
+		}
+		if err := os.Remove(candidate); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		return nil
+	}
+	if err := removeOwned(record.Native.Path, ".compact-", ".jsonl"); err != nil {
+		return err
+	}
+	if err := removeOwned(record.TempPath, ".state-compact-", ".tmp"); err != nil {
+		return err
+	}
+	if rollback {
+		if err := removeOwned(record.FinalPath, "delta-", ".jsonl"); err != nil {
+			return err
 		}
 	}
 	return nil
