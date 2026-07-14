@@ -230,6 +230,154 @@ func TestRealFuseCanonicalManagedRemovalRevealsNative(t *testing.T) {
 	waitForRealUnmount(t, mountPoint)
 }
 
+func TestRealFuseCanonicalManagedRemovalCanBeReaddedAtSamePath(t *testing.T) {
+	if os.Getenv("CODEXFOLD_RUN_FUSE_TEST") != "1" {
+		t.Skip("set CODEXFOLD_RUN_FUSE_TEST=1 to run the real FUSE-T adapter test")
+	}
+	root := t.TempDir()
+	nativeRoot := filepath.Join(root, "native")
+	route := filepath.Join("sessions", "2026", "07", "14", "rollout-republish.jsonl")
+	nativePath := filepath.Join(nativeRoot, route)
+	if err := os.MkdirAll(filepath.Dir(nativePath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	firstManagedBytes := []byte("{\"generation\":1}\n")
+	nativeBytes := []byte("{\"native\":true}\n")
+	digest := sha256.Sum256(firstManagedBytes)
+	digestHex := hex.EncodeToString(digest[:])
+	managedRoot := filepath.Join(root, "managed")
+	managedNativePath := filepath.Join(root, "managed-native.jsonl")
+	if err := os.WriteFile(managedNativePath, firstManagedBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manifest := fold.Manifest{
+		Version: fold.ManifestVersion, Kind: fold.ManifestKind,
+		Session: fold.ManifestSession{ID: "republish", RolloutPath: managedNativePath},
+		Source:  fold.ManifestSource{Bytes: int64(len(firstManagedBytes)), SHA256: digestHex},
+		Parts:   []fold.Part{{Kind: fold.PartResidual, Object: fold.ObjectRef{SHA256: digestHex, RawBytes: int64(len(firstManagedBytes))}}},
+	}
+	managedOptions := vfs.SessionOptions{
+		Root: managedRoot, ManifestPath: filepath.Join(root, "manifest.json"), Manifest: manifest,
+		Reader: fuseFixtureReader{digestHex: firstManagedBytes},
+		NativeSnapshot: vfs.NativeFile{
+			Path: managedNativePath, Bytes: int64(len(firstManagedBytes)), SHA256: digestHex,
+		},
+	}
+	firstManaged, err := vfs.OpenSession(context.Background(), managedOptions)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	filesystem := NewCanonical()
+	filesystem.SetNativeRoot(nativeRoot)
+	if err := filesystem.AddSessionAt("republish", "/"+filepath.ToSlash(route), firstManaged); err != nil {
+		t.Fatal(err)
+	}
+	mountPoint := filepath.Join(root, "mount")
+	if err := os.MkdirAll(mountPoint, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	canonicalHome := filepath.Join(root, "home")
+	if err := os.MkdirAll(canonicalHome, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(mountPoint, "sessions"), filepath.Join(canonicalHome, "sessions")); err != nil {
+		t.Fatal(err)
+	}
+	stopMount := startRealMount(t, mountPoint, filesystem)
+	target := filepath.Join(canonicalHome, route)
+	waitForRealFile(t, target, firstManagedBytes)
+
+	if err := os.WriteFile(nativePath, nativeBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stateDirectory := filepath.Dir(firstManaged.State().DeltaPath)
+	retiredStateDirectory := stateDirectory + ".retired"
+	if err := os.Rename(stateDirectory, retiredStateDirectory); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.ReadFile(target); err == nil {
+		t.Fatal("managed read unexpectedly succeeded after its state directory was retired")
+	}
+	if err := filesystem.RemoveSession("republish"); err != nil {
+		t.Fatal(err)
+	}
+	waitForRealFileTransition(t, target, nativeBytes)
+	if err := os.Remove(nativePath); err != nil {
+		t.Fatal(err)
+	}
+	waitForRealFileMissing(t, target)
+	if err := os.Rename(retiredStateDirectory, stateDirectory); err != nil {
+		t.Fatal(err)
+	}
+	republished, err := vfs.RepublishSessionState(filepath.Join(stateDirectory, "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if republished.Generation != 2 {
+		t.Fatalf("republished generation = %d, want 2", republished.Generation)
+	}
+	secondManaged, err := vfs.OpenSession(context.Background(), managedOptions)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := filesystem.UpsertSessionAt("republish", "/"+filepath.ToSlash(route), secondManaged); err != nil {
+		t.Fatal(err)
+	}
+	waitForRealFile(t, target, firstManagedBytes)
+
+	stopMount()
+	waitForRealUnmount(t, mountPoint)
+}
+
+func TestRealFuseCanonicalNativePreferenceNeverLosesPath(t *testing.T) {
+	if os.Getenv("CODEXFOLD_RUN_FUSE_TEST") != "1" {
+		t.Skip("set CODEXFOLD_RUN_FUSE_TEST=1 to run the real FUSE-T adapter test")
+	}
+	root := t.TempDir()
+	nativeRoot := filepath.Join(root, "native")
+	route := filepath.Join("sessions", "2026", "07", "14", "rollout-native-preference.jsonl")
+	nativePath := filepath.Join(nativeRoot, route)
+	if err := os.MkdirAll(filepath.Dir(nativePath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	managedBytes := []byte("{\"managed\":true}\n")
+	nativeBytes := []byte("{\"native\":true}\n")
+	if err := os.WriteFile(nativePath, nativeBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	filesystem := NewCanonical()
+	filesystem.SetNativeRoot(nativeRoot)
+	if err := filesystem.AddSessionAt("native-preference", "/"+filepath.ToSlash(route), mountSessionFixture(t, "native-preference", managedBytes)); err != nil {
+		t.Fatal(err)
+	}
+	mountPoint := filepath.Join(root, "mount")
+	if err := os.MkdirAll(mountPoint, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	stopMount := startRealMount(t, mountPoint, filesystem)
+	target := filepath.Join(mountPoint, route)
+	waitForRealFile(t, target, managedBytes)
+
+	if err := filesystem.PreferNativeSession("native-preference"); err != nil {
+		t.Fatal(err)
+	}
+	waitForRealFileTransition(t, target, nativeBytes)
+	if err := os.Remove(nativePath); err != nil {
+		t.Fatal(err)
+	}
+	waitForRealFileTransition(t, target, managedBytes)
+	if err := os.WriteFile(nativePath, nativeBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	waitForRealFileTransition(t, target, nativeBytes)
+
+	stopMount()
+	waitForRealUnmount(t, mountPoint)
+}
+
 func TestRealFuseMountCanonicalManagedRename(t *testing.T) {
 	if os.Getenv("CODEXFOLD_RUN_FUSE_TEST") != "1" {
 		t.Skip("set CODEXFOLD_RUN_FUSE_TEST=1 to run the real FUSE-T adapter test")
@@ -415,6 +563,20 @@ func waitForRealFileTransition(t *testing.T, path string, want []byte) {
 		time.Sleep(100 * time.Millisecond)
 	}
 	t.Fatal("managed file did not transition to native bytes")
+}
+
+func waitForRealFileMissing(t *testing.T, path string) {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			return
+		} else if err != nil {
+			t.Fatalf("stat transitioned file: %v", err)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatal("canonical file did not become absent")
 }
 
 type fuseFixtureReader map[string][]byte

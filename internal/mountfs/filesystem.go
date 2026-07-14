@@ -39,6 +39,7 @@ type Filesystem struct {
 	sessions    map[string]*vfs.Session
 	paths       map[string]string
 	retained    map[string]string
+	nativeFirst map[string]struct{}
 	directories map[string]struct{}
 	handles     map[uint64]*fileHandle
 	next        uint64
@@ -54,7 +55,7 @@ func New() *Filesystem {
 func NewCanonical() *Filesystem {
 	return &Filesystem{
 		sessions: make(map[string]*vfs.Session), paths: make(map[string]string),
-		retained:    make(map[string]string),
+		retained: make(map[string]string), nativeFirst: make(map[string]struct{}),
 		directories: map[string]struct{}{`/`: {}, `/sessions`: {}, `/archived_sessions`: {}},
 		handles:     make(map[uint64]*fileHandle), next: 1, canonical: true,
 	}
@@ -115,6 +116,7 @@ func (f *Filesystem) AddSessionAt(sessionID string, name string, session *vfs.Se
 	f.ensureDirectoryChainLocked(path.Dir(cleaned))
 	f.sessions[sessionID] = session
 	f.paths[cleaned] = sessionID
+	delete(f.nativeFirst, sessionID)
 	f.registerRetainedPathLocked(sessionID, session)
 	return nil
 }
@@ -142,6 +144,7 @@ func (f *Filesystem) UpsertSessionAt(sessionID string, name string, session *vfs
 	}
 	f.sessions[sessionID] = session
 	f.paths[cleaned] = sessionID
+	delete(f.nativeFirst, sessionID)
 	f.registerRetainedPathLocked(sessionID, session)
 	return nil
 }
@@ -174,6 +177,19 @@ func (f *Filesystem) MoveSessionAt(sessionID string, name string) error {
 	return nil
 }
 
+func (f *Filesystem) PreferNativeSession(sessionID string) error {
+	if !f.canonical || !safeSessionID(sessionID) {
+		return errors.New("canonical filesystem and safe session ID are required")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, exists := f.sessions[sessionID]; !exists {
+		return os.ErrNotExist
+	}
+	f.nativeFirst[sessionID] = struct{}{}
+	return nil
+}
+
 func (f *Filesystem) RemoveSession(sessionID string) error {
 	if !safeSessionID(sessionID) {
 		return errors.New("safe session ID is required")
@@ -184,6 +200,7 @@ func (f *Filesystem) RemoveSession(sessionID string) error {
 		return os.ErrNotExist
 	}
 	delete(f.sessions, sessionID)
+	delete(f.nativeFirst, sessionID)
 	for route, currentID := range f.paths {
 		if currentID == sessionID {
 			delete(f.paths, route)
@@ -676,9 +693,17 @@ func (f *Filesystem) sessionForPath(name string) (*vfs.Session, syscall.Errno) {
 		f.mu.RLock()
 		sessionID := f.paths[cleaned]
 		session := f.sessions[sessionID]
+		_, nativeFirst := f.nativeFirst[sessionID]
+		root := f.nativeRoot
+		_, retained := f.retained[cleaned]
 		f.mu.RUnlock()
 		if session == nil {
 			return nil, syscall.ENOENT
+		}
+		if nativeFirst && root != "" && !retained {
+			if info, err := os.Stat(nativePathFromRoot(root, cleaned)); err == nil && !info.IsDir() {
+				return nil, syscall.ENOENT
+			}
 		}
 		return session, 0
 	}

@@ -6,6 +6,8 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -934,22 +936,7 @@ func TestFSRollbackCanonicalRetiresManagedStateAndKeepsRoute(t *testing.T) {
 		t.Fatal(err)
 	}
 	stateDirectory := filepath.Join(storeDir, "fs", "sessions", "session")
-	copyDone := make(chan error, 1)
-	go func() {
-		deadline := time.Now().Add(5 * time.Second)
-		for time.Now().Before(deadline) {
-			if _, err := os.Stat(stateDirectory); os.IsNotExist(err) {
-				data, readErr := os.ReadFile(targetNativePath)
-				if readErr == nil {
-					readErr = os.WriteFile(mountedTarget, data, 0o600)
-				}
-				copyDone <- readErr
-				return
-			}
-			time.Sleep(10 * time.Millisecond)
-		}
-		copyDone <- errors.New("managed state was not retired")
-	}()
+	copyDone := emulateCanonicalRetirement(storeDir, "session", mountedTarget, targetNativePath)
 	executeFS(t, []string{
 		"fs", "rollback", "session", "--apply", "--canonical-namespace",
 		"--codex-home", home, "--store", storeDir, "--mount", mount, "--native-root", nativeRoot,
@@ -978,6 +965,361 @@ func TestFSRollbackCanonicalRetiresManagedStateAndKeepsRoute(t *testing.T) {
 	retained, err := filepath.Glob(filepath.Join(retired[0], "retained-native", "archived_sessions", filename))
 	if err != nil || len(retained) != 1 {
 		t.Fatalf("retired native snapshot = %#v err=%v", retained, err)
+	}
+}
+
+func TestFSRollbackCanonicalRetirementUsesRecoveredGeneration(t *testing.T) {
+	allowFixtureMount(t)
+	home, storeDir, originalPath := fsFixture(t, true)
+	original, err := os.ReadFile(originalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	filename := "rollout-session.jsonl"
+	route := filepath.Join(home, "sessions", "2026", "07", "12", filename)
+	db, err := sql.Open("sqlite", filepath.Join(home, "state_5.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`update threads set rollout_path = ? where id = 'session'`, route); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	_ = db.Close()
+
+	nativeRoot := filepath.Join(home, "fold-native")
+	nativePath := filepath.Join(nativeRoot, "archived_sessions", filename)
+	targetNativePath := filepath.Join(nativeRoot, "sessions", "2026", "07", "12", filename)
+	if err := os.MkdirAll(filepath.Dir(nativePath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(originalPath, nativePath); err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := fold.LoadManifest(storeDir, "session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolver, err := pack.Open(storeDir, pack.OpenOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	native, err := hashPath(nativePath)
+	if err != nil {
+		_ = resolver.Close()
+		t.Fatal(err)
+	}
+	recoveryStop := errors.New("stop after COW file publish")
+	managed, err := vfs.OpenSession(context.Background(), vfs.SessionOptions{
+		Root: storeDir, ManifestPath: fold.ManifestPath(storeDir, "session"), Manifest: manifest,
+		Reader: resolver, NativeSnapshot: native,
+		BeforeCOWPhase: func(phase string) error {
+			if phase == "after-file-publish" {
+				return recoveryStop
+			}
+			return nil
+		},
+	})
+	if err != nil {
+		_ = resolver.Close()
+		t.Fatal(err)
+	}
+	writer, err := managed.OpenWriter()
+	if err != nil {
+		_ = resolver.Close()
+		t.Fatal(err)
+	}
+	if _, err := writer.WriteAt(context.Background(), []byte("X"), 0); !errors.Is(err, recoveryStop) {
+		_ = writer.Close()
+		_ = resolver.Close()
+		t.Fatalf("WriteAt error = %v, want %v", err, recoveryStop)
+	}
+	if err := writer.Close(); err != nil {
+		_ = resolver.Close()
+		t.Fatal(err)
+	}
+	if err := resolver.Close(); err != nil {
+		t.Fatal(err)
+	}
+	staleState, err := managedState(storeDir, "session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if staleState.Generation != 1 {
+		t.Fatalf("pre-recovery generation = %d, want 1", staleState.Generation)
+	}
+
+	mount := filepath.Join(home, "fold-fs")
+	mountedTarget := filepath.Join(mount, "sessions", "2026", "07", "12", filename)
+	if err := os.MkdirAll(filepath.Dir(mountedTarget), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(mountedTarget, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	retirementDone := emulateCanonicalRetirementGeneration(t, storeDir, "session", mountedTarget, targetNativePath, 2)
+
+	root := NewRootCommand()
+	root.SetOut(&bytes.Buffer{})
+	root.SetErr(&bytes.Buffer{})
+	root.SetArgs([]string{
+		"fs", "rollback", "session", "--apply", "--canonical-namespace",
+		"--codex-home", home, "--store", storeDir, "--mount", mount, "--native-root", nativeRoot,
+		"--mount-wait", "500ms",
+	})
+	rollbackErr := root.Execute()
+	if err := <-retirementDone; err != nil {
+		t.Fatal(err)
+	}
+	if rollbackErr != nil {
+		t.Fatalf("rollback with recovered session state: %v", rollbackErr)
+	}
+	if _, err := os.Stat(filepath.Join(storeDir, "fs", "sessions", "session")); !os.IsNotExist(err) {
+		t.Fatalf("managed state remained after canonical rollback: %v", err)
+	}
+	if got, err := os.ReadFile(targetNativePath); err != nil || !bytes.Equal(got, original) {
+		t.Fatalf("canonical rollback bytes = %q err=%v", got, err)
+	}
+}
+
+func TestCanonicalRetirementColdLoadRestoresManagedFallbackBeforeNativePreference(t *testing.T) {
+	home, storeDir, originalPath := fsFixture(t, true)
+	original, err := os.ReadFile(originalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := fold.LoadManifest(storeDir, "session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	retainedPath := filepath.Join(storeDir, "fs", "snapshots", "session", "native.jsonl")
+	if err := os.MkdirAll(filepath.Dir(retainedPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(retainedPath, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	resolver, err := pack.Open(storeDir, pack.OpenOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	retained, err := hashPath(retainedPath)
+	if err != nil {
+		_ = resolver.Close()
+		t.Fatal(err)
+	}
+	managed, err := vfs.OpenSession(context.Background(), vfs.SessionOptions{
+		Root: storeDir, ManifestPath: fold.ManifestPath(storeDir, "session"), Manifest: manifest,
+		Reader: resolver, NativeSnapshot: retained,
+	})
+	if err != nil {
+		_ = resolver.Close()
+		t.Fatal(err)
+	}
+	if err := resolver.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	route := "/archived_sessions/rollout-session.jsonl"
+	nativeRoot := filepath.Join(home, "fold-native")
+	nativeTargetPath := filepath.Join(nativeRoot, "archived_sessions", "rollout-session.jsonl")
+	if err := os.MkdirAll(filepath.Dir(nativeTargetPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(nativeTargetPath, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	nativeTarget, err := hashPath(nativeTargetPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := createRetirementRequest(storeDir, "session", managed.State().Generation, route, nativeTarget); err != nil {
+		t.Fatal(err)
+	}
+
+	filesystem := mountfs.NewCanonical()
+	filesystem.SetNativeRoot(nativeRoot)
+	known := make(map[string]uint64)
+	knownRoutes := make(map[string]string)
+	var closers []io.Closer
+	t.Cleanup(func() {
+		for _, closer := range closers {
+			_ = closer.Close()
+		}
+	})
+	opens := 0
+	openState := func(state vfs.SessionState) (*vfs.Session, error) {
+		opens++
+		current, nextResolver, err := openManagedSession(context.Background(), storeDir, state)
+		if err == nil {
+			closers = append(closers, nextResolver)
+		}
+		return current, err
+	}
+	state, err := managedState(storeDir, "session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		handled, err := syncCanonicalRetirement(storeDir, home, nativeRoot, filesystem, state, route, true, known, knownRoutes, openState)
+		if err != nil || !handled {
+			t.Fatalf("sync retirement attempt %d: handled=%t err=%v", attempt, handled, err)
+		}
+	}
+	if opens != 1 || known["session"] != state.Generation || knownRoutes["session"] != route {
+		t.Fatalf("cold load state: opens=%d known=%#v routes=%#v", opens, known, knownRoutes)
+	}
+	acknowledgement, err := os.ReadFile(filepath.Join(storeDir, "fs", "sessions", "session", retirementAcknowledgementFilename))
+	if err != nil || !bytes.Contains(acknowledgement, []byte(`"token"`)) {
+		t.Fatalf("retirement acknowledgement = %q err=%v", acknowledgement, err)
+	}
+	if got := readMountedFilesystemFile(t, filesystem, route, len(original)); !bytes.Equal(got, original) {
+		t.Fatalf("native-preferred bytes = %q", got)
+	}
+	if err := os.Remove(nativeTargetPath); err != nil {
+		t.Fatal(err)
+	}
+	if got := readMountedFilesystemFile(t, filesystem, route, len(original)); !bytes.Equal(got, original) {
+		t.Fatalf("managed fallback bytes = %q", got)
+	}
+}
+
+func TestCanonicalRetirementDaemonRestartRejectsStaleNativeAcknowledgement(t *testing.T) {
+	home, storeDir, originalPath := fsFixture(t, true)
+	original, err := os.ReadFile(originalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := fold.LoadManifest(storeDir, "session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	retainedPath := filepath.Join(storeDir, "fs", "snapshots", "session", "native.jsonl")
+	if err := os.MkdirAll(filepath.Dir(retainedPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(retainedPath, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	resolver, err := pack.Open(storeDir, pack.OpenOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	retained, err := hashPath(retainedPath)
+	if err != nil {
+		_ = resolver.Close()
+		t.Fatal(err)
+	}
+	managed, err := vfs.OpenSession(context.Background(), vfs.SessionOptions{
+		Root: storeDir, ManifestPath: fold.ManifestPath(storeDir, "session"), Manifest: manifest,
+		Reader: resolver, NativeSnapshot: retained,
+	})
+	if err != nil {
+		_ = resolver.Close()
+		t.Fatal(err)
+	}
+	tail := []byte("{\"pending_retirement\":true}\n")
+	writer, err := managed.OpenWriter()
+	if err != nil {
+		_ = resolver.Close()
+		t.Fatal(err)
+	}
+	if _, err := writer.Append(context.Background(), tail); err != nil {
+		_ = writer.Close()
+		_ = resolver.Close()
+		t.Fatal(err)
+	}
+	if err := writer.Sync(); err != nil {
+		_ = writer.Close()
+		_ = resolver.Close()
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		_ = resolver.Close()
+		t.Fatal(err)
+	}
+	if err := resolver.Close(); err != nil {
+		t.Fatal(err)
+	}
+	current := append(append([]byte(nil), original...), tail...)
+
+	route := "/archived_sessions/rollout-session.jsonl"
+	nativeRoot := filepath.Join(home, "fold-native")
+	nativeTargetPath := filepath.Join(nativeRoot, "archived_sessions", "rollout-session.jsonl")
+	if err := os.MkdirAll(filepath.Dir(nativeTargetPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(nativeTargetPath, current, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	nativeTarget, err := hashPath(nativeTargetPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := managedState(storeDir, "session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	retirement, err := createRetirementRequest(storeDir, "session", state.Generation, route, nativeTarget)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var closers []io.Closer
+	t.Cleanup(func() {
+		for _, closer := range closers {
+			_ = closer.Close()
+		}
+	})
+	opens := 0
+	openState := func(state vfs.SessionState) (*vfs.Session, error) {
+		opens++
+		current, nextResolver, err := openManagedSession(context.Background(), storeDir, state)
+		if err == nil {
+			closers = append(closers, nextResolver)
+		}
+		return current, err
+	}
+
+	firstDaemon := mountfs.NewCanonical()
+	firstDaemon.SetNativeRoot(nativeRoot)
+	firstKnown := make(map[string]uint64)
+	firstRoutes := make(map[string]string)
+	handled, err := syncCanonicalRetirement(storeDir, home, nativeRoot, firstDaemon, state, route, true, firstKnown, firstRoutes, openState)
+	if err != nil || !handled {
+		t.Fatalf("initial retirement sync: handled=%t err=%v", handled, err)
+	}
+	if got := readMountedFilesystemFile(t, firstDaemon, route, len(current)); !bytes.Equal(got, current) {
+		t.Fatalf("native-preferred bytes = %q, want %q", got, current)
+	}
+
+	if err := os.Remove(nativeTargetPath); err != nil {
+		t.Fatal(err)
+	}
+	restartedDaemon := mountfs.NewCanonical()
+	restartedDaemon.SetNativeRoot(nativeRoot)
+	restartedKnown := make(map[string]uint64)
+	restartedRoutes := make(map[string]string)
+	handled, err = syncCanonicalRetirement(storeDir, home, nativeRoot, restartedDaemon, state, route, true, restartedKnown, restartedRoutes, openState)
+	if err != nil || !handled {
+		t.Fatalf("restart retirement sync: handled=%t err=%v", handled, err)
+	}
+	if opens != 2 {
+		t.Fatalf("daemon restarts opened managed state %d times, want 2", opens)
+	}
+	acknowledgement, err := os.ReadFile(filepath.Join(storeDir, "fs", "sessions", "session", retirementAcknowledgementFilename))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var acknowledged retirementControl
+	if err := json.Unmarshal(acknowledgement, &acknowledged); err != nil {
+		t.Fatal(err)
+	}
+	if acknowledged.Token != retirement.Token || acknowledged.Error == "" {
+		t.Fatalf("stale acknowledgement was not rejected: %#v", acknowledged)
+	}
+	if got := readMountedFilesystemFile(t, restartedDaemon, route, len(current)); !bytes.Equal(got, current) {
+		t.Fatalf("restart managed fallback bytes = %q, want %q", got, current)
 	}
 }
 
@@ -1053,24 +1395,61 @@ func TestFSRollbackCanonicalFailureWaitsForManagedRouteRestoration(t *testing.T)
 		t.Fatal(err)
 	}
 	stateDirectory := filepath.Join(storeDir, "fs", "sessions", "session")
+	retirementRequest := filepath.Join(stateDirectory, "retire.request.json")
+	canonicalRoute := "/sessions/2026/07/12/" + filename
 	restored := make(chan error, 1)
 	go func() {
 		deadline := time.Now().Add(5 * time.Second)
-		retired := false
 		for time.Now().Before(deadline) {
-			_, statErr := os.Stat(stateDirectory)
-			if !retired && os.IsNotExist(statErr) {
-				retired = true
-				_ = os.Remove(mountedTarget)
+			if _, err := os.Stat(stateDirectory); err != nil {
+				restored <- fmt.Errorf("managed state moved before retirement request: %w", err)
+				return
 			}
-			if retired && statErr == nil {
-				time.Sleep(50 * time.Millisecond)
-				restored <- os.WriteFile(mountedTarget, want, 0o600)
+			request, err := os.ReadFile(retirementRequest)
+			if err == nil {
+				var rejection retirementControl
+				if err := json.Unmarshal(request, &rejection); err != nil {
+					restored <- err
+					return
+				}
+				rejection.Error = "native rollback target is unavailable or changed"
+				if err := writeRetirementAcknowledgement(storeDir, "session", rejection); err != nil {
+					restored <- err
+					return
+				}
+				break
+			}
+			if !errors.Is(err, os.ErrNotExist) {
+				restored <- err
 				return
 			}
 			time.Sleep(5 * time.Millisecond)
 		}
-		restored <- errors.New("managed state was not restored")
+		for time.Now().Before(deadline) {
+			if _, err := os.Stat(stateDirectory); err != nil {
+				restored <- fmt.Errorf("managed state moved during retirement cancellation: %w", err)
+				return
+			}
+			if _, err := os.Stat(retirementRequest); errors.Is(err, os.ErrNotExist) {
+				state, stateErr := managedState(storeDir, "session")
+				if stateErr != nil {
+					restored <- stateErr
+					return
+				}
+				if state.Generation < 2 {
+					time.Sleep(5 * time.Millisecond)
+					continue
+				}
+				if err := os.WriteFile(mountedTarget, want, 0o600); err != nil {
+					restored <- err
+					return
+				}
+				restored <- writeMountAcknowledgement(storeDir, "session", state.Generation, canonicalRoute)
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		restored <- errors.New("managed route was not restored")
 	}()
 
 	root := NewRootCommand()
@@ -1082,8 +1461,8 @@ func TestFSRollbackCanonicalFailureWaitsForManagedRouteRestoration(t *testing.T)
 		"--mount-wait", "200ms",
 	})
 	err = root.Execute()
-	if err == nil || !strings.Contains(err.Error(), "verify canonical native rollback") {
-		t.Fatalf("rollback error = %v, want canonical verification failure", err)
+	if err == nil || !strings.Contains(err.Error(), "retirement rejected") {
+		t.Fatalf("rollback error = %v, want retirement rejection", err)
 	}
 	select {
 	case restoreErr := <-restored:
@@ -1186,23 +1565,7 @@ func TestFSRollbackCanonicalRetiresHiddenSnapshot(t *testing.T) {
 	if err := os.WriteFile(mountedTarget, original, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	stateDirectory := filepath.Join(storeDir, "fs", "sessions", "session")
-	copyDone := make(chan error, 1)
-	go func() {
-		deadline := time.Now().Add(5 * time.Second)
-		for time.Now().Before(deadline) {
-			if _, err := os.Stat(stateDirectory); os.IsNotExist(err) {
-				data, readErr := os.ReadFile(targetNativePath)
-				if readErr == nil {
-					readErr = os.WriteFile(mountedTarget, data, 0o600)
-				}
-				copyDone <- readErr
-				return
-			}
-			time.Sleep(10 * time.Millisecond)
-		}
-		copyDone <- errors.New("managed state was not retired")
-	}()
+	copyDone := emulateCanonicalRetirement(storeDir, "session", mountedTarget, targetNativePath)
 	// The mounted target is only used as the FUSE visibility probe. The
 	// canonical rollback writes the latest bytes to the retained native route.
 	executeFS(t, []string{
@@ -1487,6 +1850,122 @@ func executeFS(t *testing.T, args []string) {
 	if err := root.Execute(); err != nil {
 		t.Fatalf("execute %v: %v", args, err)
 	}
+}
+
+func emulateCanonicalRetirement(storeDir string, sessionID string, mountedTarget string, nativeTarget string) <-chan error {
+	done := make(chan error, 1)
+	go func() {
+		stateDirectory := filepath.Join(storeDir, "fs", "sessions", sessionID)
+		requestPath := filepath.Join(stateDirectory, retirementRequestFilename)
+		acknowledgementPath := filepath.Join(stateDirectory, retirementAcknowledgementFilename)
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			if _, err := os.Stat(stateDirectory); err != nil {
+				done <- fmt.Errorf("managed state moved before retirement request: %w", err)
+				return
+			}
+			request, err := os.ReadFile(requestPath)
+			if err == nil {
+				data, readErr := os.ReadFile(nativeTarget)
+				if readErr == nil {
+					readErr = os.WriteFile(mountedTarget, data, 0o600)
+				}
+				if readErr == nil {
+					readErr = os.WriteFile(acknowledgementPath, request, 0o600)
+				}
+				done <- readErr
+				return
+			}
+			if !errors.Is(err, os.ErrNotExist) {
+				done <- err
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		done <- errors.New("retirement request was not created")
+	}()
+	return done
+}
+
+func emulateCanonicalRetirementGeneration(t *testing.T, storeDir string, sessionID string, mountedTarget string, nativeTarget string, expectedGeneration uint64) <-chan error {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() {
+		stateDirectory := filepath.Join(storeDir, "fs", "sessions", sessionID)
+		requestPath := filepath.Join(stateDirectory, retirementRequestFilename)
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			data, err := os.ReadFile(requestPath)
+			if err == nil {
+				var request retirementControl
+				if err := json.Unmarshal(data, &request); err != nil {
+					done <- err
+					return
+				}
+				if request.Generation != expectedGeneration {
+					rejection := request
+					rejection.Error = fmt.Sprintf("retirement generation = %d, want recovered %d", request.Generation, expectedGeneration)
+					if err := writeRetirementAcknowledgement(storeDir, sessionID, rejection); err != nil {
+						done <- err
+						return
+					}
+					for time.Now().Before(deadline) {
+						if _, err := os.Stat(requestPath); !errors.Is(err, os.ErrNotExist) {
+							time.Sleep(5 * time.Millisecond)
+							continue
+						}
+						state, err := managedState(storeDir, sessionID)
+						if err != nil || state.Generation <= expectedGeneration {
+							time.Sleep(5 * time.Millisecond)
+							continue
+						}
+						native, err := os.ReadFile(nativeTarget)
+						if err == nil {
+							err = os.WriteFile(mountedTarget, native, 0o600)
+						}
+						if err == nil {
+							err = writeMountAcknowledgement(storeDir, sessionID, state.Generation, request.Route)
+						}
+						done <- err
+						return
+					}
+					done <- errors.New("managed route was not republished after stale retirement request")
+					return
+				}
+				native, err := os.ReadFile(nativeTarget)
+				if err == nil {
+					err = os.WriteFile(mountedTarget, native, 0o600)
+				}
+				if err == nil {
+					err = writeRetirementAcknowledgement(storeDir, sessionID, request)
+				}
+				done <- err
+				return
+			}
+			if !errors.Is(err, os.ErrNotExist) {
+				done <- err
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		done <- errors.New("retirement request was not created")
+	}()
+	return done
+}
+
+func readMountedFilesystemFile(t *testing.T, filesystem *mountfs.Filesystem, route string, size int) []byte {
+	t.Helper()
+	handle, errno := filesystem.Open(route, os.O_RDONLY)
+	if errno != 0 {
+		t.Fatalf("open mounted route %s: %v", route, errno)
+	}
+	defer filesystem.Release(handle)
+	data := make([]byte, size)
+	n, errno := filesystem.Read(handle, data, 0)
+	if errno != 0 {
+		t.Fatalf("read mounted route %s: %v", route, errno)
+	}
+	return data[:n]
 }
 
 func allowFixtureMount(t *testing.T) {

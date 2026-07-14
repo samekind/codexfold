@@ -2,6 +2,8 @@ package cli
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -545,12 +547,131 @@ type mountAcknowledgement struct {
 	Route      string `json:"route"`
 }
 
+const (
+	retirementRequestFilename         = "retire.request.json"
+	retirementAcknowledgementFilename = "retire.ack.json"
+)
+
+type retirementControl struct {
+	Token      string `json:"token"`
+	Generation uint64 `json:"generation"`
+	Route      string `json:"route"`
+	Bytes      int64  `json:"bytes"`
+	SHA256     string `json:"sha256"`
+	Error      string `json:"error,omitempty"`
+}
+
+func createRetirementRequest(store string, sessionID string, generation uint64, route string, target vfs.NativeFile) (retirementControl, error) {
+	if store == "" || !validSessionID(sessionID) || generation == 0 || route == "" || target.Bytes < 0 || len(target.SHA256) != 64 {
+		return retirementControl{}, errors.New("complete retirement request metadata is required")
+	}
+	directory := filepath.Join(filepath.Clean(store), "fs", "sessions", sessionID)
+	requestPath := filepath.Join(directory, retirementRequestFilename)
+	if _, err := os.Lstat(requestPath); err == nil {
+		return retirementControl{}, errors.New("session retirement is already pending")
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return retirementControl{}, err
+	}
+	if err := removeIfExists(filepath.Join(directory, retirementAcknowledgementFilename)); err != nil {
+		return retirementControl{}, err
+	}
+	tokenBytes := make([]byte, 16)
+	if _, err := rand.Read(tokenBytes); err != nil {
+		return retirementControl{}, err
+	}
+	request := retirementControl{Token: hex.EncodeToString(tokenBytes), Generation: generation, Route: route, Bytes: target.Bytes, SHA256: target.SHA256}
+	if err := writeSessionControlFile(directory, retirementRequestFilename, request); err != nil {
+		return retirementControl{}, err
+	}
+	return request, nil
+}
+
+func readRetirementRequest(store string, sessionID string) (retirementControl, bool, error) {
+	path := filepath.Join(filepath.Clean(store), "fs", "sessions", sessionID, retirementRequestFilename)
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return retirementControl{}, false, nil
+	}
+	if err != nil {
+		return retirementControl{}, false, err
+	}
+	var request retirementControl
+	if err := json.Unmarshal(data, &request); err != nil {
+		return retirementControl{}, false, fmt.Errorf("decode retirement request: %w", err)
+	}
+	if len(request.Token) != 32 || request.Generation == 0 || request.Route == "" || request.Bytes < 0 || len(request.SHA256) != 64 || request.Error != "" {
+		return retirementControl{}, false, errors.New("invalid retirement request")
+	}
+	return request, true, nil
+}
+
+func writeRetirementAcknowledgement(store string, sessionID string, acknowledgement retirementControl) error {
+	if len(acknowledgement.Token) != 32 || acknowledgement.Generation == 0 || acknowledgement.Route == "" || acknowledgement.Bytes < 0 || len(acknowledgement.SHA256) != 64 {
+		return errors.New("complete retirement acknowledgement metadata is required")
+	}
+	directory := filepath.Join(filepath.Clean(store), "fs", "sessions", sessionID)
+	return writeSessionControlFile(directory, retirementAcknowledgementFilename, acknowledgement)
+}
+
+func waitForRetirementAcknowledgement(ctx context.Context, store string, sessionID string, request retirementControl, timeout time.Duration) error {
+	if timeout <= 0 {
+		timeout = 15 * time.Second
+	}
+	path := filepath.Join(filepath.Clean(store), "fs", "sessions", sessionID, retirementAcknowledgementFilename)
+	deadline := time.Now().Add(timeout)
+	for {
+		data, err := os.ReadFile(path)
+		if err == nil {
+			var acknowledgement retirementControl
+			if json.Unmarshal(data, &acknowledgement) == nil &&
+				acknowledgement.Token == request.Token && acknowledgement.Generation == request.Generation &&
+				acknowledgement.Route == request.Route && acknowledgement.Bytes == request.Bytes && acknowledgement.SHA256 == request.SHA256 {
+				if acknowledgement.Error != "" {
+					return fmt.Errorf("retirement rejected: %s", acknowledgement.Error)
+				}
+				return nil
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		if time.Now().After(deadline) {
+			return errors.New("timed out waiting for retirement acknowledgement")
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(25 * time.Millisecond):
+		}
+	}
+}
+
+func clearRetirementControl(directory string) error {
+	var result error
+	for _, name := range []string{retirementRequestFilename, retirementAcknowledgementFilename} {
+		if err := removeIfExists(filepath.Join(filepath.Clean(directory), name)); err != nil {
+			result = errors.Join(result, err)
+		}
+	}
+	return result
+}
+
+func removeIfExists(path string) error {
+	if err := os.Remove(filepath.Clean(path)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
 func writeMountAcknowledgement(store string, sessionID string, generation uint64, route string) error {
 	if store == "" || !validSessionID(sessionID) || generation == 0 || route == "" {
 		return errors.New("complete mount acknowledgement metadata is required")
 	}
 	directory := filepath.Join(filepath.Clean(store), "fs", "sessions", sessionID)
-	data, err := json.Marshal(mountAcknowledgement{Generation: generation, Route: route})
+	return writeSessionControlFile(directory, "mounted.json", mountAcknowledgement{Generation: generation, Route: route})
+}
+
+func writeSessionControlFile(directory string, name string, value any) error {
+	data, err := json.Marshal(value)
 	if err != nil {
 		return err
 	}
@@ -575,7 +696,7 @@ func writeMountAcknowledgement(store string, sessionID string, generation uint64
 	if err := temporary.Close(); err != nil {
 		return err
 	}
-	return os.Rename(temporaryPath, filepath.Join(directory, "mounted.json"))
+	return os.Rename(temporaryPath, filepath.Join(directory, name))
 }
 
 func waitForMountAcknowledgement(ctx context.Context, store string, sessionID string, generation uint64, route string, timeout time.Duration) error {

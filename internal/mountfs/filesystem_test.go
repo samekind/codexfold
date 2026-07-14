@@ -264,6 +264,66 @@ func TestCanonicalFilesystemManagedSessionMasksRetainedSnapshotAtCurrentRoute(t 
 	}
 }
 
+func TestCanonicalFilesystemNativePreferenceFallsBackToManagedWithoutPathLoss(t *testing.T) {
+	root := t.TempDir()
+	route := "/sessions/2026/07/14/rollout-retirement.jsonl"
+	nativePath := nativePathFromRoot(root, route)
+	if err := os.MkdirAll(filepath.Dir(nativePath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	managedBytes := []byte("managed-current\n")
+	nativeBytes := []byte("native-current\n")
+	if err := os.WriteFile(nativePath, nativeBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	filesystem := NewCanonical()
+	filesystem.SetNativeRoot(root)
+	if err := filesystem.AddSessionAt("session", route, mountSessionFixture(t, "session", managedBytes)); err != nil {
+		t.Fatal(err)
+	}
+	read := func() []byte {
+		t.Helper()
+		handle, errno := filesystem.Open(route, os.O_RDONLY)
+		if errno != 0 {
+			t.Fatalf("Open errno=%v", errno)
+		}
+		defer filesystem.Release(handle)
+		attribute, errno := filesystem.Getattr(route)
+		if errno != 0 {
+			t.Fatalf("Getattr errno=%v", errno)
+		}
+		data := make([]byte, attribute.Size)
+		n, errno := filesystem.Read(handle, data, 0)
+		if errno != 0 || n != len(data) {
+			t.Fatalf("Read n=%d errno=%v size=%d", n, errno, len(data))
+		}
+		return data
+	}
+
+	if got := read(); !bytes.Equal(got, managedBytes) {
+		t.Fatalf("initial bytes = %q, want managed %q", got, managedBytes)
+	}
+	if err := filesystem.PreferNativeSession("session"); err != nil {
+		t.Fatal(err)
+	}
+	if got := read(); !bytes.Equal(got, nativeBytes) {
+		t.Fatalf("preferred bytes = %q, want native %q", got, nativeBytes)
+	}
+	if err := os.Remove(nativePath); err != nil {
+		t.Fatal(err)
+	}
+	if got := read(); !bytes.Equal(got, managedBytes) {
+		t.Fatalf("fallback bytes = %q, want managed %q", got, managedBytes)
+	}
+	if err := os.WriteFile(nativePath, nativeBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := read(); !bytes.Equal(got, nativeBytes) {
+		t.Fatalf("restored native bytes = %q, want %q", got, nativeBytes)
+	}
+}
+
 func TestCanonicalFilesystemHidesRetainedSnapshotAfterManagedRouteMoves(t *testing.T) {
 	root := t.TempDir()
 	filename := "rollout-2026-07-12T14-28-28-session.jsonl"

@@ -348,6 +348,13 @@ func newFSServeCommand() *cobra.Command {
 					seen[state.SessionID] = struct{}{}
 					if canonicalNamespace {
 						route, exists := routes[state.SessionID]
+						handled, err := syncCanonicalRetirement(store, home, nativeRoot, filesystem, state, route, exists, known, knownRoutes, openState)
+						if err != nil {
+							return err
+						}
+						if handled {
+							continue
+						}
 						if !exists {
 							if _, mounted := known[state.SessionID]; mounted {
 								if err := filesystem.RemoveSession(state.SessionID); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -456,6 +463,66 @@ func newFSServeCommand() *cobra.Command {
 	command.Flags().StringVar(&operationTracePath, "operation-trace", "", "Absolute path for sanitized FUSE operation names")
 	command.Flags().BoolVar(&jsonOutput, "json", false, "Emit JSON output for dry-run")
 	return command
+}
+
+func syncCanonicalRetirement(
+	store string,
+	home string,
+	nativeRoot string,
+	filesystem *mountfs.Filesystem,
+	state vfs.SessionState,
+	route string,
+	routeExists bool,
+	known map[string]uint64,
+	knownRoutes map[string]string,
+	openState func(vfs.SessionState) (*vfs.Session, error),
+) (bool, error) {
+	retirement, retiring, err := readRetirementRequest(store, state.SessionID)
+	if err != nil {
+		return false, err
+	}
+	if !retiring {
+		return false, removeIfExists(filepath.Join(store, "fs", "sessions", state.SessionID, retirementAcknowledgementFilename))
+	}
+	reject := func(message string) (bool, error) {
+		rejected := retirement
+		rejected.Error = message
+		return true, writeRetirementAcknowledgement(store, state.SessionID, rejected)
+	}
+	if !routeExists || retirement.Route != route {
+		return reject("retirement request does not match the current session route")
+	}
+	generation := known[state.SessionID]
+	if generation != state.Generation || knownRoutes[state.SessionID] != route {
+		managed, err := openState(state)
+		if err != nil {
+			return true, err
+		}
+		if err := filesystem.UpsertSessionAt(state.SessionID, route, managed); err != nil {
+			return true, err
+		}
+		generation = managed.State().Generation
+		known[state.SessionID] = generation
+		knownRoutes[state.SessionID] = route
+	}
+	if retirement.Generation != generation {
+		return reject("retirement request generation does not match the current session state")
+	}
+	nativeTargetPath, err := canonicalNativeRoute(home, nativeRoot, filepath.Join(home, filepath.FromSlash(strings.TrimPrefix(route, "/"))))
+	if err != nil {
+		return true, err
+	}
+	nativeTarget, targetErr := hashPath(nativeTargetPath)
+	if targetErr != nil || nativeTarget.Bytes != retirement.Bytes || nativeTarget.SHA256 != retirement.SHA256 {
+		return reject("native rollback target is unavailable or changed")
+	}
+	if err := filesystem.PreferNativeSession(state.SessionID); err != nil {
+		return true, err
+	}
+	if err := writeRetirementAcknowledgement(store, state.SessionID, retirement); err != nil {
+		return true, err
+	}
+	return true, nil
 }
 
 func newFSMigrateCommand() *cobra.Command {
@@ -725,34 +792,83 @@ func newFSRollbackCommand() *cobra.Command {
 					return err
 				}
 				if canonicalNamespace {
-					retiredState, err := retireManagedState(store, state.SessionID)
-					if err != nil {
-						return err
-					}
 					mountedTarget, err := canonicalMountRoute(home, mount, current.RolloutPath)
 					if err != nil {
-						_ = restoreManagedState(store, state.SessionID, retiredState)
 						return err
 					}
-					restoreManagedRoute := func(cause error, retiredSnapshot string) error {
+					canonicalRoute, err := canonicalNamespaceRoute(home, mount, current.RolloutPath)
+					if err != nil {
+						return err
+					}
+					retirement, err := createRetirementRequest(store, state.SessionID, managed.State().Generation, canonicalRoute, target)
+					if err != nil {
+						return err
+					}
+					recoveryWait := mountWait
+					if recoveryWait < 15*time.Second {
+						recoveryWait = 15 * time.Second
+					}
+					restoreManagedRoute := func(cause error, retiredState string, retiredSnapshot string) error {
 						var restoreErrors []error
-						if err := restoreCanonicalNativeSnapshot(state.NativeSnapshot.Path, retiredSnapshot); err != nil {
-							restoreErrors = append(restoreErrors, err)
+						if retiredSnapshot != "" {
+							if err := restoreCanonicalNativeSnapshot(state.NativeSnapshot.Path, retiredSnapshot); err != nil {
+								restoreErrors = append(restoreErrors, err)
+							}
 						}
-						if err := restoreManagedState(store, state.SessionID, retiredState); err != nil {
+						var restored vfs.SessionState
+						if retiredState == "" {
+							directory := filepath.Join(store, "fs", "sessions", state.SessionID)
+							if err := clearRetirementControl(directory); err != nil {
+								restoreErrors = append(restoreErrors, err)
+							} else {
+								restored, err = vfs.RepublishSessionState(filepath.Join(directory, "state.json"))
+								if err != nil {
+									restoreErrors = append(restoreErrors, err)
+								}
+							}
+						} else if err := clearRetirementControl(retiredState); err != nil {
 							restoreErrors = append(restoreErrors, err)
-						} else if _, err := waitForTargetMatch(command.Context(), mountedTarget, target, mountWait); err != nil {
-							restoreErrors = append(restoreErrors, fmt.Errorf("verify restored managed route: %w", err))
+						} else if err := restoreManagedState(store, state.SessionID, retiredState); err != nil {
+							restoreErrors = append(restoreErrors, err)
+						} else {
+							restored, err = managedState(store, state.SessionID)
+							if err != nil {
+								restoreErrors = append(restoreErrors, err)
+							}
+						}
+						if restored.Generation != 0 {
+							if err := waitForMountAcknowledgement(command.Context(), store, state.SessionID, restored.Generation, canonicalRoute, recoveryWait); err != nil {
+								restoreErrors = append(restoreErrors, fmt.Errorf("wait for restored managed route: %w", err))
+							} else if _, err := waitForTargetMatch(command.Context(), mountedTarget, target, recoveryWait); err != nil {
+								restoreErrors = append(restoreErrors, fmt.Errorf("verify restored managed route: %w", err))
+							}
 						}
 						return errors.Join(append([]error{cause}, restoreErrors...)...)
 					}
-					retiredSnapshot, err := retireCanonicalNativeSnapshot(store, nativeRoot, state.SessionID, state.NativeSnapshot.Path, target.Path, retiredState)
-					if err != nil {
-						return restoreManagedRoute(err, "")
+					if err := waitForRetirementAcknowledgement(command.Context(), store, state.SessionID, retirement, mountWait); err != nil {
+						return restoreManagedRoute(err, "", "")
 					}
 					_, err = waitForTargetMatch(command.Context(), mountedTarget, target, mountWait)
 					if err != nil {
-						return restoreManagedRoute(fmt.Errorf("verify canonical native rollback: %w", err), retiredSnapshot)
+						return restoreManagedRoute(fmt.Errorf("verify canonical native rollback: %w", err), "", "")
+					}
+					nativeTarget, err := hashPath(target.Path)
+					if err != nil || nativeTarget.Bytes != target.Bytes || nativeTarget.SHA256 != target.SHA256 {
+						if err == nil {
+							err = errors.New("canonical native rollback target changed before retirement")
+						}
+						return restoreManagedRoute(fmt.Errorf("verify canonical native rollback target: %w", err), "", "")
+					}
+					retiredState, err := retireManagedState(store, state.SessionID)
+					if err != nil {
+						return restoreManagedRoute(err, "", "")
+					}
+					retiredSnapshot, err := retireCanonicalNativeSnapshot(store, nativeRoot, state.SessionID, state.NativeSnapshot.Path, target.Path, retiredState)
+					if err != nil {
+						return restoreManagedRoute(err, retiredState, "")
+					}
+					if err := clearRetirementControl(retiredState); err != nil {
+						return restoreManagedRoute(err, retiredState, retiredSnapshot)
 					}
 					result.RetiredState = retiredState
 				} else {

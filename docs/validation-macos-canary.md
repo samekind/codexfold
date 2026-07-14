@@ -6,6 +6,12 @@ The FUSE-T macOS adapter and isolated real Codex CLI and Desktop canaries have p
 
 Additional failure-containment evidence on 2026-07-14:
 
+- Canonical rollback now uses a two-stage retirement request and acknowledgement. The daemon keeps the managed session loaded while preferring a verified native target, so removing or changing that target falls back to managed bytes instead of creating an `ENOENT` window.
+- A live pending-retirement restart loaded the managed fallback into a fresh daemon, acknowledged the exact generation and route, and preserved the complete SHA-256. Toggling the native target 100 times while opening the mounted route 2,000 times produced zero read failures.
+- A second live restart began with an earlier successful acknowledgement after the native target had disappeared. The fresh daemon replaced it with `native rollback target is unavailable or changed`, remained running, and exposed the complete managed JSONL with the same SHA-256.
+- A normal rollback completed with zero route-read failures, preserved the exact visible SHA-256, then passed archive, overwrite-fold, pack rebuild, 10,000-range shadow verification, canonical re-migration, unarchive, and a complete FUSE service restart.
+- The isolated real Codex task resumed after that restart and performed a repository review, added and mutation-tested a restart regression, ran Go and race tests, and wrote a detailed verdict. Its mounted rollout grew from 1,226,174 to 1,579,063 bytes; the complete 1,226,174-byte prefix retained SHA-256 `eff00f0583833b1d9cb03b12ed5b19cb68240c37e953c086f028e8bc6a4de2f6`, and all 746 JSONL records parsed.
+- Recovery before retirement is covered explicitly: the rollback request uses the recovered `managed.State().Generation`. A fresh-daemon regression also verifies that a stale successful acknowledgement is replaced with a rejection when its native target is no longer valid.
 - Exact contracts were imported from real FUSE traces for PATH CLI `0.144.3` and Desktop `26.707.71524+5263`.
 - Canonical migration now verifies the mounted managed target before removing the native directory entry. A clean first migration passed without a retry.
 - A real Desktop canary preserved the exact 79,067-byte, 16-record source prefix, appended an 8,414-byte, 12-record managed delta, and rolled back to their exact 87,481-byte concatenation. A subsequent native Desktop turn appended 5,590 bytes and 9 records. The final 93,071-byte, 37-record JSONL parsed completely and preserved byte order.
