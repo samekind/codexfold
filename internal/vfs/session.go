@@ -44,71 +44,112 @@ type VisibleInfo struct {
 var ErrWriterBusy = errors.New("session writer lease is already held")
 
 func OpenSession(ctx context.Context, options SessionOptions) (*Session, error) {
+	session, _, err := openSession(ctx, options, false)
+	return session, err
+}
+
+func OpenSessionWithWriter(ctx context.Context, options SessionOptions) (*Session, *WriteHandle, error) {
+	return openSession(ctx, options, true)
+}
+
+func openSession(ctx context.Context, options SessionOptions, reserveWriter bool) (*Session, *WriteHandle, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if options.Root == "" || options.ManifestPath == "" || !safeSessionID(options.Manifest.Session.ID) {
-		return nil, errors.New("session root, manifest path, and safe session ID are required")
+		return nil, nil, errors.New("session root, manifest path, and safe session ID are required")
 	}
 	view, err := NewView(options.Manifest, options.Reader)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	directory := filepath.Join(options.Root, "fs", "sessions", options.Manifest.Session.ID)
 	if err := os.MkdirAll(directory, 0o700); err != nil {
-		return nil, fmt.Errorf("create virtual session directory: %w", err)
+		return nil, nil, fmt.Errorf("create virtual session directory: %w", err)
+	}
+	leasePath := filepath.Join(directory, "writer.lease")
+	var reservedLease *os.File
+	if reserveWriter {
+		reservedLease, err = acquireWriterLease(leasePath)
+		if err != nil {
+			return nil, nil, err
+		}
+	} else if err := cleanupStaleWriterLease(leasePath); err != nil {
+		return nil, nil, err
+	}
+	cleanupReservedLease := func() {
+		if reservedLease == nil {
+			return
+		}
+		_ = unlockWriterFile(reservedLease)
+		_ = reservedLease.Close()
 	}
 	statePath := filepath.Join(directory, "state.json")
-	if err := cleanupStaleWriterLease(filepath.Join(directory, "writer.lease")); err != nil {
-		return nil, err
-	}
 	state, err := loadSessionState(statePath)
 	if errors.Is(err, os.ErrNotExist) {
 		if err := verifyNativeFile(options.NativeSnapshot); err != nil {
-			return nil, err
+			cleanupReservedLease()
+			return nil, nil, err
 		}
 		deltaPath := filepath.Join(directory, "delta.jsonl")
 		delta, err := os.OpenFile(deltaPath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
 		if err != nil {
-			return nil, fmt.Errorf("create session delta: %w", err)
+			cleanupReservedLease()
+			return nil, nil, fmt.Errorf("create session delta: %w", err)
 		}
 		if err := delta.Sync(); err != nil {
 			_ = delta.Close()
-			return nil, fmt.Errorf("sync session delta: %w", err)
+			cleanupReservedLease()
+			return nil, nil, fmt.Errorf("sync session delta: %w", err)
 		}
 		if err := delta.Close(); err != nil {
-			return nil, fmt.Errorf("close session delta: %w", err)
+			cleanupReservedLease()
+			return nil, nil, fmt.Errorf("close session delta: %w", err)
 		}
 		state = SessionState{Version: sessionStateVersion, SessionID: options.Manifest.Session.ID, Generation: 1, ManifestPath: filepath.Clean(options.ManifestPath), BaseBytes: view.Size(), BaseSHA256: options.Manifest.Source.SHA256, DeltaPath: deltaPath, NativeSnapshot: options.NativeSnapshot}
 		if err := writeSessionState(statePath, state); err != nil {
-			return nil, err
+			cleanupReservedLease()
+			return nil, nil, err
 		}
 	} else if err != nil {
-		return nil, err
+		cleanupReservedLease()
+		return nil, nil, err
 	} else {
 		if state.SessionID != options.Manifest.Session.ID || state.ManifestPath != filepath.Clean(options.ManifestPath) || state.BaseBytes != view.Size() || state.BaseSHA256 != options.Manifest.Source.SHA256 || state.NativeSnapshot != options.NativeSnapshot {
-			return nil, errors.New("persisted session state does not match the requested manifest")
+			cleanupReservedLease()
+			return nil, nil, errors.New("persisted session state does not match the requested manifest")
 		}
 		if !pathWithin(directory, state.DeltaPath) || (state.BackingPath != "" && !pathWithin(directory, state.BackingPath)) {
-			return nil, errors.New("persisted session state contains an unsafe data path")
+			cleanupReservedLease()
+			return nil, nil, errors.New("persisted session state contains an unsafe data path")
 		}
 		if _, err := os.Stat(state.DeltaPath); err != nil {
-			return nil, fmt.Errorf("stat session delta: %w", err)
+			cleanupReservedLease()
+			return nil, nil, fmt.Errorf("stat session delta: %w", err)
 		}
 		if state.BackingPath != "" {
 			if _, err := os.Stat(state.BackingPath); err != nil {
-				return nil, fmt.Errorf("stat session backing: %w", err)
+				cleanupReservedLease()
+				return nil, nil, fmt.Errorf("stat session backing: %w", err)
 			}
 		}
 	}
 	session := &Session{state: state, statePath: statePath, directory: directory, view: view, readerLeases: make(map[uint64]int), beforeCOWPhase: options.BeforeCOWPhase}
+	var writer *WriteHandle
+	if reservedLease != nil {
+		session.writerOpen = true
+		writer = &WriteHandle{session: session, leasePath: leasePath, lease: reservedLease}
+	}
 	if err := session.recover(ctx); err != nil {
-		return nil, err
+		if writer != nil {
+			_ = writer.Close()
+		}
+		return nil, nil, err
 	}
 	if recovered, err := loadSessionState(statePath); err == nil {
 		session.state = recovered
 	}
-	return session, nil
+	return session, writer, nil
 }
 
 func (s *Session) State() SessionState {
@@ -189,6 +230,15 @@ func (s *Session) OpenWriter() (*WriteHandle, error) {
 		return nil, ErrWriterBusy
 	}
 	leasePath := filepath.Join(s.directory, "writer.lease")
+	lease, err := acquireWriterLease(leasePath)
+	if err != nil {
+		return nil, err
+	}
+	s.writerOpen = true
+	return &WriteHandle{session: s, leasePath: leasePath, lease: lease}, nil
+}
+
+func acquireWriterLease(leasePath string) (*os.File, error) {
 	lease, err := os.OpenFile(leasePath, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("create writer lease: %w", err)
@@ -217,8 +267,7 @@ func (s *Session) OpenWriter() (*WriteHandle, error) {
 		_ = lease.Close()
 		return nil, fmt.Errorf("sync writer lease: %w", err)
 	}
-	s.writerOpen = true
-	return &WriteHandle{session: s, leasePath: leasePath, lease: lease}, nil
+	return lease, nil
 }
 
 func (s *Session) ensureBacking(ctx context.Context) (string, error) {

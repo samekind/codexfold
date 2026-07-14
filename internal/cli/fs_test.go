@@ -671,6 +671,102 @@ func TestFSMigrateCanonicalKeepsCodexRouteAndHidesRetainedSnapshot(t *testing.T)
 	}
 }
 
+func TestFSMigrateCanonicalReservesWriterDuringCutover(t *testing.T) {
+	allowFixtureMount(t)
+	home := t.TempDir()
+	storeDir := filepath.Join(home, "fold-store")
+	route := filepath.Join(home, "archived_sessions", "rollout-session.jsonl")
+	if err := os.MkdirAll(filepath.Dir(route), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	source := []byte("{\"type\":\"session_meta\"}\n{\"canonical\":true}\n")
+	if err := os.WriteFile(route, source, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeStateFixture(t, home, route)
+	db, err := sql.Open("sqlite", filepath.Join(home, "state_5.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`update threads set archived = 1, id = 'session' where id = 'fixture'`); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	_ = db.Close()
+	if _, err := fold.Fold(context.Background(), codex.Session{ID: "session", RolloutPath: route, Archived: true}, fold.FoldOptions{StoreDir: storeDir, Apply: true, FieldThreshold: 8}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pack.Build(context.Background(), storeDir, pack.BuildOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	nativeRoot := filepath.Join(home, "fold-native")
+	nativePath := filepath.Join(nativeRoot, "archived_sessions", filepath.Base(route))
+	if err := os.MkdirAll(filepath.Dir(nativePath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(route, nativePath); err != nil {
+		t.Fatal(err)
+	}
+	mount := filepath.Join(home, "fold-fs")
+	target := filepath.Join(mount, "archived_sessions", filepath.Base(route))
+	cliPath := approvedCLIContract(t, storeDir, "1.2.3")
+	writerAttempt := make(chan error, 1)
+	releaseWriter := make(chan struct{})
+	go func() {
+		statePath := filepath.Join(storeDir, "fs", "sessions", "session", "state.json")
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			state, stateErr := vfs.LoadSessionState(statePath)
+			if stateErr == nil {
+				if ackErr := writeMountAcknowledgement(storeDir, "session", state.Generation, "/archived_sessions/"+filepath.Base(route)); ackErr != nil {
+					writerAttempt <- ackErr
+					return
+				}
+				managed, resolver, openErr := openManagedSession(context.Background(), storeDir, state)
+				if openErr != nil {
+					writerAttempt <- openErr
+					return
+				}
+				writer, writerErr := managed.OpenWriter()
+				if err := os.MkdirAll(filepath.Dir(target), 0o700); err == nil {
+					err = os.WriteFile(target, source, 0o600)
+				}
+				writerAttempt <- writerErr
+				if writer != nil {
+					<-releaseWriter
+					_ = writer.Close()
+				}
+				_ = resolver.Close()
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		writerAttempt <- errors.New("managed state was not created")
+	}()
+
+	root := NewRootCommand()
+	root.SetOut(&bytes.Buffer{})
+	root.SetErr(&bytes.Buffer{})
+	root.SetArgs([]string{
+		"fs", "migrate", "session", "--apply", "--canonical-namespace",
+		"--codex-home", home, "--store", storeDir, "--mount", mount, "--native-root", nativeRoot,
+		"--cli", cliPath, "--desktop-app", "none", "--mount-wait", "500ms",
+	})
+	migrateErr := root.Execute()
+	writerErr := <-writerAttempt
+	close(releaseWriter)
+	if migrateErr != nil {
+		t.Fatalf("canonical migration failed: %v", migrateErr)
+	}
+	if !errors.Is(writerErr, vfs.ErrWriterBusy) {
+		t.Fatalf("concurrent writer error = %v, want %v", writerErr, vfs.ErrWriterBusy)
+	}
+	if _, err := managedState(storeDir, "session"); err != nil {
+		t.Fatalf("canonical migration did not retain managed state: %v", err)
+	}
+}
+
 func TestFSRollbackUsesLatestVisibleBytesAfterVirtualAppend(t *testing.T) {
 	allowFixtureMount(t)
 	home, storeDir, nativePath := fsFixture(t, true)

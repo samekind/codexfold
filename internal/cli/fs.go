@@ -565,10 +565,11 @@ func newFSMigrateCommand() *cobra.Command {
 					}
 					return cause
 				}
-				managed, err := vfs.OpenSession(command.Context(), vfs.SessionOptions{Root: store, ManifestPath: fold.ManifestPath(store, session.ID), Manifest: manifest, Reader: resolver, NativeSnapshot: native})
+				managed, migrationLease, err := vfs.OpenSessionWithWriter(command.Context(), vfs.SessionOptions{Root: store, ManifestPath: fold.ManifestPath(store, session.ID), Manifest: manifest, Reader: resolver, NativeSnapshot: native})
 				if err != nil {
 					return rollbackCanonicalMigration(err)
 				}
+				defer migrationLease.Close()
 				if canonicalNamespace {
 					if err := waitForMountAcknowledgement(command.Context(), store, session.ID, managed.State().Generation, canonicalRoute, mountWait); err != nil {
 						return rollbackCanonicalMigration(fmt.Errorf("wait for canonical mount acknowledgement: %w", err))

@@ -17,8 +17,8 @@ exec >"${RUN_ROOT}/run.log" 2>&1
 
 activated=0
 finish() {
-  status=$?
-  if (( status != 0 )); then
+  exit_code=$?
+  if (( exit_code != 0 )); then
     if (( activated == 1 )); then
       "${BIN}" fs service stop --apply || true
       if "${BIN}" fs namespace deactivate --apply \
@@ -32,7 +32,7 @@ finish() {
   if [[ "${REOPEN_APP}" == "1" ]]; then
     open -a /Applications/ChatGPT.app || true
   fi
-  exit "${status}"
+  exit "${exit_code}"
 }
 trap finish EXIT
 
