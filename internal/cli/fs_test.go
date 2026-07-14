@@ -981,6 +981,127 @@ func TestFSRollbackCanonicalRetiresManagedStateAndKeepsRoute(t *testing.T) {
 	}
 }
 
+func TestFSRollbackCanonicalFailureWaitsForManagedRouteRestoration(t *testing.T) {
+	allowFixtureMount(t)
+	home, storeDir, originalPath := fsFixture(t, true)
+	original, err := os.ReadFile(originalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	filename := "rollout-session.jsonl"
+	route := filepath.Join(home, "sessions", "2026", "07", "12", filename)
+	db, err := sql.Open("sqlite", filepath.Join(home, "state_5.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`update threads set rollout_path = ? where id = 'session'`, route); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	_ = db.Close()
+
+	nativeRoot := filepath.Join(home, "fold-native")
+	nativePath := filepath.Join(nativeRoot, "archived_sessions", filename)
+	if err := os.MkdirAll(filepath.Dir(nativePath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(originalPath, nativePath); err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := fold.LoadManifest(storeDir, "session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolver, err := pack.Open(storeDir, pack.OpenOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	native, err := hashPath(nativePath)
+	if err != nil {
+		_ = resolver.Close()
+		t.Fatal(err)
+	}
+	managed, err := vfs.OpenSession(context.Background(), vfs.SessionOptions{
+		Root: storeDir, ManifestPath: fold.ManifestPath(storeDir, "session"), Manifest: manifest,
+		Reader: resolver, NativeSnapshot: native,
+	})
+	if err != nil {
+		_ = resolver.Close()
+		t.Fatal(err)
+	}
+	writer, err := managed.OpenWriter()
+	if err != nil {
+		_ = resolver.Close()
+		t.Fatal(err)
+	}
+	tail := []byte("{\"rollback_failure\":true}\n")
+	if _, err := writer.Append(context.Background(), tail); err != nil {
+		_ = writer.Close()
+		_ = resolver.Close()
+		t.Fatal(err)
+	}
+	_ = writer.Close()
+	_ = resolver.Close()
+	want := append(append([]byte(nil), original...), tail...)
+
+	mount := filepath.Join(home, "fold-fs")
+	mountedTarget := filepath.Join(mount, "sessions", "2026", "07", "12", filename)
+	if err := os.MkdirAll(filepath.Dir(mountedTarget), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(mountedTarget, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stateDirectory := filepath.Join(storeDir, "fs", "sessions", "session")
+	restored := make(chan error, 1)
+	go func() {
+		deadline := time.Now().Add(5 * time.Second)
+		retired := false
+		for time.Now().Before(deadline) {
+			_, statErr := os.Stat(stateDirectory)
+			if !retired && os.IsNotExist(statErr) {
+				retired = true
+				_ = os.Remove(mountedTarget)
+			}
+			if retired && statErr == nil {
+				time.Sleep(50 * time.Millisecond)
+				restored <- os.WriteFile(mountedTarget, want, 0o600)
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		restored <- errors.New("managed state was not restored")
+	}()
+
+	root := NewRootCommand()
+	root.SetOut(&bytes.Buffer{})
+	root.SetErr(&bytes.Buffer{})
+	root.SetArgs([]string{
+		"fs", "rollback", "session", "--apply", "--canonical-namespace",
+		"--codex-home", home, "--store", storeDir, "--mount", mount, "--native-root", nativeRoot,
+		"--mount-wait", "200ms",
+	})
+	err = root.Execute()
+	if err == nil || !strings.Contains(err.Error(), "verify canonical native rollback") {
+		t.Fatalf("rollback error = %v, want canonical verification failure", err)
+	}
+	select {
+	case restoreErr := <-restored:
+		if restoreErr != nil {
+			t.Fatal(restoreErr)
+		}
+	default:
+		t.Fatal("rollback returned before the managed route became readable again")
+	}
+	state, err := managedState(storeDir, "session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Generation != 2 {
+		t.Fatalf("restored generation = %d, want 2", state.Generation)
+	}
+}
+
 func TestFSRollbackCanonicalRetiresHiddenSnapshot(t *testing.T) {
 	allowFixtureMount(t)
 	home, storeDir, originalPath := fsFixture(t, true)

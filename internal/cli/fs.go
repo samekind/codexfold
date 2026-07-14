@@ -729,19 +729,30 @@ func newFSRollbackCommand() *cobra.Command {
 					if err != nil {
 						return err
 					}
-					retiredSnapshot, err := retireCanonicalNativeSnapshot(store, nativeRoot, state.SessionID, state.NativeSnapshot.Path, target.Path, retiredState)
+					mountedTarget, err := canonicalMountRoute(home, mount, current.RolloutPath)
 					if err != nil {
 						_ = restoreManagedState(store, state.SessionID, retiredState)
 						return err
 					}
-					mountedTarget, err := canonicalMountRoute(home, mount, current.RolloutPath)
-					if err == nil {
-						_, err = waitForTargetMatch(command.Context(), mountedTarget, target, mountWait)
+					restoreManagedRoute := func(cause error, retiredSnapshot string) error {
+						var restoreErrors []error
+						if err := restoreCanonicalNativeSnapshot(state.NativeSnapshot.Path, retiredSnapshot); err != nil {
+							restoreErrors = append(restoreErrors, err)
+						}
+						if err := restoreManagedState(store, state.SessionID, retiredState); err != nil {
+							restoreErrors = append(restoreErrors, err)
+						} else if _, err := waitForTargetMatch(command.Context(), mountedTarget, target, mountWait); err != nil {
+							restoreErrors = append(restoreErrors, fmt.Errorf("verify restored managed route: %w", err))
+						}
+						return errors.Join(append([]error{cause}, restoreErrors...)...)
 					}
+					retiredSnapshot, err := retireCanonicalNativeSnapshot(store, nativeRoot, state.SessionID, state.NativeSnapshot.Path, target.Path, retiredState)
 					if err != nil {
-						_ = restoreCanonicalNativeSnapshot(state.NativeSnapshot.Path, retiredSnapshot)
-						_ = restoreManagedState(store, state.SessionID, retiredState)
-						return fmt.Errorf("verify canonical native rollback: %w", err)
+						return restoreManagedRoute(err, "")
+					}
+					_, err = waitForTargetMatch(command.Context(), mountedTarget, target, mountWait)
+					if err != nil {
+						return restoreManagedRoute(fmt.Errorf("verify canonical native rollback: %w", err), retiredSnapshot)
 					}
 					result.RetiredState = retiredState
 				} else {

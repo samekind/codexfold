@@ -53,3 +53,40 @@ func TestLoadSessionStateRejectsStateOutsideManagedSessionDirectory(t *testing.T
 		t.Fatal("LoadSessionState should reject data paths outside the managed session directory")
 	}
 }
+
+func TestRepublishSessionStateAdvancesGeneration(t *testing.T) {
+	root := t.TempDir()
+	directory := filepath.Join(root, "fs", "sessions", "session")
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	statePath := filepath.Join(directory, "state.json")
+	state := SessionState{
+		Version: sessionStateVersion, SessionID: "session", Generation: 7,
+		ManifestPath: filepath.Join(root, "manifest.json"), BaseBytes: 1,
+		BaseSHA256:     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		DeltaPath:      filepath.Join(directory, "delta.jsonl"),
+		NativeSnapshot: NativeFile{Path: filepath.Join(root, "native.jsonl"), Bytes: 1, SHA256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+	}
+	if err := os.WriteFile(state.DeltaPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeSessionState(statePath, state); err != nil {
+		t.Fatal(err)
+	}
+
+	republished, err := RepublishSessionState(statePath)
+	if err != nil {
+		t.Fatalf("RepublishSessionState: %v", err)
+	}
+	if republished.Generation != 8 {
+		t.Fatalf("republished generation = %d, want 8", republished.Generation)
+	}
+	loaded, err := LoadSessionState(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Generation != 8 {
+		t.Fatalf("persisted generation = %d, want 8", loaded.Generation)
+	}
+}

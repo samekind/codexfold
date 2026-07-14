@@ -190,6 +190,46 @@ func TestRealFuseCanonicalNativeToManagedCutover(t *testing.T) {
 	waitForRealUnmount(t, mountPoint)
 }
 
+func TestRealFuseCanonicalManagedRemovalRevealsNative(t *testing.T) {
+	if os.Getenv("CODEXFOLD_RUN_FUSE_TEST") != "1" {
+		t.Skip("set CODEXFOLD_RUN_FUSE_TEST=1 to run the real FUSE-T adapter test")
+	}
+	root := t.TempDir()
+	nativeRoot := filepath.Join(root, "native")
+	route := filepath.Join("sessions", "2026", "07", "14", "rollout-rollback.jsonl")
+	nativePath := filepath.Join(nativeRoot, route)
+	if err := os.MkdirAll(filepath.Dir(nativePath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	managedBytes := []byte("{\"managed\":true}\n")
+	nativeBytes := []byte("{\"native\":true}\n")
+	managed := mountSessionFixture(t, "rollback", managedBytes)
+
+	filesystem := NewCanonical()
+	filesystem.SetNativeRoot(nativeRoot)
+	if err := filesystem.AddSessionAt("rollback", "/"+filepath.ToSlash(route), managed); err != nil {
+		t.Fatal(err)
+	}
+	mountPoint := filepath.Join(root, "mount")
+	if err := os.MkdirAll(mountPoint, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	stopMount := startRealMount(t, mountPoint, filesystem)
+	target := filepath.Join(mountPoint, route)
+	waitForRealFile(t, target, managedBytes)
+
+	if err := os.WriteFile(nativePath, nativeBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := filesystem.RemoveSession("rollback"); err != nil {
+		t.Fatal(err)
+	}
+	waitForRealFileTransition(t, target, nativeBytes)
+
+	stopMount()
+	waitForRealUnmount(t, mountPoint)
+}
+
 func TestRealFuseMountCanonicalManagedRename(t *testing.T) {
 	if os.Getenv("CODEXFOLD_RUN_FUSE_TEST") != "1" {
 		t.Skip("set CODEXFOLD_RUN_FUSE_TEST=1 to run the real FUSE-T adapter test")
@@ -359,6 +399,22 @@ func waitForRealFile(t *testing.T, path string, want []byte) {
 		time.Sleep(100 * time.Millisecond)
 	}
 	t.Fatal("hot-loaded file did not become visible")
+}
+
+func waitForRealFileTransition(t *testing.T, path string, want []byte) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		data, err := os.ReadFile(path)
+		if err == nil && bytes.Equal(data, want) {
+			return
+		}
+		if err != nil && !os.IsNotExist(err) {
+			t.Fatalf("read transitioned file: %v", err)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatal("managed file did not transition to native bytes")
 }
 
 type fuseFixtureReader map[string][]byte

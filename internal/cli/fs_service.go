@@ -417,7 +417,13 @@ func restoreManagedState(store string, sessionID string, retiredPath string) err
 		return errors.New("store, session ID, and retired state path are required")
 	}
 	target := filepath.Join(filepath.Clean(store), "fs", "sessions", sessionID)
-	return os.Rename(filepath.Clean(retiredPath), target)
+	if err := os.Rename(filepath.Clean(retiredPath), target); err != nil {
+		return err
+	}
+	if _, err := vfs.RepublishSessionState(filepath.Join(target, "state.json")); err != nil {
+		return fmt.Errorf("republish restored managed state: %w", err)
+	}
+	return nil
 }
 
 func retainCanonicalSnapshot(store string, sessionID string, source vfs.NativeFile) (vfs.NativeFile, error) {

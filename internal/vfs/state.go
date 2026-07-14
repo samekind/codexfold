@@ -63,6 +63,21 @@ func LoadSessionState(path string) (SessionState, error) {
 	return state, nil
 }
 
+func RepublishSessionState(path string) (SessionState, error) {
+	state, err := LoadSessionState(path)
+	if err != nil {
+		return SessionState{}, err
+	}
+	if state.Generation == ^uint64(0) {
+		return SessionState{}, errors.New("session generation cannot advance")
+	}
+	state.Generation++
+	if err := writeSessionState(path, state); err != nil {
+		return SessionState{}, err
+	}
+	return state, nil
+}
+
 func DiscoverSessionStates(root string) ([]SessionState, error) {
 	directory := filepath.Join(root, "fs", "sessions")
 	entries, err := os.ReadDir(directory)
