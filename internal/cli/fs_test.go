@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -618,12 +619,6 @@ func TestFSMigrateCanonicalKeepsCodexRouteAndHidesRetainedSnapshot(t *testing.T)
 	}
 	mount := filepath.Join(home, "fold-fs")
 	target := filepath.Join(mount, "archived_sessions", filepath.Base(route))
-	if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(target, source, 0o600); err != nil {
-		t.Fatal(err)
-	}
 	cliPath := approvedCLIContract(t, storeDir, "1.2.3")
 	acknowledged := make(chan error, 1)
 	go func() {
@@ -632,7 +627,19 @@ func TestFSMigrateCanonicalKeepsCodexRouteAndHidesRetainedSnapshot(t *testing.T)
 		for time.Now().Before(deadline) {
 			state, err := vfs.LoadSessionState(statePath)
 			if err == nil {
-				acknowledged <- writeMountAcknowledgement(storeDir, "session", state.Generation, "/archived_sessions/"+filepath.Base(route))
+				if err := writeMountAcknowledgement(storeDir, "session", state.Generation, "/archived_sessions/"+filepath.Base(route)); err != nil {
+					acknowledged <- err
+					return
+				}
+				time.Sleep(100 * time.Millisecond)
+				if _, err := os.Stat(nativePath); err != nil {
+					acknowledged <- errors.New("canonical source was hidden before mounted target verification")
+					return
+				}
+				if err := os.MkdirAll(filepath.Dir(target), 0o700); err == nil {
+					err = os.WriteFile(target, source, 0o600)
+				}
+				acknowledged <- err
 				return
 			}
 			time.Sleep(10 * time.Millisecond)
@@ -642,7 +649,7 @@ func TestFSMigrateCanonicalKeepsCodexRouteAndHidesRetainedSnapshot(t *testing.T)
 	executeFS(t, []string{
 		"fs", "migrate", "session", "--apply", "--canonical-namespace",
 		"--codex-home", home, "--store", storeDir, "--mount", mount, "--native-root", nativeRoot,
-		"--cli", cliPath, "--desktop-app", "none",
+		"--cli", cliPath, "--desktop-app", "none", "--mount-wait", "500ms",
 	})
 	if err := <-acknowledged; err != nil {
 		t.Fatal(err)
@@ -714,6 +721,51 @@ func TestFSRollbackUsesLatestVisibleBytesAfterVirtualAppend(t *testing.T) {
 	}
 	if _, err := managedState(storeDir, "session"); err == nil {
 		t.Fatal("rollback left the session managed")
+	}
+}
+
+func TestFSRollbackRejectsActiveWriter(t *testing.T) {
+	home, storeDir, originalPath := fsFixture(t, true)
+	manifest, err := fold.LoadManifest(storeDir, "session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolver, err := pack.Open(storeDir, pack.OpenOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resolver.Close()
+	native, err := hashPath(originalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	managed, err := vfs.OpenSession(context.Background(), vfs.SessionOptions{
+		Root: storeDir, ManifestPath: fold.ManifestPath(storeDir, "session"), Manifest: manifest,
+		Reader: resolver, NativeSnapshot: native,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer, err := managed.OpenWriter()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+
+	root := NewRootCommand()
+	root.SetOut(&bytes.Buffer{})
+	root.SetErr(&bytes.Buffer{})
+	root.SetArgs([]string{"fs", "rollback", "session", "--codex-home", home, "--store", storeDir, "--apply"})
+	err = root.Execute()
+	if err == nil || !strings.Contains(err.Error(), "active writer") {
+		t.Fatalf("rollback error = %v, want active writer rejection", err)
+	}
+	if _, err := managedState(storeDir, "session"); err != nil {
+		t.Fatalf("active-writer rejection retired managed state: %v", err)
+	}
+	sessions, err := codex.LoadSessions(home)
+	if err != nil || len(sessions) != 1 || filepath.Clean(sessions[0].RolloutPath) != filepath.Clean(originalPath) {
+		t.Fatalf("active-writer rejection changed route: sessions=%#v err=%v", sessions, err)
 	}
 }
 

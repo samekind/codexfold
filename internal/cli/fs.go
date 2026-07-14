@@ -581,6 +581,9 @@ func newFSMigrateCommand() *cobra.Command {
 					if err != nil || filepath.Clean(current.RolloutPath) != filepath.Clean(session.RolloutPath) {
 						return rollbackCanonicalMigration(errors.New("canonical Codex route changed during migration"))
 					}
+					if _, err := waitForTargetMatch(command.Context(), target, vfs.NativeFile{Bytes: shadow.Bytes, SHA256: shadow.SHA256}, mountWait); err != nil {
+						return rollbackCanonicalMigration(fmt.Errorf("verify managed target before canonical cutover: %w", err))
+					}
 					if err := finalizeCanonicalSnapshotSource(canonicalSource, native); err != nil {
 						return rollbackCanonicalMigration(err)
 					}
@@ -708,6 +711,14 @@ func newFSRollbackCommand() *cobra.Command {
 					return err
 				}
 				defer resolver.Close()
+				rollbackLease, err := managed.OpenWriter()
+				if errors.Is(err, vfs.ErrWriterBusy) {
+					return errors.New("cannot rollback while the session has an active writer")
+				}
+				if err != nil {
+					return err
+				}
+				defer rollbackLease.Close()
 				target, err := managed.MaterializeCurrent(command.Context(), filepath.Clean(targetPath), true)
 				if err != nil {
 					return err

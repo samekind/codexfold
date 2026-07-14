@@ -94,7 +94,11 @@ snapshot_tree() {
   output="$1"
   (
     cd "${CODEX_HOME}"
-    find -H sessions archived_sessions -type f ! -name '._*' -print0 | sort -z | xargs -0 stat -f '%N\t%z'
+    while IFS= read -r -d '' rollout; do
+      size="$(stat -f '%z' "${rollout}")"
+      digest="$(shasum -a 256 "${rollout}" | awk '{print $1}')"
+      printf '%s\t%s\t%s\n' "${rollout}" "${size}" "${digest}"
+    done < <(find -H sessions archived_sessions -type f ! -name '._*' -print0 | sort -z)
   ) >"${output}"
 }
 

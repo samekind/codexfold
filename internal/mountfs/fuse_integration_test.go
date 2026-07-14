@@ -152,6 +152,44 @@ func TestRealFuseMountNativeFileOperations(t *testing.T) {
 	waitForRealUnmount(t, mountPoint)
 }
 
+func TestRealFuseCanonicalNativeToManagedCutover(t *testing.T) {
+	if os.Getenv("CODEXFOLD_RUN_FUSE_TEST") != "1" {
+		t.Skip("set CODEXFOLD_RUN_FUSE_TEST=1 to run the real FUSE-T adapter test")
+	}
+	root := t.TempDir()
+	nativeRoot := filepath.Join(root, "native")
+	route := filepath.Join("archived_sessions", "rollout-cutover.jsonl")
+	nativePath := filepath.Join(nativeRoot, route)
+	if err := os.MkdirAll(filepath.Dir(nativePath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	source := []byte("{\"cutover\":true}\n")
+	if err := os.WriteFile(nativePath, source, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	filesystem := NewCanonical()
+	filesystem.SetNativeRoot(nativeRoot)
+	mountPoint := filepath.Join(root, "mount")
+	if err := os.MkdirAll(mountPoint, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	stopMount := startRealMount(t, mountPoint, filesystem)
+	target := filepath.Join(mountPoint, route)
+
+	managed := mountSessionFixture(t, "cutover", source)
+	if err := filesystem.UpsertSessionAt("cutover", "/"+filepath.ToSlash(route), managed); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(nativePath); err != nil {
+		t.Fatal(err)
+	}
+	waitForRealFile(t, target, source)
+
+	stopMount()
+	waitForRealUnmount(t, mountPoint)
+}
+
 func TestRealFuseMountCanonicalManagedRename(t *testing.T) {
 	if os.Getenv("CODEXFOLD_RUN_FUSE_TEST") != "1" {
 		t.Skip("set CODEXFOLD_RUN_FUSE_TEST=1 to run the real FUSE-T adapter test")

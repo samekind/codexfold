@@ -4,6 +4,14 @@
 
 The FUSE-T macOS adapter and isolated real Codex CLI and Desktop canaries have passed for read, append, resume, fork, child-session enrollment, canonical archive/unarchive moves, launchd restart, rollback, namespace deactivation, and unknown-version quarantine. The project remains at `fs-engine-preview` because the user Codex home is intentionally not enrolled and sleep or full host restart has not been exercised.
 
+Additional failure-containment evidence on 2026-07-14:
+
+- Exact contracts were imported from real FUSE traces for PATH CLI `0.144.3` and Desktop `26.707.71524+5263`.
+- Canonical migration now verifies the mounted managed target before removing the native directory entry. A clean first migration passed without a retry.
+- A real Desktop canary preserved the exact 79,067-byte, 16-record source prefix, appended an 8,414-byte, 12-record managed delta, and rolled back to their exact 87,481-byte concatenation. A subsequent native Desktop turn appended 5,590 bytes and 9 records. The final 93,071-byte, 37-record JSONL parsed completely and preserved byte order.
+- Rollback now holds an exclusive writer lease across materialization and state retirement. A live FUSE writer and a real Desktop app-server both caused rollback to fail closed; after every writer drained, rollback preserved the exact visible SHA-256 and a new Desktop turn persisted to the native JSONL.
+- The canonical activation gate hashes every rollout before and after namespace activation. File size alone is no longer accepted as full-history evidence.
+
 Additional failure-containment evidence on 2026-07-13:
 
 - The mount backing directory rejects symlinks and any ordinary files before the host starts.

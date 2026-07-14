@@ -6,6 +6,7 @@ script="$repo_root/scripts/activate-canonical-after-codex-exit.sh"
 
 grep -Fq 'find -H sessions archived_sessions' "$script"
 grep -Fq 'find -H "${CODEX_HOME}/sessions" "${CODEX_HOME}/archived_sessions"' "$script"
+grep -Fq 'shasum -a 256 "${rollout}"' "$script"
 grep -Fq 'app_servers_running()' "$script"
 grep -Fq 'real-home Codex app servers did not drain' "$script"
 
