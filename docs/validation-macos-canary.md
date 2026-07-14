@@ -2,10 +2,12 @@
 
 ## Current Status
 
-The FUSE-T macOS adapter and isolated real Codex CLI and Desktop canaries have passed for read, append, resume, fork, child-session enrollment, canonical archive/unarchive moves, launchd restart, rollback, namespace deactivation, and unknown-version quarantine. The project remains at `fs-engine-preview` because the user Codex home is intentionally not enrolled and sleep or full host restart has not been exercised.
+The FUSE-T macOS adapter and isolated real Codex CLI and Desktop canaries have passed for read, append, resume, fork, child-session enrollment, canonical archive/unarchive moves, launchd restart, rollback, namespace deactivation, and unknown-version quarantine. An actual host reboot has now recovered the standalone launchd service and healthy empty mount, but no managed session was present during that reboot. The project remains at `fs-engine-preview` because the user Codex home is intentionally not enrolled, managed-session sleep/wake and full-host restart have not been exercised, the currently installed client versions are not covered by exact contracts, and canary retention has not started.
 
 Additional failure-containment evidence on 2026-07-14:
 
+- After an actual host reboot, launchd started a fresh CodexFold process and the FUSE-T mount identity was healthy. The store contained zero managed session states, ordinary user sessions remained native, and status reported `fs-engine-preview`. This proves service and mount boot recovery only; it does not satisfy managed-session host-restart recovery.
+- The post-reboot `fs doctor` check found daemon, mount, backing, delta, fallback, journal, manifest, pack, and route components healthy. It remained unhealthy overall because the currently installed Codex clients do not yet have exact compatibility contracts.
 - Canonical rollback now uses a two-stage retirement request and acknowledgement. The daemon keeps the managed session loaded while preferring a verified native target, so removing or changing that target falls back to managed bytes instead of creating an `ENOENT` window.
 - A live pending-retirement restart loaded the managed fallback into a fresh daemon, acknowledged the exact generation and route, and preserved the complete SHA-256. Toggling the native target 100 times while opening the mounted route 2,000 times produced zero read failures.
 - A second live restart began with an earlier successful acknowledgement after the native target had disappeared. The fresh daemon replaced it with `native rollback target is unavailable or changed`, remained running, and exposed the complete managed JSONL with the same SHA-256.
@@ -128,7 +130,9 @@ A direct `SIGTERM` stopped the foreground service and removed the mount cleanly.
 
 The following gates are still open:
 
-- Sleep/wake and full host-restart recovery. These disruptive checks were not run against the user's active machine.
+- Managed-session sleep/wake recovery.
+- Managed-session full host-restart recovery, including the append, compaction, migration, and rollback interruption cases required by the product contract. The successful empty-mount host boot above does not satisfy this gate.
+- Exact compatibility contracts for the currently installed Codex Desktop and CLI versions.
 - Retained-source canary routes in the real Codex home.
 - Seven incident-free days after reaching `platform-canary`.
 

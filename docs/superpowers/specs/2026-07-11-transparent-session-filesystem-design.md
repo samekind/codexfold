@@ -17,7 +17,7 @@ Every implementation plan, task, test report, release note, and control-plane st
 | `TF-001` | Opening or resuming a managed session requires no manual materialization or preparation command. |
 | `TF-002` | Unmodified Codex Desktop and Codex CLI access a normal regular-file JSONL path and do not know that storage is virtual. |
 | `TF-003` | Every byte and every file operation Codex actually uses has native-equivalent observable behavior. Platform readiness is blocked by any unsupported operation used by Codex. |
-| `TF-004` | Identical content across sessions and forks is stored once in the shared object store; session histories remain independently writable. |
+| `TF-004` | Identical byte content across sessions and forks is stored once in the shared object store; session histories remain independently writable. Reuse applies to exact repeated fields, records, and content-defined chunks at arbitrary positions and is not limited to a shared file prefix. |
 | `TF-005` | Normal append writes go to a durable delta without complete base materialization. |
 | `TF-006` | Truncate, random write, and every non-append mutation that can be represented safely must transition to copy-on-write before success. A mutating operation used by Codex may not be silently rejected in a production-ready adapter. |
 | `TF-007` | Packed runtime reads do not open loose object files per manifest part and do not perform a persistent-index lookup per object. The concrete durable and runtime index formats are selected by implementation evidence and must satisfy the performance and recovery gates. |
@@ -31,6 +31,11 @@ Every implementation plan, task, test report, release note, and control-plane st
 | `TF-015` | A Codex client version without passing compatibility evidence enters compatibility quarantine: enrollment and destructive automation pause, and an already-routed session is automatically switched to a byte-verified current native writable backing before that client version may write. Routine client upgrades require no manual session preparation. |
 | `TF-016` | Platform filesystem prerequisites requiring elevated or system-extension approval are installed only after explicit user authorization. |
 | `TF-017` | A canonical mount may never degrade into a writable ordinary directory or expose stale session files. The unmounted backing directory is empty and write-sealed, activation requires a live CodexFold mount identity, and service start succeeds only after the daemon and operational mount probe are both healthy. Desktop realpath rewrites from `CODEX_HOME/sessions` or `archived_sessions` into the mount alias are synchronously normalized in the Codex state database, and the route watcher accepts either spelling without exiting. |
+| `TF-018` | Fork-family classification and branch archival are conservative, evidence-driven, and dry-run-first. Fork ancestry, age, size, or title alone never proves that a branch is useless. An archive mutation requires explicit user selection or an explicit policy, revalidates current Codex state and rollout bytes, and preserves a recoverable session. |
+| `TF-019` | Deleting a fully duplicated branch is limited to an archived session whose applicable JSONL record sequence is proven exactly and completely contained in another retained session. Apply additionally requires current-source and temporary-unfold recovery proof, transactional Codex state cleanup, and a retained tombstone and manifest. Similarity and fork ancestry are not deletion evidence. |
+| `TF-020` | Byte-preserving storage optimization never changes rollout bytes. Repair, reconciliation, prompt cleanup, message removal, or any other content-changing operation is a separate explicit workflow that writes a separately verified output and is never run implicitly by fold, migration, compaction, enrollment, GC, or rollback. |
+| `TF-021` | Full-size transaction files, retained native snapshots, writable fallbacks, old pack generations, recovery artifacts, and temporary files are governed by hard preflight and retention budgets. Successful and abandoned temporary artifacts are cleaned automatically. Status and completion reports separate logical bytes, physical store bytes, retained source/fallback bytes, temporary/recovery bytes, projected reclamation, and actual reclaimed bytes; no physical-saving claim is allowed while equivalent full copies still occupy disk. |
+| `TF-022` | CodexFold is a standalone public product. Its public code, CLI, daemon, service definitions, configuration, storage formats, doctor, GC, rollback, and enrollment contain no dependency on or reference to a private control plane. External package managers or operators may install and supervise CodexFold only from outside the product boundary. |
 
 ### Decision Hierarchy
 
@@ -47,7 +52,7 @@ An implementation change is therefore acceptable only when its requirement cover
 ### Drift Control
 
 - Each implementation-plan task lists the requirement IDs it implements or verifies.
-- Each plan starts with a complete requirement-to-task coverage table for `TF-001` through `TF-017`.
+- Each plan starts with a complete requirement-to-task coverage table for `TF-001` through `TF-022`.
 - A requirement with no implementation or verification task blocks plan approval.
 - Completion reports list fresh evidence by requirement ID and state any unmet ID explicitly.
 - Mock, fixture, or synthetic evidence cannot satisfy a requirement that names real Codex, a real platform adapter, a client upgrade, a host restart, or a canary period.
@@ -92,6 +97,11 @@ Passing unit tests, successful materialization, a mounted filesystem, one succes
 - Claiming identical APFS, ext4, or NTFS metadata that Codex does not observe.
 - Migrating real user sessions during engine development.
 - Deleting native fallbacks before canary and rollback gates pass.
+- Treating strict byte-prefix ancestry as the only reusable-content shape.
+- Automatically deciding that a branch is useless from age, title, size, or fork ancestry.
+- Running repair, reconciliation, prompt cleanup, or other content-changing transforms as part of byte-preserving optimization.
+- Claiming physical disk savings from logical deduplication while retained sources, fallbacks, recovery copies, or temporary files still occupy the same bytes.
+- Requiring a private deployment or control-plane product at runtime.
 
 ## Architecture
 
@@ -288,7 +298,7 @@ Platform readiness is independent. Passing macOS gates does not imply Linux or W
 
 The platform-neutral core defines byte layout and transaction behavior, not a lowest-common-denominator filesystem API. Each adapter must implement the strongest native semantics Codex uses on that platform; macOS behavior may not be weakened to match Windows or Linux limitations.
 
-macFUSE, FUSE3, and WinFsp are initial candidates rather than product promises. If native-operation traces or platform gates disqualify a candidate, it must be replaced without weakening `TF-001` through `TF-016`.
+FUSE-T, FUSE3, and WinFsp are current candidates rather than product promises. If native-operation traces or platform gates disqualify a candidate, it must be replaced without weakening `TF-001` through `TF-022`.
 
 ## Migration And Rollback
 
@@ -326,6 +336,43 @@ After platform production readiness, enrollment is policy-driven rather than man
 - No user action is required to enroll, open, resume, fork, compact, or re-enroll a normal session.
 - Enrollment failure leaves the native database route and source file unchanged.
 
+## Branch Cleanup And Content-Change Boundary
+
+Storage sharing, branch archival, exact-contained deletion, and content-changing repair are four separate operations:
+
+1. **Storage sharing** preserves every byte and may reuse exact fields, records, or content-defined chunks found anywhere in any session.
+2. **Branch classification and archival** reports evidence first. It may recommend an archive candidate, but it never mutates from ancestry, age, title, or size alone and never removes recovery ability.
+3. **Exact-contained deletion** applies only to an already archived session after complete direct containment and recovery proof. It is not a side effect of folding, packing, enrollment, compaction, or GC.
+4. **Repair, reconciliation, and prompt cleanup** change content and therefore write a separate verified output. They never replace either source implicitly and never participate in byte-identical savings claims.
+
+## Storage Budget And Reclamation Accounting
+
+Before any operation that can create a full-size session copy or a new store generation, CodexFold calculates its projected peak physical bytes and checks the configured hard budget and required free-space reserve. Automatic enrollment is disabled until this preflight is implemented and passes.
+
+The default retention model is cardinality-bounded:
+
+- A managed session has at most one immutable migration snapshot and at most one current native writable fallback. A current fallback must replace or reuse stale current-fallback state rather than accumulate another full copy.
+- One transaction may create at most one full-session scratch file for the affected session. Named historical copies such as `native-before`, `fold-before`, `merged`, and `repaired` are not implicit recovery generations.
+- Pack publication retains the current generation and only the immediately previous verified generation while a lease or rollback window requires it. Older unleased generations are GC candidates.
+- Startup recovery removes abandoned temporary artifacts only after journal analysis proves that they are not the sole committed or recoverable generation.
+
+Every mutating command reports, before and after apply:
+
+```text
+logical session bytes
+unique object bytes
+pack bytes
+native source bytes
+retained snapshot bytes
+current fallback bytes
+temporary and recovery bytes
+projected peak bytes
+projected reclaimable bytes
+actual reclaimed bytes
+```
+
+Logical duplicate savings and physical disk reclamation are distinct metrics. A fold or migration may report logical reuse while reporting zero actual reclamation when source or fallback copies are still retained.
+
 ## Failure Semantics
 
 - Pack, manifest, delta, backing, and journal commits use temporary files, synchronization, and atomic replacement.
@@ -339,6 +386,8 @@ After platform production readiness, enrollment is policy-driven rather than man
 - A store has one filesystem-host process lock. Service installation and restart return success only after launchd reports a running process and the mount identity is readable.
 - Database and global-state changes use optimistic revalidation and rollback.
 - A session with an active writer is never folded, removed, migrated, or rolled back.
+- A branch is never archived or removed solely from inferred fork ancestry, age, title, or size.
+- Budget preflight failure blocks the mutating operation before any full-size temporary file is created.
 - A detected Codex Desktop or CLI version change immediately enters compatibility quarantine and schedules the native-operation compatibility suite.
 - Quarantine pauses enrollment, migration, compaction that removes fallback state, fallback deletion, and GC.
 - Before an unapproved client version may write an already-routed session, the service automatically switches it to a verified current native writable backing. It never routes the stale migration snapshot as current data.
@@ -446,6 +495,7 @@ Platform adapters translate native filesystem calls only. They do not fork or re
 - Pack and delta files use user-only permissions.
 - Mount access is restricted to the owning user.
 - Management operations require explicit apply flags for migration, rollback, fallback deletion, and GC.
+- Public runtime behavior and configuration have no private control-plane dependency.
 - Crash reports and benchmark output must not include raw rollout data.
 
 ## CLI Contract
