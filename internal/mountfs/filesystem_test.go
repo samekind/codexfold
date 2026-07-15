@@ -122,6 +122,65 @@ func TestFilesystemWriteAtVisibleEOFUsesDeltaWithoutCopyOnWrite(t *testing.T) {
 	}
 }
 
+func TestFilesystemStaleTailOffsetAppendsCompleteJSONLRecord(t *testing.T) {
+	source := []byte("{\"record\":0}\n")
+	session := mountSessionFixture(t, "session", source)
+	filesystem := New()
+	if err := filesystem.AddSession("session", session); err != nil {
+		t.Fatal(err)
+	}
+	handle, errno := filesystem.Open("/session.jsonl", os.O_RDWR)
+	if errno != 0 {
+		t.Fatalf("Open writer errno=%v", errno)
+	}
+	t.Cleanup(func() { _ = filesystem.Release(handle) })
+	first := []byte("{\"record\":1}\n")
+	second := []byte("{\"record\":2}\n")
+	staleEOF := int64(len(source))
+	if n, errno := filesystem.Write(handle, first, staleEOF); errno != 0 || n != len(first) {
+		t.Fatalf("first append = %d errno=%v", n, errno)
+	}
+	if n, errno := filesystem.Write(handle, second, staleEOF); errno != 0 || n != len(second) {
+		t.Fatalf("stale-offset append = %d errno=%v", n, errno)
+	}
+	if state := session.State(); state.BackingPath != "" {
+		t.Fatalf("stale JSONL tail offset created copy-on-write backing %q", state.BackingPath)
+	}
+	want := append(append(append([]byte(nil), source...), first...), second...)
+	current := make([]byte, len(want))
+	if n, errno := filesystem.Read(handle, current, 0); errno != 0 || n != len(want) {
+		t.Fatalf("Read after stale-offset append = %d errno=%v", n, errno)
+	}
+	if !bytes.Equal(current, want) {
+		t.Fatalf("visible bytes differ: got=%q want=%q", current, want)
+	}
+}
+
+func TestFilesystemStaleTailOffsetWithArbitraryBytesUsesCopyOnWrite(t *testing.T) {
+	source := []byte("{\"record\":0}\n")
+	session := mountSessionFixture(t, "session", source)
+	filesystem := New()
+	if err := filesystem.AddSession("session", session); err != nil {
+		t.Fatal(err)
+	}
+	handle, errno := filesystem.Open("/session.jsonl", os.O_RDWR)
+	if errno != 0 {
+		t.Fatalf("Open writer errno=%v", errno)
+	}
+	t.Cleanup(func() { _ = filesystem.Release(handle) })
+	first := []byte("{\"record\":1}\n")
+	staleEOF := int64(len(source))
+	if n, errno := filesystem.Write(handle, first, staleEOF); errno != 0 || n != len(first) {
+		t.Fatalf("first append = %d errno=%v", n, errno)
+	}
+	if n, errno := filesystem.Write(handle, []byte("PATCH"), staleEOF); errno != 0 || n != len("PATCH") {
+		t.Fatalf("random write = %d errno=%v", n, errno)
+	}
+	if state := session.State(); state.BackingPath == "" {
+		t.Fatal("arbitrary stale-offset write did not create copy-on-write backing")
+	}
+}
+
 func TestFilesystemPathTruncateUsesTheActiveWriter(t *testing.T) {
 	filesystem, source := mountFixture(t)
 	handle, errno := filesystem.Open("/session.jsonl", os.O_RDWR)

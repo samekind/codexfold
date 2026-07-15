@@ -55,30 +55,28 @@ app_servers_running() {
   return 1
 }
 
-echo "waiting for Codex Desktop and CLI to exit"
-while codex_running; do
-  sleep 2
-done
-for _ in 1 2 3; do
-  sleep 1
-  if codex_running; then
-    while codex_running; do
-      sleep 2
-    done
-  fi
-done
-drained=0
-for _ in {1..30}; do
-  if ! app_servers_running; then
-    drained=1
-    break
-  fi
-  sleep 1
-done
-if (( drained == 0 )); then
+wait_for_codex_drain() {
+  echo "waiting for Codex Desktop and CLI to exit"
+  while codex_running; do
+    sleep 2
+  done
+  for _ in 1 2 3; do
+    sleep 1
+    if codex_running; then
+      while codex_running; do
+        sleep 2
+      done
+    fi
+  done
+  for _ in {1..30}; do
+    if ! app_servers_running; then
+      return 0
+    fi
+    sleep 1
+  done
   echo "real-home Codex app servers did not drain"
-  exit 1
-fi
+  return 1
+}
 
 service_status="$(${BIN} fs service status --json)"
 jq -e '.daemon_running == true and .mount_healthy == true' <<<"${service_status}" >/dev/null
@@ -90,35 +88,43 @@ managed_count="$(find "${STORE}/fs/sessions" -type f -name state.json 2>/dev/nul
 fold_route_count="$(sqlite3 "${CODEX_HOME}/state_5.sqlite" "select count(*) from threads where rollout_path like '${MOUNT}/%';")"
 [[ "${fold_route_count}" == "0" ]]
 
-snapshot_tree() {
-  output="$1"
+snapshot_native_tree() {
+  local root="$1"
+  local output="$2"
   (
-    cd "${CODEX_HOME}"
-    while IFS= read -r -d '' rollout; do
-      size="$(stat -f '%z' "${rollout}")"
-      digest="$(shasum -a 256 "${rollout}" | awk '{print $1}')"
-      printf '%s\t%s\t%s\n' "${rollout}" "${size}" "${digest}"
-    done < <(find -H sessions archived_sessions -type f ! -name '._*' -print0 | sort -z)
+    cd "${root}"
+    find -H sessions archived_sessions -type f ! -name '._*' \
+      -exec stat -f '%N|%z|%m|%i|%p|%u|%g' {} + | LC_ALL=C sort
   ) >"${output}"
 }
 
 snapshot_critical() {
-  output="$1"
+  local root="$1"
+  local output="$2"
+  local id rollout digest
   : >"${output}"
   [[ -z "${CRITICAL_IDS_FILE}" ]] && return 0
   [[ -f "${CRITICAL_IDS_FILE}" ]]
   while IFS= read -r id || [[ -n "${id}" ]]; do
     [[ -z "${id}" || "${id}" == \#* ]] && continue
     grep -Eq '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' <<<"${id}"
-    rollout="$(find -H "${CODEX_HOME}/sessions" "${CODEX_HOME}/archived_sessions" -type f -name "rollout-*-${id}.jsonl" ! -name '._*' -print -quit)"
+    rollout="$(find -H "${root}/sessions" "${root}/archived_sessions" -type f -name "rollout-*-${id}.jsonl" ! -name '._*' -print -quit)"
     [[ -n "${rollout}" ]]
     digest="$(shasum -a 256 "${rollout}" | awk '{print $1}')"
     printf '%s\t%s\n' "${id}" "${digest}" >>"${output}"
   done <"${CRITICAL_IDS_FILE}"
 }
 
-snapshot_tree "${RUN_ROOT}/tree.before"
-snapshot_critical "${RUN_ROOT}/critical.before"
+while true; do
+  wait_for_codex_drain
+  snapshot_native_tree "${CODEX_HOME}" "${RUN_ROOT}/tree.before"
+  snapshot_critical "${CODEX_HOME}" "${RUN_ROOT}/critical.before"
+  if codex_running || app_servers_running; then
+    echo "Codex restarted during activation preflight; waiting again"
+    continue
+  fi
+  break
+done
 
 "${BIN}" fs namespace activate --apply \
   --codex-home "${CODEX_HOME}" --mount "${MOUNT}" --native-root "${NATIVE_ROOT}" --json \
@@ -130,9 +136,9 @@ activated=1
 trigger_count="$(sqlite3 "${CODEX_HOME}/state_5.sqlite" "select count(*) from sqlite_master where type='trigger' and name like 'codexfold_normalize_rollout_path_%';")"
 [[ "${trigger_count}" == "2" ]]
 
-snapshot_tree "${RUN_ROOT}/tree.after"
-snapshot_critical "${RUN_ROOT}/critical.after"
-diff -u "${RUN_ROOT}/tree.before" "${RUN_ROOT}/tree.after"
+snapshot_native_tree "${NATIVE_ROOT}" "${RUN_ROOT}/tree.native.after"
+snapshot_critical "${NATIVE_ROOT}" "${RUN_ROOT}/critical.after"
+diff -u "${RUN_ROOT}/tree.before" "${RUN_ROOT}/tree.native.after"
 diff -u "${RUN_ROOT}/critical.before" "${RUN_ROOT}/critical.after"
 
 service_status="$(${BIN} fs service status --json)"

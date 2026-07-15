@@ -1,9 +1,11 @@
 package mountfs
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -25,12 +27,15 @@ type Attr struct {
 }
 
 type fileHandle struct {
-	mu      sync.Mutex
-	session *vfs.Session
-	native  *os.File
-	read    *vfs.ReadHandle
-	write   *vfs.WriteHandle
-	append  bool
+	mu           sync.Mutex
+	session      *vfs.Session
+	native       *os.File
+	read         *vfs.ReadHandle
+	write        *vfs.WriteHandle
+	append       bool
+	appendStream bool
+	appendFloor  int64
+	appendOffset int64
 }
 
 type Filesystem struct {
@@ -445,7 +450,22 @@ func (f *Filesystem) Write(handleID uint64, data []byte, offset int64) (int, sys
 		}
 		if offset == info.Size {
 			n, err = handle.write.Append(context.Background(), data)
+			if err == nil {
+				if !handle.appendStream {
+					handle.appendFloor = offset
+				}
+				handle.appendStream = true
+				handle.appendOffset = offset + int64(n)
+			}
+		} else if handle.appendStream &&
+			offset >= handle.appendFloor && offset < handle.appendOffset &&
+			info.Size == handle.appendOffset && completeJSONL(data) {
+			n, err = handle.write.Append(context.Background(), data)
+			if err == nil {
+				handle.appendOffset += int64(n)
+			}
 		} else {
+			handle.appendStream = false
 			n, err = handle.write.WriteAt(context.Background(), data, offset)
 		}
 	}
@@ -476,6 +496,9 @@ func (f *Filesystem) Truncate(handleID uint64, size int64) syscall.Errno {
 	if err := handle.write.Truncate(context.Background(), size); err != nil {
 		return errnoFor(err)
 	}
+	if handle.appendStream && size != handle.appendOffset {
+		handle.appendStream = false
+	}
 	if handle.read != nil {
 		return refreshReader(handle)
 	}
@@ -497,6 +520,9 @@ func (f *Filesystem) TruncatePath(name string, size int64) syscall.Errno {
 		if err := handle.write.Truncate(context.Background(), size); err != nil {
 			return errnoFor(err)
 		}
+		if handle.appendStream && size != handle.appendOffset {
+			handle.appendStream = false
+		}
 		if handle.read != nil {
 			return refreshReader(handle)
 		}
@@ -512,6 +538,20 @@ func (f *Filesystem) TruncatePath(name string, size int64) syscall.Errno {
 		return errnoFor(truncateErr)
 	}
 	return errnoFor(closeErr)
+}
+
+func completeJSONL(data []byte) bool {
+	if len(data) == 0 || data[len(data)-1] != '\n' {
+		return false
+	}
+	for len(data) > 0 {
+		end := bytes.IndexByte(data, '\n')
+		if end <= 0 || !json.Valid(data[:end]) {
+			return false
+		}
+		data = data[end+1:]
+	}
+	return true
 }
 
 func (f *Filesystem) lockActiveWriter(session *vfs.Session) *fileHandle {

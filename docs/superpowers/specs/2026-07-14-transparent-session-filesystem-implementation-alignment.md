@@ -37,21 +37,21 @@ Baseline reviewed: commit `045eea1` on 2026-07-14.
 | --- | --- | --- | --- |
 | `TF-001` | `internal/cli/fs.go`, `internal/mountfs`, canonical migration and routing | Isolated CLI/Desktop direct-open and resume canaries | Partial: verified for isolated macOS canaries; automatic general enrollment is missing |
 | `TF-002` | `internal/mountfs`, `internal/sessionns`, `internal/mountid` | Real FUSE-T operation tests and isolated unmodified clients | Implemented for the validated macOS client versions |
-| `TF-003` | Neutral operation layer plus exact compatibility contracts in `internal/compat` | Real macOS traces and adapter canaries | Partial: current installed clients need fresh contracts; Linux and Windows are not validated |
+| `TF-003` | Neutral operation layer plus exact compatibility contracts in `internal/compat` | Real macOS traces and adapter canaries | Partial: current installed macOS clients are covered; Linux and Windows are not validated |
 | `TF-004` | `internal/scan`, `internal/cdc`, `internal/fold`, `internal/pack` | Repeated field, record, CDC, fork, and non-prefix corpus tests | Implemented |
 | `TF-005` | `internal/vfs` append delta and writer leases | Append-without-hydration tests and real CLI/Desktop append evidence | Implemented |
 | `TF-006` | `internal/vfs` copy-on-write backing and neutral write operations | Random-write, truncate, interruption, and real FUSE-T mutation tests | Implemented |
 | `TF-007` | Immutable packs, in-memory index, bounded cache, random-read resolver | Pack round-trip/corruption tests and 758 MiB packed-read benchmark | Implemented |
-| `TF-008` | `internal/fsctl` benchmark and `internal/testfs` stress harness | `docs/validation-fs-preview.md` | Partial: shared-core gates pass; full real-adapter metrics and other platforms remain open |
-| `TF-009` | Journal recovery, generation recovery, service keep-alive, restart-safe retirement | Recovery tests, daemon restart canaries, actual host boot of service and mount | Partial: no managed-session sleep/wake or full-host restart gate |
+| `TF-008` | `internal/fsctl` benchmark and `internal/testfs` stress harness | `docs/validation-fs-preview.md` and synchronous FUSE-T read/write measurements | Partial: shared-core and measured warm macOS gates pass; cold/full-distribution metrics and other platforms remain open |
+| `TF-009` | Journal recovery, generation recovery, service keep-alive, restart-safe retirement | Recovery tests, daemon restart canaries, managed Deep Idle sleep/wake, and actual retained-source host reboot | Partial: no actual power loss during an in-flight transaction |
 | `TF-010` | Shadow compare, optimistic routes, retained snapshots, current-byte fallback | 90,000 real random-range comparisons, rollback and failure-containment canaries | Implemented for isolated canaries |
 | `TF-011` | Codex state discovery primitives exist in `internal/codex` | Discovery unit tests | Missing: no stability policy, batch planner, or automatic enrollment loop |
 | `TF-012` | Shared Go core and macOS FUSE-T adapter | macOS real adapter tests; Linux and Windows non-CGO compile checks | Partial: Linux and Windows real adapters are missing |
 | `TF-013` | Canonical capability type in `internal/fsctl/status.go` | Status rejection tests and CLI status tests | Implemented; current status is `fs-engine-preview` |
 | `TF-014` | Snapshot retention and destructive-action guards | Migration, rollback, and quarantine tests | Implemented as a safety rule; retention promotion gates remain open |
-| `TF-015` | Exact-version compatibility and update preflight quarantine | Unknown-version fallback and isolated canary tests | Implemented; the currently installed clients are presently uncovered |
+| `TF-015` | Exact-version compatibility and update preflight quarantine | Unknown-version fallback and isolated canary tests | Implemented; the currently installed macOS CLI and Desktop are covered |
 | `TF-016` | Tagged adapter prerequisite errors and non-elevating service lifecycle | Stub, service, and authorization-gated FUSE-T evidence | Implemented |
-| `TF-017` | Canonical namespace, write-sealed backing, mount identity, route normalization, process lock | Neutral, real FUSE-T, launchd, Desktop restart, and rollback tests | Implemented for macOS canaries |
+| `TF-017` | Canonical namespace, write-sealed backing, mount identity, synchronous Darwin mount policy, route normalization, process lock | Neutral, real FUSE-T, launchd, Desktop restart, stale-offset write, and rollback tests | Implemented for macOS canaries |
 | `TF-018` | Canonical archive/unarchive file operations exist, but no conservative family classifier or guarded archive product workflow exists | No qualifying end-to-end tests | Missing |
 | `TF-019` | `internal/contain` and `internal/prune`; public `contains` and `remove-contained` commands | Exact containment, archived-only apply, transaction rollback, and recovery-manifest tests | Implemented |
 | `TF-020` | Exact fold/migrate paths are byte-preserving; `repair-rollout` and `reconcile-rollout` write separate explicit outputs | `internal/reconcile` and repair tests | Partial: add direct CLI boundary and non-invocation regression tests |
@@ -72,7 +72,7 @@ Baseline reviewed: commit `045eea1` on 2026-07-14.
 | Task 8: standalone CLI and automatic enrollment | Partial | Commit `3352b87`; command surface and guarded lifecycle exist | Task 8 Step 5, bounded automatic enrollment, is missing |
 | Task 9: service lifecycle and update guard | Complete | Commit `4589ffa`; launchd and preflight tests pass | Stronger automatic update claims remain release-gated |
 | Task 10: synthetic, crash, performance, and compile gates | Complete for the shared engine | Commit `a1ac76e`; preview validation report | It cannot satisfy real-adapter or retention gates |
-| Task 11: real macOS trace, adapter, shadow, and canary | Partial | Sanitized real CLI/Desktop/FUSE-T evidence is public | Managed-session sleep/wake and host restart, current-client compatibility, real-home canaries, and seven-day retention remain |
+| Task 11: real macOS trace, adapter, shadow, and canary | Partial | Sanitized real CLI/Desktop/FUSE-T evidence, managed sleep/wake, retained-source host reboot, current-client contracts, canonical user-home activation, and a synchronous isolated real CLI canary are public | Dedicated user-home canary retention, actual in-flight power loss, and seven-day retention remain |
 
 ## Missing Product Behavior And Exact Next Work
 
@@ -84,7 +84,7 @@ Baseline reviewed: commit `045eea1` on 2026-07-14.
 | Content-changing boundary regression | Add CLI tests proving repair and reconciliation require a separate output and cannot be invoked by fold, migration, compaction, enrollment, rollback, or GC | Command-tree tests, call-boundary tests, unchanged source hashes, and verified output hashes |
 | Hard disk budgets and bounded retention | Add a storage inventory and preflight budget used by every operation that can create a full copy or generation; enforce one migration snapshot, one current fallback, one transaction scratch file, and bounded old generations | Low-space refusal before write, repeated migration/rollback/enrollment, interrupted cleanup, live lease retention, and no unbounded retired-state growth |
 | Actual physical reclamation reporting | Extend status, doctor, and mutating results with logical, unique, pack, source, snapshot, fallback, temporary/recovery, projected peak, projected reclaimable, and actual reclaimed bytes | Fixture accounting checked against filesystem allocation before and after GC/removal; zero reclaimed bytes while full copies remain |
-| Current macOS compatibility and disruptive gates | Import exact contracts for installed clients; run a retained-source managed canary through sleep/wake and host restart; then start bounded real-home canaries only after automatic enrollment and disk budgets pass | Clean doctor, exact SHA after restart cases, rollback, no route loss, and seven incident-free days |
+| Remaining macOS disruptive and retention gates | Keep the dedicated retained-source user-home canary bounded to one explicitly selected session; perform an actual in-flight power-loss test only in a disposable host or VM; then complete the incident-free retention window | Clean doctor, exact SHA after restart and recovery cases, rollback, no route loss, and seven incident-free days |
 | Linux and Windows readiness | Implement FUSE3 and WinFsp adapters without moving shared behavior out of the core | Native operation traces, crash/restart, performance, upgrade quarantine, rollback, and retention on each platform |
 
 ## Current Capability Decision

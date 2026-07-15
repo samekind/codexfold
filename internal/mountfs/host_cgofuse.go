@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"syscall"
 
 	"github.com/jstar0/codexfold/internal/mountid"
@@ -23,6 +24,7 @@ type fuseFilesystem struct {
 	core          *Filesystem
 	recorder      func(string)
 	mountIdentity []byte
+	mountReady    atomic.Bool
 }
 
 const healthHandle = ^uint64(0) - 1
@@ -32,6 +34,9 @@ func Available() bool { return true }
 func (f *fuseFilesystem) Getattr(name string, stat *fuse.Stat_t, _ uint64) int {
 	f.record("getattr")
 	if cleanPath(name) == "/"+mountid.Path {
+		if !f.mountReady.Load() {
+			return -int(syscall.ENOENT)
+		}
 		stat.Mode = syscall.S_IFREG | 0o400
 		stat.Size = int64(len(f.mountIdentity))
 		stat.Nlink = 1
@@ -118,30 +123,55 @@ func (f *fuseFilesystem) Readdir(name string, fill func(string, *fuse.Stat_t, in
 
 func (f *fuseFilesystem) Open(name string, flags int) (int, uint64) {
 	if cleanPath(name) == "/"+mountid.Path {
+		if !f.mountReady.Load() {
+			return -int(syscall.ENOENT), ^uint64(0)
+		}
 		if flags&fuse.O_ACCMODE != fuse.O_RDONLY {
 			return -int(syscall.EPERM), ^uint64(0)
 		}
 		return 0, healthHandle
 	}
-	handle, errno := f.core.Open(name, translateOpenFlags(flags))
+	translated := translateOpenFlags(flags)
+	handle, errno := f.core.Open(name, translated)
 	if errno != 0 {
 		result := -int(errno)
-		f.recordResult("open", name, result)
+		f.recordOpen("open", name, flags, translated, handle, result)
 		return result, ^uint64(0)
 	}
-	f.recordResult("open", name, 0)
+	f.recordOpen("open", name, flags, translated, handle, 0)
 	return 0, handle
 }
 
 func (f *fuseFilesystem) Create(name string, flags int, _ uint32) (int, uint64) {
-	handle, errno := f.core.Open(name, translateOpenFlags(flags)|os.O_CREATE)
+	translated := translateOpenFlags(flags) | os.O_CREATE
+	handle, errno := f.core.Open(name, translated)
 	if errno != 0 {
 		result := -int(errno)
-		f.recordResult("create", name, result)
+		f.recordOpen("create", name, flags, translated, handle, result)
 		return result, ^uint64(0)
 	}
-	f.recordResult("create", name, 0)
+	f.recordOpen("create", name, flags, translated, handle, 0)
 	return 0, handle
+}
+
+func (f *fuseFilesystem) OpenEx(name string, info *fuse.FileInfo_t) int {
+	result, handle := f.Open(name, info.Flags)
+	if result == 0 {
+		info.Fh = handle
+		info.DirectIo = writableSession(name, info.Flags)
+		f.record(fmt.Sprintf("open_config kind=%s handle=%d direct_io=%t", operationKind(name), handle, info.DirectIo))
+	}
+	return result
+}
+
+func (f *fuseFilesystem) CreateEx(name string, _ uint32, info *fuse.FileInfo_t) int {
+	result, handle := f.Create(name, info.Flags, 0o600)
+	if result == 0 {
+		info.Fh = handle
+		info.DirectIo = writableSession(name, info.Flags)
+		f.record(fmt.Sprintf("create_config kind=%s handle=%d direct_io=%t", operationKind(name), handle, info.DirectIo))
+	}
+	return result
 }
 
 func (f *fuseFilesystem) Read(_ string, destination []byte, offset int64, handle uint64) int {
@@ -159,24 +189,27 @@ func (f *fuseFilesystem) Read(_ string, destination []byte, offset int64, handle
 	return n
 }
 
-func (f *fuseFilesystem) Write(_ string, data []byte, offset int64, handle uint64) int {
-	f.record("write")
+func (f *fuseFilesystem) Write(name string, data []byte, offset int64, handle uint64) int {
 	n, errno := f.core.Write(handle, data, offset)
 	if errno != 0 {
-		return -int(errno)
+		result := -int(errno)
+		f.recordIO("write", name, handle, offset, len(data), result)
+		return result
 	}
+	f.recordIO("write", name, handle, offset, len(data), n)
 	return n
 }
 
 func (f *fuseFilesystem) Truncate(name string, size int64, handle uint64) int {
-	f.record("truncate")
 	var errno syscall.Errno
 	if handle == 0 || handle == ^uint64(0) {
 		errno = f.core.TruncatePath(name, size)
 	} else {
 		errno = f.core.Truncate(handle, size)
 	}
-	return -int(errno)
+	result := -int(errno)
+	f.record(fmt.Sprintf("truncate kind=%s handle=%d size=%d result=%d", operationKind(name), handle, size, result))
+	return result
 }
 
 func (f *fuseFilesystem) Flush(_ string, handle uint64) int {
@@ -419,6 +452,18 @@ func (f *fuseFilesystem) record(operation string) {
 }
 
 func (f *fuseFilesystem) recordResult(operation string, name string, result int) {
+	f.record(fmt.Sprintf("%s kind=%s result=%d", operation, operationKind(name), result))
+}
+
+func (f *fuseFilesystem) recordOpen(operation string, name string, flags int, translated int, handle uint64, result int) {
+	f.record(fmt.Sprintf("%s kind=%s flags=%#x translated=%#x handle=%d result=%d", operation, operationKind(name), flags, translated, handle, result))
+}
+
+func (f *fuseFilesystem) recordIO(operation string, name string, handle uint64, offset int64, bytes int, result int) {
+	f.record(fmt.Sprintf("%s kind=%s handle=%d offset=%d bytes=%d result=%d", operation, operationKind(name), handle, offset, bytes, result))
+}
+
+func operationKind(name string) string {
 	kind := "other"
 	base := filepath.Base(name)
 	if strings.HasPrefix(base, "._") {
@@ -426,7 +471,11 @@ func (f *fuseFilesystem) recordResult(operation string, name string, result int)
 	} else if strings.HasSuffix(base, ".jsonl") {
 		kind = "session"
 	}
-	f.record(fmt.Sprintf("%s kind=%s result=%d", operation, kind, result))
+	return kind
+}
+
+func writableSession(name string, flags int) bool {
+	return operationKind(name) == "session" && flags&fuse.O_ACCMODE != fuse.O_RDONLY
 }
 
 func translateOpenFlags(flags int) int {
@@ -479,13 +528,29 @@ func mountHost(ctx context.Context, options HostOptions) (result error) {
 		case <-done:
 		}
 	}()
+	policyContext, cancelPolicy := context.WithCancel(ctx)
+	policyDone := make(chan error, 1)
+	go func() {
+		err := configureMountedFilesystem(policyContext, options.MountPoint)
+		if err == nil {
+			filesystem.mountReady.Store(true)
+		} else {
+			_ = host.Unmount()
+		}
+		policyDone <- err
+	}()
 	mounted := host.Mount(options.MountPoint, arguments)
+	cancelPolicy()
+	policyErr := <-policyDone
 	close(done)
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	if !mounted {
 		return errors.New("FUSE host exited without mounting")
+	}
+	if policyErr != nil {
+		return fmt.Errorf("configure mounted filesystem: %w", policyErr)
 	}
 	return ctx.Err()
 }

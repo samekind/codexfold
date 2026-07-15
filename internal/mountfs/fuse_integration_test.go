@@ -20,8 +20,64 @@ import (
 	"github.com/jstar0/codexfold/internal/fold"
 	"github.com/jstar0/codexfold/internal/service"
 	"github.com/jstar0/codexfold/internal/vfs"
+	"github.com/winfsp/cgofuse/fuse"
 	"golang.org/x/sys/unix"
 )
+
+func TestOperationTraceRecordsWriteShapeWithoutPath(t *testing.T) {
+	var recorded []string
+	filesystem := &fuseFilesystem{recorder: func(operation string) {
+		recorded = append(recorded, operation)
+	}}
+	privatePath := "/sessions/private-session.jsonl"
+	filesystem.recordOpen("open", privatePath, 0x9, os.O_WRONLY|os.O_APPEND, 17, 0)
+	filesystem.recordIO("write", privatePath, 17, 1234, 89, 89)
+
+	joined := strings.Join(recorded, "\n")
+	for _, field := range []string{
+		"open kind=session flags=0x9 translated=0x9 handle=17 result=0",
+		"write kind=session handle=17 offset=1234 bytes=89 result=89",
+	} {
+		if !strings.Contains(joined, field) {
+			t.Fatalf("operation trace missing %q: %s", field, joined)
+		}
+	}
+	if strings.Contains(joined, privatePath) || strings.Contains(joined, "private-session") {
+		t.Fatalf("operation trace exposed a session path: %s", joined)
+	}
+}
+
+func TestOpenExUsesDirectIOOnlyForWritableSessions(t *testing.T) {
+	source := []byte("{\"record\":0}\n")
+	managed := mountSessionFixture(t, "direct-io", source)
+	core := New()
+	if err := core.AddSession("direct-io", managed); err != nil {
+		t.Fatal(err)
+	}
+	filesystem := &fuseFilesystem{core: core}
+
+	readOnly := fuse.FileInfo_t{Flags: fuse.O_RDONLY}
+	if result := filesystem.OpenEx("/direct-io.jsonl", &readOnly); result != 0 {
+		t.Fatalf("read-only OpenEx result=%d", result)
+	}
+	if readOnly.DirectIo {
+		t.Fatal("read-only session unexpectedly enabled direct I/O")
+	}
+	if errno := core.Release(readOnly.Fh); errno != 0 {
+		t.Fatalf("release read-only handle errno=%v", errno)
+	}
+
+	writable := fuse.FileInfo_t{Flags: fuse.O_RDWR}
+	if result := filesystem.OpenEx("/direct-io.jsonl", &writable); result != 0 {
+		t.Fatalf("writable OpenEx result=%d", result)
+	}
+	if !writable.DirectIo {
+		t.Fatal("writable session did not enable direct I/O")
+	}
+	if errno := core.Release(writable.Fh); errno != 0 {
+		t.Fatalf("release writable handle errno=%v", errno)
+	}
+}
 
 func TestRealFuseMountNativeFileOperations(t *testing.T) {
 	if os.Getenv("CODEXFOLD_RUN_FUSE_TEST") != "1" {
@@ -149,6 +205,78 @@ func TestRealFuseMountNativeFileOperations(t *testing.T) {
 		t.Fatalf("remount read differs: %q err=%v", read, err)
 	}
 	stopRemount()
+	waitForRealUnmount(t, mountPoint)
+}
+
+func TestRealFuseManagedStaleTailOffsetsPreserveJSONL(t *testing.T) {
+	if os.Getenv("CODEXFOLD_RUN_FUSE_TEST") != "1" {
+		t.Skip("set CODEXFOLD_RUN_FUSE_TEST=1 to run the real FUSE-T adapter test")
+	}
+	root := t.TempDir()
+	source := []byte("{\"record\":0}\n")
+	managed := mountSessionFixture(t, "stale-tail", source)
+	filesystem := New()
+	if err := filesystem.AddSession("stale-tail", managed); err != nil {
+		t.Fatal(err)
+	}
+	mountPoint := filepath.Join(root, "mount")
+	if err := os.MkdirAll(mountPoint, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var traceMu sync.Mutex
+	var trace []string
+	options := HostOptions{
+		MountPoint: mountPoint,
+		Filesystem: filesystem,
+		Foreground: true,
+		OperationRecorder: func(operation string) {
+			traceMu.Lock()
+			defer traceMu.Unlock()
+			trace = append(trace, operation)
+		},
+	}
+	stopMount := startRealMountWithOptions(t, options)
+	var mountStat unix.Statfs_t
+	if err := unix.Statfs(mountPoint, &mountStat); err != nil {
+		t.Fatal(err)
+	}
+	if mountStat.Flags&unix.MNT_SYNCHRONOUS == 0 {
+		t.Fatal("real FUSE-T mount was reported healthy before synchronous I/O was enabled")
+	}
+	target := filepath.Join(mountPoint, "stale-tail.jsonl")
+	file, err := os.OpenFile(target, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := []byte("{\"record\":1}\n")
+	second := []byte("{\"record\":2}\n")
+	staleEOF := int64(len(source))
+	if _, err := file.WriteAt(first, staleEOF); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if _, err := file.WriteAt(second, staleEOF); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	want := append(append(append([]byte(nil), source...), first...), second...)
+	got, err := os.ReadFile(target)
+	if err != nil || !bytes.Equal(got, want) {
+		traceMu.Lock()
+		defer traceMu.Unlock()
+		t.Fatalf("stale-tail visible bytes differ: got=%q want=%q err=%v trace=%q", got, want, err, trace)
+	}
+	if state := managed.State(); state.BackingPath != "" {
+		t.Fatalf("stale-tail writes created backing %q", state.BackingPath)
+	}
+	stopMount()
 	waitForRealUnmount(t, mountPoint)
 }
 
