@@ -44,7 +44,7 @@ Baseline reviewed: commit `045eea1` on 2026-07-14.
 | `TF-007` | Immutable packs, in-memory index, bounded cache, random-read resolver | Pack round-trip/corruption tests and 758 MiB packed-read benchmark | Implemented |
 | `TF-008` | `internal/fsctl` benchmark and `internal/testfs` stress harness | `docs/validation-fs-preview.md` and synchronous FUSE-T read/write measurements | Partial: shared-core and measured warm macOS gates pass; cold/full-distribution metrics and other platforms remain open |
 | `TF-009` | Journal recovery, generation recovery, service keep-alive, restart-safe retirement | Recovery tests, daemon restart canaries, managed Deep Idle sleep/wake, and actual retained-source host reboot | Partial: no actual power loss during an in-flight transaction |
-| `TF-010` | Shadow compare, optimistic routes, retained snapshots, current-byte fallback | 90,000 real random-range comparisons, rollback and failure-containment canaries | Implemented for isolated canaries |
+| `TF-010` | Shadow compare, optimistic routes, retained snapshots, current-byte fallback | 90,000 real random-range comparisons, rollback and failure-containment canaries, and one bounded retained-source user-home canary | Implemented for macOS canaries; retention remains open |
 | `TF-011` | Codex state discovery primitives exist in `internal/codex` | Discovery unit tests | Missing: no stability policy, batch planner, or automatic enrollment loop |
 | `TF-012` | Shared Go core and macOS FUSE-T adapter | macOS real adapter tests; Linux and Windows non-CGO compile checks | Partial: Linux and Windows real adapters are missing |
 | `TF-013` | Canonical capability type in `internal/fsctl/status.go` | Status rejection tests and CLI status tests | Implemented; current status is `fs-engine-preview` |
@@ -72,7 +72,7 @@ Baseline reviewed: commit `045eea1` on 2026-07-14.
 | Task 8: standalone CLI and automatic enrollment | Partial | Commit `3352b87`; command surface and guarded lifecycle exist | Task 8 Step 5, bounded automatic enrollment, is missing |
 | Task 9: service lifecycle and update guard | Complete | Commit `4589ffa`; launchd and preflight tests pass | Stronger automatic update claims remain release-gated |
 | Task 10: synthetic, crash, performance, and compile gates | Complete for the shared engine | Commit `a1ac76e`; preview validation report | It cannot satisfy real-adapter or retention gates |
-| Task 11: real macOS trace, adapter, shadow, and canary | Partial | Sanitized real CLI/Desktop/FUSE-T evidence, managed sleep/wake, retained-source host reboot, current-client contracts, canonical user-home activation, and a synchronous isolated real CLI canary are public | Dedicated user-home canary retention, actual in-flight power loss, and seven-day retention remain |
+| Task 11: real macOS trace, adapter, shadow, and canary | Partial | Sanitized real CLI/Desktop/FUSE-T evidence, managed sleep/wake, retained-source host reboot, current-client contracts, canonical user-home activation, and synchronous isolated plus bounded user-home real CLI canaries are public | Dedicated user-home canary retention, actual in-flight power loss, and seven-day retention remain |
 
 ## Missing Product Behavior And Exact Next Work
 

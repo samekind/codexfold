@@ -2,7 +2,7 @@
 
 ## Current Status
 
-The FUSE-T macOS adapter and isolated real Codex CLI and Desktop canaries have passed for read, append, resume, fork, child-session enrollment, canonical archive/unarchive moves, launchd restart, rollback, namespace deactivation, and unknown-version quarantine. A retained-source CLI canary survived an actual host reboot while managed, then resumed through the recovered mount and rolled back to an exact native JSONL. The currently installed CLI and Desktop versions also passed exact compatibility and isolated retained-source canaries. Process-level interruption recovery now covers append, compaction, migration, and rollback, and a managed session passed an actual Deep Idle sleep/wake cycle followed by a real model turn. The user Codex home now uses the canonical namespace with ordinary sessions remaining native passthrough and zero managed sessions at activation. The project remains at `fs-engine-preview` because its dedicated retained-source user-home canary has not completed retention, in-flight transaction evidence does not claim an actual power-loss test, and the seven-day incident-free gate has not started.
+The FUSE-T macOS adapter and isolated real Codex CLI and Desktop canaries have passed for read, append, resume, fork, child-session enrollment, canonical archive/unarchive moves, launchd restart, rollback, namespace deactivation, and unknown-version quarantine. A retained-source CLI canary survived an actual host reboot while managed, then resumed through the recovered mount and rolled back to an exact native JSONL. The currently installed CLI and Desktop versions also passed exact compatibility and isolated retained-source canaries. Process-level interruption recovery now covers append, compaction, migration, and rollback, and a managed session passed an actual Deep Idle sleep/wake cycle followed by a real model turn. The user Codex home now uses the canonical namespace with ordinary sessions remaining native passthrough and one explicitly selected retained-source canary managed for observation. The project remains at `fs-engine-preview` because that canary has not completed retention, in-flight transaction evidence does not claim an actual power-loss test, and the seven-day incident-free gate has not completed.
 
 Additional synchronous-write and canonical-activation evidence on 2026-07-16:
 
@@ -13,6 +13,7 @@ Additional synchronous-write and canonical-activation evidence on 2026-07-16:
 - Updating only the mounted localhost NFS volume with `mount -u -o sync` made the previously deterministic stale-offset regression pass. The Darwin adapter now withholds its health identity until that update succeeds and `MNT_SYNCHRONOUS` is visible through `statfs`; a failure unmounts the host instead of advertising readiness. No global NFS configuration, patched FUSE-T binary, privileged helper, or system-wide mount change is used.
 - A 64 MiB mounted read measured 7,045 MiB/s versus 7,435 MiB/s from the native APFS file, or 95% of native throughput. Across 200 JSONL append-plus-`fsync` operations, the synchronous mount averaged 3.99 ms with a 5.03 ms p95, versus 3.84 ms and 5.26 ms natively.
 - A fresh isolated real CLI canary used the official unarchive flow and then resumed through the synchronous canonical mount. The complete view grew from 97,388 to 120,859 bytes and 33 valid JSONL records. The complete original prefix retained SHA-256 `4cd4bcc1807d875b70e04b3028441f330f9c7ee0cd41cbcff08c18c9ec44d416`, the 23,471-byte delta parsed independently, the expected historical and new markers were recalled, generation remained 1, and no writable backing appeared.
+- The same dedicated canary was then enrolled in the canonical user home while every ordinary rollout remained native passthrough. A real current CLI unarchive and resume produced a 120,864-byte, 33-record valid JSONL with the same exact 97,388-byte prefix SHA-256, a separately valid 23,476-byte delta, generation 1, and no writable backing. The model recalled the historical marker and emitted the new acceptance marker. Official archive moved the managed route back to `archived_sessions`; exactly one managed session remains, the mounted volume reports synchronous I/O, and the complete filesystem doctor is healthy.
 - Default, FUSE-tagged, race, vet, shell, cross-platform compile, and complete real FUSE-T suites passed after the fix. The real FUSE-T suite explicitly requires synchronous mount readiness before exercising the stale-offset regression.
 
 Additional current-client, interruption, and sleep/wake evidence on 2026-07-15:
@@ -164,7 +165,7 @@ A direct `SIGTERM` stopped the foreground service and removed the mount cleanly.
 
 The following gates are still open:
 
-- Retained-source canary routes in the real Codex home.
+- Completion of the dedicated retained-source user-home canary retention window.
 - An actual power-loss or host-restart interruption while a transaction is in flight; simultaneous process termination and a separate idle managed-session host reboot have passed, but they are recorded as distinct evidence.
 - Seven incident-free days after reaching `platform-canary`.
 
