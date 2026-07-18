@@ -270,13 +270,13 @@ The trace suite covers listing, opening, scrolling old history, resume, sending 
 
 ### macOS
 
-- Selected production adapter: FUSE-T `1.2.7` with the NFS backend explicitly requested as `backend=nfs`; relying on FUSE-T's default backend is not allowed.
-- Service: user launch service with keep-alive and mount health monitoring.
+- Selected production candidate: an Apple-native Swift FSKit extension using versioned binary Unix-domain-socket IPC to the Go CodexFold daemon.
+- Service: two user launch services, one for the Host/Go daemon chain and one for mount supervision, with child-process lock ownership, build identity, mount health, and atomic app/binary rollback checks.
 - Required tests: APFS native baseline, Apple Silicon, Codex Desktop, Codex CLI, canonical `sessions` and `archived_sessions` namespace moves, sleep/wake, network changes, user logout/login, daemon kill, mount restart, and Codex upgrade.
-- FUSE-T is the validated userspace host for this project; macFUSE is not a prerequisite for the current macOS route.
-- The FUSE-T NFS mount must use synchronous write requests before its health identity becomes readable. This is verified through the live `MNT_SYNCHRONOUS` mount flag and a real same-offset JSONL write regression; libfuse `direct_io` or disabled attribute caching alone is not accepted as evidence.
+- The Swift extension exposes regular JSONL paths and filesystem metadata while the Go daemon owns packed reads, append delta, copy-on-write backing, generation recovery, and canonical routing. The production implementation may not depend on NFS or a third-party FUSE compatibility layer.
+- FUSE-T `1.2.7` with synchronous NFS remains historical canary evidence and a development-only fallback. It is not the terminal macOS architecture and cannot satisfy native FSKit production readiness on its own.
 - FUSE-T `1.2.7`'s FSKit backend is rejected for production. An isolated real mount lost the first of two complete JSONL records written at the same stale EOF, and managed-to-native route changes remained cached past the five-second correctness gate. Basic read/write, `F_FULLFSYNC`, truncate, remount, and throughput results do not override a byte-loss failure. FUSE-T also documents that notifications are unavailable for its FSKit backend.
-- Native FSKit remains a research adapter rather than a fallback selected at runtime. The earlier probes did not provide a complete canonical namespace and did not recover automatically from every extension-process failure; no native FSKit route may replace the selected NFS backend without passing the complete platform contract independently.
+- The Apple-native FSKit implementation is distinct from FUSE-T's rejected FSKit backend. It remains `fs-engine-preview` until its complete performance, cache coherency, real-client, crash, upgrade, rollback, retention, and power-loss gates pass independently.
 - Platform readiness requires a directory-level canonical namespace or an equivalent mechanism that keeps Codex archive and unarchive moves native-compatible.
 
 ### Linux
@@ -301,7 +301,7 @@ Platform readiness is independent. Passing macOS gates does not imply Linux or W
 
 The platform-neutral core defines byte layout and transaction behavior, not a lowest-common-denominator filesystem API. Each adapter must implement the strongest native semantics Codex uses on that platform; macOS behavior may not be weakened to match Windows or Linux limitations.
 
-FUSE-T, FUSE3, and WinFsp are current candidates rather than product promises. If native-operation traces or platform gates disqualify a candidate, it must be replaced without weakening `TF-001` through `TF-022`.
+Apple-native FSKit, FUSE3, and WinFsp are current candidates rather than product promises. If native-operation traces or platform gates disqualify a candidate, it must be replaced without weakening `TF-001` through `TF-022`.
 
 ## Migration And Rollback
 

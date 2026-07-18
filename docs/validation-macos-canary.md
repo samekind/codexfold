@@ -1,6 +1,14 @@
 # macOS Adapter And Canary Validation
 
-## Current Status
+## Native FSKit Development Checkpoint
+
+As of 2026-07-18, the terminal macOS candidate is the Apple-native Swift FSKit extension connected over versioned binary UDS IPC to the Go daemon. Isolated mounted metadata, xattr, append, random-write, truncate, namespace, archive, mmap, open-unlink, and external namespace tests pass. Host/Go-child and supervisor crash recovery, build-identity checks, environment sanitization, and atomic app/definition/binary rollback also pass. A 758 MiB packed-core benchmark remains well above the filesystem target with bounded RSS.
+
+The current open gate is the native adapter path: cold reads exposed excessive 8 KiB FSKit/UDS round trips, and a bounded 1 MiB read-ahead implementation has been compiled but still requires installed-candidate performance and cache-coherency acceptance. Full isolated real Codex CLI/Desktop resume, fork, archive, restart, and exact JSONL verification must follow. Production activation and real-home migration remain disabled.
+
+The FUSE-T evidence below is retained as historical compatibility and regression evidence. It is not the terminal architecture and must not be used to claim Apple-native FSKit readiness.
+
+## Historical FUSE-T Status
 
 The FUSE-T macOS adapter and isolated real Codex CLI and Desktop canaries have passed for read, append, resume, fork, child-session enrollment, canonical archive/unarchive moves, launchd restart, rollback, namespace deactivation, and unknown-version quarantine. A retained-source CLI canary survived an actual host reboot while managed, then resumed through the recovered mount and rolled back to an exact native JSONL. The currently installed CLI and Desktop versions also passed exact compatibility and isolated retained-source canaries. Process-level interruption recovery now covers append, compaction, migration, and rollback, and a managed session passed an actual Deep Idle sleep/wake cycle followed by a real model turn. The user Codex home now uses the canonical namespace with ordinary sessions remaining native passthrough and one explicitly selected retained-source canary managed for observation. The project remains at `fs-engine-preview` because that canary has not completed retention, in-flight transaction evidence does not claim an actual power-loss test, and the seven-day incident-free gate has not completed.
 

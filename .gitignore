@@ -1,4 +1,5 @@
 /codexfold
+/codexfold.exe
 /*.sqlite
 /*.sqlite-shm
 /*.sqlite-wal

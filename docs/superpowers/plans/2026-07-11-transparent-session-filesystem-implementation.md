@@ -6,7 +6,9 @@
 
 **Architecture:** Extend Fold V1 with a block-addressable packed resolver, then place a platform-neutral exact-byte session engine above it. The engine composes an immutable manifest base with an append delta or verified writable backing; platform adapters only translate native file operations. Migration, compatibility quarantine, fallback, and promotion remain explicit journaled transactions, with real Codex routing disabled until shadow and platform gates pass.
 
-**Tech Stack:** Go 1.26, zstd, Cobra, modernc SQLite, `cgofuse` v1.6.0 behind platform/build tags, FUSE-T 1.2.7 on macOS, FUSE3 on Linux, and WinFsp plus Windows SCM on Windows.
+**Tech Stack:** Go 1.26, zstd, Cobra, modernc SQLite, an Apple-native Swift FSKit extension with versioned UDS IPC on macOS, FUSE3 on Linux, and WinFsp plus Windows SCM on Windows. FUSE-T remains historical validation evidence and a development fallback, not the terminal macOS architecture.
+
+> Architecture update, 2026-07-18: the terminal macOS route is the Apple-native Swift FSKit extension -> versioned binary UDS -> Go daemon. Earlier FUSE-T task evidence remains useful regression history but does not authorize reverting the product architecture or claiming native FSKit readiness.
 
 ## Alignment Snapshot
 

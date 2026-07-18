@@ -14,10 +14,11 @@ The requirements and release gates for normal JSONL paths backed transparently b
 
 The unreleased transparent-filesystem branch remains `fs-engine-preview`:
 
-- macOS uses the explicitly selected synchronous FUSE-T NFS backend and has real Codex CLI/Desktop canary evidence. FUSE-T's FSKit backend was tested and rejected after a deterministic same-offset JSONL byte-loss failure.
+- macOS now targets an Apple-native Swift FSKit extension connected over a versioned Unix-domain-socket protocol to the Go CodexFold daemon. Isolated mounted behavior, service crash recovery, and atomic app/binary rollback gates pass; read-ahead performance/coherency and full real Codex CLI/Desktop product acceptance remain open.
+- The earlier synchronous FUSE-T NFS route remains historical validation evidence and a development fallback only. FUSE-T's third-party FSKit backend remains rejected after deterministic byte-loss and cache-invalidation failures; it is not the Apple-native FSKit implementation in this repository.
 - Linux FUSE3 has real unprivileged read, append, copy-on-write, truncate, archive rename, crash recovery, remount, performance, and `systemd --user` lifecycle evidence.
 - Windows has a WinFsp adapter and native Windows Service host that cross-compile, but no real Windows/WinFsp host has validated them yet.
-- Retention, actual in-flight power loss, and the remaining platform-specific client and upgrade gates still block promotion.
+- The production service and production Codex home remain disabled. Native FSKit performance/coherency, real CLI/Desktop acceptance, retention, actual in-flight power loss, and the remaining platform-specific client and upgrade gates still block promotion.
 
 See [the Linux FUSE3 validation](docs/validation-linux-fuse3.md) and [the macOS canary validation](docs/validation-macos-canary.md) for the evidence boundary. The default build remains storage-only; platform mounts require explicit build tags and installed host prerequisites.
 
@@ -148,4 +149,4 @@ go vet ./...
 go build ./cmd/codexfold
 ```
 
-See [the architecture](docs/design.md), [Fold V1 format](docs/fold-v1.md), [v0.2 validation](docs/validation-v0.2.md), and [the transparent filesystem product contract](docs/superpowers/specs/2026-07-11-transparent-session-filesystem-design.md).
+See [the architecture](docs/design.md), [Fold V1 format](docs/fold-v1.md), [v0.2 validation](docs/validation-v0.2.md), [the transparent filesystem product contract](docs/superpowers/specs/2026-07-11-transparent-session-filesystem-design.md), and [the maintainer guide](docs/maintainer-guide.md).
