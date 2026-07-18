@@ -23,6 +23,8 @@ func NewRootCommand() *cobra.Command {
 		Version:       resolvedVersion(),
 	}
 	root.AddCommand(newScanCommand())
+	root.AddCommand(newForkFamilyCommand())
+	root.AddCommand(newArchiveCommand())
 	root.AddCommand(newContainsCommand())
 	root.AddCommand(newRemoveContainedCommand())
 	root.AddCommand(newFoldCommand())

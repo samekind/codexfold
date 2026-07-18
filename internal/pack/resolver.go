@@ -15,6 +15,7 @@ import (
 	"sync"
 
 	"github.com/jstar0/codexfold/internal/fold"
+	"github.com/jstar0/codexfold/internal/storage"
 	"github.com/klauspost/compress/zstd"
 )
 
@@ -29,6 +30,7 @@ type Resolver struct {
 	objects              map[string]Object
 	packs                map[string]*os.File
 	cache                *blockCache
+	lease                *storage.Lease
 	bypassOSCacheApplied bool
 	closeOnce            sync.Once
 }
@@ -49,6 +51,16 @@ func Open(storeDir string, options OpenOptions) (*Resolver, error) {
 }
 
 func openGeneration(directory string, cacheBytes int64, bypassOSCache bool) (*Resolver, error) {
+	lease, err := storage.AcquireLease(filepath.Join(directory, "leases"), "resolver")
+	if err != nil {
+		return nil, fmt.Errorf("acquire pack generation lease: %w", err)
+	}
+	keepLease := false
+	defer func() {
+		if !keepLease {
+			_ = lease.Close()
+		}
+	}()
 	data, err := os.ReadFile(filepath.Join(directory, "index.json"))
 	if err != nil {
 		return nil, fmt.Errorf("read pack index: %w", err)
@@ -64,7 +76,7 @@ func openGeneration(directory string, cacheBytes int64, bypassOSCache bool) (*Re
 	if err := validateIndex(index); err != nil {
 		return nil, err
 	}
-	resolver := &Resolver{directory: directory, index: index, objects: make(map[string]Object, len(index.Objects)), packs: make(map[string]*os.File), cache: newBlockCache(cacheBytes)}
+	resolver := &Resolver{directory: directory, index: index, objects: make(map[string]Object, len(index.Objects)), packs: make(map[string]*os.File), cache: newBlockCache(cacheBytes), lease: lease}
 	for _, object := range index.Objects {
 		resolver.objects[object.SHA256] = object
 		for _, block := range object.Blocks {
@@ -101,6 +113,7 @@ func openGeneration(directory string, cacheBytes int64, bypassOSCache bool) (*Re
 			}
 		}
 	}
+	keepLease = true
 	return resolver, nil
 }
 
@@ -196,6 +209,9 @@ func (r *Resolver) Close() error {
 			if err := r.packs[name].Close(); err != nil && closeErr == nil {
 				closeErr = err
 			}
+		}
+		if err := r.lease.Close(); err != nil {
+			closeErr = errors.Join(closeErr, err)
 		}
 	})
 	return closeErr

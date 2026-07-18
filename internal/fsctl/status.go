@@ -3,6 +3,8 @@ package fsctl
 import (
 	"fmt"
 	"strings"
+
+	"github.com/jstar0/codexfold/internal/storage"
 )
 
 type Capability string
@@ -15,8 +17,11 @@ const (
 )
 
 type Status struct {
-	Capability Capability `json:"capability"`
-	Platform   string     `json:"platform"`
+	Capability     Capability        `json:"capability"`
+	Platform       string            `json:"platform"`
+	Storage        storage.Inventory `json:"storage"`
+	StorageLimits  storage.Limits    `json:"storage_limits"`
+	AvailableBytes int64             `json:"available_bytes"`
 }
 
 func NewStatus(capability Capability, platform string) (Status, error) {

@@ -7,6 +7,8 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+
+	"github.com/jstar0/codexfold/internal/storage"
 )
 
 type DoctorIssue struct {
@@ -16,13 +18,16 @@ type DoctorIssue struct {
 }
 
 type DoctorResult struct {
-	StoreDir              string        `json:"store_dir"`
-	ManifestCount         int           `json:"manifest_count"`
-	VerifiedManifestCount int           `json:"verified_manifest_count"`
-	ObjectReferenceCount  int           `json:"object_reference_count"`
-	UniqueObjectCount     int           `json:"unique_object_count"`
-	IssueCount            int           `json:"issue_count"`
-	Issues                []DoctorIssue `json:"issues"`
+	StoreDir              string            `json:"store_dir"`
+	ManifestCount         int               `json:"manifest_count"`
+	VerifiedManifestCount int               `json:"verified_manifest_count"`
+	ObjectReferenceCount  int               `json:"object_reference_count"`
+	UniqueObjectCount     int               `json:"unique_object_count"`
+	IssueCount            int               `json:"issue_count"`
+	Issues                []DoctorIssue     `json:"issues"`
+	Storage               storage.Inventory `json:"storage"`
+	StorageLimits         storage.Limits    `json:"storage_limits"`
+	AvailableBytes        int64             `json:"available_bytes"`
 }
 
 type loadedManifest struct {
@@ -67,6 +72,22 @@ func Doctor(ctx context.Context, storeDir string) (DoctorResult, error) {
 				Scope: "object", Path: store.ObjectPath(digest), Error: err.Error(),
 			})
 		}
+	}
+	result.Storage, err = storage.Scan(ctx, storage.Options{StoreDir: storeDir, AllowMetadataIssues: true})
+	if err != nil {
+		result.Issues = append(result.Issues, DoctorIssue{Scope: "storage", Path: storeDir, Error: err.Error()})
+	} else {
+		for _, issue := range result.Storage.Issues {
+			result.Issues = append(result.Issues, DoctorIssue{Scope: "storage", Path: storeDir, Error: issue})
+		}
+	}
+	result.StorageLimits, err = storage.LoadLimits(storeDir)
+	if err != nil {
+		result.Issues = append(result.Issues, DoctorIssue{Scope: "storage-policy", Path: filepath.Join(storeDir, storage.PolicyFilename), Error: err.Error()})
+	}
+	result.AvailableBytes, err = storage.AvailableBytes(storeDir)
+	if err != nil {
+		result.Issues = append(result.Issues, DoctorIssue{Scope: "storage-space", Path: storeDir, Error: err.Error()})
 	}
 	result.IssueCount = len(result.Issues)
 	return result, nil

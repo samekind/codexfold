@@ -8,9 +8,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -32,11 +34,15 @@ func TestOperationTraceRecordsWriteShapeWithoutPath(t *testing.T) {
 	privatePath := "/sessions/private-session.jsonl"
 	filesystem.recordOpen("open", privatePath, 0x9, os.O_WRONLY|os.O_APPEND, 17, 0)
 	filesystem.recordIO("write", privatePath, 17, 1234, 89, 89)
+	filesystem.recordIO("read", privatePath, 17, 1200, 64, 64)
+	filesystem.recordHandleResult("flush", privatePath, 17, 0)
 
 	joined := strings.Join(recorded, "\n")
 	for _, field := range []string{
 		"open kind=session flags=0x9 translated=0x9 handle=17 result=0",
 		"write kind=session handle=17 offset=1234 bytes=89 result=89",
+		"read kind=session handle=17 offset=1200 bytes=64 result=64",
+		"flush kind=session handle=17 result=0",
 	} {
 		if !strings.Contains(joined, field) {
 			t.Fatalf("operation trace missing %q: %s", field, joined)
@@ -79,9 +85,20 @@ func TestOpenExUsesDirectIOOnlyForWritableSessions(t *testing.T) {
 	}
 }
 
+func TestFuseStatfsFallsBackToMountParentWithoutNativeRoot(t *testing.T) {
+	filesystem := &fuseFilesystem{core: New(), statRoot: t.TempDir()}
+	var stat fuse.Statfs_t
+	if result := filesystem.Statfs("/", &stat); result != 0 {
+		t.Fatalf("Statfs result=%d", result)
+	}
+	if stat.Bsize == 0 || stat.Blocks == 0 {
+		t.Fatalf("Statfs returned no backing capacity: %#v", stat)
+	}
+}
+
 func TestRealFuseMountNativeFileOperations(t *testing.T) {
 	if os.Getenv("CODEXFOLD_RUN_FUSE_TEST") != "1" {
-		t.Skip("set CODEXFOLD_RUN_FUSE_TEST=1 to run the real macFUSE adapter test")
+		t.Skip("set CODEXFOLD_RUN_FUSE_TEST=1 to run the real FUSE-T adapter test")
 	}
 	root := t.TempDir()
 	source := []byte("first\nsecond\nthird\n")
@@ -155,6 +172,10 @@ func TestRealFuseMountNativeFileOperations(t *testing.T) {
 		_ = appendFile.Close()
 		t.Fatal(err)
 	}
+	if _, err := unix.FcntlInt(appendFile.Fd(), unix.F_FULLFSYNC, 0); err != nil {
+		_ = appendFile.Close()
+		t.Fatalf("F_FULLFSYNC: %v", err)
+	}
 	if err := appendFile.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -206,6 +227,105 @@ func TestRealFuseMountNativeFileOperations(t *testing.T) {
 	}
 	stopRemount()
 	waitForRealUnmount(t, mountPoint)
+}
+
+func TestRealFuseTReadAndFsyncPerformance(t *testing.T) {
+	if os.Getenv("CODEXFOLD_RUN_FUSE_TEST") != "1" {
+		t.Skip("set CODEXFOLD_RUN_FUSE_TEST=1 to run the real FUSE-T adapter test")
+	}
+	root := t.TempDir()
+	line := []byte("{\"payload\":\"0123456789abcdef0123456789abcdef0123456789abcdef\"}\n")
+	source := bytes.Repeat(line, (32<<20)/len(line)+1)
+	source = source[:32<<20]
+	nativeReadPath := filepath.Join(root, "native-read.jsonl")
+	if err := os.WriteFile(nativeReadPath, source, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	managed := mountSessionFixture(t, "darwin-performance", source)
+	filesystem := New()
+	if err := filesystem.AddSession("darwin-performance", managed); err != nil {
+		t.Fatal(err)
+	}
+	mountPoint := filepath.Join(root, "mount")
+	if err := os.MkdirAll(mountPoint, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	stopMount := startRealMount(t, mountPoint, filesystem)
+	target := filepath.Join(mountPoint, "darwin-performance.jsonl")
+
+	nativeRead := bestSequentialRead(t, nativeReadPath, int64(len(source)), 3)
+	fuseRead := bestSequentialRead(t, target, int64(len(source)), 3)
+	ratio := fuseRead / nativeRead
+	if fuseRead < 1024 || ratio < 0.25 {
+		t.Fatalf("FUSE-T read %.2f MiB/s is %.1f%% of APFS %.2f MiB/s", fuseRead, ratio*100, nativeRead)
+	}
+
+	nativeAppendPath := filepath.Join(root, "native-append.jsonl")
+	if err := os.WriteFile(nativeAppendPath, []byte("{\"record\":0}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	nativeP95 := appendFsyncP95(t, nativeAppendPath, 100)
+	fuseP95 := appendFsyncP95(t, target, 100)
+	ceiling := 50 * time.Millisecond
+	if relative := nativeP95 * 5; relative > ceiling {
+		ceiling = relative
+	}
+	if fuseP95 > ceiling {
+		t.Fatalf("FUSE-T append+fsync p95 %s exceeds ceiling %s; APFS p95=%s", fuseP95, ceiling, nativeP95)
+	}
+	t.Logf("FUSE-T read=%.2f MiB/s APFS=%.2f MiB/s ratio=%.1f%% append_fsync_p95=%s APFS_p95=%s", fuseRead, nativeRead, ratio*100, fuseP95, nativeP95)
+
+	stopMount()
+	waitForRealUnmount(t, mountPoint)
+}
+
+func bestSequentialRead(t *testing.T, path string, size int64, rounds int) float64 {
+	t.Helper()
+	best := float64(0)
+	for range rounds {
+		started := time.Now()
+		file, err := os.Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		readBytes, copyErr := io.Copy(io.Discard, file)
+		closeErr := file.Close()
+		if copyErr != nil || closeErr != nil || readBytes != size {
+			t.Fatalf("sequential read %q bytes=%d copy=%v close=%v", path, readBytes, copyErr, closeErr)
+		}
+		throughput := float64(readBytes) / (1024 * 1024) / time.Since(started).Seconds()
+		if throughput > best {
+			best = throughput
+		}
+	}
+	return best
+}
+
+func appendFsyncP95(t *testing.T, path string, rounds int) time.Duration {
+	t.Helper()
+	file, err := os.OpenFile(path, os.O_RDWR|os.O_APPEND, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	durations := make([]time.Duration, 0, rounds)
+	for index := range rounds {
+		started := time.Now()
+		if _, err := fmt.Fprintf(file, "{\"append\":%d}\n", index); err != nil {
+			_ = file.Close()
+			t.Fatal(err)
+		}
+		if err := file.Sync(); err != nil {
+			_ = file.Close()
+			t.Fatal(err)
+		}
+		durations = append(durations, time.Since(started))
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	sort.Slice(durations, func(i, j int) bool { return durations[i] < durations[j] })
+	return durations[(len(durations)*95+99)/100-1]
 }
 
 func TestRealFuseManagedStaleTailOffsetsPreserveJSONL(t *testing.T) {
@@ -506,6 +626,126 @@ func TestRealFuseCanonicalNativePreferenceNeverLosesPath(t *testing.T) {
 	waitForRealUnmount(t, mountPoint)
 }
 
+func TestRealFuseCanonicalNativeAppendTransactionSurvivesRestart(t *testing.T) {
+	if os.Getenv("CODEXFOLD_RUN_FUSE_TEST") != "1" {
+		t.Skip("set CODEXFOLD_RUN_FUSE_TEST=1 to run the real FUSE-T adapter test")
+	}
+	root := t.TempDir()
+	nativeRoot := filepath.Join(root, "native")
+	route := filepath.Join("sessions", "2026", "07", "16", "rollout-native-transaction.jsonl")
+	nativePath := filepath.Join(nativeRoot, route)
+	if err := os.MkdirAll(filepath.Dir(nativePath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	base := []byte("{\"record\":0}\n")
+	if err := os.WriteFile(nativePath, base, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mountPoint := filepath.Join(root, "mount")
+	if err := os.MkdirAll(mountPoint, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(mountPoint, route)
+	var traceMu sync.Mutex
+	var trace []string
+	start := func() func() {
+		filesystem := NewCanonical()
+		filesystem.SetNativeRoot(nativeRoot)
+		if err := filesystem.RecoverNativeAppendTransactions(); err != nil {
+			t.Fatal(err)
+		}
+		return startRealMountWithOptions(t, HostOptions{
+			MountPoint: mountPoint, Filesystem: filesystem, Foreground: true,
+			OperationRecorder: func(operation string) {
+				traceMu.Lock()
+				trace = append(trace, operation)
+				traceMu.Unlock()
+			},
+		})
+	}
+
+	stopMount := start()
+	large := append([]byte("{\"large\":\""), bytes.Repeat([]byte("x"), 1<<20)...)
+	large = append(large, []byte("\"}\n")...)
+	file, err := os.OpenFile(target, os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, err := file.Write(large); err != nil || n != len(large) {
+		_ = file.Close()
+		t.Fatalf("write large append: n=%d err=%v", n, err)
+	}
+	want := append(append([]byte(nil), base...), large...)
+	backingAfterWrite, err := os.ReadFile(nativePath)
+	if err != nil || (!bytes.Equal(backingAfterWrite, base) && !bytes.Equal(backingAfterWrite, want)) {
+		_ = file.Close()
+		traceMu.Lock()
+		currentTrace := strings.Join(trace, "\n")
+		traceMu.Unlock()
+		t.Fatalf("backing exposed a partial transaction: bytes=%d err=%v trace=%s", len(backingAfterWrite), err, currentTrace)
+	}
+	visible, err := os.ReadFile(target)
+	if err != nil || !bytes.Equal(visible, want) {
+		_ = file.Close()
+		t.Fatalf("pending mounted view: bytes=%d err=%v want=%d", len(visible), err, len(want))
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		t.Fatalf("fsync large append: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("close large append: %v", err)
+	}
+	assertNativeBytes(t, nativePath, want)
+
+	stopMount()
+	waitForRealUnmount(t, mountPoint)
+	stopMount = start()
+	waitForRealFile(t, target, want)
+
+	afterRestart := []byte("{\"after_restart\":true}\n")
+	file, err = os.OpenFile(target, os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, err := file.Write(afterRestart); err != nil || n != len(afterRestart) {
+		_ = file.Close()
+		t.Fatalf("write after restart: n=%d err=%v", n, err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("release commit after restart: %v", err)
+	}
+	want = append(want, afterRestart...)
+	assertNativeBytes(t, nativePath, want)
+	if !completeJSONL(want) {
+		t.Fatal("real FUSE append produced invalid JSONL")
+	}
+
+	traceMu.Lock()
+	joined := strings.Join(trace, "\n")
+	traceMu.Unlock()
+	for _, marker := range []string{"open kind=session", "write kind=session", "fsync", "flush", "release"} {
+		if !strings.Contains(joined, marker) {
+			t.Fatalf("real append trace missing %q: %s", marker, joined)
+		}
+	}
+	if writes := strings.Count(joined, "write kind=session"); writes < 30 {
+		t.Fatalf("large append was not exercised as split FUSE writes: writes=%d", writes)
+	}
+	for _, entry := range strings.Split(joined, "\n") {
+		if strings.Contains(entry, "kind=session") && strings.Contains(entry, "result=-") {
+			t.Fatalf("session operation failed in real append trace: %s", entry)
+		}
+	}
+	for _, entry := range strings.Split(joined, "\n") {
+		if strings.Contains(entry, "kind=appledouble") && strings.Contains(entry, "result=-5") {
+			t.Fatalf("AppleDouble metadata was routed through JSONL validation: %s", entry)
+		}
+	}
+	stopMount()
+	waitForRealUnmount(t, mountPoint)
+}
+
 func TestRealFuseMountCanonicalManagedRename(t *testing.T) {
 	if os.Getenv("CODEXFOLD_RUN_FUSE_TEST") != "1" {
 		t.Skip("set CODEXFOLD_RUN_FUSE_TEST=1 to run the real FUSE-T adapter test")
@@ -650,12 +890,24 @@ func waitForRealUnmount(t *testing.T, mountPoint string) {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
-		if err := service.ProbeMount(mountPoint); err != nil {
+		var stat unix.Statfs_t
+		if err := unix.Statfs(mountPoint, &stat); err != nil || !sameRealMountPath(unix.ByteSliceToString(stat.Mntonname[:]), mountPoint) {
 			return
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
 	t.Fatal("FUSE mount remained active after shutdown")
+}
+
+func sameRealMountPath(left string, right string) bool {
+	canonical := func(path string) string {
+		resolved, err := filepath.EvalSymlinks(path)
+		if err == nil {
+			return filepath.Clean(resolved)
+		}
+		return filepath.Clean(path)
+	}
+	return canonical(left) == canonical(right)
 }
 
 func waitForRealFile(t *testing.T, path string, want []byte) {

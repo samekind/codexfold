@@ -1,0 +1,419 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		54CC8E546672A2B2EB8778AE /* ProfileModule.swift in Sources */ = {isa = PBXBuildFile; fileRef = A321270CF90754EFB5FB4F82 /* ProfileModule.swift */; };
+		5A3E15ED0688984A0382281F /* Host.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0299A73CFDD46513958B3173 /* Host.swift */; };
+		AC5E7B1EB1279405828432A1 /* Wire.swift in Sources */ = {isa = PBXBuildFile; fileRef = 442319991E8D02494E8E8966 /* Wire.swift */; };
+		D146B22FE62339A25BA1F531 /* CodexFoldFSKitModule.appex in Embed ExtensionKit Extensions */ = {isa = PBXBuildFile; fileRef = 0EB68F3D6D26A8642A137511 /* CodexFoldFSKitModule.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		AE33723DBF591F025AAAE018 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 708C773DF138FE6212E0FC9A /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 00016AAD22571AA1F375B40A;
+			remoteInfo = CodexFoldFSKitModule;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		7F086318D92AAA862935176E /* Embed ExtensionKit Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "$(EXTENSIONS_FOLDER_PATH)";
+			dstSubfolderSpec = 16;
+			files = (
+				D146B22FE62339A25BA1F531 /* CodexFoldFSKitModule.appex in Embed ExtensionKit Extensions */,
+			);
+			name = "Embed ExtensionKit Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
+/* Begin PBXFileReference section */
+		0299A73CFDD46513958B3173 /* Host.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Host.swift; sourceTree = "<group>"; };
+		0EB68F3D6D26A8642A137511 /* CodexFoldFSKitModule.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.extensionkit-extension"; includeInIndex = 0; path = CodexFoldFSKitModule.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		12B2D089AE4A8AE24344C2F8 /* CodexFoldFSKit.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = CodexFoldFSKit.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		442319991E8D02494E8E8966 /* Wire.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Wire.swift; sourceTree = "<group>"; };
+		45646F5D9CFE136ED2DC3D6E /* CodexFoldFSKitModule.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = CodexFoldFSKitModule.entitlements; sourceTree = "<group>"; };
+		683C4E970391FE59129607C0 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		8B37F589115C048AA0DA2C76 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		A321270CF90754EFB5FB4F82 /* ProfileModule.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProfileModule.swift; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXGroup section */
+		00AEBFA549CEA3A2EF2670ED /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				12B2D089AE4A8AE24344C2F8 /* CodexFoldFSKit.app */,
+				0EB68F3D6D26A8642A137511 /* CodexFoldFSKitModule.appex */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		4DED45333D2D92F454B627C0 = {
+			isa = PBXGroup;
+			children = (
+				B470688CF65E5B72C59AEBB3 /* Extension */,
+				A88D2555D5D45400A73FD862 /* Host */,
+				00AEBFA549CEA3A2EF2670ED /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		A88D2555D5D45400A73FD862 /* Host */ = {
+			isa = PBXGroup;
+			children = (
+				0299A73CFDD46513958B3173 /* Host.swift */,
+				8B37F589115C048AA0DA2C76 /* Info.plist */,
+			);
+			path = Host;
+			sourceTree = "<group>";
+		};
+		B470688CF65E5B72C59AEBB3 /* Extension */ = {
+			isa = PBXGroup;
+			children = (
+				45646F5D9CFE136ED2DC3D6E /* CodexFoldFSKitModule.entitlements */,
+				683C4E970391FE59129607C0 /* Info.plist */,
+				A321270CF90754EFB5FB4F82 /* ProfileModule.swift */,
+				442319991E8D02494E8E8966 /* Wire.swift */,
+			);
+			path = Extension;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		00016AAD22571AA1F375B40A /* CodexFoldFSKitModule */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 2AA9F9298B9AF2C59CCB9ED4 /* Build configuration list for PBXNativeTarget "CodexFoldFSKitModule" */;
+			buildPhases = (
+				C77A846ECB9F07A35A0A7952 /* Sources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = CodexFoldFSKitModule;
+			packageProductDependencies = (
+			);
+			productName = CodexFoldFSKitModule;
+			productReference = 0EB68F3D6D26A8642A137511 /* CodexFoldFSKitModule.appex */;
+			productType = "com.apple.product-type.extensionkit-extension";
+		};
+		07E85731B7BEF398A8C4E4EC /* CodexFoldFSKit */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 830559E5E3522260B246A010 /* Build configuration list for PBXNativeTarget "CodexFoldFSKit" */;
+			buildPhases = (
+				0E5DA05244BDCF249A088B8C /* Sources */,
+				7F086318D92AAA862935176E /* Embed ExtensionKit Extensions */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				74BE85F55E9506D33987AFBF /* PBXTargetDependency */,
+			);
+			name = CodexFoldFSKit;
+			packageProductDependencies = (
+			);
+			productName = CodexFoldFSKit;
+			productReference = 12B2D089AE4A8AE24344C2F8 /* CodexFoldFSKit.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		708C773DF138FE6212E0FC9A /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 1430;
+				TargetAttributes = {
+					00016AAD22571AA1F375B40A = {
+						DevelopmentTeam = Y987FUR837;
+						ProvisioningStyle = Automatic;
+					};
+					07E85731B7BEF398A8C4E4EC = {
+						DevelopmentTeam = Y987FUR837;
+						ProvisioningStyle = Automatic;
+					};
+				};
+			};
+			buildConfigurationList = 16739CA6CFCBE5CD8461F74B /* Build configuration list for PBXProject "CodexFoldFSKit" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = 4DED45333D2D92F454B627C0;
+			minimizedProjectReferenceProxies = 1;
+			preferredProjectObjectVersion = 77;
+			productRefGroup = 00AEBFA549CEA3A2EF2670ED /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				07E85731B7BEF398A8C4E4EC /* CodexFoldFSKit */,
+				00016AAD22571AA1F375B40A /* CodexFoldFSKitModule */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXSourcesBuildPhase section */
+		0E5DA05244BDCF249A088B8C /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				5A3E15ED0688984A0382281F /* Host.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		C77A846ECB9F07A35A0A7952 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				54CC8E546672A2B2EB8778AE /* ProfileModule.swift in Sources */,
+				AC5E7B1EB1279405828432A1 /* Wire.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		74BE85F55E9506D33987AFBF /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 00016AAD22571AA1F375B40A /* CodexFoldFSKitModule */;
+			targetProxy = AE33723DBF591F025AAAE018 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		07A6AEE6F5B5E6DA978DAA00 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = CodexFoldFSKit.entitlements;
+				COMBINE_HIDPI_IMAGES = YES;
+				INFOPLIST_FILE = Host/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = vip.jstar.codexfold.fskitprofileprobe;
+				REGISTER_APP_GROUPS = YES;
+				SDKROOT = macosx;
+			};
+			name = Release;
+		};
+		109F1AB456D7EEE08D96BA16 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				APPLICATION_EXTENSION_API_ONLY = YES;
+				CODE_SIGN_ENTITLEMENTS = Extension/CodexFoldFSKitModule.entitlements;
+				COMBINE_HIDPI_IMAGES = YES;
+				ENABLE_APP_SANDBOX = YES;
+				INFOPLIST_FILE = Extension/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/../Frameworks @executable_path/../../../../Frameworks";
+				PRODUCT_BUNDLE_IDENTIFIER = vip.jstar.codexfold.fskitprofileprobe.module;
+				REGISTER_APP_GROUPS = YES;
+				SDKROOT = macosx;
+				SKIP_INSTALL = YES;
+			};
+			name = Debug;
+		};
+		2ABE4C480A0163130E06B856 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGN_STYLE = Automatic;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				DEVELOPMENT_TEAM = Y987FUR837;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 27.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+		39F4FAD3CDE67351EA64468B /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = CodexFoldFSKit.entitlements;
+				COMBINE_HIDPI_IMAGES = YES;
+				INFOPLIST_FILE = Host/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = vip.jstar.codexfold.fskitprofileprobe;
+				REGISTER_APP_GROUPS = YES;
+				SDKROOT = macosx;
+			};
+			name = Debug;
+		};
+		B61FA346F14A61E65CC7F596 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGN_STYLE = Automatic;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				DEVELOPMENT_TEAM = Y987FUR837;
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 27.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
+		ED8C7963C890ACC5C7FF9A70 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				APPLICATION_EXTENSION_API_ONLY = YES;
+				CODE_SIGN_ENTITLEMENTS = Extension/CodexFoldFSKitModule.entitlements;
+				COMBINE_HIDPI_IMAGES = YES;
+				ENABLE_APP_SANDBOX = YES;
+				INFOPLIST_FILE = Extension/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/../Frameworks @executable_path/../../../../Frameworks";
+				PRODUCT_BUNDLE_IDENTIFIER = vip.jstar.codexfold.fskitprofileprobe.module;
+				REGISTER_APP_GROUPS = YES;
+				SDKROOT = macosx;
+				SKIP_INSTALL = YES;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		16739CA6CFCBE5CD8461F74B /* Build configuration list for PBXProject "CodexFoldFSKit" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				2ABE4C480A0163130E06B856 /* Debug */,
+				B61FA346F14A61E65CC7F596 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		2AA9F9298B9AF2C59CCB9ED4 /* Build configuration list for PBXNativeTarget "CodexFoldFSKitModule" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				109F1AB456D7EEE08D96BA16 /* Debug */,
+				ED8C7963C890ACC5C7FF9A70 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		830559E5E3522260B246A010 /* Build configuration list for PBXNativeTarget "CodexFoldFSKit" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				39F4FAD3CDE67351EA64468B /* Debug */,
+				07A6AEE6F5B5E6DA978DAA00 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = 708C773DF138FE6212E0FC9A /* Project object */;
+}

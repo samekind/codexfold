@@ -96,8 +96,7 @@ func (h *ReadHandle) ReadAt(ctx context.Context, destination []byte, offset int6
 
 func (h *ReadHandle) Close() error {
 	h.closeOnce.Do(func() {
-		h.closeErr = h.file.Close()
-		h.session.releaseReader(h.generation)
+		h.closeErr = errors.Join(h.file.Close(), h.session.releaseReader(h.generation))
 	})
 	return h.closeErr
 }

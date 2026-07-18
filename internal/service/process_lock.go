@@ -3,12 +3,20 @@ package service
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 )
 
 type ProcessLock struct {
 	file *os.File
+}
+
+type ProcessLockStatus struct {
+	Held bool
+	PID  int
 }
 
 func AcquireProcessLock(path string) (*ProcessLock, error) {
@@ -61,4 +69,37 @@ func (l *ProcessLock) Close() error {
 		return unlockErr
 	}
 	return closeErr
+}
+
+func InspectProcessLock(path string) (ProcessLockStatus, error) {
+	if !filepath.IsAbs(path) {
+		return ProcessLockStatus{}, errors.New("absolute process lock path is required")
+	}
+	file, err := os.OpenFile(filepath.Clean(path), os.O_RDWR, 0)
+	if errors.Is(err, os.ErrNotExist) {
+		return ProcessLockStatus{}, nil
+	}
+	if err != nil {
+		return ProcessLockStatus{}, err
+	}
+	defer file.Close()
+	locked, err := tryLockProcessFile(file)
+	if err != nil {
+		return ProcessLockStatus{}, err
+	}
+	if locked {
+		return ProcessLockStatus{}, unlockProcessFile(file)
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return ProcessLockStatus{Held: true}, err
+	}
+	value, err := io.ReadAll(io.LimitReader(file, 64))
+	if err != nil {
+		return ProcessLockStatus{Held: true}, err
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(value)))
+	if err != nil || pid <= 1 {
+		return ProcessLockStatus{Held: true}, errors.New("held process lock has an invalid owner PID")
+	}
+	return ProcessLockStatus{Held: true, PID: pid}, nil
 }

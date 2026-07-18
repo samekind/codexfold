@@ -10,7 +10,7 @@ import (
 	"testing"
 
 	"github.com/jstar0/codexfold/internal/cdc"
-	"github.com/jstar0/codexfold/internal/codex"
+	"github.com/jstar0/codexfold/internal/storage"
 )
 
 func TestFoldRejectsSourceMutationBeforeManifestCommit(t *testing.T) {
@@ -21,7 +21,7 @@ func TestFoldRejectsSourceMutationBeforeManifestCommit(t *testing.T) {
 		t.Fatalf("write source: %v", err)
 	}
 
-	_, err := Fold(context.Background(), codex.Session{
+	_, err := Fold(context.Background(), Session{
 		ID: "changing", RolloutPath: sourcePath, Archived: true,
 	}, FoldOptions{
 		StoreDir: storeDir, Apply: true, FieldThreshold: 4,
@@ -55,6 +55,91 @@ func TestFoldRejectsSourceMutationBeforeManifestCommit(t *testing.T) {
 	}
 }
 
+func TestFoldBudgetRejectsBeforeWritingObjectsOrManifest(t *testing.T) {
+	root := t.TempDir()
+	sourcePath := filepath.Join(root, "rollout.jsonl")
+	storeDir := filepath.Join(root, "store")
+	if err := os.WriteFile(sourcePath, []byte("{\"value\":\"budgeted-field\"}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	checker := &foldRejectingChecker{}
+	_, err := Fold(context.Background(), Session{ID: "budget", RolloutPath: sourcePath, Archived: true}, FoldOptions{
+		StoreDir: storeDir, Apply: true, FieldThreshold: 4, Budget: checker,
+	})
+	if !errors.Is(err, storage.ErrBudgetExceeded) {
+		t.Fatalf("Fold error = %v, want storage budget rejection", err)
+	}
+	if checker.Calls != 1 || checker.Projection.Operation != "fold" || checker.Projection.AdditionalPersistentBytes <= 0 {
+		t.Fatalf("unexpected fold budget projection: %#v", checker)
+	}
+	if _, err := os.Stat(storeDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("fold store exists after preflight rejection: %v", err)
+	}
+}
+
+func TestFoldReportsProjectedAndActualPhysicalAccounting(t *testing.T) {
+	root := t.TempDir()
+	sourcePath := filepath.Join(root, "source.jsonl")
+	storeDir := filepath.Join(root, "store")
+	source := []byte("{\"value\":\"physical-accounting\"}\n")
+	if err := os.WriteFile(sourcePath, source, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result, err := Fold(context.Background(), Session{ID: "accounting", RolloutPath: sourcePath, Archived: true}, FoldOptions{StoreDir: storeDir, Apply: true, FieldThreshold: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Storage == nil || result.Storage.Budget.ProjectedPeakBytes <= 0 || result.Storage.After.LogicalSessionBytes != int64(len(source)) {
+		t.Fatalf("fold storage accounting is incomplete: %#v", result.Storage)
+	}
+	if result.Storage.ActualReclaimedBytes != 0 {
+		t.Fatalf("fold with retained source claimed reclamation: %#v", result.Storage)
+	}
+}
+
+func TestUnfoldBudgetRejectsBeforeCreatingRestoreTarget(t *testing.T) {
+	root := t.TempDir()
+	sourcePath := filepath.Join(root, "source.jsonl")
+	storeDir := filepath.Join(root, "store")
+	if err := os.WriteFile(sourcePath, []byte("{\"value\":\"restore-budget\"}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Fold(context.Background(), Session{ID: "restore", RolloutPath: sourcePath, Archived: true}, FoldOptions{StoreDir: storeDir, Apply: true, FieldThreshold: 4}); err != nil {
+		t.Fatal(err)
+	}
+	checker := &foldRejectingChecker{}
+	target := filepath.Join(root, "output", "restored.jsonl")
+	if _, err := UnfoldWithOptions(context.Background(), storeDir, "restore", UnfoldOptions{TargetPath: target, Budget: checker}); !errors.Is(err, storage.ErrBudgetExceeded) {
+		t.Fatalf("UnfoldWithOptions error = %v, want storage budget rejection", err)
+	}
+	if checker.Calls != 1 || checker.Projection.Operation != "unfold" {
+		t.Fatalf("unexpected unfold budget projection: %#v", checker)
+	}
+	if _, err := os.Stat(filepath.Dir(target)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("restore target directory exists after preflight rejection: %v", err)
+	}
+}
+
+func TestUnfoldReportsStorageBudgetWithoutClaimingReclamation(t *testing.T) {
+	root := t.TempDir()
+	sourcePath := filepath.Join(root, "source.jsonl")
+	storeDir := filepath.Join(root, "store")
+	if err := os.WriteFile(sourcePath, []byte("{\"value\":\"unfold-accounting\"}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Fold(context.Background(), Session{ID: "unfold-accounting", RolloutPath: sourcePath, Archived: true}, FoldOptions{StoreDir: storeDir, Apply: true, FieldThreshold: 4}); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(root, "restored.jsonl")
+	result, err := Unfold(context.Background(), storeDir, "unfold-accounting", target, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Storage == nil || result.Storage.Budget.ProjectedPeakBytes <= result.Storage.Budget.CurrentPhysicalBytes || result.Storage.ActualReclaimedBytes != 0 {
+		t.Fatalf("unfold storage accounting is incomplete: %#v", result.Storage)
+	}
+}
+
 func TestFoldRejectsSameSizeMutationEvenWhenMtimeIsRestored(t *testing.T) {
 	root := t.TempDir()
 	sourcePath := filepath.Join(root, "rollout.jsonl")
@@ -72,7 +157,7 @@ func TestFoldRejectsSameSizeMutationEvenWhenMtimeIsRestored(t *testing.T) {
 		t.Fatalf("stat source: %v", err)
 	}
 
-	_, err = Fold(context.Background(), codex.Session{
+	_, err = Fold(context.Background(), Session{
 		ID: "same-size-change", RolloutPath: sourcePath, Archived: true,
 	}, FoldOptions{
 		StoreDir: storeDir, Apply: true, FieldThreshold: 4,
@@ -102,7 +187,7 @@ func TestFoldCreatesVerifiedManifestAndReusesRepeatedField(t *testing.T) {
 		t.Fatalf("write source: %v", err)
 	}
 
-	result, err := Fold(context.Background(), codex.Session{
+	result, err := Fold(context.Background(), Session{
 		ID: "fixture", Title: "Fixture", CWD: "/workspace", RolloutPath: sourcePath, Archived: true,
 	}, FoldOptions{
 		StoreDir:         storeDir,
@@ -148,7 +233,7 @@ func TestFoldDryRunDoesNotCreateStore(t *testing.T) {
 	if err := os.WriteFile(sourcePath, []byte("{\"value\":\"large-value\"}\n"), 0o644); err != nil {
 		t.Fatalf("write source: %v", err)
 	}
-	result, err := Fold(context.Background(), codex.Session{ID: "dry", RolloutPath: sourcePath, Archived: true}, FoldOptions{
+	result, err := Fold(context.Background(), Session{ID: "dry", RolloutPath: sourcePath, Archived: true}, FoldOptions{
 		StoreDir: storeDir, FieldThreshold: 4,
 	})
 	if err != nil {
@@ -178,7 +263,7 @@ func TestFoldWritesToExplicitGenerationManifestWithoutReplacingPrimary(t *testin
 		t.Fatal(err)
 	}
 	generationPath := filepath.Join(storeDir, "manifests", "generations", "session", "2.json")
-	result, err := Fold(context.Background(), codex.Session{ID: "session", RolloutPath: sourcePath, Archived: true}, FoldOptions{StoreDir: storeDir, Apply: true, FieldThreshold: 8, ManifestPathOverride: generationPath})
+	result, err := Fold(context.Background(), Session{ID: "session", RolloutPath: sourcePath, Archived: true}, FoldOptions{StoreDir: storeDir, Apply: true, FieldThreshold: 8, ManifestPathOverride: generationPath})
 	if err != nil {
 		t.Fatalf("Fold generation manifest: %v", err)
 	}
@@ -214,7 +299,7 @@ func TestFoldRoundTripsEmptyInvalidAndOversizedRollouts(t *testing.T) {
 			if err := os.WriteFile(sourcePath, test.source, 0o644); err != nil {
 				t.Fatalf("write source: %v", err)
 			}
-			result, err := Fold(context.Background(), codex.Session{ID: test.name, RolloutPath: sourcePath, Archived: true}, FoldOptions{
+			result, err := Fold(context.Background(), Session{ID: test.name, RolloutPath: sourcePath, Archived: true}, FoldOptions{
 				StoreDir: storeDir, Apply: true, FieldThreshold: 4, MaxJSONLineBytes: test.maxLineBytes,
 			})
 			if err != nil {
@@ -243,11 +328,22 @@ func TestFoldHonorsCanceledContextWithoutManifest(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, err := Fold(ctx, codex.Session{ID: "canceled", RolloutPath: sourcePath, Archived: true}, FoldOptions{StoreDir: storeDir, Apply: true})
+	_, err := Fold(ctx, Session{ID: "canceled", RolloutPath: sourcePath, Archived: true}, FoldOptions{StoreDir: storeDir, Apply: true})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("Fold error = %v, want context.Canceled", err)
 	}
 	if _, statErr := os.Stat(ManifestPath(storeDir, "canceled")); !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatalf("manifest committed after cancellation: %v", statErr)
 	}
+}
+
+type foldRejectingChecker struct {
+	Calls      int
+	Projection storage.Projection
+}
+
+func (c *foldRejectingChecker) Check(_ context.Context, projection storage.Projection) (storage.Assessment, error) {
+	c.Calls++
+	c.Projection = projection
+	return storage.Assessment{}, storage.ErrBudgetExceeded
 }

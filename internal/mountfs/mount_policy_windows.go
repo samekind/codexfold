@@ -1,4 +1,4 @@
-//go:build !darwin && fuse && cgo
+//go:build windows && winfsp
 
 package mountfs
 

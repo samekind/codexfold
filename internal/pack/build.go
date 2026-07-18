@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -15,22 +16,25 @@ import (
 	"time"
 
 	"github.com/jstar0/codexfold/internal/fold"
+	"github.com/jstar0/codexfold/internal/storage"
 	"github.com/klauspost/compress/zstd"
 )
 
 type BuildOptions struct {
 	BlockBytes    int64
 	PackBytes     int64
+	Budget        storage.Checker
 	BeforePublish func() error
 }
 
 type BuildResult struct {
-	Generation  string `json:"generation"`
-	ObjectCount int    `json:"object_count"`
-	BlockCount  int    `json:"block_count"`
-	PackCount   int    `json:"pack_count"`
-	RawBytes    int64  `json:"raw_bytes"`
-	StoredBytes int64  `json:"stored_bytes"`
+	Generation  string                      `json:"generation"`
+	ObjectCount int                         `json:"object_count"`
+	BlockCount  int                         `json:"block_count"`
+	PackCount   int                         `json:"pack_count"`
+	RawBytes    int64                       `json:"raw_bytes"`
+	StoredBytes int64                       `json:"stored_bytes"`
+	Storage     *storage.MutationAccounting `json:"storage,omitempty"`
 }
 
 type packWriter struct {
@@ -56,6 +60,27 @@ func Build(ctx context.Context, storeDir string, options BuildOptions) (BuildRes
 		return BuildResult{}, errors.New("pack block size exceeds platform integer size")
 	}
 	refs, err := referencedObjects(storeDir)
+	if err != nil {
+		return BuildResult{}, err
+	}
+	budget := options.Budget
+	if budget == nil {
+		guard, err := storage.DefaultGuard(storeDir)
+		if err != nil {
+			return BuildResult{}, err
+		}
+		budget = guard
+	}
+	estimatedBytes, err := estimatedGenerationBytes(refs)
+	if err != nil {
+		return BuildResult{}, err
+	}
+	storageAssessment, err := budget.Check(ctx, storage.Projection{
+		Operation:                       "pack-build",
+		AdditionalPersistentBytes:       estimatedBytes,
+		TemporaryBytes:                  estimatedBytes,
+		TemporaryPersistentOverlapBytes: estimatedBytes,
+	})
 	if err != nil {
 		return BuildResult{}, err
 	}
@@ -149,7 +174,24 @@ func Build(ctx context.Context, storeDir string, options BuildOptions) (BuildRes
 	if err := publishCurrent(packsDir, generation); err != nil {
 		return BuildResult{}, err
 	}
+	result.Storage = storage.CompleteAccounting(ctx, storageAssessment, storeDir)
 	return result, nil
+}
+
+func estimatedGenerationBytes(refs []fold.ObjectRef) (int64, error) {
+	const fixedOverhead = int64(1 << 20)
+	var rawBytes int64
+	for _, ref := range refs {
+		if ref.RawBytes < 0 || rawBytes > math.MaxInt64-ref.RawBytes {
+			return 0, errors.New("pack generation byte estimate overflow")
+		}
+		rawBytes += ref.RawBytes
+	}
+	compressionOverhead := rawBytes/16 + fixedOverhead
+	if rawBytes > math.MaxInt64-compressionOverhead {
+		return 0, errors.New("pack generation byte estimate overflow")
+	}
+	return rawBytes + compressionOverhead, nil
 }
 
 func referencedObjects(storeDir string) ([]fold.ObjectRef, error) {

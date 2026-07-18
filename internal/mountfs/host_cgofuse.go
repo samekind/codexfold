@@ -1,9 +1,8 @@
-//go:build fuse && cgo
+//go:build (darwin && fuse && cgo) || (linux && fuse && fuse3 && cgo) || (windows && winfsp)
 
 package mountfs
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -13,10 +12,11 @@ import (
 	"strings"
 	"sync/atomic"
 	"syscall"
+	"time"
 
+	"github.com/jstar0/codexfold/internal/buildid"
 	"github.com/jstar0/codexfold/internal/mountid"
 	"github.com/winfsp/cgofuse/fuse"
-	"golang.org/x/sys/unix"
 )
 
 type fuseFilesystem struct {
@@ -24,6 +24,7 @@ type fuseFilesystem struct {
 	core          *Filesystem
 	recorder      func(string)
 	mountIdentity []byte
+	statRoot      string
 	mountReady    atomic.Bool
 }
 
@@ -32,9 +33,9 @@ const healthHandle = ^uint64(0) - 1
 func Available() bool { return true }
 
 func (f *fuseFilesystem) Getattr(name string, stat *fuse.Stat_t, _ uint64) int {
-	f.record("getattr")
 	if cleanPath(name) == "/"+mountid.Path {
 		if !f.mountReady.Load() {
+			f.recordResult("getattr", name, -int(syscall.ENOENT))
 			return -int(syscall.ENOENT)
 		}
 		stat.Mode = syscall.S_IFREG | 0o400
@@ -43,10 +44,12 @@ func (f *fuseFilesystem) Getattr(name string, stat *fuse.Stat_t, _ uint64) int {
 		stat.Blksize = 4096
 		stat.Blocks = (stat.Size + 511) / 512
 		stat.Uid, stat.Gid, _ = fuse.Getcontext()
+		f.recordResult("getattr", name, 0)
 		return 0
 	}
 	attribute, errno := f.core.Getattr(name)
 	if errno != 0 {
+		f.recordResult("getattr", name, -int(errno))
 		return -int(errno)
 	}
 	stat.Mode = attribute.Mode
@@ -58,6 +61,7 @@ func (f *fuseFilesystem) Getattr(name string, stat *fuse.Stat_t, _ uint64) int {
 	stat.Ctim = stat.Mtim
 	stat.Atim = stat.Mtim
 	stat.Uid, stat.Gid, _ = fuse.Getcontext()
+	f.recordResult("getattr", name, 0)
 	return 0
 }
 
@@ -66,27 +70,9 @@ func (f *fuseFilesystem) Statfs(name string, stat *fuse.Statfs_t) int {
 	root := f.core.nativeRoot
 	f.core.mu.RUnlock()
 	if root == "" {
-		result := -int(syscall.ENOENT)
-		f.recordResult("statfs", name, result)
-		return result
+		root = f.statRoot
 	}
-	var source unix.Statfs_t
-	result := unixResult(unix.Statfs(root, &source))
-	if result == 0 {
-		stat.Bsize = uint64(source.Bsize)
-		if source.Iosize > 0 {
-			stat.Frsize = uint64(source.Iosize)
-		} else {
-			stat.Frsize = uint64(source.Bsize)
-		}
-		stat.Blocks = source.Blocks
-		stat.Bfree = source.Bfree
-		stat.Bavail = source.Bavail
-		stat.Files = source.Files
-		stat.Ffree = source.Ffree
-		stat.Favail = source.Ffree
-		stat.Namemax = 255
-	}
+	result := populateFilesystemStat(root, stat)
 	f.recordResult("statfs", name, result)
 	return result
 }
@@ -133,6 +119,13 @@ func (f *fuseFilesystem) Open(name string, flags int) (int, uint64) {
 	}
 	translated := translateOpenFlags(flags)
 	handle, errno := f.core.Open(name, translated)
+	if errno == syscall.EBUSY && writableSession(name, flags) {
+		deadline := time.Now().Add(250 * time.Millisecond)
+		for errno == syscall.EBUSY && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+			handle, errno = f.core.Open(name, translated)
+		}
+	}
 	if errno != 0 {
 		result := -int(errno)
 		f.recordOpen("open", name, flags, translated, handle, result)
@@ -174,18 +167,23 @@ func (f *fuseFilesystem) CreateEx(name string, _ uint32, info *fuse.FileInfo_t) 
 	return result
 }
 
-func (f *fuseFilesystem) Read(_ string, destination []byte, offset int64, handle uint64) int {
-	f.record("read")
+func (f *fuseFilesystem) Read(name string, destination []byte, offset int64, handle uint64) int {
 	if handle == healthHandle {
 		if offset < 0 || offset >= int64(len(f.mountIdentity)) {
+			f.recordIO("read", name, handle, offset, len(destination), 0)
 			return 0
 		}
-		return copy(destination, f.mountIdentity[offset:])
+		n := copy(destination, f.mountIdentity[offset:])
+		f.recordIO("read", name, handle, offset, len(destination), n)
+		return n
 	}
 	n, errno := f.core.Read(handle, destination, offset)
 	if errno != 0 {
-		return -int(errno)
+		result := -int(errno)
+		f.recordIO("read", name, handle, offset, len(destination), result)
+		return result
 	}
+	f.recordIO("read", name, handle, offset, len(destination), n)
 	return n
 }
 
@@ -212,28 +210,34 @@ func (f *fuseFilesystem) Truncate(name string, size int64, handle uint64) int {
 	return result
 }
 
-func (f *fuseFilesystem) Flush(_ string, handle uint64) int {
-	f.record("flush")
+func (f *fuseFilesystem) Flush(name string, handle uint64) int {
 	if handle == healthHandle {
+		f.recordHandleResult("flush", name, handle, 0)
 		return 0
 	}
-	return -int(f.core.Flush(handle))
+	result := -int(f.core.Flush(handle))
+	f.recordHandleResult("flush", name, handle, result)
+	return result
 }
 
-func (f *fuseFilesystem) Fsync(_ string, _ bool, handle uint64) int {
-	f.record("fsync")
+func (f *fuseFilesystem) Fsync(name string, dataOnly bool, handle uint64) int {
 	if handle == healthHandle {
+		f.record(fmt.Sprintf("fsync kind=%s handle=%d datasync=%t result=0", operationKind(name), handle, dataOnly))
 		return 0
 	}
-	return -int(f.core.Fsync(handle))
+	result := -int(f.core.Fsync(handle))
+	f.record(fmt.Sprintf("fsync kind=%s handle=%d datasync=%t result=%d", operationKind(name), handle, dataOnly, result))
+	return result
 }
 
-func (f *fuseFilesystem) Release(_ string, handle uint64) int {
-	f.record("release")
+func (f *fuseFilesystem) Release(name string, handle uint64) int {
 	if handle == healthHandle {
+		f.recordHandleResult("release", name, handle, 0)
 		return 0
 	}
-	return -int(f.core.Release(handle))
+	result := -int(f.core.Release(handle))
+	f.recordHandleResult("release", name, handle, result)
+	return result
 }
 
 func (f *fuseFilesystem) Mkdir(name string, mode uint32) int {
@@ -326,8 +330,7 @@ func (f *fuseFilesystem) Utimens(name string, times []fuse.Timespec) int {
 		if len(times) != 2 {
 			result = -int(syscall.EINVAL)
 		} else {
-			unixTimes := []unix.Timespec{{Sec: times[0].Sec, Nsec: times[0].Nsec}, {Sec: times[1].Sec, Nsec: times[1].Nsec}}
-			result = unixResult(unix.UtimesNanoAt(unix.AT_FDCWD, path, unixTimes, 0))
+			result = setFileTimes(path, times)
 		}
 	}
 	f.recordResult("utimens", name, result)
@@ -340,7 +343,7 @@ func (f *fuseFilesystem) Setxattr(name string, attribute string, value []byte, f
 	if errc != 0 {
 		return errc
 	}
-	return unixResult(unix.Setxattr(path, attribute, value, flags))
+	return setExtendedAttribute(path, attribute, value, flags)
 }
 
 func (f *fuseFilesystem) Getxattr(name string, attribute string) (int, []byte) {
@@ -349,16 +352,7 @@ func (f *fuseFilesystem) Getxattr(name string, attribute string) (int, []byte) {
 	if errc != 0 {
 		return errc, nil
 	}
-	size, err := unix.Getxattr(path, attribute, nil)
-	if err != nil {
-		return unixResult(err), nil
-	}
-	value := make([]byte, size)
-	n, err := unix.Getxattr(path, attribute, value)
-	if err != nil {
-		return unixResult(err), nil
-	}
-	return 0, value[:n]
+	return getExtendedAttribute(path, attribute)
 }
 
 func (f *fuseFilesystem) Listxattr(name string, fill func(string) bool) int {
@@ -367,17 +361,12 @@ func (f *fuseFilesystem) Listxattr(name string, fill func(string) bool) int {
 	if errc != 0 {
 		return errc
 	}
-	size, err := unix.Listxattr(path, nil)
-	if err != nil {
-		return unixResult(err)
+	result, attributes := listExtendedAttributes(path)
+	if result != 0 {
+		return result
 	}
-	buffer := make([]byte, size)
-	n, err := unix.Listxattr(path, buffer)
-	if err != nil {
-		return unixResult(err)
-	}
-	for _, attribute := range bytes.Split(bytes.TrimRight(buffer[:n], "\x00"), []byte{0}) {
-		if len(attribute) != 0 && !fill(string(attribute)) {
+	for _, attribute := range attributes {
+		if attribute != "" && !fill(attribute) {
 			break
 		}
 	}
@@ -390,7 +379,7 @@ func (f *fuseFilesystem) Removexattr(name string, attribute string) int {
 	if errc != 0 {
 		return errc
 	}
-	return unixResult(unix.Removexattr(path, attribute))
+	return removeExtendedAttribute(path, attribute)
 }
 
 func (f *fuseFilesystem) xattrPath(name string, create bool) (string, int) {
@@ -463,6 +452,10 @@ func (f *fuseFilesystem) recordIO(operation string, name string, handle uint64, 
 	f.record(fmt.Sprintf("%s kind=%s handle=%d offset=%d bytes=%d result=%d", operation, operationKind(name), handle, offset, bytes, result))
 }
 
+func (f *fuseFilesystem) recordHandleResult(operation string, name string, handle uint64, result int) {
+	f.record(fmt.Sprintf("%s kind=%s handle=%d result=%d", operation, operationKind(name), handle, result))
+}
+
 func operationKind(name string) string {
 	kind := "other"
 	base := filepath.Base(name)
@@ -507,18 +500,44 @@ func mountHost(ctx context.Context, options HostOptions) (result error) {
 			result = fmt.Errorf("%w: %v", ErrPrerequisite, recovered)
 		}
 	}()
-	identity, err := mountid.New()
+	if err := validateFuseProvider(); err != nil {
+		return fmt.Errorf("validate selected FUSE provider: %w", err)
+	}
+	buildSHA256 := options.BuildSHA256
+	var err error
+	if buildSHA256 == "" {
+		buildSHA256, err = buildid.CurrentSHA256()
+		if err != nil {
+			return fmt.Errorf("hash mounted executable: %w", err)
+		}
+	}
+	identity, err := mountid.New(buildSHA256)
 	if err != nil {
 		return fmt.Errorf("generate mount identity: %w", err)
 	}
-	filesystem := &fuseFilesystem{core: options.Filesystem, recorder: options.OperationRecorder, mountIdentity: []byte(identity)}
+	filesystem := &fuseFilesystem{
+		core:          options.Filesystem,
+		recorder:      options.OperationRecorder,
+		mountIdentity: []byte(identity),
+		statRoot:      filepath.Dir(options.MountPoint),
+	}
 	host := fuse.NewFileSystemHost(filesystem)
+	backing, err := prepareMountedBacking(options.MountPoint)
+	if err != nil {
+		return fmt.Errorf("prepare mount backing permissions: %w", err)
+	}
+	backingClosed := false
+	defer func() {
+		if !backingClosed {
+			_ = backing.Close()
+		}
+	}()
 	arguments := []string{"-o", "fsname=codexfold", "-o", "default_permissions", "-o", "attr_timeout=0", "-o", "entry_timeout=0", "-o", "negative_timeout=0"}
 	if options.Foreground {
 		arguments = append(arguments, "-f")
 	}
 	if runtime.GOOS == "darwin" {
-		arguments = append(arguments, "-o", "volname=CodexFold")
+		arguments = append(arguments, "-o", "backend=nfs", "-o", "volname=CodexFold")
 	}
 	done := make(chan struct{})
 	go func() {
@@ -533,6 +552,9 @@ func mountHost(ctx context.Context, options HostOptions) (result error) {
 	go func() {
 		err := configureMountedFilesystem(policyContext, options.MountPoint)
 		if err == nil {
+			err = backing.Seal()
+		}
+		if err == nil {
 			filesystem.mountReady.Store(true)
 		} else {
 			_ = host.Unmount()
@@ -542,6 +564,8 @@ func mountHost(ctx context.Context, options HostOptions) (result error) {
 	mounted := host.Mount(options.MountPoint, arguments)
 	cancelPolicy()
 	policyErr := <-policyDone
+	backingErr := backing.Close()
+	backingClosed = true
 	close(done)
 	if err := ctx.Err(); err != nil {
 		return err
@@ -551,6 +575,9 @@ func mountHost(ctx context.Context, options HostOptions) (result error) {
 	}
 	if policyErr != nil {
 		return fmt.Errorf("configure mounted filesystem: %w", policyErr)
+	}
+	if backingErr != nil {
+		return fmt.Errorf("seal unmounted backing directory: %w", backingErr)
 	}
 	return ctx.Err()
 }

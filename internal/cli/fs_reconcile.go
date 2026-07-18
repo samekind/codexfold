@@ -28,7 +28,7 @@ func newFSRepairRolloutCommand() *cobra.Command {
 			if !filepath.IsAbs(args[0]) || !filepath.IsAbs(outputPath) {
 				return errors.New("source and --output paths must be absolute")
 			}
-			result, err := reconcile.RepairWithOptions(args[0], outputPath, reconcile.RepairOptions{AllowOrphans: orphanPath != "", OrphanPath: orphanPath})
+			result, err := reconcile.RepairWithOptions(args[0], outputPath, reconcile.RepairOptions{AllowOrphans: orphanPath != "", OrphanPath: orphanPath, Context: command.Context()})
 			if err != nil {
 				return err
 			}
@@ -36,10 +36,14 @@ func newFSRepairRolloutCommand() *cobra.Command {
 				return writeJSON(command, result)
 			}
 			_, err = fmt.Fprintf(command.OutOrStdout(),
-				"physical=%d invalid=%d reconstructed=%d orphans=%d output=%d regressions=%d max_buffer=%d path=%s sha256=%s\n",
+				"physical=%d invalid=%d reconstructed=%d conversations=%d preserved=%d reconstructed_conversations=%d conversation_verified=%t orphans=%d output=%d regressions=%d max_buffer=%d path=%s sha256=%s\n",
 				result.PhysicalLines,
 				result.InvalidPhysicalLines,
 				result.ReconstructedRecords,
+				result.SourceConversationRecords,
+				result.PreservedConversationRecords,
+				result.ReconstructedConversationRecords,
+				result.ConversationIntegrityVerified,
 				result.OrphanLines,
 				result.OutputRecords,
 				result.TimestampRegressions,
@@ -74,7 +78,7 @@ func newFSReconcileRolloutCommand() *cobra.Command {
 				if !filepath.IsAbs(outputPath) {
 					return errors.New("--output must be absolute with --apply")
 				}
-				result, err = reconcile.Merge(args[0], args[1], outputPath)
+				result, err = reconcile.MergeWithOptions(args[0], args[1], outputPath, reconcile.MergeOptions{Context: command.Context()})
 			} else {
 				result, err = reconcile.Analyze(args[0], args[1])
 			}

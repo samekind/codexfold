@@ -181,6 +181,209 @@ func TestFilesystemStaleTailOffsetWithArbitraryBytesUsesCopyOnWrite(t *testing.T
 	}
 }
 
+func TestNativePassthroughPreservesOutOfOrderAppendChunksByOffset(t *testing.T) {
+	root := t.TempDir()
+	nativeRoot := filepath.Join(root, "native")
+	route := "/sessions/2026/07/16/rollout-repro.jsonl"
+	nativePath := nativePathFromRoot(nativeRoot, route)
+	if err := os.MkdirAll(filepath.Dir(nativePath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	base := []byte("{\"record\":0}\n")
+	if err := os.WriteFile(nativePath, base, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	filesystem := NewCanonical()
+	filesystem.SetNativeRoot(nativeRoot)
+	large := append([]byte("{\"large\":\""), bytes.Repeat([]byte("x"), 40*1024)...)
+	large = append(large, []byte("\"}\n")...)
+	small := []byte("{\"record\":2}\n")
+	split := 32 * 1024
+
+	largeHandle, errno := filesystem.Open(route, os.O_WRONLY|os.O_APPEND)
+	if errno != 0 {
+		t.Fatalf("open large writer: %v", errno)
+	}
+	defer filesystem.Release(largeHandle)
+	smallHandle, errno := filesystem.Open(route, os.O_WRONLY|os.O_APPEND)
+	if errno != 0 {
+		t.Fatalf("open small writer: %v", errno)
+	}
+	defer filesystem.Release(smallHandle)
+
+	baseOffset := int64(len(base))
+	if n, errno := filesystem.Write(largeHandle, large[:split], baseOffset); errno != 0 || n != split {
+		t.Fatalf("write large prefix: n=%d errno=%v", n, errno)
+	}
+	if n, errno := filesystem.Write(smallHandle, small, baseOffset+int64(len(large))); errno != 0 || n != len(small) {
+		t.Fatalf("write later record: n=%d errno=%v", n, errno)
+	}
+	if n, errno := filesystem.Write(largeHandle, large[split:], baseOffset+int64(split)); errno != 0 || n != len(large)-split {
+		t.Fatalf("write large suffix: n=%d errno=%v", n, errno)
+	}
+	if errno := filesystem.Fsync(largeHandle); errno != 0 {
+		t.Fatalf("commit out-of-order chunks: %v", errno)
+	}
+
+	got, err := os.ReadFile(nativePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := append(append(append([]byte(nil), base...), large...), small...)
+	if !bytes.Equal(got, want) {
+		t.Fatalf("native append chunks interleaved: got=%d bytes want=%d bytes", len(got), len(want))
+	}
+}
+
+func TestNativePassthroughRetryAtOverlappingOffsetIsIdempotent(t *testing.T) {
+	root := t.TempDir()
+	nativeRoot := filepath.Join(root, "native")
+	route := "/sessions/2026/07/16/rollout-retry.jsonl"
+	nativePath := nativePathFromRoot(nativeRoot, route)
+	if err := os.MkdirAll(filepath.Dir(nativePath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	base := []byte("{\"record\":0}\n")
+	if err := os.WriteFile(nativePath, base, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	filesystem := NewCanonical()
+	filesystem.SetNativeRoot(nativeRoot)
+	handle, errno := filesystem.Open(route, os.O_WRONLY|os.O_APPEND)
+	if errno != 0 {
+		t.Fatalf("open writer: %v", errno)
+	}
+	defer filesystem.Release(handle)
+	record := []byte("{\"payload\":{\"internal_chat_message_metadata_passthrough\":{\"turn_id\":\"turn\"}}}\n")
+	retry := record[len(record)-71:]
+	baseOffset := int64(len(base))
+	if n, errno := filesystem.Write(handle, record, baseOffset); errno != 0 || n != len(record) {
+		t.Fatalf("write record: n=%d errno=%v", n, errno)
+	}
+	if n, errno := filesystem.Write(handle, retry, baseOffset+int64(len(record)-len(retry))); errno != 0 || n != len(retry) {
+		t.Fatalf("retry suffix: n=%d errno=%v", n, errno)
+	}
+	if errno := filesystem.Fsync(handle); errno != 0 {
+		t.Fatalf("commit overlapping retry: %v", errno)
+	}
+
+	got, err := os.ReadFile(nativePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := append(append([]byte(nil), base...), record...)
+	if !bytes.Equal(got, want) {
+		t.Fatalf("overlapping retry was appended: got=%q want=%q", got, want)
+	}
+}
+
+func TestNativePassthroughStagesAppendUntilFsync(t *testing.T) {
+	root := t.TempDir()
+	nativeRoot := filepath.Join(root, "native")
+	route := "/sessions/2026/07/16/rollout-staged.jsonl"
+	nativePath := nativePathFromRoot(nativeRoot, route)
+	if err := os.MkdirAll(filepath.Dir(nativePath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	base := []byte("{\"record\":0}\n")
+	if err := os.WriteFile(nativePath, base, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	filesystem := NewCanonical()
+	filesystem.SetNativeRoot(nativeRoot)
+	writer, errno := filesystem.Open(route, os.O_WRONLY|os.O_APPEND)
+	if errno != 0 {
+		t.Fatalf("open writer: %v", errno)
+	}
+	defer filesystem.Release(writer)
+	record := []byte("{\"record\":1}\n")
+	if n, errno := filesystem.Write(writer, record, int64(len(base))); errno != 0 || n != len(record) {
+		t.Fatalf("stage append: n=%d errno=%v", n, errno)
+	}
+
+	backing, err := os.ReadFile(nativePath)
+	if err != nil || !bytes.Equal(backing, base) {
+		t.Fatalf("uncommitted bytes reached backing: got=%q err=%v", backing, err)
+	}
+	attribute, errno := filesystem.Getattr(route)
+	if errno != 0 || attribute.Size != int64(len(base)+len(record)) {
+		t.Fatalf("visible staged size=%d errno=%v", attribute.Size, errno)
+	}
+	reader, errno := filesystem.Open(route, os.O_RDONLY)
+	if errno != 0 {
+		t.Fatalf("open staged reader: %v", errno)
+	}
+	defer filesystem.Release(reader)
+	visible := make([]byte, len(base)+len(record))
+	if n, errno := filesystem.Read(reader, visible, 0); errno != 0 || n != len(visible) {
+		t.Fatalf("read staged bytes: n=%d errno=%v", n, errno)
+	}
+	want := append(append([]byte(nil), base...), record...)
+	if !bytes.Equal(visible, want) {
+		t.Fatalf("staged visible bytes=%q want=%q", visible, want)
+	}
+
+	if errno := filesystem.Fsync(writer); errno != 0 {
+		t.Fatalf("commit staged append: %v", errno)
+	}
+	backing, err = os.ReadFile(nativePath)
+	if err != nil || !bytes.Equal(backing, want) {
+		t.Fatalf("committed backing=%q err=%v", backing, err)
+	}
+}
+
+func TestNativePassthroughInvalidAppendFailsClosed(t *testing.T) {
+	root := t.TempDir()
+	nativeRoot := filepath.Join(root, "native")
+	route := "/sessions/2026/07/16/rollout-invalid.jsonl"
+	nativePath := nativePathFromRoot(nativeRoot, route)
+	if err := os.MkdirAll(filepath.Dir(nativePath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	base := []byte("{\"record\":0}\n")
+	if err := os.WriteFile(nativePath, base, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	filesystem := NewCanonical()
+	filesystem.SetNativeRoot(nativeRoot)
+	writer, errno := filesystem.Open(route, os.O_WRONLY|os.O_APPEND)
+	if errno != 0 {
+		t.Fatalf("open writer: %v", errno)
+	}
+	defer filesystem.Release(writer)
+	if n, errno := filesystem.Write(writer, []byte("not-json\n"), int64(len(base))); errno != 0 || n != len("not-json\n") {
+		t.Fatalf("stage invalid append: n=%d errno=%v", n, errno)
+	}
+	if errno := filesystem.Fsync(writer); errno != syscall.EIO {
+		t.Fatalf("invalid append fsync errno=%v, want EIO", errno)
+	}
+	backing, err := os.ReadFile(nativePath)
+	if err != nil || !bytes.Equal(backing, base) {
+		t.Fatalf("invalid append changed backing: got=%q err=%v", backing, err)
+	}
+	attribute, errno := filesystem.Getattr(route)
+	if errno != 0 || attribute.Size != int64(len(base)) {
+		t.Fatalf("invalid append remained visible: size=%d errno=%v", attribute.Size, errno)
+	}
+
+	record := []byte("{\"record\":1}\n")
+	if n, errno := filesystem.Write(writer, record, int64(len(base))); errno != 0 || n != len(record) {
+		t.Fatalf("retry valid append: n=%d errno=%v", n, errno)
+	}
+	if errno := filesystem.Fsync(writer); errno != 0 {
+		t.Fatalf("commit valid retry: %v", errno)
+	}
+	want := append(append([]byte(nil), base...), record...)
+	backing, err = os.ReadFile(nativePath)
+	if err != nil || !bytes.Equal(backing, want) {
+		t.Fatalf("valid retry backing=%q err=%v", backing, err)
+	}
+}
+
 func TestFilesystemPathTruncateUsesTheActiveWriter(t *testing.T) {
 	filesystem, source := mountFixture(t)
 	handle, errno := filesystem.Open("/session.jsonl", os.O_RDWR)
@@ -633,7 +836,7 @@ func TestCanonicalFilesystemPassesThroughNativeSessionFiles(t *testing.T) {
 	if errno != 0 {
 		t.Fatalf("native create Open errno=%v", errno)
 	}
-	createdBytes := []byte("created-session\n")
+	createdBytes := []byte("{\"created\":\"session\"}\n")
 	if n, errno := filesystem.Write(created, createdBytes, 0); errno != 0 || n != len(createdBytes) {
 		t.Fatalf("native create Write = %d errno=%v", n, errno)
 	}
@@ -659,6 +862,65 @@ func TestCanonicalFilesystemPassesThroughNativeSessionFiles(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(strings.TrimPrefix(renamedPath, "/")))); !os.IsNotExist(err) {
 		t.Fatalf("native destination remained after unlink: %v", err)
+	}
+}
+
+func TestCanonicalFilesystemSupportsFSKitOpenUnlinkStaging(t *testing.T) {
+	root := t.TempDir()
+	directory := filepath.Join(root, "sessions", "2026", "07", "12")
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "archived_sessions"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	filesystem := NewCanonical()
+	filesystem.SetNativeRoot(root)
+
+	original := "/sessions/2026/07/12/open.jsonl"
+	hidden := "/sessions/2026/07/12/.nfs.20051026.83fd"
+	base := []byte("{\"record\":0}\n")
+	if err := os.WriteFile(filepath.Join(directory, "open.jsonl"), base, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	handle, errno := filesystem.Open(original, os.O_RDWR)
+	if errno != 0 {
+		t.Fatalf("open errno=%v", errno)
+	}
+	if errno := filesystem.Rename(original, hidden); errno != 0 {
+		t.Fatalf("open-unlink rename errno=%v", errno)
+	}
+	if got, errno := filesystem.HandlePath(handle); errno != 0 || got != hidden {
+		t.Fatalf("handle path = %q errno=%v, want %q", got, errno, hidden)
+	}
+	appended := []byte("{\"record\":1}\n")
+	if n, errno := filesystem.Write(handle, appended, int64(len(base))); errno != 0 || n != len(appended) {
+		t.Fatalf("write after hidden rename = %d errno=%v", n, errno)
+	}
+	if errno := filesystem.Release(handle); errno != 0 {
+		t.Fatalf("release errno=%v", errno)
+	}
+	hiddenNative := filepath.Join(directory, filepath.Base(hidden))
+	want := append(append([]byte(nil), base...), appended...)
+	if got, err := os.ReadFile(hiddenNative); err != nil || !bytes.Equal(got, want) {
+		t.Fatalf("hidden bytes = %q err=%v, want %q", got, err, want)
+	}
+	if errno := filesystem.Unlink(hidden); errno != 0 {
+		t.Fatalf("unlink hidden errno=%v", errno)
+	}
+	if _, err := os.Stat(hiddenNative); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("hidden file remained: %v", err)
+	}
+
+	second := "/sessions/2026/07/12/second.jsonl"
+	if err := os.WriteFile(filepath.Join(directory, "second.jsonl"), base, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if errno := filesystem.Rename(second, "/sessions/2026/07/12/.not-nfs"); errno != syscall.EPERM {
+		t.Fatalf("non-FSKit hidden rename errno=%v, want EPERM", errno)
+	}
+	if errno := filesystem.Rename(second, "/archived_sessions/.nfs.20051026.83fd"); errno != syscall.EPERM {
+		t.Fatalf("cross-directory open-unlink rename errno=%v, want EPERM", errno)
 	}
 }
 

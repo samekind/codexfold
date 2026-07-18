@@ -2,6 +2,7 @@ package reconcile
 
 import (
 	"bufio"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -11,6 +12,8 @@ import (
 	"path/filepath"
 	"sort"
 	"time"
+
+	"github.com/jstar0/codexfold/internal/storage"
 )
 
 type SourceSummary struct {
@@ -24,16 +27,22 @@ type SourceSummary struct {
 }
 
 type Result struct {
-	Base              SourceSummary `json:"base"`
-	Branch            SourceSummary `json:"branch"`
-	SharedRecords     int64         `json:"shared_records"`
-	BaseOnlyRecords   int64         `json:"base_only_records"`
-	AddedFromBranch   int64         `json:"added_from_branch"`
-	OutputRecords     int64         `json:"output_records"`
-	OutputBytes       int64         `json:"output_bytes,omitempty"`
-	OutputSHA256      string        `json:"output_sha256,omitempty"`
-	OutputPath        string        `json:"output_path,omitempty"`
-	OutputRegressions int64         `json:"output_timestamp_regressions,omitempty"`
+	Base              SourceSummary               `json:"base"`
+	Branch            SourceSummary               `json:"branch"`
+	SharedRecords     int64                       `json:"shared_records"`
+	BaseOnlyRecords   int64                       `json:"base_only_records"`
+	AddedFromBranch   int64                       `json:"added_from_branch"`
+	OutputRecords     int64                       `json:"output_records"`
+	OutputBytes       int64                       `json:"output_bytes,omitempty"`
+	OutputSHA256      string                      `json:"output_sha256,omitempty"`
+	OutputPath        string                      `json:"output_path,omitempty"`
+	OutputRegressions int64                       `json:"output_timestamp_regressions,omitempty"`
+	Storage           *storage.MutationAccounting `json:"storage,omitempty"`
+}
+
+type MergeOptions struct {
+	Context context.Context
+	Budget  storage.Checker
 }
 
 type recordKey struct {
@@ -70,6 +79,10 @@ func Analyze(basePath, branchPath string) (Result, error) {
 }
 
 func Merge(basePath, branchPath, outputPath string) (Result, error) {
+	return MergeWithOptions(basePath, branchPath, outputPath, MergeOptions{})
+}
+
+func MergeWithOptions(basePath, branchPath, outputPath string, options MergeOptions) (Result, error) {
 	if outputPath == "" {
 		return Result{}, errors.New("output path is required")
 	}
@@ -112,6 +125,28 @@ func Merge(basePath, branchPath, outputPath string) (Result, error) {
 		}
 		return records[i].timestamp.Before(records[j].timestamp)
 	})
+	ctx := options.Context
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var outputBytes int64
+	for _, record := range records {
+		if record.length < 0 || outputBytes > int64(^uint64(0)>>1)-record.length {
+			return Result{}, errors.New("reconciled output byte count overflow")
+		}
+		outputBytes += record.length
+	}
+	budget := options.Budget
+	if budget == nil {
+		budget = storage.VolumeGuard{Path: filepath.Dir(outputAbs)}
+	}
+	storageAssessment, err := budget.Check(ctx, storage.Projection{
+		Operation: "reconcile-rollout", AdditionalPersistentBytes: outputBytes,
+		TemporaryBytes: outputBytes, TemporaryPersistentOverlapBytes: outputBytes,
+	})
+	if err != nil {
+		return Result{}, err
+	}
 
 	baseFile, err := os.Open(baseAbs)
 	if err != nil {
@@ -146,6 +181,9 @@ func Merge(basePath, branchPath, outputPath string) (Result, error) {
 	outputHasher := sha256.New()
 	writer := io.MultiWriter(temp, outputHasher)
 	for _, record := range records {
+		if err := ctx.Err(); err != nil {
+			return Result{}, err
+		}
 		source := baseFile
 		if record.source == 1 {
 			source = branchFile
@@ -185,6 +223,7 @@ func Merge(basePath, branchPath, outputPath string) (Result, error) {
 	if output.summary.Records != result.OutputRecords || output.summary.SHA256 != result.OutputSHA256 || output.summary.TimestampRegressions != 0 {
 		return Result{}, errors.New("merged output verification failed")
 	}
+	result.Storage = storage.CompleteAccounting(ctx, storageAssessment, "")
 	return result, nil
 }
 

@@ -12,6 +12,15 @@ It finds exact duplicate raw JSON string tokens, complete JSONL records, and con
 
 The requirements and release gates for normal JSONL paths backed transparently by shared storage are defined in [the transparent filesystem product contract](docs/superpowers/specs/2026-07-11-transparent-session-filesystem-design.md). No release may claim `随点随开`, transparent session access, or production-ready virtual sessions before the platform-specific gates in that contract pass.
 
+The unreleased transparent-filesystem branch remains `fs-engine-preview`:
+
+- macOS uses the explicitly selected synchronous FUSE-T NFS backend and has real Codex CLI/Desktop canary evidence. FUSE-T's FSKit backend was tested and rejected after a deterministic same-offset JSONL byte-loss failure.
+- Linux FUSE3 has real unprivileged read, append, copy-on-write, truncate, archive rename, crash recovery, remount, performance, and `systemd --user` lifecycle evidence.
+- Windows has a WinFsp adapter and native Windows Service host that cross-compile, but no real Windows/WinFsp host has validated them yet.
+- Retention, actual in-flight power loss, and the remaining platform-specific client and upgrade gates still block promotion.
+
+See [the Linux FUSE3 validation](docs/validation-linux-fuse3.md) and [the macOS canary validation](docs/validation-macos-canary.md) for the evidence boundary. The default build remains storage-only; platform mounts require explicit build tags and installed host prerequisites.
+
 ## Install
 
 ```bash
@@ -81,6 +90,27 @@ codexfold remove-contained <contained-session-id> <container-session-id> --apply
 
 The first command is proof-only. `--apply` additionally requires an existing verified fold, a current source SHA-256 match, and a successful temporary unfold. It then isolates the source file, removes the archived thread and associated local state in one SQLite transaction, cleans exact thread-ID references from Codex global state, and finally deletes the isolated source. A tombstone and fold manifest remain for byte-level recovery. Concurrent global-state changes abort the operation instead of being overwritten.
 
+## Fork Families And Archival
+
+Inspect the explicit Codex spawn graph and compare two selected rollouts without mutation:
+
+```bash
+codexfold fork-family show <session-id>
+codexfold fork-family compare <left-session-id> <right-session-id>
+```
+
+The report keeps graph ancestry separate from exact content evidence. It can identify identical applicable records, complete containment, shared prefixes with independent tails, other exact shared records, or an unknown relationship. It never labels a branch useless from ancestry, age, title, or size.
+
+Preview and explicitly archive one active session:
+
+```bash
+codexfold archive <session-id>
+codexfold archive <session-id> --apply
+codexfold archive recover <session-id> --apply
+```
+
+Archive is dry-run-first and preserves the rollout bytes. Apply requires the native writer probe, revalidates the selected SQLite route and complete source SHA-256, moves the rollout to Codex's flat `archived_sessions` path, and updates the official archive fields in one guarded transaction. A durable journal supports deterministic recovery if file and database commit acknowledgement are interrupted. Archive never deletes a session; exact-contained deletion remains the separate archived-only `remove-contained` operation.
+
 ## Maintenance
 
 Verify every manifest and referenced object:
@@ -107,6 +137,7 @@ codexfold gc --apply
 - Restore writes to a temporary file, verifies the complete SHA-256, then atomically replaces the target.
 - Existing indexes, manifests, and restore targets are never replaced without an explicit overwrite flag.
 - Contained-session removal is archived-only, proof-first, transaction-guarded, and retains recovery evidence.
+- Fork-family reporting is evidence-only, archive is explicit and recoverable, and neither operation triggers deletion.
 
 ## Development
 

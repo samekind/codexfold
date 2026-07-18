@@ -10,20 +10,23 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/jstar0/codexfold/internal/buildid"
 	"github.com/jstar0/codexfold/internal/codex"
 	"github.com/jstar0/codexfold/internal/mountfs"
 	"github.com/jstar0/codexfold/internal/service"
+	"github.com/jstar0/codexfold/internal/storage"
 	"github.com/jstar0/codexfold/internal/vfs"
 	"github.com/spf13/cobra"
 )
 
 const serviceLabel = "com.codexfold.fs"
+
+const nativeFSKitStartupTimeout = 45 * time.Second
 
 type operationTrace struct {
 	mu   sync.Mutex
@@ -62,9 +65,31 @@ func (t *operationTrace) Close() error {
 }
 
 type FSServiceActionResult struct {
-	Action string `json:"action"`
-	Path   string `json:"path,omitempty"`
-	DryRun bool   `json:"dry_run"`
+	Action         string `json:"action"`
+	Path           string `json:"path,omitempty"`
+	SupervisorPath string `json:"supervisor_path,omitempty"`
+	DryRun         bool   `json:"dry_run"`
+}
+
+type FSServiceInstallResult struct {
+	Path              string `json:"path"`
+	DryRun            bool   `json:"dry_run"`
+	Bytes             int    `json:"bytes"`
+	SupervisorPath    string `json:"supervisor_path,omitempty"`
+	SupervisorBytes   int    `json:"supervisor_bytes,omitempty"`
+	FSKitAppPath      string `json:"fskit_app_path,omitempty"`
+	FSKitLauncherPath string `json:"fskit_launcher_path,omitempty"`
+	FSKitResourcePath string `json:"fskit_resource_path,omitempty"`
+	FSKitAppChanged   bool   `json:"fskit_app_changed,omitempty"`
+}
+
+type FSServiceBinaryUpdateResult struct {
+	Candidate       string `json:"candidate"`
+	Target          string `json:"target"`
+	CurrentSHA256   string `json:"current_sha256"`
+	CandidateSHA256 string `json:"candidate_sha256"`
+	Changed         bool   `json:"changed"`
+	DryRun          bool   `json:"dry_run"`
 }
 
 type FSUpdatePreflightResult struct {
@@ -75,26 +100,230 @@ type FSUpdatePreflightResult struct {
 }
 
 func newFSServiceCommand() *cobra.Command {
-	command := &cobra.Command{Use: "service", Short: "Manage the per-user transparent filesystem service"}
+	command := &cobra.Command{Use: "service", Short: "Manage the transparent filesystem service"}
 	command.AddCommand(newFSServiceInstallCommand())
 	command.AddCommand(newFSServiceStartCommand())
 	command.AddCommand(newFSServiceStopCommand())
+	command.AddCommand(newFSServiceRestartCommand())
 	command.AddCommand(newFSServiceStatusCommand())
+	command.AddCommand(newFSServiceUpdateBinaryCommand())
 	command.AddCommand(newFSServiceUpdatePreflightCommand())
+	addPlatformServiceCommands(command)
+	return command
+}
+
+func newFSServiceUpdateBinaryCommand() *cobra.Command {
+	var codexHome, mountPoint, definitionPath string
+	var apply, jsonOutput bool
+	command := &cobra.Command{
+		Use:   "update-binary <candidate>",
+		Short: "Atomically replace, restart, verify, and roll back the service binary",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(command *cobra.Command, args []string) error {
+			candidate, err := filepath.Abs(args[0])
+			if err != nil {
+				return err
+			}
+			definition, err := resolveServiceDefinitionPath(definitionPath)
+			if err != nil {
+				return err
+			}
+			platform, err := service.CurrentPlatform()
+			if err != nil {
+				return err
+			}
+			target, err := service.DefinitionBinary(platform, definition)
+			if err != nil {
+				return err
+			}
+			currentSHA256, err := buildid.FileSHA256(target)
+			if err != nil {
+				return err
+			}
+			candidateSHA256, err := buildid.FileSHA256(candidate)
+			if err != nil {
+				return err
+			}
+			result := FSServiceBinaryUpdateResult{
+				Candidate: candidate, Target: target, CurrentSHA256: currentSHA256,
+				CandidateSHA256: candidateSHA256, Changed: currentSHA256 != candidateSHA256, DryRun: !apply,
+			}
+			if apply && result.Changed {
+				home, err := codex.ResolveHome(codexHome)
+				if err != nil {
+					return err
+				}
+				if err := requireFilesystemActivationAllowed(home); err != nil {
+					return err
+				}
+				mount := defaultMountPoint(home, mountPoint)
+				update, err := service.StageBinaryUpdate(candidate, target)
+				if err != nil {
+					return err
+				}
+				if err := stopPlatformService(command.Context(), platform, definition); err != nil {
+					_ = update.Commit()
+					return fmt.Errorf("stop filesystem service before binary update: %w", err)
+				}
+				if err := update.Promote(); err != nil {
+					rollbackErr := update.Rollback()
+					var cleanupErr error
+					var restartErr error
+					if rollbackErr == nil {
+						cleanupErr = update.Commit()
+						restartErr = startPlatformService(command.Context(), platform, definition, mount)
+					}
+					return errors.Join(fmt.Errorf("promote filesystem service binary: %w", err), rollbackErr, cleanupErr, restartErr)
+				}
+				if err := startPlatformService(command.Context(), platform, definition, mount); err != nil {
+					_ = stopPlatformService(command.Context(), platform, definition)
+					rollbackErr := update.Rollback()
+					var restartErr error
+					if rollbackErr == nil {
+						restartErr = startPlatformService(command.Context(), platform, definition, mount)
+						_ = update.Commit()
+					}
+					return errors.Join(fmt.Errorf("start verified filesystem service binary: %w", err), rollbackErr, restartErr)
+				}
+				if err := update.Commit(); err != nil {
+					return fmt.Errorf("remove filesystem binary rollback artifact: %w", err)
+				}
+			}
+			if jsonOutput {
+				return writeJSON(command, result)
+			}
+			_, err = fmt.Fprintf(command.OutOrStdout(), "dry_run=%t changed=%t target=%s current=%s candidate=%s\n", result.DryRun, result.Changed, result.Target, result.CurrentSHA256, result.CandidateSHA256)
+			return err
+		},
+	}
+	command.Flags().StringVar(&codexHome, "codex-home", "", "Codex home directory; defaults to CODEX_HOME or ~/.codex")
+	command.Flags().StringVar(&mountPoint, "mount", "", "Mounted CodexFold filesystem path; defaults to <codex-home>/fold-fs")
+	addServiceDefinitionFlags(command, &definitionPath)
+	command.Flags().BoolVar(&apply, "apply", false, "Stop, replace, restart, and verify the service binary")
+	command.Flags().BoolVar(&jsonOutput, "json", false, "Emit JSON output")
 	return command
 }
 
 func newFSServiceInstallCommand() *cobra.Command {
 	var codexHome, storeDir, mountPoint, binaryPath, plistPath, logDir, nativeRoot, operationTracePath string
-	var apply, canonicalNamespace, jsonOutput bool
+	var frontend, fskitResource, fskitAppPath, fskitAppSource, label string
+	var enrollmentInterval, enrollmentStableFor time.Duration
+	var enrollmentBatchSize int
+	var apply, canonicalNamespace, enrollmentCanary, jsonOutput bool
 	command := &cobra.Command{
 		Use:   "install",
-		Short: "Render and optionally bootstrap a per-user launchd service",
+		Short: "Render and optionally start the native platform service",
 		Args:  cobra.NoArgs,
-		RunE: func(command *cobra.Command, _ []string) error {
+		RunE: func(command *cobra.Command, _ []string) (runErr error) {
 			home, store, mount, binary, plist, logs, err := resolveServicePaths(codexHome, storeDir, mountPoint, binaryPath, plistPath, logDir)
 			if err != nil {
 				return err
+			}
+			if apply {
+				if err := requireFilesystemActivationAllowed(home); err != nil {
+					return err
+				}
+			}
+			platform, err := service.CurrentPlatform()
+			if err != nil {
+				return err
+			}
+			if frontend == "" {
+				frontend = "fuse"
+			}
+			if label == "" {
+				label = serviceLabel
+			}
+			if label != serviceLabel && platform != service.PlatformLaunchd {
+				return errors.New("custom service labels are supported only for macOS LaunchAgents")
+			}
+			hadExistingDefinition := false
+			if apply {
+				if info, statErr := os.Stat(plist); statErr == nil {
+					if !info.Mode().IsRegular() {
+						return errors.New("installed service definition is not a regular file")
+					}
+					hadExistingDefinition = true
+				} else if !errors.Is(statErr, os.ErrNotExist) {
+					return statErr
+				}
+			}
+			if frontend == "native-fskit" {
+				if platform != service.PlatformLaunchd {
+					return errors.New("native-fskit service frontend is available only on macOS")
+				}
+				canonicalNamespace = true
+				userHome, err := os.UserHomeDir()
+				if err != nil {
+					return err
+				}
+				if fskitAppPath == "" {
+					fskitAppPath = service.DefaultFSKitAppPath(userHome)
+				}
+				fskitAppPath, err = filepath.Abs(fskitAppPath)
+				if err != nil {
+					return err
+				}
+			}
+			var appTransaction fsKitAppTransaction
+			var definitionUpdates []*service.DefinitionUpdate
+			rollbackInstall := false
+			restartPreviousService := false
+			defer func() {
+				if !rollbackInstall {
+					return
+				}
+				rollbackContext, cancel := context.WithTimeout(context.Background(), 2*nativeFSKitStartupTimeout+15*time.Second)
+				defer cancel()
+				runErr = errors.Join(runErr, rollbackFailedServiceInstall(
+					rollbackContext, platform, plist, mount, definitionUpdates, appTransaction,
+					restartPreviousService, stopPlatformService, startPlatformService,
+				))
+			}()
+			if apply && frontend == "native-fskit" && hadExistingDefinition {
+				rollbackInstall = true
+				restartPreviousService = true
+				stopErr := stopPlatformService(command.Context(), platform, plist)
+				if err := waitPlatformServiceInactive(command.Context(), platform, plist, mount, 30*time.Second); err != nil {
+					return errors.Join(stopErr, err)
+				}
+			}
+			if apply && frontend == "native-fskit" {
+				if fskitAppSource != "" {
+					fskitAppSource, err = filepath.Abs(fskitAppSource)
+					if err != nil {
+						return err
+					}
+				}
+				appTransaction, err = prepareFSKitAppPlatform(command.Context(), fskitAppSource, fskitAppPath)
+				if err != nil {
+					return err
+				}
+				rollbackInstall = true
+				restartPreviousService = hadExistingDefinition && appTransaction.Changed()
+				if fskitResource == "" {
+					fskitResource = filepath.Join(appTransaction.AppGroupPath(), service.FSKitResourceDirectoryName)
+				}
+			}
+			if frontend == "native-fskit" && fskitResource == "" {
+				userHome, err := os.UserHomeDir()
+				if err != nil {
+					return err
+				}
+				fskitResource = service.DefaultFSKitResourcePath(userHome)
+			}
+			if frontend == "native-fskit" && apply {
+				within, err := filepath.Rel(appTransaction.AppGroupPath(), filepath.Clean(fskitResource))
+				if err != nil || within == ".." || strings.HasPrefix(within, ".."+string(filepath.Separator)) {
+					return errors.New("native FSKit resource must remain inside the configured App Group")
+				}
+			}
+			launcherPath := ""
+			if frontend == "native-fskit" {
+				launcherPath, err = service.FSKitHostLauncherPath(fskitAppPath)
+				if err != nil {
+					return err
+				}
 			}
 			if canonicalNamespace {
 				if nativeRoot == "" {
@@ -105,100 +334,288 @@ func newFSServiceInstallCommand() *cobra.Command {
 				}
 				nativeRoot = filepath.Clean(nativeRoot)
 			}
-			definition, err := service.RenderLaunchd(service.Options{
-				Label: serviceLabel, BinaryPath: binary, CodexHome: home, StoreDir: store, MountPoint: mount,
+			if enrollmentCanary {
+				userHome, err := os.UserHomeDir()
+				if err != nil {
+					return err
+				}
+				if err := validateCompatibilityCanary(home, filepath.Join(userHome, ".codex"), store, canonicalNamespace, compatibilityFlags{cliPath: "none", desktopPath: "none"}); err != nil {
+					return err
+				}
+			}
+			options := service.Options{
+				Label: label, BinaryPath: binary, CodexHome: home, StoreDir: store, MountPoint: mount,
 				StdoutPath: filepath.Join(logs, "stdout.log"), StderrPath: filepath.Join(logs, "stderr.log"),
 				CanonicalNamespace: canonicalNamespace, NativeRoot: nativeRoot, OperationTrace: operationTracePath,
-			})
+				EnrollmentInterval: enrollmentInterval, EnrollmentStableFor: enrollmentStableFor,
+				EnrollmentBatchSize: enrollmentBatchSize, EnrollmentCanary: enrollmentCanary,
+				Frontend: frontend, FSKitResource: fskitResource, LauncherPath: launcherPath,
+			}
+			definition, err := service.RenderDefinition(platform, options)
 			if err != nil {
 				return err
 			}
-			if apply && (runtime.GOOS != "darwin" || !mountfs.Available()) {
-				return errors.New("service installation requires a FUSE-enabled macOS build and an authorized host prerequisite")
+			if apply && frontend == "fuse" && !mountfs.Available() {
+				return errors.New("service installation requires a platform FUSE build and an authorized host prerequisite")
 			}
 			if apply {
 				if err := os.MkdirAll(logs, 0o700); err != nil {
 					return err
 				}
 			}
-			result, err := service.WriteDefinition(plist, definition, apply)
-			if err != nil {
+			written := service.InstallResult{Path: plist, DryRun: !apply, Bytes: len(definition)}
+			if apply {
+				update, err := service.StageDefinitionUpdate(plist, definition)
+				if err != nil {
+					return err
+				}
+				definitionUpdates = append(definitionUpdates, update)
+				rollbackInstall = true
+			} else if _, err := service.WriteDefinition(plist, definition, false); err != nil {
 				return err
 			}
+			result := FSServiceInstallResult{Path: written.Path, DryRun: written.DryRun, Bytes: written.Bytes}
+			if frontend == "native-fskit" {
+				result.FSKitAppPath = fskitAppPath
+				result.FSKitLauncherPath = launcherPath
+				result.FSKitResourcePath = fskitResource
+				if appTransaction != nil {
+					result.FSKitAppChanged = appTransaction.Changed()
+				}
+				supervisorDefinition, err := service.RenderLaunchdSupervisor(options)
+				if err != nil {
+					return err
+				}
+				supervisorPath := nativeFSKitSupervisorDefinitionPath(plist)
+				if apply {
+					update, err := service.StageDefinitionUpdate(supervisorPath, supervisorDefinition)
+					if err != nil {
+						_ = commitDefinitionUpdates(definitionUpdates)
+						return err
+					}
+					definitionUpdates = append(definitionUpdates, update)
+				} else if _, err := service.WriteDefinition(supervisorPath, supervisorDefinition, false); err != nil {
+					return err
+				}
+				result.SupervisorPath = supervisorPath
+				result.SupervisorBytes = len(supervisorDefinition)
+			}
 			if apply {
-				manager := service.Manager{}
-				_ = manager.Bootout(command.Context(), plist)
-				if err := manager.Bootstrap(command.Context(), plist); err != nil {
+				for _, update := range definitionUpdates {
+					if err := update.Promote(); err != nil {
+						return err
+					}
+				}
+			}
+			if apply {
+				restartPreviousService = restartPreviousService || hadExistingDefinition
+				if err := installPlatformService(command.Context(), platform, plist, binary, mount); err != nil {
 					return err
 				}
-				if err := manager.Kickstart(command.Context(), serviceLabel); err != nil {
-					return err
+			}
+			rollbackInstall = false
+			cleanupErr := commitDefinitionUpdates(definitionUpdates)
+			if appTransaction != nil {
+				if err := appTransaction.Commit(); err != nil {
+					cleanupErr = errors.Join(cleanupErr, fmt.Errorf("remove FSKit app rollback artifacts: %w", err))
 				}
-				if _, err := manager.WaitHealthy(command.Context(), serviceLabel, mount, 15*time.Second); err != nil {
-					_ = manager.Bootout(command.Context(), plist)
-					return err
-				}
+			}
+			if cleanupErr != nil {
+				return cleanupErr
 			}
 			if jsonOutput {
 				return writeJSON(command, result)
 			}
-			_, err = fmt.Fprintf(command.OutOrStdout(), "dry_run=%t path=%s bytes=%d\n", result.DryRun, result.Path, result.Bytes)
+			_, err = fmt.Fprintf(command.OutOrStdout(), "dry_run=%t path=%s bytes=%d supervisor=%s\n", result.DryRun, result.Path, result.Bytes, result.SupervisorPath)
 			return err
 		},
 	}
 	addServicePathFlags(command, &codexHome, &storeDir, &mountPoint, &binaryPath, &plistPath, &logDir)
 	command.Flags().BoolVar(&canonicalNamespace, "canonical-namespace", false, "Start the service with the canonical Codex session namespace")
+	command.Flags().StringVar(&frontend, "frontend", "fuse", "Filesystem frontend: fuse or native-fskit")
+	command.Flags().StringVar(&label, "label", serviceLabel, "Service label; non-default labels are intended for isolated macOS validation")
+	command.Flags().StringVar(&fskitResource, "fskit-resource", "", "Native FSKit resource inside the App Group; defaults to <App Group>/native-fskit")
+	command.Flags().StringVar(&fskitAppPath, "fskit-app", "", "Installed signed FSKit app; defaults to ~/Applications/CodexFoldFSKit.app")
+	command.Flags().StringVar(&fskitAppSource, "fskit-app-source", "", "Signed FSKit app candidate to atomically install or update at --fskit-app")
 	command.Flags().StringVar(&nativeRoot, "native-root", "", "Canonical native backing root; defaults to <codex-home>/fold-native")
-	command.Flags().StringVar(&operationTracePath, "operation-trace", "", "Absolute path for sanitized FUSE operation names")
-	command.Flags().BoolVar(&apply, "apply", false, "Write, bootstrap, and start the per-user service")
+	command.Flags().StringVar(&operationTracePath, "operation-trace", "", "Absolute path for sanitized filesystem operation names")
+	command.Flags().DurationVar(&enrollmentInterval, "enrollment-interval", 0, "Periodic stable-session enrollment interval; zero disables the loop")
+	command.Flags().DurationVar(&enrollmentStableFor, "enrollment-stable-for", time.Hour, "Required unchanged interval before periodic enrollment")
+	command.Flags().IntVar(&enrollmentBatchSize, "enrollment-batch-size", 1, "Maximum sessions enrolled per periodic cycle")
+	command.Flags().BoolVar(&enrollmentCanary, "enrollment-canary", false, "Enable periodic apply only for an explicitly isolated Codex home while capability remains preview")
+	command.Flags().BoolVar(&apply, "apply", false, "Write, install, and start the native platform service")
 	command.Flags().BoolVar(&jsonOutput, "json", false, "Emit JSON output")
 	return command
 }
 
-func newFSServiceStartCommand() *cobra.Command {
-	return newFSServiceLifecycleCommand("start", true, func(ctx context.Context, manager service.Manager, plist string) error {
-		_ = manager.Bootout(ctx, plist)
-		if err := manager.Bootstrap(ctx, plist); err != nil {
+func rollbackDefinitionUpdates(updates []*service.DefinitionUpdate) error {
+	var result error
+	for index := len(updates) - 1; index >= 0; index-- {
+		result = errors.Join(result, updates[index].Rollback())
+	}
+	return errors.Join(result, commitDefinitionUpdates(updates))
+}
+
+func commitDefinitionUpdates(updates []*service.DefinitionUpdate) error {
+	var result error
+	for _, update := range updates {
+		result = errors.Join(result, update.Commit())
+	}
+	return result
+}
+
+type stopServiceOperation func(context.Context, service.Platform, string) error
+type startServiceOperation func(context.Context, service.Platform, string, string) error
+
+func rollbackFailedServiceInstall(
+	ctx context.Context,
+	platform service.Platform,
+	definitionPath string,
+	mountPoint string,
+	definitionUpdates []*service.DefinitionUpdate,
+	appTransaction fsKitAppTransaction,
+	restartPreviousService bool,
+	stop stopServiceOperation,
+	start startServiceOperation,
+) error {
+	if restartPreviousService && stop != nil {
+		// A failed start normally booted the jobs out already. This extra stop is
+		// best effort so rollback can also recover failures before the health gate.
+		_ = stop(ctx, platform, definitionPath)
+	}
+	result := rollbackDefinitionUpdates(definitionUpdates)
+	if appTransaction != nil {
+		result = errors.Join(result, appTransaction.Rollback(ctx))
+	}
+	if restartPreviousService {
+		if start == nil {
+			result = errors.Join(result, errors.New("service rollback restart operation is unavailable"))
+		} else {
+			result = errors.Join(result, start(ctx, platform, definitionPath, mountPoint))
+		}
+	}
+	return result
+}
+
+func waitPlatformServiceInactive(ctx context.Context, platform service.Platform, definitionPath string, mountPoint string, timeout time.Duration) error {
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	var lockPaths nativeFSKitProcessLockPaths
+	checkLocks := false
+	if platform == service.PlatformLaunchd {
+		frontend, err := service.DefinitionFrontend(platform, definitionPath)
+		if err != nil {
 			return err
 		}
-		return manager.Kickstart(ctx, serviceLabel)
-	})
+		if frontend == "native-fskit" {
+			lockPaths, err = nativeFSKitLaunchdLockPaths(definitionPath)
+			if err != nil {
+				return err
+			}
+			checkLocks = true
+		}
+	}
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	var daemonLock, supervisorLock service.ProcessLockStatus
+	for {
+		status, err := platformServiceStatus(ctx, platform, mountPoint, definitionPath)
+		if err != nil {
+			return err
+		}
+		if checkLocks {
+			daemonLock, err = service.InspectProcessLock(lockPaths.daemon)
+			if err != nil {
+				return fmt.Errorf("inspect daemon process lock: %w", err)
+			}
+			supervisorLock, err = service.InspectProcessLock(lockPaths.supervisor)
+			if err != nil {
+				return fmt.Errorf("inspect supervisor process lock: %w", err)
+			}
+		}
+		if !status.DaemonRunning && !status.SupervisorRunning && !status.MountHealthy && !daemonLock.Held && !supervisorLock.Held {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-deadline.C:
+			return fmt.Errorf(
+				"previous filesystem service did not stop cleanly: daemon=%t supervisor=%t mount=%t daemon_lock=%t daemon_lock_pid=%d supervisor_lock=%t supervisor_lock_pid=%d",
+				status.DaemonRunning, status.SupervisorRunning, status.MountHealthy,
+				daemonLock.Held, daemonLock.PID, supervisorLock.Held, supervisorLock.PID,
+			)
+		case <-ticker.C:
+		}
+	}
+}
+
+func newFSServiceStartCommand() *cobra.Command {
+	return newFSServiceLifecycleCommand("start", true)
 }
 
 func newFSServiceStopCommand() *cobra.Command {
-	return newFSServiceLifecycleCommand("stop", false, func(ctx context.Context, manager service.Manager, plist string) error {
-		return manager.Bootout(ctx, plist)
-	})
+	return newFSServiceLifecycleCommand("stop", false)
 }
 
-func newFSServiceLifecycleCommand(action string, waitForMount bool, run func(context.Context, service.Manager, string) error) *cobra.Command {
+func newFSServiceRestartCommand() *cobra.Command {
+	return newFSServiceLifecycleCommand("restart", true)
+}
+
+func newFSServiceLifecycleCommand(action string, waitForMount bool) *cobra.Command {
 	var plistPath, codexHome, mountPoint string
 	var apply, jsonOutput bool
 	command := &cobra.Command{
 		Use:   action,
-		Short: action + " the per-user filesystem service",
+		Short: action + " the filesystem service",
 		Args:  cobra.NoArgs,
 		RunE: func(command *cobra.Command, _ []string) error {
-			plist, err := resolvePlistPath(plistPath)
+			definition, err := resolveServiceDefinitionPath(plistPath)
 			if err != nil {
 				return err
 			}
-			result := FSServiceActionResult{Action: action, Path: plist, DryRun: !apply}
-			if apply {
-				if runtime.GOOS != "darwin" {
-					return errors.New("launchd service lifecycle is available only on macOS")
-				}
-				manager := service.Manager{}
-				if err := run(command.Context(), manager, plist); err != nil {
+			var home string
+			if apply && (action == "start" || action == "restart") {
+				home, err = codex.ResolveHome(codexHome)
+				if err != nil {
 					return err
 				}
-				if waitForMount {
-					home, err := codex.ResolveHome(codexHome)
-					if err != nil {
+				if err := requireFilesystemActivationAllowed(home); err != nil {
+					return err
+				}
+			}
+			platform, err := service.CurrentPlatform()
+			if err != nil {
+				return err
+			}
+			result := FSServiceActionResult{Action: action, Path: definition, DryRun: !apply}
+			if apply {
+				frontend, err := service.DefinitionFrontend(platform, definition)
+				if err != nil {
+					return err
+				}
+				if frontend == "native-fskit" {
+					result.SupervisorPath = nativeFSKitSupervisorDefinitionPath(definition)
+				}
+				if waitForMount && frontend == "fuse" && !mountfs.Available() {
+					return errors.New("service start requires a platform FUSE build and an authorized host prerequisite")
+				}
+				if action == "start" {
+					if err := startPlatformService(command.Context(), platform, definition, defaultMountPoint(home, mountPoint)); err != nil {
 						return err
 					}
-					if _, err := manager.WaitHealthy(command.Context(), serviceLabel, defaultMountPoint(home, mountPoint), 15*time.Second); err != nil {
-						_ = manager.Bootout(command.Context(), plist)
+				} else if action == "restart" {
+					if err := stopPlatformService(command.Context(), platform, definition); err != nil {
+						return err
+					}
+					if err := startPlatformService(command.Context(), platform, definition, defaultMountPoint(home, mountPoint)); err != nil {
+						return err
+					}
+				} else {
+					if err := stopPlatformService(command.Context(), platform, definition); err != nil {
 						return err
 					}
 				}
@@ -206,22 +623,22 @@ func newFSServiceLifecycleCommand(action string, waitForMount bool, run func(con
 			if jsonOutput {
 				return writeJSON(command, result)
 			}
-			_, err = fmt.Fprintf(command.OutOrStdout(), "action=%s dry_run=%t path=%s\n", action, result.DryRun, plist)
+			_, err = fmt.Fprintf(command.OutOrStdout(), "action=%s dry_run=%t path=%s supervisor=%s\n", action, result.DryRun, definition, result.SupervisorPath)
 			return err
 		},
 	}
-	command.Flags().StringVar(&plistPath, "plist", "", "LaunchAgent plist path")
+	addServiceDefinitionFlags(command, &plistPath)
 	if waitForMount {
 		command.Flags().StringVar(&codexHome, "codex-home", "", "Codex home directory; defaults to CODEX_HOME or ~/.codex")
 		command.Flags().StringVar(&mountPoint, "mount", "", "Mounted CodexFold filesystem path; defaults to <codex-home>/fold-fs")
 	}
-	command.Flags().BoolVar(&apply, "apply", false, "Execute the launchctl action")
+	command.Flags().BoolVar(&apply, "apply", false, "Execute the native service-manager action")
 	command.Flags().BoolVar(&jsonOutput, "json", false, "Emit JSON output")
 	return command
 }
 
 func newFSServiceStatusCommand() *cobra.Command {
-	var codexHome, mountPoint string
+	var codexHome, mountPoint, definitionPath string
 	var jsonOutput bool
 	command := &cobra.Command{
 		Use:   "status",
@@ -232,18 +649,327 @@ func newFSServiceStatusCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			status := service.Manager{}.Status(command.Context(), serviceLabel, defaultMountPoint(home, mountPoint))
+			platform, err := service.CurrentPlatform()
+			if err != nil {
+				return err
+			}
+			definition, err := resolveServiceDefinitionPath(definitionPath)
+			if err != nil {
+				return err
+			}
+			status, err := platformServiceStatus(command.Context(), platform, defaultMountPoint(home, mountPoint), definition)
+			if err != nil {
+				return err
+			}
 			if jsonOutput {
 				return writeJSON(command, status)
 			}
-			_, err = fmt.Fprintf(command.OutOrStdout(), "daemon=%t mount=%t daemon_error=%q mount_error=%q\n", status.DaemonRunning, status.MountHealthy, status.DaemonError, status.MountError)
+			_, err = fmt.Fprintf(command.OutOrStdout(), "daemon=%t supervisor=%t mount=%t build=%t running_build=%s disk_build=%s binary=%s daemon_error=%q supervisor_error=%q mount_error=%q build_error=%q\n", status.DaemonRunning, status.SupervisorRunning, status.MountHealthy, status.Build.Healthy, status.Build.RunningBuildSHA256, status.Build.ConfiguredBuildSHA256, status.Build.ConfiguredBinaryPath, status.DaemonError, status.SupervisorError, status.MountError, status.Build.Error)
 			return err
 		},
 	}
 	command.Flags().StringVar(&codexHome, "codex-home", "", "Codex home directory; defaults to CODEX_HOME or ~/.codex")
 	command.Flags().StringVar(&mountPoint, "mount", "", "Mounted CodexFold filesystem path; defaults to <codex-home>/fold-fs")
+	addServiceDefinitionFlags(command, &definitionPath)
 	command.Flags().BoolVar(&jsonOutput, "json", false, "Emit JSON output")
 	return command
+}
+
+func installPlatformService(ctx context.Context, platform service.Platform, definitionPath string, binaryPath string, mountPoint string) error {
+	label, err := service.DefinitionLabel(platform, definitionPath)
+	if err != nil {
+		return err
+	}
+	if platform == service.PlatformWindows {
+		manager := service.WindowsManager{}
+		_ = manager.Stop(ctx, label)
+		if err := manager.Install(ctx, label, binaryPath, definitionPath); err != nil {
+			return err
+		}
+	}
+	return startPlatformService(ctx, platform, definitionPath, mountPoint)
+}
+
+func startPlatformService(ctx context.Context, platform service.Platform, definitionPath string, mountPoint string) error {
+	frontend, err := service.DefinitionFrontend(platform, definitionPath)
+	if err != nil {
+		return err
+	}
+	label, err := service.DefinitionLabel(platform, definitionPath)
+	if err != nil {
+		return err
+	}
+	switch platform {
+	case service.PlatformLaunchd:
+		manager := service.Manager{}
+		if frontend == "native-fskit" {
+			supervisorLabel := nativeFSKitSupervisorLabel(label)
+			supervisorDefinition := nativeFSKitSupervisorDefinitionPath(definitionPath)
+			_ = manager.Bootout(ctx, supervisorDefinition)
+			_ = manager.Bootout(ctx, definitionPath)
+			if err := manager.Enable(ctx, label); err != nil {
+				return err
+			}
+			if err := manager.Enable(ctx, supervisorLabel); err != nil {
+				return err
+			}
+			if err := manager.Bootstrap(ctx, definitionPath); err != nil {
+				return err
+			}
+			if err := manager.Kickstart(ctx, label); err != nil {
+				_ = manager.Bootout(ctx, definitionPath)
+				return err
+			}
+			if err := manager.Bootstrap(ctx, supervisorDefinition); err != nil {
+				_ = manager.Bootout(ctx, definitionPath)
+				return err
+			}
+			if err := manager.Kickstart(ctx, supervisorLabel); err != nil {
+				_ = manager.Bootout(ctx, supervisorDefinition)
+				_ = manager.Bootout(ctx, definitionPath)
+				return err
+			}
+			if err := waitLaunchdNativeFSKitHealthy(ctx, manager, label, definitionPath, mountPoint, nativeFSKitStartupTimeout); err != nil {
+				_ = manager.Bootout(ctx, supervisorDefinition)
+				_ = manager.Bootout(ctx, definitionPath)
+				return err
+			}
+			if err := verifyServiceBuild(service.PlatformLaunchd, definitionPath, mountPoint); err != nil {
+				_ = manager.Bootout(ctx, supervisorDefinition)
+				_ = manager.Bootout(ctx, definitionPath)
+				return err
+			}
+			return nil
+		}
+		_ = manager.Bootout(ctx, definitionPath)
+		if err := manager.Enable(ctx, label); err != nil {
+			return err
+		}
+		if err := manager.Bootstrap(ctx, definitionPath); err != nil {
+			return err
+		}
+		if err := manager.Kickstart(ctx, label); err != nil {
+			_ = manager.Bootout(ctx, definitionPath)
+			return err
+		}
+		if _, err := manager.WaitHealthy(ctx, label, mountPoint, 15*time.Second); err != nil {
+			_ = manager.Bootout(ctx, definitionPath)
+			return err
+		}
+		if err := verifyServiceBuild(service.PlatformLaunchd, definitionPath, mountPoint); err != nil {
+			_ = manager.Bootout(ctx, definitionPath)
+			return err
+		}
+		return nil
+	case service.PlatformSystemd:
+		unit, err := systemdServiceUnit(definitionPath, label)
+		if err != nil {
+			return err
+		}
+		manager := service.SystemdManager{}
+		_ = manager.Stop(ctx, unit)
+		if err := manager.Start(ctx, unit); err != nil {
+			return err
+		}
+		if _, err := manager.WaitHealthy(ctx, unit, mountPoint, 15*time.Second); err != nil {
+			_ = manager.Stop(ctx, unit)
+			return err
+		}
+		if err := verifyServiceBuild(service.PlatformSystemd, definitionPath, mountPoint); err != nil {
+			_ = manager.Stop(ctx, unit)
+			return err
+		}
+		return nil
+	case service.PlatformWindows:
+		manager := service.WindowsManager{}
+		_ = manager.Stop(ctx, label)
+		if err := manager.Start(ctx, label); err != nil {
+			return err
+		}
+		if _, err := manager.WaitHealthy(ctx, label, mountPoint, 15*time.Second); err != nil {
+			_ = manager.Stop(ctx, label)
+			return err
+		}
+		if err := verifyServiceBuild(service.PlatformWindows, definitionPath, mountPoint); err != nil {
+			_ = manager.Stop(ctx, label)
+			return err
+		}
+		return nil
+	default:
+		return errors.New("unknown service platform")
+	}
+}
+
+func stopPlatformService(ctx context.Context, platform service.Platform, definitionPath string) error {
+	frontend, err := service.DefinitionFrontend(platform, definitionPath)
+	if err != nil {
+		return err
+	}
+	label, err := service.DefinitionLabel(platform, definitionPath)
+	if err != nil {
+		return err
+	}
+	switch platform {
+	case service.PlatformLaunchd:
+		if frontend == "native-fskit" {
+			manager := service.Manager{}
+			supervisorErr := manager.Bootout(ctx, nativeFSKitSupervisorDefinitionPath(definitionPath))
+			daemonErr := manager.Bootout(ctx, definitionPath)
+			return errors.Join(supervisorErr, daemonErr)
+		}
+		return (service.Manager{}).Bootout(ctx, definitionPath)
+	case service.PlatformSystemd:
+		unit, err := systemdServiceUnit(definitionPath, label)
+		if err != nil {
+			return err
+		}
+		return (service.SystemdManager{}).Stop(ctx, unit)
+	case service.PlatformWindows:
+		return (service.WindowsManager{}).Stop(ctx, label)
+	default:
+		return errors.New("unknown service platform")
+	}
+}
+
+func verifyServiceBuild(platform service.Platform, definitionPath string, mountPoint string) error {
+	status := service.InspectBuild(platform, definitionPath, mountPoint)
+	if !status.Healthy {
+		return fmt.Errorf("filesystem service build verification failed: %s", status.Error)
+	}
+	return nil
+}
+
+func platformServiceStatus(ctx context.Context, platform service.Platform, mountPoint string, definitionPath string) (service.Status, error) {
+	frontend, err := service.DefinitionFrontend(platform, definitionPath)
+	if err != nil {
+		return service.Status{}, err
+	}
+	label, err := service.DefinitionLabel(platform, definitionPath)
+	if err != nil {
+		return service.Status{}, err
+	}
+	var status service.Status
+	switch platform {
+	case service.PlatformLaunchd:
+		manager := service.Manager{}
+		status = manager.Status(ctx, label, mountPoint)
+		if frontend == "native-fskit" {
+			lockPaths, err := nativeFSKitLaunchdLockPaths(definitionPath)
+			if err != nil {
+				return service.Status{}, err
+			}
+			status = validateLaunchdChildProcess(status, lockPaths.daemon, "daemon")
+			supervisor := validateLaunchdChildProcess(
+				manager.Status(ctx, nativeFSKitSupervisorLabel(label), mountPoint),
+				lockPaths.supervisor,
+				"supervisor",
+			)
+			status.SupervisorRunning = supervisor.DaemonRunning
+			status.SupervisorPID = supervisor.DaemonPID
+			status.SupervisorError = supervisor.DaemonError
+		}
+	case service.PlatformSystemd:
+		unit, err := service.SystemdUnitName(label)
+		if err != nil {
+			return service.Status{}, err
+		}
+		status = (service.SystemdManager{}).Status(ctx, unit, mountPoint)
+	case service.PlatformWindows:
+		status = (service.WindowsManager{}).Status(ctx, label, mountPoint)
+	default:
+		return service.Status{}, errors.New("unknown service platform")
+	}
+	status.Build = service.InspectBuild(platform, definitionPath, mountPoint)
+	return status, nil
+}
+
+type nativeFSKitProcessLockPaths struct {
+	daemon     string
+	supervisor string
+}
+
+func nativeFSKitLaunchdLockPaths(definitionPath string) (nativeFSKitProcessLockPaths, error) {
+	store, err := service.DefinitionStore(service.PlatformLaunchd, definitionPath)
+	if err != nil {
+		return nativeFSKitProcessLockPaths{}, err
+	}
+	resource, err := service.DefinitionFSKitResource(service.PlatformLaunchd, definitionPath)
+	if err != nil {
+		return nativeFSKitProcessLockPaths{}, err
+	}
+	return nativeFSKitProcessLockPaths{
+		daemon:     filepath.Join(store, "fs", "service.lock"),
+		supervisor: filepath.Join(resource, service.NativeFSKitSupervisorLockName),
+	}, nil
+}
+
+func validateLaunchdChildProcess(status service.Status, lockPath string, role string) service.Status {
+	if !status.DaemonRunning {
+		return status
+	}
+	lockStatus, err := service.InspectProcessLock(lockPath)
+	if err != nil {
+		status.DaemonRunning = false
+		status.DaemonError = fmt.Sprintf("inspect %s process lock: %v", role, err)
+		return status
+	}
+	if !lockStatus.Held {
+		status.DaemonRunning = false
+		status.DaemonError = fmt.Sprintf("%s host is running without an active child process lock", role)
+		return status
+	}
+	parentPID, err := service.ProcessParentPID(lockStatus.PID)
+	if err != nil {
+		status.DaemonRunning = false
+		status.DaemonError = fmt.Sprintf("inspect %s child process %d: %v", role, lockStatus.PID, err)
+		return status
+	}
+	if parentPID != status.DaemonPID {
+		status.DaemonRunning = false
+		status.DaemonError = fmt.Sprintf("%s process lock owner %d belongs to host %d, not launchd host %d", role, lockStatus.PID, parentPID, status.DaemonPID)
+	}
+	return status
+}
+
+func waitLaunchdNativeFSKitHealthy(ctx context.Context, manager service.Manager, label string, definitionPath string, mountPoint string, timeout time.Duration) error {
+	if timeout <= 0 {
+		timeout = 15 * time.Second
+	}
+	lockPaths, err := nativeFSKitLaunchdLockPaths(definitionPath)
+	if err != nil {
+		return err
+	}
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	var daemon, supervisor service.Status
+	supervisorLabel := nativeFSKitSupervisorLabel(label)
+	for {
+		daemon = validateLaunchdChildProcess(manager.Status(ctx, label, mountPoint), lockPaths.daemon, "daemon")
+		supervisor = validateLaunchdChildProcess(manager.Status(ctx, supervisorLabel, mountPoint), lockPaths.supervisor, "supervisor")
+		if daemon.DaemonRunning && supervisor.DaemonRunning && daemon.MountHealthy {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-deadline.C:
+			return fmt.Errorf("native FSKit service did not become healthy: daemon=%t supervisor=%t mount=%t daemon_error=%q supervisor_error=%q mount_error=%q", daemon.DaemonRunning, supervisor.DaemonRunning, daemon.MountHealthy, daemon.DaemonError, supervisor.DaemonError, daemon.MountError)
+		case <-ticker.C:
+		}
+	}
+}
+
+func systemdServiceUnit(definitionPath string, label string) (string, error) {
+	unit, err := service.SystemdUnitName(label)
+	if err != nil {
+		return "", err
+	}
+	if filepath.Base(definitionPath) != unit {
+		return "", fmt.Errorf("systemd definition filename must be %s", unit)
+	}
+	return unit, nil
 }
 
 func newFSServiceUpdatePreflightCommand() *cobra.Command {
@@ -428,7 +1154,7 @@ func restoreManagedState(store string, sessionID string, retiredPath string) err
 	return nil
 }
 
-func retainCanonicalSnapshot(store string, sessionID string, source vfs.NativeFile) (vfs.NativeFile, error) {
+func retainCanonicalSnapshot(ctx context.Context, store string, sessionID string, source vfs.NativeFile, budget storage.Checker) (vfs.NativeFile, error) {
 	if store == "" || !validSessionID(sessionID) || source.Path == "" {
 		return vfs.NativeFile{}, errors.New("store, session ID, and source snapshot are required")
 	}
@@ -439,6 +1165,16 @@ func retainCanonicalSnapshot(store string, sessionID string, source vfs.NativeFi
 	}
 	if verified.Bytes != source.Bytes || verified.SHA256 != source.SHA256 {
 		return vfs.NativeFile{}, errors.New("canonical native snapshot changed during migration")
+	}
+	if budget == nil {
+		guard, err := storage.DefaultGuard(store)
+		if err != nil {
+			return vfs.NativeFile{}, err
+		}
+		budget = guard
+	}
+	if _, err := budget.Check(ctx, storage.Projection{Operation: "retain-migration-snapshot", AdditionalPersistentBytes: source.Bytes}); err != nil {
+		return vfs.NativeFile{}, err
 	}
 	retainedDir := filepath.Join(filepath.Clean(store), "fs", "snapshots", sessionID)
 	retainedPath := filepath.Join(retainedDir, "native.jsonl")
@@ -891,8 +1627,13 @@ func addServicePathFlags(command *cobra.Command, codexHome, storeDir, mountPoint
 	command.Flags().StringVar(storeDir, "store", "", "Fold store directory; defaults to <codex-home>/fold-store")
 	command.Flags().StringVar(mountPoint, "mount", "", "Mounted CodexFold filesystem path; defaults to <codex-home>/fold-fs")
 	command.Flags().StringVar(binaryPath, "binary", "", "Absolute CodexFold binary path; defaults to the current executable")
-	command.Flags().StringVar(plistPath, "plist", "", "LaunchAgent plist path")
+	addServiceDefinitionFlags(command, plistPath)
 	command.Flags().StringVar(logDir, "log-dir", "", "Service log directory; defaults to <store>/service/logs")
+}
+
+func addServiceDefinitionFlags(command *cobra.Command, definitionPath *string) {
+	command.Flags().StringVar(definitionPath, "definition", "", "Native service definition path")
+	command.Flags().StringVar(definitionPath, "plist", "", "LaunchAgent plist path (macOS compatibility alias)")
 }
 
 func resolveServicePaths(codexHome, storeDir, mountPoint, binaryPath, plistPath, logDir string) (string, string, string, string, string, string, error) {
@@ -913,7 +1654,7 @@ func resolveServicePaths(codexHome, storeDir, mountPoint, binaryPath, plistPath,
 	if err != nil {
 		return "", "", "", "", "", "", err
 	}
-	plist, err := resolvePlistPath(plistPath)
+	plist, err := resolveServiceDefinitionPath(plistPath)
 	if err != nil {
 		return "", "", "", "", "", "", err
 	}
@@ -937,4 +1678,54 @@ func resolvePlistPath(explicit string) (string, error) {
 		return "", err
 	}
 	return filepath.Join(home, "Library", "LaunchAgents", serviceLabel+".plist"), nil
+}
+
+func nativeFSKitSupervisorDefinitionPath(definitionPath string) string {
+	definitionPath = filepath.Clean(definitionPath)
+	extension := filepath.Ext(definitionPath)
+	base := strings.TrimSuffix(filepath.Base(definitionPath), extension)
+	if extension == "" {
+		extension = ".plist"
+	}
+	return filepath.Join(filepath.Dir(definitionPath), base+".supervisor"+extension)
+}
+
+func nativeFSKitSupervisorLabel(label string) string {
+	return label + ".supervisor"
+}
+
+func resolveServiceDefinitionPath(explicit string) (string, error) {
+	if explicit != "" {
+		return filepath.Abs(explicit)
+	}
+	platform, err := service.CurrentPlatform()
+	if err != nil {
+		return "", err
+	}
+	switch platform {
+	case service.PlatformLaunchd:
+		return resolvePlistPath("")
+	case service.PlatformSystemd:
+		configHome := os.Getenv("XDG_CONFIG_HOME")
+		if !filepath.IsAbs(configHome) {
+			home, err := os.UserHomeDir()
+			if err != nil {
+				return "", err
+			}
+			configHome = filepath.Join(home, ".config")
+		}
+		unit, err := service.SystemdUnitName(serviceLabel)
+		if err != nil {
+			return "", err
+		}
+		return filepath.Join(configHome, "systemd", "user", unit), nil
+	case service.PlatformWindows:
+		programData := os.Getenv("ProgramData")
+		if programData == "" {
+			return "", errors.New("ProgramData is not set")
+		}
+		return filepath.Join(programData, "CodexFold", "service.json"), nil
+	default:
+		return "", errors.New("unknown service platform")
+	}
 }

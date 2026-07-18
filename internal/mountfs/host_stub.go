@@ -1,4 +1,4 @@
-//go:build !fuse || !cgo
+//go:build (!darwin && !linux && !windows) || (darwin && (!fuse || !cgo)) || (linux && (!fuse || !fuse3 || !cgo)) || (windows && !winfsp)
 
 package mountfs
 

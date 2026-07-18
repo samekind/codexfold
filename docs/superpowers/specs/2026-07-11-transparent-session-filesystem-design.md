@@ -270,11 +270,13 @@ The trace suite covers listing, opening, scrolling old history, resume, sending 
 
 ### macOS
 
-- Current reference adapter: FUSE-T `1.2.7`.
+- Selected production adapter: FUSE-T `1.2.7` with the NFS backend explicitly requested as `backend=nfs`; relying on FUSE-T's default backend is not allowed.
 - Service: user launch service with keep-alive and mount health monitoring.
 - Required tests: APFS native baseline, Apple Silicon, Codex Desktop, Codex CLI, canonical `sessions` and `archived_sessions` namespace moves, sleep/wake, network changes, user logout/login, daemon kill, mount restart, and Codex upgrade.
 - FUSE-T is the validated userspace host for this project; macFUSE is not a prerequisite for the current macOS route.
 - The FUSE-T NFS mount must use synchronous write requests before its health identity becomes readable. This is verified through the live `MNT_SYNCHRONOUS` mount flag and a real same-offset JSONL write regression; libfuse `direct_io` or disabled attribute caching alone is not accepted as evidence.
+- FUSE-T `1.2.7`'s FSKit backend is rejected for production. An isolated real mount lost the first of two complete JSONL records written at the same stale EOF, and managed-to-native route changes remained cached past the five-second correctness gate. Basic read/write, `F_FULLFSYNC`, truncate, remount, and throughput results do not override a byte-loss failure. FUSE-T also documents that notifications are unavailable for its FSKit backend.
+- Native FSKit remains a research adapter rather than a fallback selected at runtime. The earlier probes did not provide a complete canonical namespace and did not recover automatically from every extension-process failure; no native FSKit route may replace the selected NFS backend without passing the complete platform contract independently.
 - Platform readiness requires a directory-level canonical namespace or an equivalent mechanism that keeps Codex archive and unarchive moves native-compatible.
 
 ### Linux

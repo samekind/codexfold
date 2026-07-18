@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -20,20 +21,23 @@ import (
 	"github.com/jstar0/codexfold/internal/compat"
 	"github.com/jstar0/codexfold/internal/fold"
 	"github.com/jstar0/codexfold/internal/fsctl"
+	"github.com/jstar0/codexfold/internal/fskitproto"
 	"github.com/jstar0/codexfold/internal/mountfs"
 	"github.com/jstar0/codexfold/internal/pack"
 	"github.com/jstar0/codexfold/internal/service"
+	"github.com/jstar0/codexfold/internal/storage"
 	"github.com/jstar0/codexfold/internal/vfs"
 	"github.com/spf13/cobra"
 )
 
 type FSMigrateResult struct {
-	SessionID string             `json:"session_id"`
-	Native    vfs.NativeFile     `json:"native"`
-	Target    string             `json:"target"`
-	Shadow    fsctl.ShadowResult `json:"shadow"`
-	DryRun    bool               `json:"dry_run"`
-	Routed    bool               `json:"routed"`
+	SessionID string                      `json:"session_id"`
+	Native    vfs.NativeFile              `json:"native"`
+	Target    string                      `json:"target"`
+	Shadow    fsctl.ShadowResult          `json:"shadow"`
+	DryRun    bool                        `json:"dry_run"`
+	Routed    bool                        `json:"routed"`
+	Storage   *storage.MutationAccounting `json:"storage,omitempty"`
 }
 
 type FSCompatibilityResult struct {
@@ -46,31 +50,41 @@ type FSCompatibilityResult struct {
 type FSServeResult struct {
 	MountPoint      string `json:"mount_point"`
 	ManagedSessions int    `json:"managed_sessions"`
+	Frontend        string `json:"frontend"`
+	ResourcePath    string `json:"resource_path,omitempty"`
 	DryRun          bool   `json:"dry_run"`
 }
 
 type FSRollbackResult struct {
-	SessionID    string         `json:"session_id"`
-	From         string         `json:"from"`
-	Target       vfs.NativeFile `json:"target"`
-	RetiredState string         `json:"retired_state,omitempty"`
-	DryRun       bool           `json:"dry_run"`
-	Routed       bool           `json:"routed"`
+	SessionID    string                      `json:"session_id"`
+	From         string                      `json:"from"`
+	Target       vfs.NativeFile              `json:"target"`
+	RetiredState string                      `json:"retired_state,omitempty"`
+	DryRun       bool                        `json:"dry_run"`
+	Routed       bool                        `json:"routed"`
+	Storage      *storage.MutationAccounting `json:"storage,omitempty"`
 }
 
 type FSCompactResult struct {
-	SessionID         string `json:"session_id"`
-	CurrentGeneration uint64 `json:"current_generation"`
-	NextGeneration    uint64 `json:"next_generation"`
-	Bytes             int64  `json:"bytes,omitempty"`
-	SHA256            string `json:"sha256,omitempty"`
-	DryRun            bool   `json:"dry_run"`
+	SessionID         string                      `json:"session_id"`
+	CurrentGeneration uint64                      `json:"current_generation"`
+	NextGeneration    uint64                      `json:"next_generation"`
+	Bytes             int64                       `json:"bytes,omitempty"`
+	SHA256            string                      `json:"sha256,omitempty"`
+	DryRun            bool                        `json:"dry_run"`
+	Storage           *storage.MutationAccounting `json:"storage,omitempty"`
 }
 
 type FSRecoverResult struct {
 	SessionIDs []string `json:"session_ids"`
 	Recovered  int      `json:"recovered"`
 	DryRun     bool     `json:"dry_run"`
+}
+
+type FSNativeValidationResult struct {
+	Healthy bool                           `json:"healthy"`
+	Report  mountfs.NativePreflightReport  `json:"report"`
+	Issues  []mountfs.NativePreflightIssue `json:"issues,omitempty"`
 }
 
 type compatibilityFlags struct {
@@ -85,14 +99,17 @@ func newFSCommand() *cobra.Command {
 	command := &cobra.Command{Use: "fs", Short: "Operate the transparent session filesystem"}
 	command.AddCommand(newFSStatusCommand())
 	command.AddCommand(newFSDoctorCommand())
+	command.AddCommand(newFSValidateNativeCommand())
 	command.AddCommand(newFSCompatibilityCommand())
 	command.AddCommand(newFSCompatibilityImportCommand())
 	command.AddCommand(newFSBenchmarkCommand())
 	command.AddCommand(newFSServeCommand())
+	command.AddCommand(newFSNativeSupervisorCommand())
 	command.AddCommand(newFSMigrateCommand())
 	command.AddCommand(newFSRollbackCommand())
 	command.AddCommand(newFSCompactCommand())
 	command.AddCommand(newFSRecoverCommand())
+	command.AddCommand(newFSEnrollCommand())
 	command.AddCommand(newFSRepairRolloutCommand())
 	command.AddCommand(newFSReconcileRolloutCommand())
 	command.AddCommand(newFSNamespaceCommand())
@@ -100,24 +117,103 @@ func newFSCommand() *cobra.Command {
 	return command
 }
 
+func newFSValidateNativeCommand() *cobra.Command {
+	var codexHome string
+	var nativeRoot string
+	var auditAll bool
+	var jsonOutput bool
+	command := &cobra.Command{
+		Use:   "validate-native",
+		Short: "Validate active native rollout JSONL before writer routing",
+		Args:  cobra.NoArgs,
+		RunE: func(command *cobra.Command, _ []string) error {
+			home, err := codex.ResolveHome(codexHome)
+			if err != nil {
+				return err
+			}
+			root := nativeRoot
+			if root == "" {
+				root = filepath.Join(home, "fold-native")
+			}
+			result := FSNativeValidationResult{Healthy: true}
+			if auditAll {
+				audit, err := mountfs.AuditNativeWriterRollouts(command.Context(), root)
+				if err != nil {
+					return err
+				}
+				result.Report = audit.NativePreflightReport
+				result.Issues = audit.Issues
+				result.Healthy = len(result.Issues) == 0
+			} else {
+				filesystem := mountfs.NewCanonical()
+				filesystem.SetNativeRoot(root)
+				result.Report, err = filesystem.ValidateNativeWriterRollouts(command.Context())
+				if err != nil {
+					result.Healthy = false
+					result.Issues = []mountfs.NativePreflightIssue{{Message: err.Error()}}
+				}
+			}
+			if jsonOutput {
+				if err := writeJSON(command, result); err != nil {
+					return err
+				}
+			} else {
+				if _, err := fmt.Fprintf(command.OutOrStdout(), "healthy=%t files=%d bytes=%d validated=%d incremental=%d cached=%d issues=%d\n", result.Healthy, result.Report.Files, result.Report.Bytes, result.Report.ValidatedFiles, result.Report.IncrementalFiles, result.Report.CachedFiles, len(result.Issues)); err != nil {
+					return err
+				}
+			}
+			if !result.Healthy {
+				return fmt.Errorf("native rollout validation failed with %d issue(s)", len(result.Issues))
+			}
+			return nil
+		},
+	}
+	command.Flags().StringVar(&codexHome, "codex-home", "", "Codex home directory; defaults to CODEX_HOME or ~/.codex")
+	command.Flags().StringVar(&nativeRoot, "native-root", "", "Native rollout root; defaults to <codex-home>/fold-native")
+	command.Flags().BoolVar(&auditAll, "audit-all", false, "Bypass the cache and report every invalid active rollout")
+	command.Flags().BoolVar(&jsonOutput, "json", false, "Emit JSON output")
+	return command
+}
+
 func newFSStatusCommand() *cobra.Command {
+	var codexHome string
+	var storeDir string
 	var jsonOutput bool
 	command := &cobra.Command{
 		Use:   "status",
 		Short: "Report the highest verified filesystem capability",
 		Args:  cobra.NoArgs,
 		RunE: func(command *cobra.Command, _ []string) error {
+			home, err := codex.ResolveHome(codexHome)
+			if err != nil {
+				return err
+			}
+			store := resolveFoldStore(home, storeDir)
 			status, err := fsctl.NewStatus(verifiedCapability(), runtime.GOOS)
+			if err != nil {
+				return err
+			}
+			status.Storage, err = storage.Scan(command.Context(), storage.Options{StoreDir: store, AllowMetadataIssues: true})
+			if err != nil {
+				return err
+			}
+			status.StorageLimits, err = storage.LoadLimits(store)
+			if err != nil {
+				return err
+			}
+			status.AvailableBytes, err = storage.AvailableBytes(store)
 			if err != nil {
 				return err
 			}
 			if jsonOutput {
 				return writeJSON(command, status)
 			}
-			_, err = fmt.Fprintf(command.OutOrStdout(), "capability=%s platform=%s\n", status.Capability, status.Platform)
+			_, err = fmt.Fprintf(command.OutOrStdout(), "capability=%s platform=%s logical=%s physical=%s available=%s\n", status.Capability, status.Platform, formatBytes(status.Storage.LogicalSessionBytes), formatBytes(status.Storage.TotalPhysicalBytes), formatBytes(status.AvailableBytes))
 			return err
 		},
 	}
+	command.Flags().StringVar(&codexHome, "codex-home", "", "Codex home directory; defaults to CODEX_HOME or ~/.codex")
+	command.Flags().StringVar(&storeDir, "store", "", "Fold store directory; defaults to <codex-home>/fold-store")
 	command.Flags().BoolVar(&jsonOutput, "json", false, "Emit JSON output")
 	return command
 }
@@ -237,7 +333,14 @@ func newFSServeCommand() *cobra.Command {
 	var foreground bool
 	var canonicalNamespace bool
 	var nativeRoot string
+	var frontend string
+	var nativeFSKitSocket string
+	var nativeFSKitResource string
 	var operationTracePath string
+	var enrollmentInterval time.Duration
+	var enrollmentStableFor time.Duration
+	var enrollmentBatchSize int
+	var enrollmentCanary bool
 	var jsonOutput bool
 	command := &cobra.Command{
 		Use:   "serve",
@@ -248,11 +351,41 @@ func newFSServeCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			if apply {
+				if err := requireFilesystemActivationAllowed(home); err != nil {
+					return err
+				}
+			}
 			if canonicalNamespace {
 				if nativeRoot == "" || !filepath.IsAbs(nativeRoot) {
 					return errors.New("canonical namespace requires an absolute native root")
 				}
 				nativeRoot = filepath.Clean(nativeRoot)
+			}
+			if frontend != "fuse" && frontend != "native-fskit" {
+				return errors.New("filesystem frontend must be fuse or native-fskit")
+			}
+			if frontend == "native-fskit" {
+				if runtime.GOOS != "darwin" {
+					return errors.New("native-fskit frontend is available only on macOS")
+				}
+				if !canonicalNamespace {
+					return errors.New("native-fskit frontend requires the canonical namespace")
+				}
+			}
+			if enrollmentInterval < 0 || enrollmentStableFor < 0 || enrollmentBatchSize < 0 {
+				return errors.New("enrollment timing and batch values cannot be negative")
+			}
+			if enrollmentInterval > 0 {
+				if !canonicalNamespace {
+					return errors.New("periodic enrollment requires the canonical namespace")
+				}
+				if enrollmentStableFor <= 0 || enrollmentBatchSize <= 0 {
+					return errors.New("periodic enrollment requires a positive stable window and batch size")
+				}
+			}
+			if enrollmentCanary && enrollmentInterval <= 0 {
+				return errors.New("enrollment canary requires periodic enrollment")
 			}
 			store := resolveFoldStore(home, storeDir)
 			mount := defaultMountPoint(home, mountPoint)
@@ -260,12 +393,21 @@ func newFSServeCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			result := FSServeResult{MountPoint: mount, ManagedSessions: len(states), DryRun: !apply}
+			if nativeFSKitResource == "" {
+				nativeFSKitResource = filepath.Join(store, "fs", "native-fskit")
+			}
+			if nativeFSKitSocket == "" {
+				nativeFSKitSocket = defaultNativeFSKitSocket(home, nativeFSKitResource)
+			}
+			result := FSServeResult{MountPoint: mount, ManagedSessions: len(states), Frontend: frontend, DryRun: !apply}
+			if frontend == "native-fskit" {
+				result.ResourcePath = nativeFSKitResource
+			}
 			if !apply {
 				if jsonOutput {
 					return writeJSON(command, result)
 				}
-				_, err = fmt.Fprintf(command.OutOrStdout(), "dry_run=true mount=%s sessions=%d\n", mount, len(states))
+				_, err = fmt.Fprintf(command.OutOrStdout(), "dry_run=true frontend=%s mount=%s sessions=%d resource=%s\n", frontend, mount, len(states), result.ResourcePath)
 				return err
 			}
 			processLock, err := service.AcquireProcessLock(filepath.Join(store, "fs", "service.lock"))
@@ -285,9 +427,14 @@ func newFSServeCommand() *cobra.Command {
 				}
 				result.ManagedSessions = len(states)
 			}
-			if err := os.MkdirAll(mount, 0o700); err != nil {
+			if _, _, err := startupStorageGC(command.Context(), store); err != nil {
 				return err
 			}
+			states, err = vfs.DiscoverSessionStates(store)
+			if err != nil {
+				return err
+			}
+			result.ManagedSessions = len(states)
 			var operationRecorder func(string)
 			if operationTracePath != "" {
 				recorder, closer, err := newOperationRecorder(operationTracePath)
@@ -308,9 +455,50 @@ func newFSServeCommand() *cobra.Command {
 			if canonicalNamespace {
 				filesystem = mountfs.NewCanonical()
 				filesystem.SetNativeRoot(nativeRoot)
+				if err := filesystem.RecoverNativeAppendTransactions(); err != nil {
+					return fmt.Errorf("recover native append transactions: %w", err)
+				}
+				if _, err := filesystem.ValidateNativeWriterRollouts(command.Context()); err != nil {
+					return fmt.Errorf("validate native writer rollouts: %w", err)
+				}
 			}
 			ctx, cancel := context.WithCancel(command.Context())
 			defer cancel()
+			var nativeWatcherDone chan error
+			if frontend == "native-fskit" {
+				nativeWatcherDone = make(chan error, 1)
+				go func() {
+					err := filesystem.WatchNativeNamespace(ctx)
+					nativeWatcherDone <- err
+					if err != nil && !errors.Is(err, context.Canceled) {
+						cancel()
+					}
+				}()
+			}
+			var enrollmentDone chan struct{}
+			if enrollmentInterval > 0 {
+				enrollmentDone = make(chan struct{})
+				flags := enrollmentFlags{
+					codexHome: home, storeDir: store, mountPoint: mount, nativeRoot: nativeRoot,
+					stableFor: enrollmentStableFor, batchSize: enrollmentBatchSize,
+					canonicalNamespace: canonicalNamespace, canary: enrollmentCanary,
+				}
+				go func() {
+					defer close(enrollmentDone)
+					runPeriodicEnrollment(ctx, flags, enrollmentInterval, func(result FSEnrollmentApplyResult, cycleErr error) {
+						if cycleErr != nil {
+							if !errors.Is(cycleErr, context.Canceled) {
+								_, _ = fmt.Fprintf(command.ErrOrStderr(), "enrollment cycle failed: %v\n", cycleErr)
+							}
+							return
+						}
+						if len(result.Plan.Selected) == 0 && result.Apply.Applied == 0 {
+							return
+						}
+						_, _ = fmt.Fprintf(command.ErrOrStderr(), "enrollment cycle sessions=%d selected=%d applied=%d\n", len(result.Plan.Decisions), len(result.Plan.Selected), result.Apply.Applied)
+					})
+				}()
+			}
 			closers := make([]io.Closer, 0)
 			known := make(map[string]uint64)
 			knownRoutes := make(map[string]string)
@@ -451,9 +639,26 @@ func newFSServeCommand() *cobra.Command {
 					}
 				}
 			}()
-			mountErr := mountfs.Mount(ctx, mountfs.HostOptions{MountPoint: mount, Filesystem: filesystem, Foreground: foreground, OperationRecorder: operationRecorder})
+			var mountErr error
+			if frontend == "native-fskit" {
+				mountErr = mountfs.ServeNativeFSKit(ctx, filesystem, mountfs.NativeFSKitServerOptions{
+					SocketPath: nativeFSKitSocket, ResourcePath: nativeFSKitResource, Recorder: operationRecorder,
+				})
+			} else {
+				mountErr = mountfs.Mount(ctx, mountfs.HostOptions{MountPoint: mount, Filesystem: filesystem, Foreground: foreground, OperationRecorder: operationRecorder})
+			}
 			cancel()
 			<-watcherDone
+			if enrollmentDone != nil {
+				<-enrollmentDone
+			}
+			var nativeWatcherErr error
+			if nativeWatcherDone != nil {
+				nativeWatcherErr = <-nativeWatcherDone
+				if errors.Is(nativeWatcherErr, context.Canceled) {
+					nativeWatcherErr = nil
+				}
+			}
 			for _, closer := range closers {
 				_ = closer.Close()
 			}
@@ -461,7 +666,7 @@ func newFSServeCommand() *cobra.Command {
 			case watcherErr := <-watcherErrors:
 				return watcherErr
 			default:
-				return mountErr
+				return errors.Join(mountErr, nativeWatcherErr)
 			}
 		},
 	}
@@ -472,9 +677,28 @@ func newFSServeCommand() *cobra.Command {
 	command.Flags().BoolVar(&foreground, "foreground", true, "Keep the FUSE host in the foreground")
 	command.Flags().BoolVar(&canonicalNamespace, "canonical-namespace", false, "Expose sessions and archived_sessions as a shared virtual namespace")
 	command.Flags().StringVar(&nativeRoot, "native-root", "", "Backing root for unmanaged canonical session files")
+	command.Flags().StringVar(&frontend, "frontend", "fuse", "Filesystem frontend: fuse or native-fskit")
+	command.Flags().StringVar(&nativeFSKitSocket, "fskit-socket", "", "Native FSKit daemon Unix socket; defaults to a short per-home path in /private/tmp")
+	command.Flags().StringVar(&nativeFSKitResource, "fskit-resource", "", "Native FSKit resource; defaults to the security-scoped <store>/fs/native-fskit directory")
 	command.Flags().StringVar(&operationTracePath, "operation-trace", "", "Absolute path for sanitized FUSE operation names")
+	command.Flags().DurationVar(&enrollmentInterval, "enrollment-interval", 0, "Periodic stable-session enrollment interval; zero disables the loop")
+	command.Flags().DurationVar(&enrollmentStableFor, "enrollment-stable-for", time.Hour, "Required unchanged interval before periodic enrollment")
+	command.Flags().IntVar(&enrollmentBatchSize, "enrollment-batch-size", 1, "Maximum sessions enrolled per periodic cycle")
+	command.Flags().BoolVar(&enrollmentCanary, "enrollment-canary", false, "Allow periodic enrollment only in an explicitly isolated Codex home while capability remains preview")
 	command.Flags().BoolVar(&jsonOutput, "json", false, "Emit JSON output for dry-run")
 	return command
+}
+
+func defaultNativeFSKitSocket(home string, resourcePath string) string {
+	if fskitproto.UsesDirectoryResource(resourcePath) {
+		return filepath.Join(filepath.Clean(resourcePath), "daemon.sock")
+	}
+	digest := sha256.Sum256([]byte(filepath.Clean(home)))
+	userHome, err := os.UserHomeDir()
+	if err == nil && runtime.GOOS == "darwin" {
+		return filepath.Join(userHome, "Library", "Containers", "vip.jstar.codexfold.fskitprofileprobe.module", "Data", "tmp", fmt.Sprintf("cf-%s.sock", hex.EncodeToString(digest[:4])))
+	}
+	return filepath.Join("/private/tmp", fmt.Sprintf("codexfold-fskit-%d-%s.sock", os.Getuid(), hex.EncodeToString(digest[:4])))
 }
 
 func syncCanonicalRetirement(
@@ -555,6 +779,11 @@ func newFSMigrateCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			if apply {
+				if err := requireFilesystemActivationAllowed(home); err != nil {
+					return err
+				}
+			}
 			store := resolveFoldStore(home, storeDir)
 			session, manifest, resolver, view, err := openFoldView(home, store, args[0])
 			if err != nil {
@@ -610,6 +839,14 @@ func newFSMigrateCommand() *cobra.Command {
 				if err := mountHealthProbe(mount); err != nil {
 					return fmt.Errorf("filesystem mount point is not healthy: %w", err)
 				}
+				projectedPersistent := int64(1 << 20)
+				if canonicalNamespace {
+					projectedPersistent += native.Bytes
+				}
+				storageAssessment, err := assessStoreMutation(command.Context(), store, storage.Projection{Operation: "fs-migrate", AdditionalPersistentBytes: projectedPersistent})
+				if err != nil {
+					return err
+				}
 				canonicalSource := ""
 				canonicalRoute := ""
 				if canonicalNamespace {
@@ -623,7 +860,7 @@ func newFSMigrateCommand() *cobra.Command {
 					if err != nil {
 						return err
 					}
-					retained, err := retainCanonicalSnapshot(store, session.ID, native)
+					retained, err := retainCanonicalSnapshot(command.Context(), store, session.ID, native, nil)
 					if err != nil {
 						return err
 					}
@@ -699,6 +936,7 @@ func newFSMigrateCommand() *cobra.Command {
 				}
 				result.Routed = true
 				result.DryRun = false
+				result.Storage = storage.CompleteAccounting(command.Context(), storageAssessment, store)
 			}
 			if jsonOutput {
 				return writeJSON(command, result)
@@ -771,6 +1009,10 @@ func newFSRollbackCommand() *cobra.Command {
 			result := FSRollbackResult{SessionID: state.SessionID, From: current.RolloutPath, Target: vfs.NativeFile{Path: filepath.Clean(targetPath)}, DryRun: !apply}
 			if apply {
 				if currentNativeFallback {
+					storageAssessment, err := assessStoreMutation(command.Context(), store, storage.Projection{Operation: "fs-rollback"})
+					if err != nil {
+						return err
+					}
 					target, err := hashPath(current.RolloutPath)
 					if err != nil {
 						return err
@@ -783,6 +1025,7 @@ func newFSRollbackCommand() *cobra.Command {
 					result.RetiredState = retiredState
 					result.Routed = true
 					result.DryRun = false
+					result.Storage = storage.CompleteAccounting(command.Context(), storageAssessment, store)
 					if jsonOutput {
 						return writeJSON(command, result)
 					}
@@ -807,6 +1050,23 @@ func newFSRollbackCommand() *cobra.Command {
 					return err
 				}
 				defer rollbackLease.Close()
+				visible, err := managed.VisibleInfo()
+				if err != nil {
+					return err
+				}
+				reclaimableBytes := int64(0)
+				if info, err := os.Stat(targetPath); err == nil && info.Mode().IsRegular() {
+					reclaimableBytes = info.Size()
+				} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+					return err
+				}
+				storageAssessment, err := assessStoreMutation(command.Context(), store, storage.Projection{
+					Operation: "fs-rollback", AdditionalPersistentBytes: visible.Size, TemporaryBytes: visible.Size,
+					TemporaryPersistentOverlapBytes: visible.Size, ReclaimableBytes: reclaimableBytes,
+				})
+				if err != nil {
+					return err
+				}
 				target, err := managed.MaterializeCurrent(command.Context(), filepath.Clean(targetPath), true)
 				if err != nil {
 					return err
@@ -904,6 +1164,7 @@ func newFSRollbackCommand() *cobra.Command {
 				result.Target = target
 				result.Routed = true
 				result.DryRun = false
+				result.Storage = storage.CompleteAccounting(command.Context(), storageAssessment, store)
 			}
 			if jsonOutput {
 				return writeJSON(command, result)
@@ -951,6 +1212,24 @@ func newFSCompactCommand() *cobra.Command {
 					return err
 				}
 				defer resolver.Close()
+				visible, err := managed.VisibleInfo()
+				if err != nil {
+					return err
+				}
+				persistentBytes, err := conservativeStoredBytes(visible.Size)
+				if err != nil {
+					return err
+				}
+				if persistentBytes > math.MaxInt64-persistentBytes {
+					return errors.New("compact storage byte estimate overflow")
+				}
+				persistentBytes *= 2
+				storageAssessment, err := assessStoreMutation(command.Context(), store, storage.Projection{
+					Operation: "fs-compact", AdditionalPersistentBytes: persistentBytes, TemporaryBytes: visible.Size,
+				})
+				if err != nil {
+					return err
+				}
 				var preparedResolver *pack.Resolver
 				defer func() {
 					if preparedResolver != nil {
@@ -968,7 +1247,7 @@ func newFSCompactCommand() *cobra.Command {
 						FieldThreshold: currentManifest.Settings.FieldThreshold, MaxJSONLineBytes: currentManifest.Settings.MaxJSONLineBytes,
 						CDC: cdc.Options{MinBytes: currentManifest.Settings.CDCMinBytes, AverageBytes: currentManifest.Settings.CDCAverageBytes, MaxBytes: currentManifest.Settings.CDCMaxBytes},
 					}
-					if _, err := fold.Fold(ctx, codex.Session{ID: state.SessionID, Title: currentManifest.Session.Title, CWD: currentManifest.Session.CWD, RolloutPath: current.Path, Archived: true}, options); err != nil {
+					if _, err := fold.Fold(ctx, fold.Session{ID: state.SessionID, Title: currentManifest.Session.Title, CWD: currentManifest.Session.CWD, RolloutPath: current.Path, Archived: true}, options); err != nil {
 						return vfs.PreparedGeneration{}, err
 					}
 					if _, err := pack.Build(ctx, store, pack.BuildOptions{}); err != nil {
@@ -995,6 +1274,7 @@ func newFSCompactCommand() *cobra.Command {
 				result.Bytes = compact.Bytes
 				result.SHA256 = compact.SHA256
 				result.DryRun = false
+				result.Storage = storage.CompleteAccounting(command.Context(), storageAssessment, store)
 			}
 			if jsonOutput {
 				return writeJSON(command, result)
@@ -1290,12 +1570,53 @@ func requireStorageHealth(ctx context.Context, store string) error {
 	return nil
 }
 
+func assessStoreMutation(ctx context.Context, store string, projection storage.Projection) (storage.Assessment, error) {
+	guard, err := storage.DefaultGuard(store)
+	if err != nil {
+		return storage.Assessment{}, err
+	}
+	return guard.Check(ctx, projection)
+}
+
+func conservativeStoredBytes(rawBytes int64) (int64, error) {
+	if rawBytes < 0 {
+		return 0, errors.New("storage byte estimate cannot be negative")
+	}
+	overhead := rawBytes/16 + 1<<20
+	if rawBytes > math.MaxInt64-overhead {
+		return 0, errors.New("storage byte estimate overflow")
+	}
+	return rawBytes + overhead, nil
+}
+
+func startupStorageGC(ctx context.Context, store string) (storage.StorageGCResult, bool, error) {
+	if err := requireStorageHealth(ctx, store); err != nil {
+		return storage.StorageGCResult{}, false, nil
+	}
+	result, err := storage.Collect(ctx, storage.GCOptions{StoreDir: store, Apply: true})
+	return result, true, err
+}
+
 func fsDoctor(ctx context.Context, home string, store string, mount string) fsctl.DoctorReport {
-	serviceStatus := service.Manager{}.Status(ctx, serviceLabel, mount)
+	var serviceStatus service.Status
+	platform, platformErr := service.CurrentPlatform()
+	definition, definitionErr := resolveServiceDefinitionPath("")
+	if platformErr == nil && definitionErr == nil {
+		serviceStatus, platformErr = platformServiceStatus(ctx, platform, mount, definition)
+	}
+	if platformErr != nil || definitionErr != nil {
+		serviceStatus.DaemonError = errors.Join(platformErr, definitionErr).Error()
+	}
+	var storageInventory storage.Inventory
+	var storageLimits storage.Limits
+	var availableBytes int64
 	checks := []fsctl.Check{
 		{Component: fsctl.ComponentDaemon, Run: func(context.Context) error {
 			if !serviceStatus.DaemonRunning {
 				return errors.New(serviceStatus.DaemonError)
+			}
+			if !serviceStatus.Build.Healthy {
+				return errors.New(serviceStatus.Build.Error)
 			}
 			return nil
 		}},
@@ -1324,6 +1645,19 @@ func fsDoctor(ctx context.Context, home string, store string, mount string) fsct
 				return fmt.Errorf("fold doctor reported %d issues", report.IssueCount)
 			}
 			return nil
+		}},
+		{Component: fsctl.ComponentStorage, Run: func(ctx context.Context) error {
+			var err error
+			storageInventory, err = storage.Scan(ctx, storage.Options{StoreDir: store, AllowMetadataIssues: true})
+			if err != nil {
+				return err
+			}
+			storageLimits, err = storage.LoadLimits(store)
+			if err != nil {
+				return err
+			}
+			availableBytes, err = storage.AvailableBytes(store)
+			return err
 		}},
 	}
 	states, stateErr := vfs.DiscoverSessionStates(store)
@@ -1396,7 +1730,11 @@ func fsDoctor(ctx context.Context, home string, store string, mount string) fsct
 			return nil
 		}},
 	)
-	return fsctl.Doctor(ctx, checks)
+	report := fsctl.Doctor(ctx, checks)
+	report.Storage = storageInventory
+	report.StorageLimits = storageLimits
+	report.AvailableBytes = availableBytes
+	return report
 }
 
 func defaultMountPoint(home string, explicit string) string {

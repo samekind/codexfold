@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/jstar0/codexfold/internal/fold"
+	"github.com/jstar0/codexfold/internal/storage"
 )
 
 type SessionOptions struct {
@@ -21,18 +22,21 @@ type SessionOptions struct {
 	Manifest       fold.Manifest
 	Reader         ObjectReader
 	NativeSnapshot NativeFile
+	Budget         storage.Checker
 	BeforeCOWPhase func(string) error
 }
 
 type Session struct {
-	mu             sync.Mutex
-	state          SessionState
-	statePath      string
-	directory      string
-	view           *View
-	readerLeases   map[uint64]int
-	writerOpen     bool
-	beforeCOWPhase func(string) error
+	mu               sync.Mutex
+	state            SessionState
+	statePath        string
+	directory        string
+	view             *View
+	readerLeases     map[uint64]int
+	readerLeaseFiles map[uint64]*storage.Lease
+	writerOpen       bool
+	budget           storage.Checker
+	beforeCOWPhase   func(string) error
 }
 
 type VisibleInfo struct {
@@ -58,6 +62,14 @@ func openSession(ctx context.Context, options SessionOptions, reserveWriter bool
 	}
 	if options.Root == "" || options.ManifestPath == "" || !safeSessionID(options.Manifest.Session.ID) {
 		return nil, nil, errors.New("session root, manifest path, and safe session ID are required")
+	}
+	budget := options.Budget
+	if budget == nil {
+		guard, err := storage.DefaultGuard(options.Root)
+		if err != nil {
+			return nil, nil, err
+		}
+		budget = guard
 	}
 	view, err := NewView(options.Manifest, options.Reader)
 	if err != nil {
@@ -134,7 +146,11 @@ func openSession(ctx context.Context, options SessionOptions, reserveWriter bool
 			}
 		}
 	}
-	session := &Session{state: state, statePath: statePath, directory: directory, view: view, readerLeases: make(map[uint64]int), beforeCOWPhase: options.BeforeCOWPhase}
+	session := &Session{
+		state: state, statePath: statePath, directory: directory, view: view,
+		readerLeases: make(map[uint64]int), readerLeaseFiles: make(map[uint64]*storage.Lease),
+		budget: budget, beforeCOWPhase: options.BeforeCOWPhase,
+	}
 	var writer *WriteHandle
 	if reservedLease != nil {
 		session.writerOpen = true
@@ -156,6 +172,15 @@ func (s *Session) State() SessionState {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.state
+}
+
+func (s *Session) MetadataPath() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.state.BackingPath != "" {
+		return s.state.BackingPath
+	}
+	return s.state.DeltaPath
 }
 
 func (s *Session) VisibleInfo() (VisibleInfo, error) {
@@ -181,6 +206,20 @@ func (s *Session) OpenReader() (*ReadHandle, error) {
 	s.mu.Lock()
 	state := s.state
 	view := s.view
+	if s.readerLeases[state.Generation] == 0 {
+		leaseRoot := filepath.Join(s.directory, "leases")
+		if err := os.Mkdir(leaseRoot, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+			s.mu.Unlock()
+			return nil, fmt.Errorf("create reader lease root: %w", err)
+		}
+		leaseDirectory := filepath.Join(s.directory, "leases", fmt.Sprintf("generation-%020d", state.Generation))
+		lease, err := storage.AcquireLease(leaseDirectory, "reader")
+		if err != nil {
+			s.mu.Unlock()
+			return nil, fmt.Errorf("acquire reader generation lease: %w", err)
+		}
+		s.readerLeaseFiles[state.Generation] = lease
+	}
 	s.readerLeases[state.Generation]++
 	s.mu.Unlock()
 
@@ -194,13 +233,13 @@ func (s *Session) OpenReader() (*ReadHandle, error) {
 	}
 	file, err := os.Open(path)
 	if err != nil {
-		s.releaseReader(state.Generation)
+		_ = s.releaseReader(state.Generation)
 		return nil, fmt.Errorf("open session reader file: %w", err)
 	}
 	info, err := file.Stat()
 	if err != nil {
 		_ = file.Close()
-		s.releaseReader(state.Generation)
+		_ = s.releaseReader(state.Generation)
 		return nil, fmt.Errorf("stat session reader file: %w", err)
 	}
 	handle.file = file
@@ -213,14 +252,18 @@ func (s *Session) OpenReader() (*ReadHandle, error) {
 	return handle, nil
 }
 
-func (s *Session) releaseReader(generation uint64) {
+func (s *Session) releaseReader(generation uint64) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	var lease *storage.Lease
 	if s.readerLeases[generation] <= 1 {
 		delete(s.readerLeases, generation)
+		lease = s.readerLeaseFiles[generation]
+		delete(s.readerLeaseFiles, generation)
 	} else {
 		s.readerLeases[generation]--
 	}
+	s.mu.Unlock()
+	return lease.Close()
 }
 
 func (s *Session) OpenWriter() (*WriteHandle, error) {
@@ -285,6 +328,12 @@ func (s *Session) ensureBacking(ctx context.Context) (string, error) {
 		return "", err
 	}
 	defer reader.Close()
+	if _, err := s.budget.Check(ctx, storage.Projection{
+		Operation: "copy-on-write", AdditionalPersistentBytes: reader.Size(), TemporaryBytes: reader.Size(),
+		TemporaryPersistentOverlapBytes: reader.Size(),
+	}); err != nil {
+		return "", err
+	}
 	temporary, err := os.CreateTemp(s.directory, ".backing-*.tmp")
 	if err != nil {
 		return "", fmt.Errorf("create temporary backing: %w", err)
@@ -406,6 +455,20 @@ func (s *Session) MaterializeCurrent(ctx context.Context, target string, overwri
 		return NativeFile{}, err
 	}
 	defer reader.Close()
+	reclaimableBytes := int64(0)
+	if overwrite {
+		if info, err := os.Stat(target); err == nil && info.Mode().IsRegular() {
+			reclaimableBytes = info.Size()
+		} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return NativeFile{}, err
+		}
+	}
+	if _, err := s.budget.Check(ctx, storage.Projection{
+		Operation: "materialize-current", AdditionalPersistentBytes: reader.Size(), TemporaryBytes: reader.Size(),
+		TemporaryPersistentOverlapBytes: reader.Size(), ReclaimableBytes: reclaimableBytes,
+	}); err != nil {
+		return NativeFile{}, err
+	}
 	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 		return NativeFile{}, err
 	}

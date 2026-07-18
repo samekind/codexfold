@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -17,16 +18,23 @@ import (
 )
 
 type Options struct {
-	Label              string
-	BinaryPath         string
-	CodexHome          string
-	StoreDir           string
-	MountPoint         string
-	StdoutPath         string
-	StderrPath         string
-	CanonicalNamespace bool
-	NativeRoot         string
-	OperationTrace     string
+	Label               string
+	BinaryPath          string
+	LauncherPath        string
+	CodexHome           string
+	StoreDir            string
+	MountPoint          string
+	StdoutPath          string
+	StderrPath          string
+	CanonicalNamespace  bool
+	NativeRoot          string
+	OperationTrace      string
+	EnrollmentInterval  time.Duration
+	EnrollmentStableFor time.Duration
+	EnrollmentBatchSize int
+	EnrollmentCanary    bool
+	Frontend            string
+	FSKitResource       string
 }
 
 type InstallResult struct {
@@ -52,10 +60,15 @@ type Manager struct {
 }
 
 type Status struct {
-	DaemonRunning bool   `json:"daemon_running"`
-	MountHealthy  bool   `json:"mount_healthy"`
-	DaemonError   string `json:"daemon_error,omitempty"`
-	MountError    string `json:"mount_error,omitempty"`
+	DaemonRunning     bool        `json:"daemon_running"`
+	DaemonPID         int         `json:"daemon_pid,omitempty"`
+	SupervisorRunning bool        `json:"supervisor_running,omitempty"`
+	SupervisorPID     int         `json:"supervisor_pid,omitempty"`
+	MountHealthy      bool        `json:"mount_healthy"`
+	DaemonError       string      `json:"daemon_error,omitempty"`
+	SupervisorError   string      `json:"supervisor_error,omitempty"`
+	MountError        string      `json:"mount_error,omitempty"`
+	Build             BuildStatus `json:"build"`
 }
 
 type UpdateInput struct {
@@ -75,24 +88,41 @@ type UpdateDecision struct {
 }
 
 func RenderLaunchd(options Options) ([]byte, error) {
+	serveArguments, err := ServeArguments(options)
+	if err != nil {
+		return nil, err
+	}
+	return renderLaunchdJob(options.Label, launchdProgramArguments(options, serveArguments), options.StdoutPath, options.StderrPath), nil
+}
+
+func RenderLaunchdSupervisor(options Options) ([]byte, error) {
 	if err := validateOptions(options); err != nil {
 		return nil, err
 	}
+	if options.Frontend != "native-fskit" {
+		return nil, errors.New("native FSKit supervisor requires the native-fskit frontend")
+	}
 	arguments := []string{
-		options.BinaryPath, "fs", "serve", "--apply", "--foreground=true",
-		"--codex-home", options.CodexHome, "--store", options.StoreDir, "--mount", options.MountPoint,
+		"fs", "supervise", "--apply",
+		"--resource", options.FSKitResource, "--mount", options.MountPoint,
 	}
-	if options.CanonicalNamespace {
-		arguments = append(arguments, "--canonical-namespace", "--native-root", options.NativeRoot)
+	return renderLaunchdJob(options.Label+".supervisor", launchdProgramArguments(options, arguments), options.StdoutPath, options.StderrPath), nil
+}
+
+func launchdProgramArguments(options Options, childArguments []string) []string {
+	if options.Frontend == "native-fskit" {
+		arguments := []string{options.LauncherPath, "--run-helper", options.BinaryPath}
+		return append(arguments, childArguments...)
 	}
-	if options.OperationTrace != "" {
-		arguments = append(arguments, "--operation-trace", options.OperationTrace)
-	}
+	return append([]string{options.BinaryPath}, childArguments...)
+}
+
+func renderLaunchdJob(label string, arguments []string, stdoutPath string, stderrPath string) []byte {
 	var output bytes.Buffer
 	output.WriteString("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n")
 	output.WriteString("<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n")
 	output.WriteString("<plist version=\"1.0\">\n<dict>\n")
-	writePlistString(&output, "Label", options.Label)
+	writePlistString(&output, "Label", label)
 	output.WriteString("  <key>ProgramArguments</key>\n  <array>\n")
 	for _, argument := range arguments {
 		output.WriteString("    <string>")
@@ -100,13 +130,49 @@ func RenderLaunchd(options Options) ([]byte, error) {
 		output.WriteString("</string>\n")
 	}
 	output.WriteString("  </array>\n")
-	writePlistString(&output, "StandardOutPath", options.StdoutPath)
-	writePlistString(&output, "StandardErrorPath", options.StderrPath)
+	writePlistString(&output, "StandardOutPath", stdoutPath)
+	writePlistString(&output, "StandardErrorPath", stderrPath)
 	output.WriteString("  <key>RunAtLoad</key>\n  <true/>\n")
 	output.WriteString("  <key>KeepAlive</key>\n  <true/>\n")
 	output.WriteString("  <key>ProcessType</key>\n  <string>Background</string>\n")
+	output.WriteString("  <key>ThrottleInterval</key>\n  <integer>2</integer>\n")
 	output.WriteString("</dict>\n</plist>\n")
-	return output.Bytes(), nil
+	return output.Bytes()
+}
+
+func ServeArguments(options Options) ([]string, error) {
+	if err := validateOptions(options); err != nil {
+		return nil, err
+	}
+	arguments := []string{
+		"fs", "serve", "--apply", "--foreground=true",
+		"--codex-home", options.CodexHome, "--store", options.StoreDir, "--mount", options.MountPoint,
+	}
+	frontend := options.Frontend
+	if frontend == "" {
+		frontend = "fuse"
+	}
+	arguments = append(arguments, "--frontend", frontend)
+	if frontend == "native-fskit" {
+		arguments = append(arguments, "--fskit-resource", options.FSKitResource)
+	}
+	if options.CanonicalNamespace {
+		arguments = append(arguments, "--canonical-namespace", "--native-root", options.NativeRoot)
+	}
+	if options.OperationTrace != "" {
+		arguments = append(arguments, "--operation-trace", options.OperationTrace)
+	}
+	if options.EnrollmentInterval > 0 {
+		arguments = append(arguments,
+			"--enrollment-interval", options.EnrollmentInterval.String(),
+			"--enrollment-stable-for", options.EnrollmentStableFor.String(),
+			"--enrollment-batch-size", strconv.Itoa(options.EnrollmentBatchSize),
+		)
+		if options.EnrollmentCanary {
+			arguments = append(arguments, "--enrollment-canary")
+		}
+	}
+	return arguments, nil
 }
 
 func WriteDefinition(path string, definition []byte, apply bool) (InstallResult, error) {
@@ -120,7 +186,7 @@ func WriteDefinition(path string, definition []byte, apply bool) (InstallResult,
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return InstallResult{}, err
 	}
-	temporary, err := os.CreateTemp(filepath.Dir(path), ".launchd-*.tmp")
+	temporary, err := os.CreateTemp(filepath.Dir(path), ".service-definition-*.tmp")
 	if err != nil {
 		return InstallResult{}, err
 	}
@@ -151,24 +217,55 @@ func (m Manager) Bootstrap(ctx context.Context, plistPath string) error {
 	if !filepath.IsAbs(plistPath) {
 		return errors.New("absolute launchd plist path is required")
 	}
-	_, err := m.runner().Run(ctx, "launchctl", "bootstrap", m.domain(), plistPath)
-	return err
+	output, err := m.runner().Run(ctx, "launchctl", "bootstrap", m.domain(), plistPath)
+	if err != nil {
+		return commandFailure("launchctl bootstrap", output, err)
+	}
+	return nil
 }
 
 func (m Manager) Bootout(ctx context.Context, plistPath string) error {
 	if !filepath.IsAbs(plistPath) {
 		return errors.New("absolute launchd plist path is required")
 	}
-	_, err := m.runner().Run(ctx, "launchctl", "bootout", m.domain(), plistPath)
-	return err
+	output, err := m.runner().Run(ctx, "launchctl", "bootout", m.domain(), plistPath)
+	if err != nil {
+		return commandFailure("launchctl bootout", output, err)
+	}
+	return nil
 }
 
 func (m Manager) Kickstart(ctx context.Context, label string) error {
 	if !safeLabel(label) {
 		return errors.New("safe launchd label is required")
 	}
-	_, err := m.runner().Run(ctx, "launchctl", "kickstart", m.domain()+"/"+label)
-	return err
+	output, err := m.runner().Run(ctx, "launchctl", "kickstart", m.domain()+"/"+label)
+	if err != nil {
+		return commandFailure("launchctl kickstart", output, err)
+	}
+	return nil
+}
+
+func (m Manager) Enable(ctx context.Context, label string) error {
+	if !safeLabel(label) {
+		return errors.New("safe launchd label is required")
+	}
+	output, err := m.runner().Run(ctx, "launchctl", "enable", m.domain()+"/"+label)
+	if err != nil {
+		return commandFailure("launchctl enable", output, err)
+	}
+	return nil
+}
+
+func (m Manager) Disable(ctx context.Context, label string) error {
+	if !safeLabel(label) {
+		return errors.New("safe launchd label is required")
+	}
+	output, err := m.runner().Run(ctx, "launchctl", "disable", m.domain()+"/"+label)
+	if err != nil {
+		return commandFailure("launchctl disable", output, err)
+	}
+	return nil
 }
 
 func (m Manager) Status(ctx context.Context, label string, mountPoint string) Status {
@@ -178,6 +275,18 @@ func (m Manager) Status(ctx context.Context, label string, mountPoint string) St
 		result.DaemonError = err.Error()
 	} else if strings.Contains(string(output), "state = running") {
 		result.DaemonRunning = true
+		for _, line := range strings.Split(string(output), "\n") {
+			line = strings.TrimSpace(line)
+			if !strings.HasPrefix(line, "pid = ") {
+				continue
+			}
+			result.DaemonPID, _ = strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(line, "pid = ")))
+			break
+		}
+		if result.DaemonPID <= 1 {
+			result.DaemonRunning = false
+			result.DaemonError = "launchd job is running without a valid PID"
+		}
 	} else {
 		result.DaemonError = "launchd job is loaded but not running"
 	}
@@ -252,7 +361,7 @@ func (m Manager) domain() string {
 
 func validateOptions(options Options) error {
 	if !safeLabel(options.Label) {
-		return errors.New("safe launchd label is required")
+		return errors.New("safe service label is required")
 	}
 	for name, path := range map[string]string{
 		"binary": options.BinaryPath, "Codex home": options.CodexHome, "store": options.StoreDir,
@@ -267,6 +376,38 @@ func validateOptions(options Options) error {
 	}
 	if options.OperationTrace != "" && !filepath.IsAbs(options.OperationTrace) {
 		return errors.New("operation trace path must be absolute")
+	}
+	if options.EnrollmentInterval < 0 || options.EnrollmentStableFor < 0 || options.EnrollmentBatchSize < 0 {
+		return errors.New("enrollment timing and batch values cannot be negative")
+	}
+	if options.EnrollmentInterval > 0 {
+		if !options.CanonicalNamespace {
+			return errors.New("periodic enrollment requires the canonical namespace")
+		}
+		if options.EnrollmentStableFor <= 0 || options.EnrollmentBatchSize <= 0 {
+			return errors.New("periodic enrollment requires a positive stable window and batch size")
+		}
+	}
+	if options.EnrollmentCanary && options.EnrollmentInterval <= 0 {
+		return errors.New("enrollment canary requires periodic enrollment")
+	}
+	frontend := options.Frontend
+	if frontend == "" {
+		frontend = "fuse"
+	}
+	if frontend != "fuse" && frontend != "native-fskit" {
+		return errors.New("filesystem frontend must be fuse or native-fskit")
+	}
+	if frontend == "native-fskit" {
+		if !options.CanonicalNamespace {
+			return errors.New("native-fskit frontend requires the canonical namespace")
+		}
+		if !filepath.IsAbs(options.LauncherPath) {
+			return errors.New("native-fskit frontend requires an absolute host launcher path")
+		}
+		if !filepath.IsAbs(options.FSKitResource) {
+			return errors.New("native-fskit frontend requires an absolute resource path")
+		}
 	}
 	return nil
 }

@@ -9,9 +9,11 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/jstar0/codexfold/internal/fold"
+	"github.com/jstar0/codexfold/internal/storage"
 )
 
 func TestSessionAppendPersistsWithoutHydratingBase(t *testing.T) {
@@ -92,6 +94,45 @@ func TestSessionAllowsOnlyOneWriterLease(t *testing.T) {
 	_ = second.Close()
 }
 
+func TestSessionReaderHoldsGenerationLeaseUntilClose(t *testing.T) {
+	root := t.TempDir()
+	manifest, reader, _ := sessionFixture(t, root)
+	session := openFixtureSession(t, root, manifest, reader, nil)
+	handle, err := session.OpenReader()
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaseDirectory := filepath.Join(root, "fs", "sessions", "session", "leases", "generation-00000000000000000001")
+	active, err := storage.DirectoryHasActiveLease(leaseDirectory, false)
+	if err != nil || !active {
+		t.Fatalf("reader generation lease: active=%t err=%v", active, err)
+	}
+	if err := handle.Close(); err != nil {
+		t.Fatal(err)
+	}
+	active, err = storage.DirectoryHasActiveLease(leaseDirectory, true)
+	if err != nil || active {
+		t.Fatalf("closed reader generation lease: active=%t err=%v", active, err)
+	}
+}
+
+func TestSessionReaderDoesNotRecreateRetiredStateDirectory(t *testing.T) {
+	root := t.TempDir()
+	manifest, reader, _ := sessionFixture(t, root)
+	session := openFixtureSession(t, root, manifest, reader, nil)
+	stateDirectory := filepath.Dir(session.State().DeltaPath)
+	retired := stateDirectory + ".retired"
+	if err := os.Rename(stateDirectory, retired); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.OpenReader(); err == nil {
+		t.Fatal("reader unexpectedly opened after the state directory was retired")
+	}
+	if _, err := os.Lstat(stateDirectory); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("retired state directory was recreated: %v", err)
+	}
+}
+
 func TestSessionRandomWriteTransitionsToVerifiedBacking(t *testing.T) {
 	root := t.TempDir()
 	manifest, reader, source := sessionFixture(t, root)
@@ -126,6 +167,67 @@ func TestSessionRandomWriteTransitionsToVerifiedBacking(t *testing.T) {
 	}
 	if session.State().BackingPath == "" {
 		t.Fatal("random write did not activate a backing file")
+	}
+}
+
+func TestSessionBudgetRejectsCopyOnWriteBeforeCreatingBacking(t *testing.T) {
+	root := t.TempDir()
+	manifest, reader, source := sessionFixture(t, root)
+	checker := &vfsRejectingChecker{}
+	session, err := OpenSession(context.Background(), SessionOptions{
+		Root: root, ManifestPath: filepath.Join(root, "manifest.json"), Manifest: manifest, Reader: reader,
+		NativeSnapshot: NativeFile{Path: manifest.Session.RolloutPath, Bytes: manifest.Source.Bytes, SHA256: manifest.Source.SHA256},
+		Budget:         checker,
+	})
+	if err != nil {
+		t.Fatalf("OpenSession: %v", err)
+	}
+	writer, err := session.OpenWriter()
+	if err != nil {
+		t.Fatalf("OpenWriter: %v", err)
+	}
+	if _, err := writer.WriteAt(context.Background(), []byte("X"), 0); !errors.Is(err, storage.ErrBudgetExceeded) {
+		t.Fatalf("WriteAt error = %v, want storage budget rejection", err)
+	}
+	_ = writer.Close()
+	if checker.Calls != 1 || checker.Projection.Operation != "copy-on-write" || checker.Projection.TemporaryBytes != int64(len(source)) {
+		t.Fatalf("unexpected COW budget projection: %#v", checker)
+	}
+	if state := session.State(); state.BackingPath != "" || state.Generation != 1 {
+		t.Fatalf("budget rejection changed session state: %#v", state)
+	}
+	entries, err := os.ReadDir(filepath.Join(root, "fs", "sessions", "session"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.Contains(entry.Name(), "backing") {
+			t.Fatalf("backing artifact exists after preflight rejection: %s", entry.Name())
+		}
+	}
+}
+
+func TestSessionBudgetRejectsMaterializeBeforeCreatingTarget(t *testing.T) {
+	root := t.TempDir()
+	manifest, reader, _ := sessionFixture(t, root)
+	checker := &vfsRejectingChecker{}
+	session, err := OpenSession(context.Background(), SessionOptions{
+		Root: root, ManifestPath: filepath.Join(root, "manifest.json"), Manifest: manifest, Reader: reader,
+		NativeSnapshot: NativeFile{Path: manifest.Session.RolloutPath, Bytes: manifest.Source.Bytes, SHA256: manifest.Source.SHA256},
+		Budget:         checker,
+	})
+	if err != nil {
+		t.Fatalf("OpenSession: %v", err)
+	}
+	target := filepath.Join(root, "new", "current.jsonl")
+	if _, err := session.MaterializeCurrent(context.Background(), target, false); !errors.Is(err, storage.ErrBudgetExceeded) {
+		t.Fatalf("MaterializeCurrent error = %v, want storage budget rejection", err)
+	}
+	if checker.Calls != 1 || checker.Projection.Operation != "materialize-current" {
+		t.Fatalf("unexpected materialize budget projection: %#v", checker)
+	}
+	if _, err := os.Stat(filepath.Dir(target)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("materialize target directory exists after preflight rejection: %v", err)
 	}
 }
 
@@ -250,4 +352,15 @@ func readHandle(t *testing.T, handle *ReadHandle) []byte {
 func digestBytes(data []byte) string {
 	digest := sha256.Sum256(data)
 	return hex.EncodeToString(digest[:])
+}
+
+type vfsRejectingChecker struct {
+	Calls      int
+	Projection storage.Projection
+}
+
+func (c *vfsRejectingChecker) Check(_ context.Context, projection storage.Projection) (storage.Assessment, error) {
+	c.Calls++
+	c.Projection = projection
+	return storage.Assessment{}, storage.ErrBudgetExceeded
 }

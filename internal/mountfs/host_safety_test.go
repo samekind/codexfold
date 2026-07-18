@@ -20,6 +20,20 @@ func TestPrepareMountPointRejectsOrdinaryFiles(t *testing.T) {
 	}
 }
 
+func TestPrepareMountPointCreatesAndSealsMissingBackingDirectory(t *testing.T) {
+	mountPoint := filepath.Join(t.TempDir(), "missing", "mount")
+	if err := prepareMountPoint(mountPoint); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(mountPoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.IsDir() || info.Mode().Perm() != 0o500 {
+		t.Fatalf("created mount backing mode=%#o directory=%t", info.Mode().Perm(), info.IsDir())
+	}
+}
+
 func TestPrepareMountPointSealsEmptyBackingDirectory(t *testing.T) {
 	mountPoint := filepath.Join(t.TempDir(), "mount")
 	if err := os.MkdirAll(mountPoint, 0o700); err != nil {

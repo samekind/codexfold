@@ -3,6 +3,8 @@ package fsctl
 import (
 	"context"
 	"fmt"
+
+	"github.com/jstar0/codexfold/internal/storage"
 )
 
 const (
@@ -16,9 +18,10 @@ const (
 	ComponentFallback = "fallback"
 	ComponentJournal  = "journal"
 	ComponentClient   = "client"
+	ComponentStorage  = "storage"
 )
 
-var RequiredComponents = []string{ComponentDaemon, ComponentMount, ComponentPack, ComponentManifest, ComponentDelta, ComponentBacking, ComponentRoute, ComponentFallback, ComponentJournal, ComponentClient}
+var RequiredComponents = []string{ComponentDaemon, ComponentMount, ComponentPack, ComponentManifest, ComponentDelta, ComponentBacking, ComponentRoute, ComponentFallback, ComponentJournal, ComponentClient, ComponentStorage}
 
 type Check struct {
 	Component string
@@ -35,10 +38,13 @@ type Issue struct {
 }
 
 type DoctorReport struct {
-	Healthy         bool            `json:"healthy"`
-	IssueCount      int             `json:"issue_count"`
-	Issues          []Issue         `json:"issues,omitempty"`
-	ComponentHealth map[string]bool `json:"component_health"`
+	Healthy         bool              `json:"healthy"`
+	IssueCount      int               `json:"issue_count"`
+	Issues          []Issue           `json:"issues,omitempty"`
+	ComponentHealth map[string]bool   `json:"component_health"`
+	Storage         storage.Inventory `json:"storage"`
+	StorageLimits   storage.Limits    `json:"storage_limits"`
+	AvailableBytes  int64             `json:"available_bytes"`
 }
 
 func Doctor(ctx context.Context, checks []Check) DoctorReport {

@@ -17,27 +17,64 @@ import (
 
 	"github.com/jstar0/codexfold/internal/codex"
 	"github.com/jstar0/codexfold/internal/compat"
+	"github.com/jstar0/codexfold/internal/enroll"
 	"github.com/jstar0/codexfold/internal/fold"
 	"github.com/jstar0/codexfold/internal/fsctl"
 	"github.com/jstar0/codexfold/internal/mountfs"
 	"github.com/jstar0/codexfold/internal/pack"
+	"github.com/jstar0/codexfold/internal/storage"
 	"github.com/jstar0/codexfold/internal/vfs"
 )
+
+type cliRejectingChecker struct {
+	Calls      int
+	Projection storage.Projection
+}
+
+func (c *cliRejectingChecker) Check(_ context.Context, projection storage.Projection) (storage.Assessment, error) {
+	c.Calls++
+	c.Projection = projection
+	return storage.Assessment{}, storage.ErrBudgetExceeded
+}
 
 func TestRootExposesPackAndFilesystemCommands(t *testing.T) {
 	root := NewRootCommand()
 	for _, commandPath := range [][]string{
 		{"pack", "build"}, {"pack", "doctor"},
-		{"fs", "status"}, {"fs", "doctor"}, {"fs", "compatibility"}, {"fs", "compatibility-import"}, {"fs", "benchmark"},
+		{"fs", "status"}, {"fs", "doctor"}, {"fs", "validate-native"}, {"fs", "compatibility"}, {"fs", "compatibility-import"}, {"fs", "benchmark"},
 		{"fs", "serve"}, {"fs", "migrate"}, {"fs", "rollback"}, {"fs", "compact"}, {"fs", "recover"},
+		{"fs", "enroll", "plan"}, {"fs", "enroll", "apply"},
 		{"fs", "namespace", "status"}, {"fs", "namespace", "activate"},
 		{"fs", "namespace", "deactivate"}, {"fs", "namespace", "recover"},
 		{"fs", "service", "install"}, {"fs", "service", "start"}, {"fs", "service", "stop"},
-		{"fs", "service", "status"}, {"fs", "service", "update-preflight"},
+		{"fs", "service", "status"}, {"fs", "service", "update-binary"}, {"fs", "service", "update-preflight"},
 	} {
 		if _, _, err := root.Find(commandPath); err != nil {
 			t.Fatalf("command %v should be exposed: %v", commandPath, err)
 		}
+	}
+}
+
+func TestRetainCanonicalSnapshotBudgetRejectsBeforeCreatingSnapshot(t *testing.T) {
+	root := t.TempDir()
+	store := filepath.Join(root, "store")
+	sourcePath := filepath.Join(root, "source.jsonl")
+	if err := os.WriteFile(sourcePath, []byte("budgeted snapshot"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	source, err := hashPath(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checker := &cliRejectingChecker{}
+	if _, err := retainCanonicalSnapshot(context.Background(), store, "session", source, checker); !errors.Is(err, storage.ErrBudgetExceeded) {
+		t.Fatalf("retainCanonicalSnapshot error = %v, want storage budget rejection", err)
+	}
+	if checker.Calls != 1 || checker.Projection.Operation != "retain-migration-snapshot" || checker.Projection.AdditionalPersistentBytes != source.Bytes {
+		t.Fatalf("unexpected snapshot budget projection: %#v", checker)
+	}
+	if _, err := os.Stat(filepath.Join(store, "fs", "snapshots")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("snapshot directory exists after preflight rejection: %v", err)
 	}
 }
 
@@ -330,6 +367,64 @@ func TestFSServiceInstallIsDryRunByDefaultAndApplyRequiresFuseBuild(t *testing.T
 	}
 }
 
+func TestFSServiceInstallRendersNativeFSKitDaemonAndSupervisor(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("native FSKit services are macOS-only")
+	}
+	home, storeDir, _ := fsFixture(t, true)
+	definition := filepath.Join(home, "LaunchAgents", "com.codexfold.fs.plist")
+	fskitApp := filepath.Join(home, "Applications", "CodexFoldFSKit.app")
+	root := NewRootCommand()
+	var output bytes.Buffer
+	root.SetOut(&output)
+	root.SetErr(&bytes.Buffer{})
+	root.SetArgs([]string{
+		"fs", "service", "install", "--frontend", "native-fskit",
+		"--codex-home", home, "--store", storeDir, "--definition", definition,
+		"--fskit-app", fskitApp, "--json",
+	})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("native FSKit service dry-run: %v", err)
+	}
+	var result FSServiceInstallResult
+	if err := json.Unmarshal(output.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	wantSupervisor := filepath.Join(filepath.Dir(definition), "com.codexfold.fs.supervisor.plist")
+	if !result.DryRun || result.Path != definition || result.SupervisorPath != wantSupervisor || result.SupervisorBytes == 0 {
+		t.Fatalf("native FSKit install result = %#v", result)
+	}
+	for _, path := range []string{definition, wantSupervisor} {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("dry-run wrote %s: %v", path, err)
+		}
+	}
+	launcher := filepath.Join(fskitApp, "Contents", "MacOS", "CodexFoldFSKit")
+	if result.FSKitAppPath != fskitApp || result.FSKitLauncherPath != launcher || result.FSKitResourcePath == "" {
+		t.Fatalf("native FSKit resolved paths = %#v", result)
+	}
+}
+
+func TestFSServiceRestartIsExposedAsDryRun(t *testing.T) {
+	home := t.TempDir()
+	definition := filepath.Join(home, "com.codexfold.fs.plist")
+	root := NewRootCommand()
+	var output bytes.Buffer
+	root.SetOut(&output)
+	root.SetErr(&bytes.Buffer{})
+	root.SetArgs([]string{"fs", "service", "restart", "--definition", definition, "--json"})
+	if err := root.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	var result FSServiceActionResult
+	if err := json.Unmarshal(output.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Action != "restart" || !result.DryRun || result.Path != definition {
+		t.Fatalf("restart dry-run = %#v", result)
+	}
+}
+
 func TestFSUpdatePreflightQuarantineRoutesLatestVisibleBytesNative(t *testing.T) {
 	allowFixtureMount(t)
 	home, storeDir, nativePath := fsFixture(t, true)
@@ -441,6 +536,206 @@ func TestFSMigrateIsDryRunByDefaultAndDoesNotChangeRoute(t *testing.T) {
 	sessions, err := codex.LoadSessions(home)
 	if err != nil || sessions[0].RolloutPath != nativePath {
 		t.Fatalf("dry-run changed route: sessions=%#v err=%v", sessions, err)
+	}
+}
+
+func TestFSEnrollmentPlanRequiresTwoStableObservationsAndCanaryGate(t *testing.T) {
+	home, storeDir, _ := fsFixture(t, true)
+	allowEnrollmentWriterProbe(t)
+	oldProbe := mountHealthProbe
+	mountHealthProbe = func(string) error { return nil }
+	t.Cleanup(func() { mountHealthProbe = oldProbe })
+	mount := filepath.Join(home, "mount")
+	nativeRoot := filepath.Join(home, "fold-native")
+	args := []string{
+		"fs", "enroll", "plan", "--codex-home", home, "--store", storeDir, "--mount", mount,
+		"--canonical-namespace", "--native-root", nativeRoot, "--enrollment-canary", "--stable-for", "1ns", "--record-observations", "--json",
+	}
+	runPlan := func() enroll.Plan {
+		root := NewRootCommand()
+		var output bytes.Buffer
+		root.SetOut(&output)
+		root.SetErr(&bytes.Buffer{})
+		root.SetArgs(args)
+		if err := root.Execute(); err != nil {
+			t.Fatalf("enrollment plan: %v", err)
+		}
+		var plan enroll.Plan
+		if err := json.Unmarshal(output.Bytes(), &plan); err != nil {
+			t.Fatalf("decode enrollment plan: %v\n%s", err, output.String())
+		}
+		return plan
+	}
+	first := runPlan()
+	if len(first.Selected) != 0 {
+		t.Fatalf("first observation selected enrollment: %#v", first)
+	}
+	time.Sleep(time.Millisecond)
+	second := runPlan()
+	if len(second.Selected) != 1 || second.Selected[0].SessionID != "session" {
+		t.Fatalf("second stable observation was not selected: %#v", second)
+	}
+}
+
+func TestFSEnrollmentApplyRunsFoldPackMigrateAndStopsBeforeRouteOnFailure(t *testing.T) {
+	home, storeDir, nativePath := fsFixture(t, true)
+	allowEnrollmentWriterProbe(t)
+	oldProbe := mountHealthProbe
+	mountHealthProbe = func(string) error { return nil }
+	t.Cleanup(func() { mountHealthProbe = oldProbe })
+	observationPath := enrollmentObservationPath(storeDir)
+	info, err := os.Stat(nativePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := enroll.SaveObservations(observationPath, enroll.Observations{"session": {
+		Path: nativePath, Size: info.Size(), ModTimeUnixNano: info.ModTime().UnixNano(), StableSinceUnixNano: time.Now().Add(-time.Hour).UnixNano(),
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	oldRunner := runEnrollmentCommand
+	defer func() { runEnrollmentCommand = oldRunner }()
+	var calls [][]string
+	runEnrollmentCommand = func(_ context.Context, args []string) error {
+		calls = append(calls, append([]string(nil), args...))
+		if len(calls) == 2 {
+			return errors.New("pack failed")
+		}
+		return nil
+	}
+	root := NewRootCommand()
+	root.SetOut(&bytes.Buffer{})
+	root.SetErr(&bytes.Buffer{})
+	root.SetArgs([]string{
+		"fs", "enroll", "apply", "--codex-home", home, "--store", storeDir, "--mount", filepath.Join(home, "mount"),
+		"--canonical-namespace", "--native-root", filepath.Join(home, "fold-native"), "--enrollment-canary", "--stable-for", "1ns", "--apply",
+	})
+	if err := root.Execute(); err == nil || !strings.Contains(err.Error(), "pack failed") {
+		t.Fatalf("enrollment apply error = %v, want pack failure", err)
+	}
+	if len(calls) != 2 || len(calls[0]) < 2 || calls[0][0] != "fold" || calls[1][0] != "pack" {
+		t.Fatalf("enrollment command sequence = %#v", calls)
+	}
+	sessions, err := codex.LoadSessions(home)
+	if err != nil || len(sessions) != 1 || filepath.Clean(sessions[0].RolloutPath) != filepath.Clean(nativePath) {
+		t.Fatalf("failed enrollment changed route: sessions=%#v err=%v", sessions, err)
+	}
+	if data, err := os.ReadFile(nativePath); err != nil || len(data) == 0 {
+		t.Fatalf("failed enrollment changed source: bytes=%d err=%v", len(data), err)
+	}
+}
+
+func TestPeriodicEnrollmentLoopRunsSerialCyclesAndStopsWithContext(t *testing.T) {
+	oldRunner := runServiceEnrollmentCycle
+	defer func() { runServiceEnrollmentCycle = oldRunner }()
+
+	started := make(chan struct{}, 2)
+	release := make(chan struct{}, 2)
+	flagErrors := make(chan error, 1)
+	runServiceEnrollmentCycle = func(ctx context.Context, flags enrollmentFlags) (FSEnrollmentApplyResult, error) {
+		if flags.batchSize != 3 || flags.stableFor != 2*time.Hour || !flags.canonicalNamespace {
+			select {
+			case flagErrors <- fmt.Errorf("unexpected enrollment flags: %#v", flags):
+			default:
+			}
+		}
+		started <- struct{}{}
+		select {
+		case <-ctx.Done():
+			return FSEnrollmentApplyResult{}, ctx.Err()
+		case <-release:
+			return FSEnrollmentApplyResult{}, nil
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		runPeriodicEnrollment(ctx, enrollmentFlags{batchSize: 3, stableFor: 2 * time.Hour, canonicalNamespace: true}, time.Millisecond, nil)
+		close(done)
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("periodic enrollment did not run")
+	}
+	select {
+	case <-started:
+		t.Fatal("periodic enrollment overlapped a running cycle")
+	case <-time.After(10 * time.Millisecond):
+	}
+	release <- struct{}{}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("periodic enrollment did not schedule the next cycle")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("periodic enrollment did not stop with its context")
+	}
+	select {
+	case err := <-flagErrors:
+		t.Fatal(err)
+	default:
+	}
+}
+
+func TestEnrollmentCycleInPreviewRecordsObservationsWithoutMutating(t *testing.T) {
+	home, storeDir, _ := fsFixture(t, true)
+	allowEnrollmentWriterProbe(t)
+	oldProbe := mountHealthProbe
+	mountHealthProbe = func(string) error { return nil }
+	t.Cleanup(func() { mountHealthProbe = oldProbe })
+	oldRunner := runEnrollmentCommand
+	defer func() { runEnrollmentCommand = oldRunner }()
+	runEnrollmentCommand = func(context.Context, []string) error {
+		t.Fatal("preview enrollment cycle attempted a mutation")
+		return nil
+	}
+
+	result, err := runEnrollmentCycle(context.Background(), enrollmentFlags{
+		codexHome: home, storeDir: storeDir, mountPoint: filepath.Join(home, "mount"),
+		nativeRoot: filepath.Join(home, "fold-native"), canonicalNamespace: true,
+		stableFor: time.Nanosecond, batchSize: 1,
+	})
+	if err != nil {
+		t.Fatalf("runEnrollmentCycle: %v", err)
+	}
+	if result.Apply.Applied != 0 || len(result.Plan.Selected) != 0 {
+		t.Fatalf("preview cycle selected or applied sessions: %#v", result)
+	}
+	observations, err := enroll.LoadObservations(enrollmentObservationPath(storeDir))
+	if err != nil || len(observations) != 1 {
+		t.Fatalf("preview cycle did not persist observations: observations=%#v err=%v", observations, err)
+	}
+}
+
+func allowEnrollmentWriterProbe(t *testing.T) {
+	t.Helper()
+	oldProbe := enrollmentWriterProbe
+	enrollmentWriterProbe = func(context.Context, []codex.Session) (map[string]bool, error) {
+		return map[string]bool{}, nil
+	}
+	t.Cleanup(func() { enrollmentWriterProbe = oldProbe })
+}
+
+func TestEnrollmentStorageHealthAllowsBootstrapButRejectsBrokenCommittedPack(t *testing.T) {
+	storeDir := t.TempDir()
+	if err := requireEnrollmentStorageHealth(context.Background(), storeDir); err != nil {
+		t.Fatalf("empty enrollment store should be a valid bootstrap state: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(storeDir, "packs"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(storeDir, "packs", "CURRENT"), []byte("missing-generation\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := requireEnrollmentStorageHealth(context.Background(), storeDir); err == nil {
+		t.Fatal("a broken committed pack generation passed enrollment health")
 	}
 }
 
@@ -642,7 +937,7 @@ func TestFSMigrateCanonicalKeepsCodexRouteAndHidesRetainedSnapshot(t *testing.T)
 		t.Fatal(err)
 	}
 	_ = db.Close()
-	if _, err := fold.Fold(context.Background(), codex.Session{ID: "session", RolloutPath: route, Archived: true}, fold.FoldOptions{StoreDir: storeDir, Apply: true, FieldThreshold: 8}); err != nil {
+	if _, err := fold.Fold(context.Background(), fold.Session{ID: "session", RolloutPath: route, Archived: true}, fold.FoldOptions{StoreDir: storeDir, Apply: true, FieldThreshold: 8}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pack.Build(context.Background(), storeDir, pack.BuildOptions{}); err != nil {
@@ -827,7 +1122,7 @@ func interruptedCanonicalMigrationFixture(t *testing.T) interruptedCanonicalFixt
 		t.Fatal(err)
 	}
 	_ = db.Close()
-	if _, err := fold.Fold(context.Background(), codex.Session{ID: "session", RolloutPath: route, Archived: true}, fold.FoldOptions{StoreDir: storeDir, Apply: true, FieldThreshold: 8}); err != nil {
+	if _, err := fold.Fold(context.Background(), fold.Session{ID: "session", RolloutPath: route, Archived: true}, fold.FoldOptions{StoreDir: storeDir, Apply: true, FieldThreshold: 8}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pack.Build(context.Background(), storeDir, pack.BuildOptions{}); err != nil {
@@ -845,7 +1140,7 @@ func interruptedCanonicalMigrationFixture(t *testing.T) interruptedCanonicalFixt
 	if err != nil {
 		t.Fatal(err)
 	}
-	retained, err := retainCanonicalSnapshot(storeDir, "session", native)
+	retained, err := retainCanonicalSnapshot(context.Background(), storeDir, "session", native, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -893,7 +1188,7 @@ func TestFSMigrateCanonicalReservesWriterDuringCutover(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = db.Close()
-	if _, err := fold.Fold(context.Background(), codex.Session{ID: "session", RolloutPath: route, Archived: true}, fold.FoldOptions{StoreDir: storeDir, Apply: true, FieldThreshold: 8}); err != nil {
+	if _, err := fold.Fold(context.Background(), fold.Session{ID: "session", RolloutPath: route, Archived: true}, fold.FoldOptions{StoreDir: storeDir, Apply: true, FieldThreshold: 8}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pack.Build(context.Background(), storeDir, pack.BuildOptions{}); err != nil {
@@ -1983,6 +2278,104 @@ func TestFSReadOnlyCommandsRunWithoutClaimingMountHealth(t *testing.T) {
 	}
 }
 
+func TestFSStatusAndDoctorExposePhysicalStorageAccounting(t *testing.T) {
+	home, storeDir, _ := fsFixture(t, true)
+	for _, args := range [][]string{
+		{"fs", "status", "--codex-home", home, "--store", storeDir, "--json"},
+		{"fs", "doctor", "--codex-home", home, "--store", storeDir, "--json"},
+	} {
+		root := NewRootCommand()
+		var output bytes.Buffer
+		root.SetOut(&output)
+		root.SetErr(&bytes.Buffer{})
+		root.SetArgs(args)
+		if err := root.Execute(); err != nil {
+			t.Fatalf("%v: %v", args, err)
+		}
+		var payload struct {
+			Storage struct {
+				LogicalSessionBytes int64 `json:"logical_session_bytes"`
+				TotalPhysicalBytes  int64 `json:"total_physical_bytes"`
+			} `json:"storage"`
+			StorageLimits  storage.Limits `json:"storage_limits"`
+			AvailableBytes int64          `json:"available_bytes"`
+		}
+		if err := json.Unmarshal(output.Bytes(), &payload); err != nil {
+			t.Fatalf("decode %v: %v\n%s", args, err, output.String())
+		}
+		if payload.Storage.LogicalSessionBytes <= 0 || payload.Storage.TotalPhysicalBytes <= 0 || payload.StorageLimits.MaxPhysicalBytes <= 0 || payload.AvailableBytes <= 0 {
+			t.Fatalf("incomplete storage accounting for %v: %#v", args, payload)
+		}
+	}
+}
+
+func TestStartupStorageGCRunsOnlyAfterHealthyStoreVerification(t *testing.T) {
+	_, storeDir, _ := fsFixture(t, true)
+	if _, err := pack.Build(context.Background(), storeDir, pack.BuildOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pack.Build(context.Background(), storeDir, pack.BuildOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	before := countPackGenerationDirectories(t, storeDir)
+	result, ran, err := startupStorageGC(context.Background(), storeDir)
+	if err != nil {
+		t.Fatalf("startupStorageGC: %v", err)
+	}
+	if !ran || before != 3 || result.RemovedCount != 1 || countPackGenerationDirectories(t, storeDir) != 2 {
+		t.Fatalf("healthy startup GC result: before=%d ran=%t result=%#v after=%d", before, ran, result, countPackGenerationDirectories(t, storeDir))
+	}
+
+	if _, err := pack.Build(context.Background(), storeDir, pack.BuildOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	current, err := os.ReadFile(filepath.Join(storeDir, "packs", "CURRENT"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	index, err := os.ReadFile(filepath.Join(storeDir, "packs", strings.TrimSpace(string(current)), "index.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded struct {
+		Objects []struct {
+			Blocks []struct {
+				Pack string `json:"pack"`
+			} `json:"blocks"`
+		} `json:"objects"`
+	}
+	if err := json.Unmarshal(index, &decoded); err != nil || len(decoded.Objects) == 0 || len(decoded.Objects[0].Blocks) == 0 {
+		t.Fatalf("decode current pack index: %#v err=%v", decoded, err)
+	}
+	packPath := filepath.Join(storeDir, "packs", strings.TrimSpace(string(current)), decoded.Objects[0].Blocks[0].Pack)
+	if err := os.WriteFile(packPath, []byte("corrupt"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	before = countPackGenerationDirectories(t, storeDir)
+	_, ran, err = startupStorageGC(context.Background(), storeDir)
+	if err != nil {
+		t.Fatalf("unhealthy startupStorageGC: %v", err)
+	}
+	if ran || countPackGenerationDirectories(t, storeDir) != before {
+		t.Fatalf("unhealthy store was mutated: ran=%t before=%d after=%d", ran, before, countPackGenerationDirectories(t, storeDir))
+	}
+}
+
+func countPackGenerationDirectories(t *testing.T, store string) int {
+	t.Helper()
+	entries, err := os.ReadDir(filepath.Join(store, "packs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	count := 0
+	for _, entry := range entries {
+		if entry.IsDir() && !strings.HasPrefix(entry.Name(), ".") {
+			count++
+		}
+	}
+	return count
+}
+
 func fsFixture(t *testing.T, archived bool) (string, string, string) {
 	t.Helper()
 	home := t.TempDir()
@@ -2006,7 +2399,7 @@ func fsFixture(t *testing.T, archived bool) (string, string, string) {
 		}
 	}
 	session := codex.Session{ID: "session", RolloutPath: nativePath, Archived: archived}
-	if _, err := fold.Fold(context.Background(), session, fold.FoldOptions{StoreDir: storeDir, Apply: true, FieldThreshold: 8}); err != nil {
+	if _, err := fold.Fold(context.Background(), toFoldSession(session), fold.FoldOptions{StoreDir: storeDir, Apply: true, FieldThreshold: 8}); err != nil {
 		t.Fatalf("fold fixture: %v", err)
 	}
 	if _, err := pack.Build(context.Background(), storeDir, pack.BuildOptions{}); err != nil {

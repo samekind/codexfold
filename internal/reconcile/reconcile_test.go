@@ -1,11 +1,26 @@
 package reconcile
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/jstar0/codexfold/internal/storage"
 )
+
+type reconcileRejectingChecker struct {
+	Calls      int
+	Projection storage.Projection
+}
+
+func (c *reconcileRejectingChecker) Check(_ context.Context, projection storage.Projection) (storage.Assessment, error) {
+	c.Calls++
+	c.Projection = projection
+	return storage.Assessment{}, storage.ErrBudgetExceeded
+}
 
 func TestMergeInsertsBranchOnlyRecordsByTimestamp(t *testing.T) {
 	dir := t.TempDir()
@@ -27,6 +42,9 @@ func TestMergeInsertsBranchOnlyRecordsByTimestamp(t *testing.T) {
 	if result.SharedRecords != 2 || result.AddedFromBranch != 1 || result.OutputRecords != 3 {
 		t.Fatalf("unexpected result: %#v", result)
 	}
+	if result.Storage == nil || result.Storage.Budget.ProjectedPeakBytes <= 0 || result.Storage.ActualReclaimedBytes != 0 {
+		t.Fatalf("merge storage accounting is incomplete: %#v", result.Storage)
+	}
 	data, err := os.ReadFile(output)
 	if err != nil {
 		t.Fatal(err)
@@ -38,6 +56,23 @@ func TestMergeInsertsBranchOnlyRecordsByTimestamp(t *testing.T) {
 	}, "\n") + "\n"
 	if string(data) != want {
 		t.Fatalf("merged bytes:\n%s\nwant:\n%s", data, want)
+	}
+}
+
+func TestMergeBudgetRejectsBeforeCreatingOutput(t *testing.T) {
+	dir := t.TempDir()
+	base := writeRollout(t, dir, "base.jsonl", []string{record("2026-07-13T01:00:00Z", "a")})
+	branch := writeRollout(t, dir, "branch.jsonl", []string{record("2026-07-13T01:01:00Z", "b")})
+	output := filepath.Join(dir, "output", "merged.jsonl")
+	checker := &reconcileRejectingChecker{}
+	if _, err := MergeWithOptions(base, branch, output, MergeOptions{Budget: checker}); !errors.Is(err, storage.ErrBudgetExceeded) {
+		t.Fatalf("MergeWithOptions error = %v, want storage budget rejection", err)
+	}
+	if checker.Calls != 1 || checker.Projection.Operation != "reconcile-rollout" || checker.Projection.AdditionalPersistentBytes <= 0 {
+		t.Fatalf("unexpected merge budget projection: %#v", checker)
+	}
+	if _, err := os.Stat(filepath.Dir(output)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("merge output directory exists after preflight rejection: %v", err)
 	}
 }
 

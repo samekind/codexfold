@@ -1,0 +1,39 @@
+name: CodexFoldFSKit
+options:
+  bundleIdPrefix: vip.jstar.codexfold
+settings:
+  base:
+    MACOSX_DEPLOYMENT_TARGET: "27.0"
+    DEVELOPMENT_TEAM: Y987FUR837
+    CODE_SIGN_STYLE: Automatic
+    SWIFT_VERSION: "5.0"
+targets:
+  CodexFoldFSKit:
+    type: application
+    platform: macOS
+    sources:
+      - path: Host
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: vip.jstar.codexfold.fskitprofileprobe
+        INFOPLIST_FILE: Host/Info.plist
+        CODE_SIGN_ENTITLEMENTS: CodexFoldFSKit.entitlements
+        REGISTER_APP_GROUPS: YES
+    dependencies:
+      - target: CodexFoldFSKitModule
+        embed: true
+  CodexFoldFSKitModule:
+    type: extensionkit-extension
+    platform: macOS
+    sources:
+      - path: Extension
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: vip.jstar.codexfold.fskitprofileprobe.module
+        INFOPLIST_FILE: Extension/Info.plist
+        CODE_SIGN_ENTITLEMENTS: Extension/CodexFoldFSKitModule.entitlements
+        REGISTER_APP_GROUPS: YES
+        ENABLE_APP_SANDBOX: YES
+        SKIP_INSTALL: YES
+        APPLICATION_EXTENSION_API_ONLY: YES
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/../Frameworks @executable_path/../../../../Frameworks"

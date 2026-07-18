@@ -32,7 +32,7 @@ func newFoldCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			result, err := fold.Fold(command.Context(), session, options)
+			result, err := fold.Fold(command.Context(), toFoldSession(session), options)
 			if err != nil {
 				return err
 			}
@@ -174,6 +174,13 @@ func findSession(sessions []codex.Session, sessionID string) (codex.Session, err
 		}
 	}
 	return codex.Session{}, fmt.Errorf("Codex session not found: %s", sessionID)
+}
+
+func toFoldSession(session codex.Session) fold.Session {
+	return fold.Session{
+		ID: session.ID, Title: session.Title, CWD: session.CWD,
+		RolloutPath: session.RolloutPath, Archived: session.Archived,
+	}
 }
 
 func writeJSON(command *cobra.Command, value any) error {

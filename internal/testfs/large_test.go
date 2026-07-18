@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jstar0/codexfold/internal/codex"
 	"github.com/jstar0/codexfold/internal/fold"
 	"github.com/jstar0/codexfold/internal/fsctl"
 	"github.com/jstar0/codexfold/internal/pack"
@@ -44,7 +43,7 @@ func TestLargePreviewBenchmark(t *testing.T) {
 	}
 	store := filepath.Join(root, "store")
 	foldStart := time.Now()
-	if _, err := fold.Fold(context.Background(), codex.Session{ID: fixture.ID, RolloutPath: fixture.Path, Archived: true}, fold.FoldOptions{StoreDir: store, Apply: true, FieldThreshold: 1 << 20}); err != nil {
+	if _, err := fold.Fold(context.Background(), fold.Session{ID: fixture.ID, RolloutPath: fixture.Path, Archived: true}, fold.FoldOptions{StoreDir: store, Apply: true, FieldThreshold: 1 << 20}); err != nil {
 		t.Fatal(err)
 	}
 	foldDuration := time.Since(foldStart)

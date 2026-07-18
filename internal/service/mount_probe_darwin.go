@@ -26,10 +26,8 @@ func defaultMountProbe(path string) error {
 	if actualPath != requestedPath {
 		return errors.New("path is not a mount root")
 	}
-	macFUSE := strings.Contains(filesystem, "fuse")
-	fuseT := filesystem == "nfs" && strings.HasPrefix(mountedFrom, "fuse-t:")
-	if !macFUSE && !fuseT {
-		return errors.New("mount root is not backed by a supported FUSE provider")
+	if !validDarwinMountProvider(filesystem, mountedFrom) {
+		return errors.New("mount root is not backed by CodexFold native FSKit or the supported FUSE-T fallback")
 	}
 	value, err := os.ReadFile(filepath.Join(path, mountid.Path))
 	if err != nil {
@@ -42,6 +40,12 @@ func defaultMountProbe(path string) error {
 		return err
 	}
 	return nil
+}
+
+func validDarwinMountProvider(filesystem string, mountedFrom string) bool {
+	filesystem = strings.ToLower(strings.TrimSpace(filesystem))
+	mountedFrom = strings.ToLower(strings.TrimSpace(mountedFrom))
+	return filesystem == "codexfold" || filesystem == "nfs" && strings.HasPrefix(mountedFrom, "fuse-t:")
 }
 
 func canonicalMountPath(path string) string {

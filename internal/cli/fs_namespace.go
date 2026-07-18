@@ -61,6 +61,11 @@ func newFSNamespaceActivateCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			if apply {
+				if err := requireFilesystemActivationAllowed(options.Home); err != nil {
+					return err
+				}
+			}
 			if !apply {
 				result, err := sessionns.Inspect(options)
 				if err != nil {

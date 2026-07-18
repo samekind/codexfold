@@ -14,6 +14,7 @@ type HostOptions struct {
 	Filesystem        *Filesystem
 	Foreground        bool
 	OperationRecorder func(string)
+	BuildSHA256       string
 }
 
 func Mount(ctx context.Context, options HostOptions) error {
@@ -30,7 +31,16 @@ func Mount(ctx context.Context, options HostOptions) error {
 }
 
 func prepareMountPoint(path string) error {
+	if err := recoverStaleMount(path); err != nil {
+		return fmt.Errorf("recover stale mount: %w", err)
+	}
 	info, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			return fmt.Errorf("create mount backing directory: %w", err)
+		}
+		info, err = os.Lstat(path)
+	}
 	if err != nil {
 		return fmt.Errorf("inspect mount backing directory: %w", err)
 	}

@@ -168,7 +168,10 @@ func newRemovalFixture(t *testing.T) removalFixture {
 	}
 	contained := codex.Session{ID: "contained", Title: "Contained", CWD: "/workspace", RolloutPath: containedPath, Archived: true}
 	container := codex.Session{ID: "container", Title: "Container", CWD: "/workspace", RolloutPath: containerPath}
-	if _, err := fold.Fold(context.Background(), contained, fold.FoldOptions{StoreDir: store, Apply: true, FieldThreshold: 4}); err != nil {
+	if _, err := fold.Fold(context.Background(), fold.Session{
+		ID: contained.ID, Title: contained.Title, CWD: contained.CWD,
+		RolloutPath: contained.RolloutPath, Archived: contained.Archived,
+	}, fold.FoldOptions{StoreDir: store, Apply: true, FieldThreshold: 4}); err != nil {
 		t.Fatalf("fold contained fixture: %v", err)
 	}
 

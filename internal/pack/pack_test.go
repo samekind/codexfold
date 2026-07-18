@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/jstar0/codexfold/internal/fold"
+	"github.com/jstar0/codexfold/internal/storage"
 )
 
 func TestBuildAndResolverReadExactRandomRanges(t *testing.T) {
@@ -91,6 +92,48 @@ func TestResolverSupportsOSCacheBypassOption(t *testing.T) {
 	}
 }
 
+func TestResolverHoldsGenerationLeaseUntilClose(t *testing.T) {
+	root := t.TempDir()
+	refs := putObjects(t, root, []byte("leased-generation"))
+	writeManifest(t, root, "session", refs)
+	result, err := Build(context.Background(), root, BuildOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolver, err := Open(root, OpenOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaseDirectory := filepath.Join(root, "packs", result.Generation, "leases")
+	active, err := storage.DirectoryHasActiveLease(leaseDirectory, false)
+	if err != nil || !active {
+		t.Fatalf("resolver generation lease: active=%t err=%v", active, err)
+	}
+	if err := resolver.Close(); err != nil {
+		t.Fatal(err)
+	}
+	active, err = storage.DirectoryHasActiveLease(leaseDirectory, true)
+	if err != nil || active {
+		t.Fatalf("closed resolver generation lease: active=%t err=%v", active, err)
+	}
+}
+
+func TestOpenDoesNotRecreateGenerationMissingFromCurrent(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "packs"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "packs", "CURRENT"), []byte("gen-missing\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(root, OpenOptions{}); err == nil {
+		t.Fatal("resolver unexpectedly opened a missing generation")
+	}
+	if _, err := os.Lstat(filepath.Join(root, "packs", "gen-missing")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("missing pack generation was recreated: %v", err)
+	}
+}
+
 func TestBuildInterruptionKeepsPreviousGenerationCurrent(t *testing.T) {
 	root := t.TempDir()
 	refs := putObjects(t, root, []byte("first-generation"))
@@ -120,6 +163,35 @@ func TestBuildInterruptionKeepsPreviousGenerationCurrent(t *testing.T) {
 	buffer := make([]byte, refs[0].RawBytes)
 	if _, err := resolver.ReadAt(context.Background(), refs[0], buffer, 0); err != nil && !errors.Is(err, io.EOF) {
 		t.Fatalf("read previous generation: %v", err)
+	}
+}
+
+func TestBuildBudgetRejectsBeforeCreatingCandidateGeneration(t *testing.T) {
+	root := t.TempDir()
+	refs := putObjects(t, root, []byte("budgeted-pack-object"))
+	writeManifest(t, root, "session", refs)
+	checker := rejectingChecker{}
+	if _, err := Build(context.Background(), root, BuildOptions{Budget: &checker}); !errors.Is(err, storage.ErrBudgetExceeded) {
+		t.Fatalf("Build error = %v, want storage budget rejection", err)
+	}
+	if checker.Calls != 1 {
+		t.Fatalf("budget checks = %d, want 1", checker.Calls)
+	}
+	if _, err := os.Stat(filepath.Join(root, "packs")); !os.IsNotExist(err) {
+		t.Fatalf("candidate packs directory exists after preflight rejection: %v", err)
+	}
+}
+
+func TestBuildReportsStorageAccounting(t *testing.T) {
+	root := t.TempDir()
+	refs := putObjects(t, root, []byte("accounted-pack"))
+	writeManifest(t, root, "session", refs)
+	result, err := Build(context.Background(), root, BuildOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Storage == nil || result.Storage.Budget.ProjectedPeakBytes <= result.Storage.Budget.CurrentPhysicalBytes || result.Storage.After.Packs.ApparentBytes == 0 {
+		t.Fatalf("pack storage accounting is incomplete: %#v", result.Storage)
 	}
 }
 
@@ -255,4 +327,13 @@ func loadCurrentIndex(t *testing.T, root string) Index {
 		t.Fatalf("decode index: %v", err)
 	}
 	return index
+}
+
+type rejectingChecker struct {
+	Calls int
+}
+
+func (c *rejectingChecker) Check(context.Context, storage.Projection) (storage.Assessment, error) {
+	c.Calls++
+	return storage.Assessment{}, storage.ErrBudgetExceeded
 }
