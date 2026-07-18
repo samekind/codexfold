@@ -36,6 +36,8 @@ git diff --check
 
 Native macOS FSKit changes additionally require an XcodeGen consistency check and Release build with the Xcode version declared by the project. Commit `project.yml` and the regenerated project together.
 
+Windows CI compiles every package and test binary but does not execute the full runtime suite. That is intentional until a real Windows/WinFsp host validates directory durability, locking, service, mount, and file-sharing semantics. A green Windows compile check is not Windows readiness evidence.
+
 ## Isolated Native FSKit Validation
 
 Never point development tests at `~/.codex`. Create a disposable Codex home, store, native root, mount point, service label, and service definition. Production `com.codexfold.fs` must remain disabled during preview work.

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"testing"
@@ -209,11 +210,7 @@ func TestNativeFSKitServerExposesReadOnlyMountIdentity(t *testing.T) {
 }
 
 func TestNativeFSKitServerPublishesDirectoryResourceWithScopedSocket(t *testing.T) {
-	root, err := os.MkdirTemp("/private/tmp", "cfs-r-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	root := shortNativeFSKitTestDir(t, "cfs-r-")
 	resource := filepath.Join(root, "native-fskit")
 	filesystem := NewCanonical()
 	filesystem.SetNativeRoot(filepath.Join(root, "native"))
@@ -237,7 +234,7 @@ func TestNativeFSKitServerPublishesDirectoryResourceWithScopedSocket(t *testing.
 	}()
 	deadline := time.Now().Add(5 * time.Second)
 	var client *fskitproto.Client
-	err = nil
+	var err error
 	for time.Now().Before(deadline) {
 		client, err = fskitproto.DialResource(resource, 100*time.Millisecond)
 		if err == nil {
@@ -346,10 +343,7 @@ func TestNativeFSKitServerNormalizesFSKitWholeFileSnapshotsIntoJSONLAppends(t *t
 
 func startNativeFSKitTestServer(t *testing.T, filesystem *Filesystem, root string) (*fskitproto.Client, func()) {
 	t.Helper()
-	socketRoot, err := os.MkdirTemp("/private/tmp", "cfs-")
-	if err != nil {
-		t.Fatal(err)
-	}
+	socketRoot := shortNativeFSKitTestDir(t, "cfs-")
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	options := NativeFSKitServerOptions{
@@ -379,7 +373,6 @@ func startNativeFSKitTestServer(t *testing.T, filesystem *Filesystem, root strin
 	}
 	stop := func() {
 		cancel()
-		defer os.RemoveAll(socketRoot)
 		select {
 		case err := <-done:
 			if err != nil && !errors.Is(err, context.Canceled) {
@@ -390,6 +383,20 @@ func startNativeFSKitTestServer(t *testing.T, filesystem *Filesystem, root strin
 		}
 	}
 	return client, stop
+}
+
+func shortNativeFSKitTestDir(t *testing.T, pattern string) string {
+	t.Helper()
+	base := os.TempDir()
+	if runtime.GOOS == "darwin" || runtime.GOOS == "linux" {
+		base = "/tmp"
+	}
+	root, err := os.MkdirTemp(base, pattern)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	return root
 }
 
 func writeNativeFSKitTestPayload(t *testing.T, client *fskitproto.Client, handle uint64, offset int64, data []byte) {

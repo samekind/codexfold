@@ -27,6 +27,8 @@ git diff --check
 
 For a focused change, run the smallest relevant package tests first, then the common gate before requesting review.
 
+Windows currently has compile and cross-build gates only. Do not describe those checks as real WinFsp or Windows Service runtime validation.
+
 ## Branches and Commits
 
 - Create a branch from current `main`; use a descriptive prefix such as `feat/`, `fix/`, `docs/`, or `test/`.

@@ -42,7 +42,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -51,6 +51,19 @@ jobs:
           go-version-file: go.mod
           cache: true
       - run: go test ./... -count=1
+      - run: go build ./cmd/codexfold
+
+  windows-compile:
+    name: windows-compile
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Compile all test packages without claiming runtime validation
+        run: go test ./... -run '^$' -count=1
       - run: go build ./cmd/codexfold
 
   race:
