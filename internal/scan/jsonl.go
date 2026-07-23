@@ -9,8 +9,8 @@ import (
 	"hash"
 	"io"
 
-	"github.com/jstar0/codexfold/internal/cdc"
-	"github.com/jstar0/codexfold/internal/jsonraw"
+	"github.com/samekind/codexfold/internal/cdc"
+	"github.com/samekind/codexfold/internal/jsonraw"
 )
 
 const (

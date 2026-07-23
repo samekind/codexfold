@@ -62,7 +62,10 @@ func LoadManifest(storeDir string, sessionID string) (Manifest, error) {
 	if err := validateSessionID(sessionID); err != nil {
 		return Manifest{}, err
 	}
-	path := ManifestPath(storeDir, sessionID)
+	return LoadManifestPath(ManifestPath(storeDir, sessionID))
+}
+
+func LoadManifestPath(path string) (Manifest, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return Manifest{}, fmt.Errorf("read fold manifest: %w", err)
@@ -81,7 +84,13 @@ func writeManifest(storeDir string, manifest Manifest, overwrite bool) error {
 	if err := validateSessionID(manifest.Session.ID); err != nil {
 		return err
 	}
-	path := ManifestPath(storeDir, manifest.Session.ID)
+	return writeManifestPath(ManifestPath(storeDir, manifest.Session.ID), manifest, overwrite)
+}
+
+func writeManifestPath(path string, manifest Manifest, overwrite bool) error {
+	if err := validateManifest(manifest); err != nil {
+		return err
+	}
 	if !overwrite {
 		if _, err := os.Stat(path); err == nil {
 			return fmt.Errorf("fold manifest already exists: %s", path)

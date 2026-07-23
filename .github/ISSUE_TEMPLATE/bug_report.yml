@@ -1,0 +1,58 @@
+name: Bug report
+description: Report a reproducible CodexFold defect using synthetic or redacted data.
+title: "bug: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Do not attach real Codex rollouts, databases, credentials, private prompts, or unredacted logs. Use GitHub Security Advisories for vulnerabilities.
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      placeholder: v0.2.1 or commit SHA
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - macOS
+        - Linux
+        - Windows
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Observed behavior
+      description: Include the command, sanitized error, and whether storage-only or filesystem-preview behavior was involved.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Synthetic reproduction
+      description: Provide minimal steps using generated or redacted fixtures.
+    validations:
+      required: true
+  - type: textarea
+    id: verification
+    attributes:
+      label: Verification already attempted
+      description: List doctor, tests, hashes, restart checks, or rollback attempts without private data.
+  - type: checkboxes
+    id: hygiene
+    attributes:
+      label: Data hygiene
+      options:
+        - label: I removed real session content, credentials, private prompts, local paths, and unredacted logs.
+          required: true

@@ -1,4 +1,6 @@
 /codexfold
+/codexfold.exe
+/dist/
 /*.sqlite
 /*.sqlite-shm
 /*.sqlite-wal
@@ -6,3 +8,5 @@
 *.test
 .DS_Store
 .worktrees/
+xcuserdata/
+*.xcuserstate

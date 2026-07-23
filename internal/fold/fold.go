@@ -10,45 +10,59 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"math"
 	"os"
+	"path/filepath"
+	"strings"
 
-	"github.com/jstar0/codexfold/internal/cdc"
-	"github.com/jstar0/codexfold/internal/codex"
-	"github.com/jstar0/codexfold/internal/jsonraw"
+	"github.com/samekind/codexfold/internal/cdc"
+	"github.com/samekind/codexfold/internal/jsonraw"
+	"github.com/samekind/codexfold/internal/storage"
 )
 
 type FoldOptions struct {
-	StoreDir         string
-	Apply            bool
-	Overwrite        bool
-	RemoveSource     bool
-	AllowActive      bool
-	FieldThreshold   int64
-	MaxJSONLineBytes int64
-	CDC              cdc.Options
-	beforeCommit     func() error
+	StoreDir             string
+	ManifestPathOverride string
+	Apply                bool
+	Overwrite            bool
+	RemoveSource         bool
+	AllowActive          bool
+	FieldThreshold       int64
+	MaxJSONLineBytes     int64
+	CDC                  cdc.Options
+	Budget               storage.Checker
+	beforeCommit         func() error
+}
+
+type Session struct {
+	ID          string
+	Title       string
+	CWD         string
+	RolloutPath string
+	Archived    bool
 }
 
 type FoldResult struct {
-	SessionID        string `json:"session_id"`
-	SourcePath       string `json:"source_path"`
-	ManifestPath     string `json:"manifest_path"`
-	SourceBytes      int64  `json:"source_bytes"`
-	SourceSHA256     string `json:"source_sha256"`
-	PartCount        int    `json:"part_count"`
-	FieldParts       int    `json:"field_parts"`
-	ResidualParts    int    `json:"residual_parts"`
-	UniqueObjects    int    `json:"unique_objects"`
-	ReusedObjects    int    `json:"reused_objects"`
-	NewStoredBytes   int64  `json:"new_stored_bytes"`
-	OversizedLines   int64  `json:"oversized_lines"`
-	InvalidJSONLines int64  `json:"invalid_json_lines"`
-	Verified         bool   `json:"verified"`
-	DryRun           bool   `json:"dry_run"`
-	RemovedSource    bool   `json:"removed_source"`
+	SessionID        string                      `json:"session_id"`
+	SourcePath       string                      `json:"source_path"`
+	ManifestPath     string                      `json:"manifest_path"`
+	SourceBytes      int64                       `json:"source_bytes"`
+	SourceSHA256     string                      `json:"source_sha256"`
+	PartCount        int                         `json:"part_count"`
+	FieldParts       int                         `json:"field_parts"`
+	ResidualParts    int                         `json:"residual_parts"`
+	UniqueObjects    int                         `json:"unique_objects"`
+	ReusedObjects    int                         `json:"reused_objects"`
+	NewStoredBytes   int64                       `json:"new_stored_bytes"`
+	OversizedLines   int64                       `json:"oversized_lines"`
+	InvalidJSONLines int64                       `json:"invalid_json_lines"`
+	Verified         bool                        `json:"verified"`
+	DryRun           bool                        `json:"dry_run"`
+	RemovedSource    bool                        `json:"removed_source"`
+	Storage          *storage.MutationAccounting `json:"storage,omitempty"`
 }
 
-func Fold(ctx context.Context, session codex.Session, options FoldOptions) (FoldResult, error) {
+func Fold(ctx context.Context, session Session, options FoldOptions) (FoldResult, error) {
 	if options.StoreDir == "" {
 		return FoldResult{}, errors.New("fold store directory is required")
 	}
@@ -68,6 +82,14 @@ func Fold(ctx context.Context, session codex.Session, options FoldOptions) (Fold
 		options.CDC = cdc.Options{MinBytes: 4 * 1024, AverageBytes: 16 * 1024, MaxBytes: 64 * 1024}
 	}
 	manifestPath := ManifestPath(options.StoreDir, session.ID)
+	if options.ManifestPathOverride != "" {
+		manifestPath = filepath.Clean(options.ManifestPathOverride)
+		manifestRoot := filepath.Join(options.StoreDir, "manifests")
+		relative, err := filepath.Rel(manifestRoot, manifestPath)
+		if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+			return FoldResult{}, errors.New("manifest override must remain inside the fold manifest directory")
+		}
+	}
 	if options.Apply && !options.Overwrite {
 		if _, err := os.Stat(manifestPath); err == nil {
 			return FoldResult{}, fmt.Errorf("fold manifest already exists: %s", manifestPath)
@@ -89,6 +111,38 @@ func Fold(ctx context.Context, session codex.Session, options FoldOptions) (Fold
 	before, err := file.Stat()
 	if err != nil {
 		return FoldResult{}, fmt.Errorf("stat rollout: %w", err)
+	}
+	var storageAssessment storage.Assessment
+	if options.Apply {
+		budget := options.Budget
+		if budget == nil {
+			guard, err := storage.DefaultGuard(options.StoreDir)
+			if err != nil {
+				return FoldResult{}, err
+			}
+			budget = guard
+		}
+		persistentBytes, err := estimateFoldStorageBytes(before.Size())
+		if err != nil {
+			return FoldResult{}, err
+		}
+		maximumObjectBytes := min(before.Size(), max(options.CDC.MaxBytes, options.MaxJSONLineBytes))
+		temporaryBytes, err := estimateFoldStorageBytes(maximumObjectBytes)
+		if err != nil {
+			return FoldResult{}, err
+		}
+		reclaimableBytes := int64(0)
+		if options.RemoveSource {
+			reclaimableBytes = before.Size()
+		}
+		storageAssessment, err = budget.Check(ctx, storage.Projection{
+			Operation: "fold", AdditionalPersistentBytes: persistentBytes,
+			TemporaryBytes: temporaryBytes, TemporaryPersistentOverlapBytes: min(temporaryBytes, persistentBytes),
+			ReclaimableBytes: reclaimableBytes,
+		})
+		if err != nil {
+			return FoldResult{}, err
+		}
 	}
 
 	manifest := Manifest{
@@ -260,7 +314,7 @@ complete:
 	if err := store.SyncPending(ctx); err != nil {
 		return FoldResult{}, err
 	}
-	if err := writeManifest(options.StoreDir, manifest, options.Overwrite); err != nil {
+	if err := writeManifestPath(manifestPath, manifest, options.Overwrite); err != nil {
 		return FoldResult{}, err
 	}
 	if options.RemoveSource {
@@ -269,7 +323,20 @@ complete:
 		}
 		result.RemovedSource = true
 	}
+	result.Storage = storage.CompleteAccounting(ctx, storageAssessment, options.StoreDir)
 	return result, nil
+}
+
+func estimateFoldStorageBytes(rawBytes int64) (int64, error) {
+	const fixedOverhead = int64(1 << 20)
+	if rawBytes < 0 {
+		return 0, errors.New("fold byte estimate cannot be negative")
+	}
+	overhead := rawBytes/16 + fixedOverhead
+	if rawBytes > math.MaxInt64-overhead {
+		return 0, errors.New("fold byte estimate overflow")
+	}
+	return rawBytes + overhead, nil
 }
 
 func verifyCurrentSource(path string, initial os.FileInfo, source ManifestSource) error {

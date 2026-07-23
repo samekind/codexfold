@@ -1,0 +1,27 @@
+# Sanitized Codex resume write sequence captured on macOS on 2026-07-16.
+# Fields are operation, absolute offset, and byte count. No path or content is retained.
+open 2
+write 51836 553
+fsync
+write 52389 233
+fsync
+write 52622 705
+fsync
+write 53327 402
+fsync
+write 53729 311
+fsync
+write 54040 141
+fsync
+write 54181 1435
+fsync
+write 55616 261
+fsync
+write 55877 445
+fsync
+write 56322 583
+fsync
+write 56905 350
+fsync
+flush
+release

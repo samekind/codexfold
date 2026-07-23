@@ -7,8 +7,8 @@ import (
 	"runtime/debug"
 	"strings"
 
-	"github.com/jstar0/codexfold/internal/codex"
-	"github.com/jstar0/codexfold/internal/scan"
+	"github.com/samekind/codexfold/internal/codex"
+	"github.com/samekind/codexfold/internal/scan"
 	"github.com/spf13/cobra"
 )
 
@@ -23,6 +23,8 @@ func NewRootCommand() *cobra.Command {
 		Version:       resolvedVersion(),
 	}
 	root.AddCommand(newScanCommand())
+	root.AddCommand(newForkFamilyCommand())
+	root.AddCommand(newArchiveCommand())
 	root.AddCommand(newContainsCommand())
 	root.AddCommand(newRemoveContainedCommand())
 	root.AddCommand(newFoldCommand())
@@ -30,6 +32,8 @@ func NewRootCommand() *cobra.Command {
 	root.AddCommand(newUnfoldCommand("materialize"))
 	root.AddCommand(newDoctorCommand())
 	root.AddCommand(newGCCommand())
+	root.AddCommand(newPackCommand())
+	root.AddCommand(newFSCommand())
 	return root
 }
 

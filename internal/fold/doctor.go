@@ -2,11 +2,13 @@ package fold
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
-	"strings"
+
+	"github.com/samekind/codexfold/internal/storage"
 )
 
 type DoctorIssue struct {
@@ -16,13 +18,21 @@ type DoctorIssue struct {
 }
 
 type DoctorResult struct {
-	StoreDir              string        `json:"store_dir"`
-	ManifestCount         int           `json:"manifest_count"`
-	VerifiedManifestCount int           `json:"verified_manifest_count"`
-	ObjectReferenceCount  int           `json:"object_reference_count"`
-	UniqueObjectCount     int           `json:"unique_object_count"`
-	IssueCount            int           `json:"issue_count"`
-	Issues                []DoctorIssue `json:"issues"`
+	StoreDir              string            `json:"store_dir"`
+	ManifestCount         int               `json:"manifest_count"`
+	VerifiedManifestCount int               `json:"verified_manifest_count"`
+	ObjectReferenceCount  int               `json:"object_reference_count"`
+	UniqueObjectCount     int               `json:"unique_object_count"`
+	IssueCount            int               `json:"issue_count"`
+	Issues                []DoctorIssue     `json:"issues"`
+	Storage               storage.Inventory `json:"storage"`
+	StorageLimits         storage.Limits    `json:"storage_limits"`
+	AvailableBytes        int64             `json:"available_bytes"`
+}
+
+type loadedManifest struct {
+	Path     string
+	Manifest Manifest
 }
 
 func Doctor(ctx context.Context, storeDir string) (DoctorResult, error) {
@@ -35,7 +45,8 @@ func Doctor(ctx context.Context, storeDir string) (DoctorResult, error) {
 	result.Issues = append(result.Issues, loadIssues...)
 	store := NewObjectStore(storeDir)
 	unique := make(map[string]ObjectRef)
-	for _, manifest := range manifests {
+	for _, loaded := range manifests {
+		manifest := loaded.Manifest
 		if err := ctx.Err(); err != nil {
 			return DoctorResult{}, err
 		}
@@ -45,7 +56,7 @@ func Doctor(ctx context.Context, storeDir string) (DoctorResult, error) {
 		}
 		if err := verifyStoredManifest(ctx, store, manifest); err != nil {
 			result.Issues = append(result.Issues, DoctorIssue{
-				Scope: "manifest", Path: ManifestPath(storeDir, manifest.Session.ID), Error: err.Error(),
+				Scope: "manifest", Path: loaded.Path, Error: err.Error(),
 			})
 		} else {
 			result.VerifiedManifestCount++
@@ -62,32 +73,50 @@ func Doctor(ctx context.Context, storeDir string) (DoctorResult, error) {
 			})
 		}
 	}
+	result.Storage, err = storage.Scan(ctx, storage.Options{StoreDir: storeDir, AllowMetadataIssues: true})
+	if err != nil {
+		result.Issues = append(result.Issues, DoctorIssue{Scope: "storage", Path: storeDir, Error: err.Error()})
+	} else {
+		for _, issue := range result.Storage.Issues {
+			result.Issues = append(result.Issues, DoctorIssue{Scope: "storage", Path: storeDir, Error: issue})
+		}
+	}
+	result.StorageLimits, err = storage.LoadLimits(storeDir)
+	if err != nil {
+		result.Issues = append(result.Issues, DoctorIssue{Scope: "storage-policy", Path: filepath.Join(storeDir, storage.PolicyFilename), Error: err.Error()})
+	}
+	result.AvailableBytes, err = storage.AvailableBytes(storeDir)
+	if err != nil {
+		result.Issues = append(result.Issues, DoctorIssue{Scope: "storage-space", Path: storeDir, Error: err.Error()})
+	}
 	result.IssueCount = len(result.Issues)
 	return result, nil
 }
 
-func loadAllManifests(storeDir string) ([]Manifest, []DoctorIssue, error) {
+func loadAllManifests(storeDir string) ([]loadedManifest, []DoctorIssue, error) {
 	manifestDir := filepath.Join(storeDir, "manifests")
-	entries, err := os.ReadDir(manifestDir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return []Manifest{}, []DoctorIssue{}, nil
-		}
-		return nil, nil, fmt.Errorf("read manifest directory: %w", err)
-	}
-	manifests := make([]Manifest, 0, len(entries))
+	manifests := make([]loadedManifest, 0)
 	issues := make([]DoctorIssue, 0)
-	for _, entry := range entries {
+	err := filepath.WalkDir(manifestDir, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
 		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
-			continue
+			return nil
 		}
-		sessionID := strings.TrimSuffix(entry.Name(), filepath.Ext(entry.Name()))
-		manifest, err := LoadManifest(storeDir, sessionID)
+		manifest, err := LoadManifestPath(path)
 		if err != nil {
-			issues = append(issues, DoctorIssue{Scope: "manifest", Path: filepath.Join(manifestDir, entry.Name()), Error: err.Error()})
-			continue
+			issues = append(issues, DoctorIssue{Scope: "manifest", Path: path, Error: err.Error()})
+			return nil
 		}
-		manifests = append(manifests, manifest)
+		manifests = append(manifests, loadedManifest{Path: path, Manifest: manifest})
+		return nil
+	})
+	if errors.Is(err, os.ErrNotExist) {
+		return []loadedManifest{}, []DoctorIssue{}, nil
+	}
+	if err != nil {
+		return nil, nil, fmt.Errorf("read manifest directory: %w", err)
 	}
 	return manifests, issues, nil
 }

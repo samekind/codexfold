@@ -7,8 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-
-	"github.com/jstar0/codexfold/internal/codex"
+	"time"
 )
 
 func TestDoctorDetectsReferencedObjectCorruption(t *testing.T) {
@@ -18,7 +17,7 @@ func TestDoctorDetectsReferencedObjectCorruption(t *testing.T) {
 	if err := os.WriteFile(sourcePath, []byte("{\"value\":\"large-field-value\"}\n"), 0o644); err != nil {
 		t.Fatalf("write source: %v", err)
 	}
-	if _, err := Fold(context.Background(), codex.Session{ID: "doctor", RolloutPath: sourcePath, Archived: true}, FoldOptions{
+	if _, err := Fold(context.Background(), Session{ID: "doctor", RolloutPath: sourcePath, Archived: true}, FoldOptions{
 		StoreDir: storeDir, Apply: true, FieldThreshold: 4,
 	}); err != nil {
 		t.Fatalf("Fold returned error: %v", err)
@@ -29,6 +28,9 @@ func TestDoctorDetectsReferencedObjectCorruption(t *testing.T) {
 	}
 	if clean.IssueCount != 0 || clean.ManifestCount != 1 {
 		t.Fatalf("unexpected clean doctor result: %#v", clean)
+	}
+	if clean.Storage.LogicalSessionBytes == 0 || clean.Storage.TotalPhysicalBytes == 0 || clean.StorageLimits.MaxPhysicalBytes == 0 || clean.AvailableBytes == 0 {
+		t.Fatalf("doctor storage accounting is incomplete: %#v", clean)
 	}
 	manifest, err := LoadManifest(storeDir, "doctor")
 	if err != nil {
@@ -54,7 +56,7 @@ func TestGCDryRunAndApplyRemoveOnlyUnreferencedObjects(t *testing.T) {
 	if err := os.WriteFile(sourcePath, []byte("{\"value\":\"large-field-value\"}\n"), 0o644); err != nil {
 		t.Fatalf("write source: %v", err)
 	}
-	if _, err := Fold(context.Background(), codex.Session{ID: "gc", RolloutPath: sourcePath, Archived: true}, FoldOptions{
+	if _, err := Fold(context.Background(), Session{ID: "gc", RolloutPath: sourcePath, Archived: true}, FoldOptions{
 		StoreDir: storeDir, Apply: true, FieldThreshold: 4,
 	}); err != nil {
 		t.Fatalf("Fold returned error: %v", err)
@@ -90,6 +92,82 @@ func TestGCDryRunAndApplyRemoveOnlyUnreferencedObjects(t *testing.T) {
 	}
 }
 
+func TestGCIncludesBoundedGenerationAndTemporaryCleanup(t *testing.T) {
+	root := t.TempDir()
+	storeDir := filepath.Join(root, "store")
+	sourcePath := filepath.Join(root, "rollout.jsonl")
+	if err := os.WriteFile(sourcePath, []byte("{\"value\":\"storage-gc\"}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Fold(context.Background(), Session{ID: "session", RolloutPath: sourcePath, Archived: true}, FoldOptions{StoreDir: storeDir, Apply: true, FieldThreshold: 4}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(storeDir, "packs"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(storeDir, "packs", "CURRENT"), []byte("gen-3\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-2 * time.Hour)
+	for _, generation := range []string{"gen-1", "gen-2", "gen-3"} {
+		directory := filepath.Join(storeDir, "packs", generation)
+		if err := os.MkdirAll(directory, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(directory, "pack-000001.pack"), []byte(generation), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(directory, old.Add(time.Duration(generation[len(generation)-1]-'0')*time.Minute), old.Add(time.Duration(generation[len(generation)-1]-'0')*time.Minute)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	temporary := filepath.Join(storeDir, ".backing-abandoned.tmp")
+	if err := os.WriteFile(temporary, []byte("temporary"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(temporary, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := GC(context.Background(), storeDir, true)
+	if err != nil {
+		t.Fatalf("GC: %v", err)
+	}
+	if result.Storage.RemovedCount != 2 || result.ActualReclaimedBytes <= 0 {
+		t.Fatalf("bounded storage was not collected: %#v", result)
+	}
+	if _, err := os.Stat(filepath.Join(storeDir, "packs", "gen-1")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("old pack generation remains: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(storeDir, "packs", "gen-2")); err != nil {
+		t.Fatalf("previous pack generation was removed: %v", err)
+	}
+	if _, err := os.Stat(temporary); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("abandoned temporary remains: %v", err)
+	}
+}
+
+func TestDoctorAndGCKeepGenerationManifestObjects(t *testing.T) {
+	root := t.TempDir()
+	storeDir := filepath.Join(root, "store")
+	sourcePath := filepath.Join(root, "generation.jsonl")
+	if err := os.WriteFile(sourcePath, []byte("{\"value\":\"generation-only-field\"}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manifestPath := filepath.Join(storeDir, "manifests", "generations", "session", "2.json")
+	if _, err := Fold(context.Background(), Session{ID: "session", RolloutPath: sourcePath, Archived: true}, FoldOptions{StoreDir: storeDir, ManifestPathOverride: manifestPath, Apply: true, FieldThreshold: 4}); err != nil {
+		t.Fatalf("Fold generation: %v", err)
+	}
+	doctor, err := Doctor(context.Background(), storeDir)
+	if err != nil || doctor.ManifestCount != 1 || doctor.IssueCount != 0 {
+		t.Fatalf("generation manifest not covered by doctor: %#v err=%v", doctor, err)
+	}
+	gc, err := GC(context.Background(), storeDir, true)
+	if err != nil || gc.OrphanCount != 0 || gc.Referenced == 0 {
+		t.Fatalf("generation object treated as orphan: %#v err=%v", gc, err)
+	}
+}
+
 func TestRemoveSourceRequiresGuardAndCanMaterializeAgain(t *testing.T) {
 	root := t.TempDir()
 	storeDir := filepath.Join(root, "store")
@@ -98,13 +176,13 @@ func TestRemoveSourceRequiresGuardAndCanMaterializeAgain(t *testing.T) {
 	if err := os.WriteFile(sourcePath, source, 0o644); err != nil {
 		t.Fatalf("write source: %v", err)
 	}
-	_, err := Fold(context.Background(), codex.Session{ID: "active", RolloutPath: sourcePath}, FoldOptions{
+	_, err := Fold(context.Background(), Session{ID: "active", RolloutPath: sourcePath}, FoldOptions{
 		StoreDir: storeDir, Apply: true, RemoveSource: true, FieldThreshold: 4,
 	})
 	if err == nil {
 		t.Fatalf("non-archived source removal should require --allow-active")
 	}
-	result, err := Fold(context.Background(), codex.Session{ID: "archived", RolloutPath: sourcePath, Archived: true}, FoldOptions{
+	result, err := Fold(context.Background(), Session{ID: "archived", RolloutPath: sourcePath, Archived: true}, FoldOptions{
 		StoreDir: storeDir, Apply: true, RemoveSource: true, FieldThreshold: 4,
 	})
 	if err != nil {
