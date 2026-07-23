@@ -15,8 +15,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jstar0/codexfold/internal/mountfs"
-	"github.com/jstar0/codexfold/internal/service"
+	"github.com/samekind/codexfold/internal/mountfs"
+	"github.com/samekind/codexfold/internal/service"
 )
 
 func TestRealLinuxFSServeRecoversAfterHostSIGKILL(t *testing.T) {

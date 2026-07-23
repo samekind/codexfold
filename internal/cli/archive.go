@@ -5,8 +5,8 @@ import (
 	"errors"
 	"fmt"
 
-	archivepkg "github.com/jstar0/codexfold/internal/archive"
-	"github.com/jstar0/codexfold/internal/codex"
+	archivepkg "github.com/samekind/codexfold/internal/archive"
+	"github.com/samekind/codexfold/internal/codex"
 	"github.com/spf13/cobra"
 )
 

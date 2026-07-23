@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"path/filepath"
 
-	"github.com/jstar0/codexfold/internal/codex"
-	"github.com/jstar0/codexfold/internal/sessionns"
-	"github.com/jstar0/codexfold/internal/vfs"
+	"github.com/samekind/codexfold/internal/codex"
+	"github.com/samekind/codexfold/internal/sessionns"
+	"github.com/samekind/codexfold/internal/vfs"
 	"github.com/spf13/cobra"
 )
 

@@ -11,7 +11,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/jstar0/codexfold/internal/fold"
+	"github.com/samekind/codexfold/internal/fold"
 )
 
 type PreparedGeneration struct {

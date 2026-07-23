@@ -15,8 +15,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jstar0/codexfold/internal/fold"
-	"github.com/jstar0/codexfold/internal/vfs"
+	"github.com/samekind/codexfold/internal/fold"
+	"github.com/samekind/codexfold/internal/vfs"
 )
 
 func TestFilesystemIOIdleRequiresNoActiveIOAndCompletedIdleWindow(t *testing.T) {

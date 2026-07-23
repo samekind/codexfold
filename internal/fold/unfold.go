@@ -7,7 +7,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/jstar0/codexfold/internal/storage"
+	"github.com/samekind/codexfold/internal/storage"
 )
 
 type UnfoldResult struct {

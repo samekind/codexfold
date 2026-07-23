@@ -20,8 +20,8 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/jstar0/codexfold/internal/fskitproto"
-	"github.com/jstar0/codexfold/internal/vfs"
+	"github.com/samekind/codexfold/internal/fskitproto"
+	"github.com/samekind/codexfold/internal/vfs"
 )
 
 type Attr struct {

@@ -8,7 +8,7 @@ import (
 	"os"
 	"os/exec"
 
-	"github.com/jstar0/codexfold/internal/codex"
+	"github.com/samekind/codexfold/internal/codex"
 )
 
 func detectEnrollmentWriters(ctx context.Context, sessions []codex.Session) (map[string]bool, error) {

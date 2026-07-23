@@ -7,8 +7,8 @@ import (
 	"runtime/debug"
 	"strings"
 
-	"github.com/jstar0/codexfold/internal/codex"
-	"github.com/jstar0/codexfold/internal/scan"
+	"github.com/samekind/codexfold/internal/codex"
+	"github.com/samekind/codexfold/internal/scan"
 	"github.com/spf13/cobra"
 )
 

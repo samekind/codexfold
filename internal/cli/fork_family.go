@@ -3,8 +3,8 @@ package cli
 import (
 	"fmt"
 
-	"github.com/jstar0/codexfold/internal/codex"
-	"github.com/jstar0/codexfold/internal/family"
+	"github.com/samekind/codexfold/internal/codex"
+	"github.com/samekind/codexfold/internal/family"
 	"github.com/spf13/cobra"
 )
 

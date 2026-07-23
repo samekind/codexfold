@@ -12,8 +12,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	archivepkg "github.com/jstar0/codexfold/internal/archive"
-	"github.com/jstar0/codexfold/internal/codex"
+	archivepkg "github.com/samekind/codexfold/internal/archive"
+	"github.com/samekind/codexfold/internal/codex"
 	_ "modernc.org/sqlite"
 )
 

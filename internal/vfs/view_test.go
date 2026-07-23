@@ -10,7 +10,7 @@ import (
 	"math/rand"
 	"testing"
 
-	"github.com/jstar0/codexfold/internal/fold"
+	"github.com/samekind/codexfold/internal/fold"
 )
 
 func TestViewReadsExactBytesAcrossPartBoundaries(t *testing.T) {

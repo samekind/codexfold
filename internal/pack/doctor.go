@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/jstar0/codexfold/internal/fold"
+	"github.com/samekind/codexfold/internal/fold"
 )
 
 type DoctorIssue struct {

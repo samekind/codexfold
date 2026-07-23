@@ -13,7 +13,7 @@ import (
 	"sort"
 	"time"
 
-	"github.com/jstar0/codexfold/internal/storage"
+	"github.com/samekind/codexfold/internal/storage"
 )
 
 type SourceSummary struct {

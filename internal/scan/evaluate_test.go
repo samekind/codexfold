@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jstar0/codexfold/internal/codex"
+	"github.com/samekind/codexfold/internal/codex"
 )
 
 func TestIncrementalEvaluateSkipsUnchangedFileWithoutDoubleCounting(t *testing.T) {

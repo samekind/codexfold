@@ -18,7 +18,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jstar0/codexfold/internal/service"
+	"github.com/samekind/codexfold/internal/service"
 	"golang.org/x/sys/unix"
 )
 

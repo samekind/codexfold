@@ -1,5 +1,9 @@
 # CodexFold
 
+[![CI](https://github.com/samekind/codexfold/actions/workflows/ci.yml/badge.svg)](https://github.com/samekind/codexfold/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/samekind/codexfold?include_prereleases)](https://github.com/samekind/codexfold/releases)
+[![License](https://img.shields.io/github/license/samekind/codexfold)](LICENSE)
+
 CodexFold is an unofficial, local-first tool for measuring, deduplicating, storing, and restoring Codex session rollouts.
 
 It finds exact duplicate raw JSON string tokens, complete JSONL records, and content-defined chunks. Folded rollouts use a shared SHA-256/zstd object store and a versioned manifest. Every restore must match the original byte count and SHA-256.
@@ -8,13 +12,20 @@ It finds exact duplicate raw JSON string tokens, complete JSONL records, and con
 
 ## Current Status
 
-`v0.2.1` is `storage-engine`: exact deduplicated storage, byte-identical recovery, incremental analysis, containment, and guarded removal are available. It is not a transparent virtual-filesystem release. Codex cannot directly open a folded manifest without materialization in this version.
+`v0.3.0-beta.1` is the first versioned `fs-engine-preview`. It preserves the released storage-engine commands from `v0.2.1` and adds the transparent filesystem implementation, guarded service lifecycle, and platform validation described below.
 
 The requirements and release gates for normal JSONL paths backed transparently by shared storage are defined in [the transparent filesystem product contract](docs/superpowers/specs/2026-07-11-transparent-session-filesystem-design.md). No release may claim `随点随开`, transparent session access, or production-ready virtual sessions before the platform-specific gates in that contract pass.
 
-The unreleased transparent-filesystem branch remains `fs-engine-preview`:
+| Platform | Adapter | Evidence in this release | Readiness |
+|---|---|---|---|
+| macOS 27 | Apple-native Swift FSKit | Real isolated CLI/Desktop, native mount, restart, recovery, performance, and exact-byte Canary | `fs-engine-preview` |
+| Linux | FUSE3 | Real unprivileged mount, mutation, remount, recovery, performance, and user-service lifecycle | Preview; no real Codex client gate yet |
+| Windows | WinFsp | Cross-build and compile coverage | Not runtime-validated |
+
+The transparent filesystem preview has these explicit boundaries:
 
 - macOS now targets an Apple-native Swift FSKit extension connected over a versioned Unix-domain-socket protocol to the Go CodexFold daemon. The signed build 102 App/extension and current helper candidate pass the isolated mounted operation matrix, exact-byte and cache-coherency gates, independently restarted cold/warm `F_NOCACHE` performance rounds, bounded runtime RSS, crash and host-restart recovery, transactional app/binary rollback, exact current-client compatibility contracts, and real Codex CLI/Desktop acceptance.
+- Release source metadata is `0.3.0 (103)`. Build 103 compiles and passes nested signature verification; the complete mounted and real-client evidence remains attached to behavior-identical build 102 rather than being silently relabeled.
 - The earlier synchronous FUSE-T NFS route remains historical validation evidence and a development fallback only. FUSE-T's third-party FSKit backend remains rejected after deterministic byte-loss and cache-invalidation failures; it is not the Apple-native FSKit implementation in this repository.
 - Linux FUSE3 has real unprivileged read, append, copy-on-write, truncate, archive rename, crash recovery, remount, performance, and `systemd --user` lifecycle evidence.
 - Windows has a WinFsp adapter and native Windows Service host that cross-compile, but no real Windows/WinFsp host has validated them yet.
@@ -24,9 +35,16 @@ See [the Linux FUSE3 validation](docs/validation-linux-fuse3.md) and [the macOS 
 
 ## Install
 
+Install the versioned preview with Go:
+
 ```bash
-go install github.com/jstar0/codexfold/cmd/codexfold@latest
+go install github.com/samekind/codexfold/cmd/codexfold@v0.3.0-beta.1
+codexfold --version
 ```
+
+The [GitHub Release](https://github.com/samekind/codexfold/releases/tag/v0.3.0-beta.1) provides checksum-covered default CLI archives for macOS, Linux, and Windows on `amd64` and `arm64`. These archives expose the local storage and recovery command surface; they do not contain a generally signed macOS FSKit App.
+
+The FSKit App under `platform/darwin/fskit` currently requires Xcode 27, XcodeGen, an eligible Apple development team, and source signing. The validated App uses a maintainer Apple Development identity and is neither Developer ID distributed nor notarized for general installation. Follow the [maintainer guide](docs/maintainer-guide.md) and use only an isolated Codex home until the product contract permits production promotion.
 
 ## Analyze
 
@@ -143,10 +161,10 @@ codexfold gc --apply
 ## Development
 
 ```bash
-go test ./... -count=1
-go test -race ./... -count=1
-go vet ./...
-go build ./cmd/codexfold
+./scripts/test-cross-platform.sh
+./scripts/test-native-fskit-cache.sh # macOS FSKit changes
+./scripts/check-release.sh
+git diff --check
 ```
 
-See [the architecture](docs/design.md), [Fold V1 format](docs/fold-v1.md), [v0.2 validation](docs/validation-v0.2.md), [the transparent filesystem product contract](docs/superpowers/specs/2026-07-11-transparent-session-filesystem-design.md), and [the maintainer guide](docs/maintainer-guide.md).
+See the [changelog](CHANGELOG.md), [v0.3.0-beta.1 release notes](docs/releases/v0.3.0-beta.1.md), [architecture](docs/design.md), [Fold V1 format](docs/fold-v1.md), [v0.2 validation](docs/validation-v0.2.md), [transparent filesystem product contract](docs/superpowers/specs/2026-07-11-transparent-session-filesystem-design.md), and [maintainer guide](docs/maintainer-guide.md).

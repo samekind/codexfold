@@ -6,7 +6,7 @@ import (
 	"errors"
 	"strings"
 
-	"github.com/jstar0/codexfold/internal/buildid"
+	"github.com/samekind/codexfold/internal/buildid"
 )
 
 const (

@@ -9,8 +9,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/jstar0/codexfold/internal/cdc"
-	"github.com/jstar0/codexfold/internal/storage"
+	"github.com/samekind/codexfold/internal/cdc"
+	"github.com/samekind/codexfold/internal/storage"
 )
 
 func TestFoldRejectsSourceMutationBeforeManifestCommit(t *testing.T) {

@@ -22,6 +22,7 @@ Run the common quality gate:
 
 ```bash
 ./scripts/test-cross-platform.sh
+./scripts/check-release.sh
 git diff --check
 ```
 
@@ -43,6 +44,18 @@ Windows currently has compile and cross-build gates only. Do not describe those 
 - Add or update tests before changing a status or readiness claim.
 - Keep production Codex homes and production service definitions untouched during development validation.
 - Resolve review conversations and keep the branch current with `main` before merge.
+
+## Versions and Releases
+
+- Update `VERSION`, `CHANGELOG.md`, the matching file under `docs/releases`, and
+  the FSKit marketing/build versions in one release pull request.
+- Run `scripts/check-release.sh` before tagging. A release tag must be exactly
+  `v$(cat VERSION)` and must point to a commit contained by `main`.
+- Release CLI archives are generated from `.goreleaser.yaml`; do not commit
+  locally built archives, checksums, Apps, or provisioning profiles.
+- Do not attach an Apple Development-signed FSKit App to a public release. A
+  public App asset requires Developer ID distribution signing, notarization,
+  and a separate installation test on a clean machine.
 
 ## Filesystem Changes
 

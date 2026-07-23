@@ -12,8 +12,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jstar0/codexfold/internal/fold"
-	"github.com/jstar0/codexfold/internal/storage"
+	"github.com/samekind/codexfold/internal/fold"
+	"github.com/samekind/codexfold/internal/storage"
 )
 
 type SessionOptions struct {

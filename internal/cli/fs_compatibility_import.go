@@ -7,8 +7,8 @@ import (
 	"path/filepath"
 	"runtime"
 
-	"github.com/jstar0/codexfold/internal/codex"
-	"github.com/jstar0/codexfold/internal/compat"
+	"github.com/samekind/codexfold/internal/codex"
+	"github.com/samekind/codexfold/internal/compat"
 	"github.com/spf13/cobra"
 )
 

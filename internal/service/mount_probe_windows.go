@@ -6,7 +6,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/jstar0/codexfold/internal/mountid"
+	"github.com/samekind/codexfold/internal/mountid"
 )
 
 func defaultMountProbe(path string) error {

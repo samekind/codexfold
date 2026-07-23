@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/jstar0/codexfold/internal/buildid"
+	"github.com/samekind/codexfold/internal/buildid"
 )
 
 func TestBinaryUpdatePromotesAndCommitsAtomically(t *testing.T) {

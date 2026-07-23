@@ -9,10 +9,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jstar0/codexfold/internal/fold"
-	"github.com/jstar0/codexfold/internal/fsctl"
-	"github.com/jstar0/codexfold/internal/pack"
-	"github.com/jstar0/codexfold/internal/vfs"
+	"github.com/samekind/codexfold/internal/fold"
+	"github.com/samekind/codexfold/internal/fsctl"
+	"github.com/samekind/codexfold/internal/pack"
+	"github.com/samekind/codexfold/internal/vfs"
 )
 
 type largeGateReport struct {

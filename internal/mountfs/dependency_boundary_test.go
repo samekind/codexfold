@@ -12,12 +12,12 @@ func TestAdapterCoreDoesNotDependOnCodexDatabase(t *testing.T) {
 	repoRoot := dependencyRepoRoot(t)
 
 	assertPackageExcludesDependencies(t, repoRoot, "./internal/fold", []string{
-		"github.com/jstar0/codexfold/internal/codex",
+		"github.com/samekind/codexfold/internal/codex",
 		"modernc.org",
 	})
 	assertPackageExcludesDependencies(t, repoRoot, "./internal/mountfs", []string{
-		"github.com/jstar0/codexfold/internal/codex",
-		"github.com/jstar0/codexfold/internal/service",
+		"github.com/samekind/codexfold/internal/codex",
+		"github.com/samekind/codexfold/internal/service",
 		"modernc.org",
 	})
 }

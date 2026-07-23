@@ -6,7 +6,7 @@ import (
 	"context"
 	"errors"
 
-	"github.com/jstar0/codexfold/internal/codex"
+	"github.com/samekind/codexfold/internal/codex"
 )
 
 func detectEnrollmentWriters(context.Context, []codex.Session) (map[string]bool, error) {

@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"path/filepath"
 
-	"github.com/jstar0/codexfold/internal/reconcile"
+	"github.com/samekind/codexfold/internal/reconcile"
 	"github.com/spf13/cobra"
 )
 

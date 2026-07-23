@@ -5,7 +5,7 @@ package mountfs
 import (
 	"os"
 
-	"github.com/jstar0/codexfold/internal/fskitproto"
+	"github.com/samekind/codexfold/internal/fskitproto"
 )
 
 func nativeFSKitStat(string) (fskitproto.StatFS, error) {

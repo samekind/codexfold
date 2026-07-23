@@ -8,8 +8,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/jstar0/codexfold/internal/family"
-	"github.com/jstar0/codexfold/internal/scan"
+	"github.com/samekind/codexfold/internal/family"
+	"github.com/samekind/codexfold/internal/scan"
 	_ "modernc.org/sqlite"
 )
 

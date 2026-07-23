@@ -13,8 +13,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jstar0/codexfold/internal/compat"
-	"github.com/jstar0/codexfold/internal/fsctl"
+	"github.com/samekind/codexfold/internal/compat"
+	"github.com/samekind/codexfold/internal/fsctl"
 )
 
 type Options struct {

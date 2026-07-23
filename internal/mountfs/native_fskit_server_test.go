@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jstar0/codexfold/internal/fskitproto"
-	"github.com/jstar0/codexfold/internal/mountid"
+	"github.com/samekind/codexfold/internal/fskitproto"
+	"github.com/samekind/codexfold/internal/mountid"
 )
 
 func TestNativeFSKitServerPreservesJSONLWritesAndNamespaceMutations(t *testing.T) {

@@ -7,7 +7,7 @@ import (
 	"runtime"
 	"time"
 
-	"github.com/jstar0/codexfold/internal/service"
+	"github.com/samekind/codexfold/internal/service"
 	"github.com/spf13/cobra"
 )
 

@@ -15,12 +15,12 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/jstar0/codexfold/internal/buildid"
-	"github.com/jstar0/codexfold/internal/codex"
-	"github.com/jstar0/codexfold/internal/mountfs"
-	"github.com/jstar0/codexfold/internal/service"
-	"github.com/jstar0/codexfold/internal/storage"
-	"github.com/jstar0/codexfold/internal/vfs"
+	"github.com/samekind/codexfold/internal/buildid"
+	"github.com/samekind/codexfold/internal/codex"
+	"github.com/samekind/codexfold/internal/mountfs"
+	"github.com/samekind/codexfold/internal/service"
+	"github.com/samekind/codexfold/internal/storage"
+	"github.com/samekind/codexfold/internal/vfs"
 	"github.com/spf13/cobra"
 )
 

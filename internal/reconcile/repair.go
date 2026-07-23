@@ -15,7 +15,7 @@ import (
 	"regexp"
 	"time"
 
-	"github.com/jstar0/codexfold/internal/storage"
+	"github.com/samekind/codexfold/internal/storage"
 )
 
 const maxRepairBufferedBytes = int64(64 * 1024 * 1024)

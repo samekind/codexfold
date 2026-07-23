@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/jstar0/codexfold/internal/buildid"
-	"github.com/jstar0/codexfold/internal/mountid"
+	"github.com/samekind/codexfold/internal/buildid"
+	"github.com/samekind/codexfold/internal/mountid"
 )
 
 func TestInspectBuildMatchesRunningMountAndConfiguredBinary(t *testing.T) {

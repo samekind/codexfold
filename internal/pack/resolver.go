@@ -15,9 +15,9 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/jstar0/codexfold/internal/fold"
-	"github.com/jstar0/codexfold/internal/storage"
 	"github.com/klauspost/compress/zstd"
+	"github.com/samekind/codexfold/internal/fold"
+	"github.com/samekind/codexfold/internal/storage"
 )
 
 type OpenOptions struct {

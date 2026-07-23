@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/jstar0/codexfold/internal/fsctl"
+	"github.com/samekind/codexfold/internal/fsctl"
 )
 
 func requireFilesystemActivationAllowed(home string) error {

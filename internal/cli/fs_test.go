@@ -14,15 +14,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jstar0/codexfold/internal/codex"
-	"github.com/jstar0/codexfold/internal/compat"
-	"github.com/jstar0/codexfold/internal/enroll"
-	"github.com/jstar0/codexfold/internal/fold"
-	"github.com/jstar0/codexfold/internal/fsctl"
-	"github.com/jstar0/codexfold/internal/mountfs"
-	"github.com/jstar0/codexfold/internal/pack"
-	"github.com/jstar0/codexfold/internal/storage"
-	"github.com/jstar0/codexfold/internal/vfs"
+	"github.com/samekind/codexfold/internal/codex"
+	"github.com/samekind/codexfold/internal/compat"
+	"github.com/samekind/codexfold/internal/enroll"
+	"github.com/samekind/codexfold/internal/fold"
+	"github.com/samekind/codexfold/internal/fsctl"
+	"github.com/samekind/codexfold/internal/mountfs"
+	"github.com/samekind/codexfold/internal/pack"
+	"github.com/samekind/codexfold/internal/storage"
+	"github.com/samekind/codexfold/internal/vfs"
 )
 
 type cliRejectingChecker struct {

@@ -18,7 +18,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jstar0/codexfold/internal/fskitproto"
+	"github.com/samekind/codexfold/internal/fskitproto"
 	"golang.org/x/sys/unix"
 )
 

@@ -7,8 +7,8 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/jstar0/codexfold/internal/cli"
-	"github.com/jstar0/codexfold/internal/launcher"
+	"github.com/samekind/codexfold/internal/cli"
+	"github.com/samekind/codexfold/internal/launcher"
 )
 
 func main() {

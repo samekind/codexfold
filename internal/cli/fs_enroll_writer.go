@@ -4,7 +4,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/jstar0/codexfold/internal/codex"
+	"github.com/samekind/codexfold/internal/codex"
 )
 
 var enrollmentWriterProbe = detectEnrollmentWriters

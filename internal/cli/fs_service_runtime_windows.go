@@ -11,8 +11,8 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/jstar0/codexfold/internal/mountfs"
-	"github.com/jstar0/codexfold/internal/service"
+	"github.com/samekind/codexfold/internal/mountfs"
+	"github.com/samekind/codexfold/internal/service"
 	"github.com/spf13/cobra"
 	"golang.org/x/sys/windows/svc"
 )

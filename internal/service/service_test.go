@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jstar0/codexfold/internal/compat"
-	"github.com/jstar0/codexfold/internal/fsctl"
+	"github.com/samekind/codexfold/internal/compat"
+	"github.com/samekind/codexfold/internal/fsctl"
 )
 
 func TestRenderLaunchdUsesAbsoluteArgumentsAndContainsNoSessionContent(t *testing.T) {

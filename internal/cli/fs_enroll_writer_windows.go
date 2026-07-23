@@ -7,7 +7,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/jstar0/codexfold/internal/codex"
+	"github.com/samekind/codexfold/internal/codex"
 	"golang.org/x/sys/windows"
 )
 

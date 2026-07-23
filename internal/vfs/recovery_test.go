@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jstar0/codexfold/internal/fold"
-	"github.com/jstar0/codexfold/internal/storage"
+	"github.com/samekind/codexfold/internal/fold"
+	"github.com/samekind/codexfold/internal/storage"
 )
 
 func TestRecoverFinishesPublishedCopyOnWriteGeneration(t *testing.T) {

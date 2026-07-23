@@ -30,7 +30,7 @@ func TestContentChangingReconcilePackageHasOneExplicitCLIBoundary(t *testing.T) 
 			return err
 		}
 		for _, imported := range file.Imports {
-			if imported.Path.Value != `"github.com/jstar0/codexfold/internal/reconcile"` {
+			if imported.Path.Value != `"github.com/samekind/codexfold/internal/reconcile"` {
 				continue
 			}
 			if filepath.Clean(path) != filepath.Join(repoRoot, "internal", "cli", "fs_reconcile.go") {

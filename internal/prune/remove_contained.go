@@ -15,9 +15,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jstar0/codexfold/internal/codex"
-	"github.com/jstar0/codexfold/internal/contain"
-	"github.com/jstar0/codexfold/internal/fold"
+	"github.com/samekind/codexfold/internal/codex"
+	"github.com/samekind/codexfold/internal/contain"
+	"github.com/samekind/codexfold/internal/fold"
 	_ "modernc.org/sqlite"
 )
 

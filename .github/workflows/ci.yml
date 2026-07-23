@@ -35,6 +35,8 @@ jobs:
         run: |
           go mod tidy
           git diff --exit-code -- go.mod go.sum
+      - name: Check release metadata
+        run: ./scripts/check-release.sh
       - run: go vet ./...
 
   test:
@@ -52,6 +54,20 @@ jobs:
           cache: true
       - run: go test ./... -count=1
       - run: go build ./cmd/codexfold
+      - name: Test native FSKit cache implementation
+        if: runner.os == 'macOS'
+        run: ./scripts/test-native-fskit-cache.sh
+
+  release-config:
+    name: release-config
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: check
 
   windows-compile:
     name: windows-compile

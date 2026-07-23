@@ -82,10 +82,13 @@ Readiness claims must use only the capability names defined in the product contr
 
 ## Merge and Release Procedure
 
-1. Obtain an approving review and green required checks.
-2. Squash merge into `main` unless preserving separate audited commits is materially useful.
-3. Re-run platform-specific signed builds and isolated real-adapter gates for release candidates.
-4. Verify release notes distinguish implemented, tested, preview, canary, and production-ready behavior.
-5. Never delete retained native sources or enable bulk enrollment before the contract permits it.
+1. Update `VERSION`, `CHANGELOG.md`, `docs/releases/v<version>.md`, and the FSKit marketing/build versions together.
+2. Run `scripts/check-release.sh`, `scripts/test-cross-platform.sh`, the Swift cache tests, XcodeGen consistency, and the applicable mounted adapter suites.
+3. Obtain an approving review and green required checks.
+4. Merge into `main`; a release tag may not point to a branch-only commit.
+5. Create the annotated `v<version>` tag from the verified `main` commit. The release workflow builds default CLI archives, injects the tag into `codexfold --version`, produces `checksums.txt`, and uses the checked-in release notes.
+6. Verify every uploaded archive against `checksums.txt` and execute at least one native release binary before publishing the release as non-draft.
+7. Release notes must distinguish implemented, tested, preview, canary, and production-ready behavior. Never attach a maintainer Apple Development-signed FSKit App as a generally installable asset.
+8. Never delete retained native sources or enable bulk enrollment before the contract permits it.
 
 If a release or service update fails, preserve the failing evidence, restore the last verified app/binary/definition generation, verify exact bytes and build identity, and keep automatic enrollment disabled until the incident is understood.

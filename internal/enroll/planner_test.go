@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jstar0/codexfold/internal/codex"
-	"github.com/jstar0/codexfold/internal/storage"
+	"github.com/samekind/codexfold/internal/codex"
+	"github.com/samekind/codexfold/internal/storage"
 )
 
 func TestPlannerRequiresStableArchivedSessionAndAllGlobalGates(t *testing.T) {

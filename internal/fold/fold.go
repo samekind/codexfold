@@ -15,9 +15,9 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/jstar0/codexfold/internal/cdc"
-	"github.com/jstar0/codexfold/internal/jsonraw"
-	"github.com/jstar0/codexfold/internal/storage"
+	"github.com/samekind/codexfold/internal/cdc"
+	"github.com/samekind/codexfold/internal/jsonraw"
+	"github.com/samekind/codexfold/internal/storage"
 )
 
 type FoldOptions struct {

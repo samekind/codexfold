@@ -1,4 +1,4 @@
-module github.com/jstar0/codexfold
+module github.com/samekind/codexfold
 
 go 1.26
 

@@ -5,7 +5,7 @@ package mountfs
 import (
 	"syscall"
 
-	"github.com/jstar0/codexfold/internal/fskitproto"
+	"github.com/samekind/codexfold/internal/fskitproto"
 )
 
 func platformSetXattr(string, string, []byte, fskitproto.XattrPolicy) error { return syscall.ENOTSUP }

@@ -9,7 +9,7 @@ import (
 	"runtime"
 	"testing"
 
-	"github.com/jstar0/codexfold/internal/service"
+	"github.com/samekind/codexfold/internal/service"
 )
 
 type rollbackTestApp struct {
