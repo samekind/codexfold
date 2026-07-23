@@ -30,7 +30,15 @@ func (a *rollbackTestApp) Rollback(context.Context) error {
 func TestRollbackFailedServiceInstallRestoresDefinitionAndAppBeforeRestart(t *testing.T) {
 	root := t.TempDir()
 	definition := filepath.Join(root, "com.codexfold.test.plist")
+	binary := filepath.Join(root, "codexfold")
+	candidate := filepath.Join(root, "candidate")
 	if err := os.WriteFile(definition, []byte("old-definition"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(binary, []byte("old-binary"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(candidate, []byte("new-binary"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	update, err := service.StageDefinitionUpdate(definition, []byte("new-definition"))
@@ -38,6 +46,13 @@ func TestRollbackFailedServiceInstallRestoresDefinitionAndAppBeforeRestart(t *te
 		t.Fatal(err)
 	}
 	if err := update.Promote(); err != nil {
+		t.Fatal(err)
+	}
+	binaryUpdate, err := service.StageBinaryUpdate(candidate, binary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := binaryUpdate.Promote(); err != nil {
 		t.Fatal(err)
 	}
 
@@ -70,13 +85,20 @@ func TestRollbackFailedServiceInstallRestoresDefinitionAndAppBeforeRestart(t *te
 		if string(current) != "old-definition" {
 			return errors.New("service restarted before definition rollback")
 		}
+		current, err = os.ReadFile(binary)
+		if err != nil {
+			return err
+		}
+		if string(current) != "old-binary" {
+			return errors.New("service restarted before binary rollback")
+		}
 		order = append(order, "start")
 		return nil
 	}
 
 	if err := rollbackFailedServiceInstall(
 		context.Background(), service.PlatformLaunchd, definition, filepath.Join(root, "mount"),
-		[]*service.DefinitionUpdate{update}, app, true, stop, start,
+		[]*service.DefinitionUpdate{update}, app, binaryUpdate, true, stop, start,
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -105,7 +127,7 @@ func TestRollbackFailedFirstInstallDoesNotStartAService(t *testing.T) {
 	started := false
 	if err := rollbackFailedServiceInstall(
 		context.Background(), service.PlatformLaunchd, definition, filepath.Join(root, "mount"),
-		[]*service.DefinitionUpdate{update}, nil, false,
+		[]*service.DefinitionUpdate{update}, nil, nil, false,
 		func(context.Context, service.Platform, string) error { return nil },
 		func(context.Context, service.Platform, string, string) error { started = true; return nil },
 	); err != nil {
@@ -170,5 +192,18 @@ func TestNativeFSKitProcessLocksReportHeldOwners(t *testing.T) {
 	}
 	if !supervisorStatus.Held || supervisorStatus.PID != os.Getpid() {
 		t.Fatalf("supervisor lock = %#v", supervisorStatus)
+	}
+}
+
+func TestNativeFSKitServiceInactiveRequiresUnmountedMount(t *testing.T) {
+	status := service.Status{}
+	if nativeFSKitServiceInactive(status, service.ProcessLockStatus{}, service.ProcessLockStatus{}, true, nil) {
+		t.Fatal("an unhealthy but still-mounted filesystem was accepted as inactive")
+	}
+	if nativeFSKitServiceInactive(status, service.ProcessLockStatus{}, service.ProcessLockStatus{}, false, errors.New("mount state unknown")) {
+		t.Fatal("an unknown mount state was accepted as inactive")
+	}
+	if !nativeFSKitServiceInactive(status, service.ProcessLockStatus{}, service.ProcessLockStatus{}, false, nil) {
+		t.Fatal("fully stopped native FSKit service was not accepted as inactive")
 	}
 }

@@ -41,6 +41,23 @@ func defaultMountProbe(path string) error {
 	return validateMountIdentity(path)
 }
 
+// MountPresent reports whether path is currently a mount root, independent of
+// whether it is backed by CodexFold.
+func MountPresent(path string) (bool, error) {
+	data, err := os.ReadFile("/proc/self/mountinfo")
+	if err != nil {
+		return false, err
+	}
+	want := filepath.Clean(path)
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 5 && filepath.Clean(unescapeLinuxMountField(fields[4])) == want {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func unescapeLinuxMountField(value string) string {
 	return strings.NewReplacer(`\040`, " ", `\011`, "\t", `\012`, "\n", `\134`, `\`).Replace(value)
 }

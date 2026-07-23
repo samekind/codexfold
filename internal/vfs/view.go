@@ -59,12 +59,15 @@ func (v *View) ReadAt(ctx context.Context, destination []byte, offset int64) (in
 	if offset >= v.Size() {
 		return 0, io.EOF
 	}
+	partIndex := sort.Search(len(v.ends), func(index int) bool { return v.ends[index] > offset })
+	if partIndex == len(v.ends) {
+		return 0, fmt.Errorf("manifest has no part for offset %d", offset)
+	}
 	written := 0
 	for written < len(destination) && offset < v.Size() {
 		if err := ctx.Err(); err != nil {
 			return written, err
 		}
-		partIndex := sort.Search(len(v.ends), func(index int) bool { return v.ends[index] > offset })
 		if partIndex == len(v.ends) {
 			return written, fmt.Errorf("manifest has no part for offset %d", offset)
 		}
@@ -79,6 +82,7 @@ func (v *View) ReadAt(ctx context.Context, destination []byte, offset int64) (in
 		if int64(need) > remaining {
 			need = int(remaining)
 		}
+		partDestinationStart := written
 		n, err := v.reader.ReadAt(ctx, part.Object, destination[written:written+need], inside)
 		if n < 0 || n > need {
 			return written, fmt.Errorf("object reader returned invalid byte count %d for request %d", n, need)
@@ -94,9 +98,37 @@ func (v *View) ReadAt(ctx context.Context, destination []byte, offset int64) (in
 		if err != nil && !errors.Is(err, io.EOF) {
 			return written, fmt.Errorf("read manifest part %d: %w", partIndex, err)
 		}
+		if inside == 0 && int64(need) == part.Object.RawBytes {
+			source := destination[partDestinationStart : partDestinationStart+need]
+			for written < len(destination) && partIndex+1 < len(v.manifest.Parts) {
+				if err := ctx.Err(); err != nil {
+					return written, err
+				}
+				next := v.manifest.Parts[partIndex+1]
+				if !sameObjectBytes(part.Object, next.Object) {
+					break
+				}
+				repeatedBytes := len(destination) - written
+				if int64(repeatedBytes) > next.Object.RawBytes {
+					repeatedBytes = int(next.Object.RawBytes)
+				}
+				copy(destination[written:written+repeatedBytes], source[:repeatedBytes])
+				written += repeatedBytes
+				offset += int64(repeatedBytes)
+				partIndex++
+				if int64(repeatedBytes) < next.Object.RawBytes {
+					break
+				}
+			}
+		}
+		partIndex++
 	}
 	if written < len(destination) {
 		return written, io.EOF
 	}
 	return written, nil
+}
+
+func sameObjectBytes(first fold.ObjectRef, second fold.ObjectRef) bool {
+	return first.SHA256 == second.SHA256 && first.RawBytes == second.RawBytes
 }

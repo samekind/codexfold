@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -222,6 +223,7 @@ func newFSDoctorCommand() *cobra.Command {
 	var codexHome string
 	var storeDir string
 	var mountPoint string
+	var definitionPath string
 	var jsonOutput bool
 	command := &cobra.Command{
 		Use:   "doctor",
@@ -234,7 +236,7 @@ func newFSDoctorCommand() *cobra.Command {
 			}
 			store := resolveFoldStore(home, storeDir)
 			mount := defaultMountPoint(home, mountPoint)
-			report := fsDoctor(command.Context(), home, store, mount)
+			report := fsDoctor(command.Context(), home, store, mount, definitionPath)
 			if jsonOutput {
 				return writeJSON(command, report)
 			}
@@ -245,6 +247,7 @@ func newFSDoctorCommand() *cobra.Command {
 	command.Flags().StringVar(&codexHome, "codex-home", "", "Codex home directory; defaults to CODEX_HOME or ~/.codex")
 	command.Flags().StringVar(&storeDir, "store", "", "Fold store directory; defaults to <codex-home>/fold-store")
 	command.Flags().StringVar(&mountPoint, "mount", "", "Mounted CodexFold filesystem path; defaults to <codex-home>/fold-fs")
+	addServiceDefinitionFlags(command, &definitionPath)
 	command.Flags().BoolVar(&jsonOutput, "json", false, "Emit JSON output")
 	return command
 }
@@ -296,15 +299,61 @@ func newFSBenchmarkCommand() *cobra.Command {
 				return err
 			}
 			store := resolveFoldStore(home, storeDir)
-			session, manifest, resolver, view, err := openFoldView(home, store, args[0])
+			states, err := vfs.DiscoverSessionStates(store)
 			if err != nil {
 				return err
 			}
-			defer resolver.Close()
-			if manifest.Source.SHA256 == "" {
-				return errors.New("manifest source digest is missing")
+			var managedState *vfs.SessionState
+			for index := range states {
+				if states[index].SessionID == args[0] {
+					state := states[index]
+					managedState = &state
+					break
+				}
 			}
-			report, err := fsctl.Benchmark(command.Context(), session.RolloutPath, view, options)
+
+			var nativePath string
+			var virtual fsctl.Readable
+			var closeVirtual func() error
+			var cleanup func()
+			if managedState != nil {
+				managed, resolver, openErr := openManagedSession(command.Context(), store, *managedState)
+				if openErr != nil {
+					return openErr
+				}
+				defer resolver.Close()
+				reader, openErr := managed.OpenReader()
+				if openErr != nil {
+					return openErr
+				}
+				closeVirtual = reader.Close
+				defer func() { _ = closeVirtual() }()
+
+				benchmarkDir, openErr := os.MkdirTemp("", "codexfold-benchmark-")
+				if openErr != nil {
+					return openErr
+				}
+				cleanup = func() { _ = os.RemoveAll(benchmarkDir) }
+				defer cleanup()
+				materialized, materializeErr := managed.MaterializeCurrent(command.Context(), filepath.Join(benchmarkDir, "visible.jsonl"), false)
+				if materializeErr != nil {
+					return materializeErr
+				}
+				nativePath = materialized.Path
+				virtual = reader
+			} else {
+				session, manifest, resolver, view, openErr := openFoldView(home, store, args[0])
+				if openErr != nil {
+					return openErr
+				}
+				defer resolver.Close()
+				if manifest.Source.SHA256 == "" {
+					return errors.New("manifest source digest is missing")
+				}
+				nativePath = session.RolloutPath
+				virtual = view
+			}
+			report, err := fsctl.Benchmark(command.Context(), nativePath, virtual, options)
 			if err != nil {
 				return err
 			}
@@ -321,6 +370,7 @@ func newFSBenchmarkCommand() *cobra.Command {
 	command.Flags().IntVar(&options.RandomBlockBytes, "random-block-bytes", 0, "Random read block size")
 	command.Flags().IntVar(&options.RandomReads, "random-reads", 0, "Random read count")
 	command.Flags().Int64Var(&options.Seed, "seed", 1, "Deterministic random seed")
+	command.Flags().BoolVar(&options.BypassOSCache, "bypass-os-cache", false, "Request OS cache bypass for the native and packed reads")
 	command.Flags().BoolVar(&jsonOutput, "json", false, "Emit JSON output")
 	return command
 }
@@ -427,14 +477,6 @@ func newFSServeCommand() *cobra.Command {
 				}
 				result.ManagedSessions = len(states)
 			}
-			if _, _, err := startupStorageGC(command.Context(), store); err != nil {
-				return err
-			}
-			states, err = vfs.DiscoverSessionStates(store)
-			if err != nil {
-				return err
-			}
-			result.ManagedSessions = len(states)
 			var operationRecorder func(string)
 			if operationTracePath != "" {
 				recorder, closer, err := newOperationRecorder(operationTracePath)
@@ -455,6 +497,9 @@ func newFSServeCommand() *cobra.Command {
 			if canonicalNamespace {
 				filesystem = mountfs.NewCanonical()
 				filesystem.SetNativeRoot(nativeRoot)
+				if frontend == "native-fskit" {
+					filesystem.SetNativeNamespaceRefreshMount(mount)
+				}
 				if err := filesystem.RecoverNativeAppendTransactions(); err != nil {
 					return fmt.Errorf("recover native append transactions: %w", err)
 				}
@@ -499,40 +544,44 @@ func newFSServeCommand() *cobra.Command {
 					})
 				}()
 			}
-			closers := make([]io.Closer, 0)
 			known := make(map[string]uint64)
 			knownRoutes := make(map[string]string)
+			knownPacks := make(map[string]string)
 			var loadMu sync.Mutex
-			openState := func(state vfs.SessionState) (*vfs.Session, error) {
+			openState := func(state vfs.SessionState) (*vfs.Session, *pack.Resolver, error) {
 				managed, resolver, err := openManagedSession(ctx, store, state)
 				if err != nil {
-					return nil, err
+					return nil, nil, err
 				}
-				closers = append(closers, resolver)
-				return managed, nil
+				return managed, resolver, nil
 			}
-			filesystem.SetSessionLoader(func(sessionID string) (*vfs.Session, error) {
+			filesystem.SetOwnedSessionLoader(func(sessionID string) (*vfs.Session, io.Closer, error) {
 				loadMu.Lock()
 				defer loadMu.Unlock()
 				states, err := vfs.DiscoverSessionStates(store)
 				if err != nil {
-					return nil, err
+					return nil, nil, err
 				}
 				for _, state := range states {
 					if state.SessionID == sessionID {
-						managed, err := openState(state)
+						managed, resolver, err := openState(state)
 						if err == nil {
 							known[state.SessionID] = state.Generation
+							knownPacks[state.SessionID] = resolver.Generation()
 						}
-						return managed, err
+						return managed, resolver, err
 					}
 				}
-				return nil, os.ErrNotExist
+				return nil, nil, os.ErrNotExist
 			})
 			load := func() error {
 				loadMu.Lock()
 				defer loadMu.Unlock()
 				states, err := vfs.DiscoverSessionStates(store)
+				if err != nil {
+					return err
+				}
+				currentPack, err := pack.CurrentGeneration(store)
 				if err != nil {
 					return err
 				}
@@ -548,7 +597,7 @@ func newFSServeCommand() *cobra.Command {
 					seen[state.SessionID] = struct{}{}
 					if canonicalNamespace {
 						route, exists := routes[state.SessionID]
-						handled, err := syncCanonicalRetirement(store, home, nativeRoot, filesystem, state, route, exists, known, knownRoutes, openState)
+						handled, err := syncCanonicalRetirement(store, home, nativeRoot, filesystem, state, route, exists, known, knownRoutes, knownPacks, currentPack, openState)
 						if err != nil {
 							return err
 						}
@@ -562,11 +611,12 @@ func newFSServeCommand() *cobra.Command {
 								}
 								delete(known, state.SessionID)
 								delete(knownRoutes, state.SessionID)
+								delete(knownPacks, state.SessionID)
 							}
 							continue
 						}
 						generation, generationKnown := known[state.SessionID]
-						if generationKnown && generation == state.Generation {
+						if generationKnown && generation == state.Generation && knownPacks[state.SessionID] == currentPack {
 							if knownRoutes[state.SessionID] == route {
 								continue
 							}
@@ -579,31 +629,33 @@ func newFSServeCommand() *cobra.Command {
 							}
 							continue
 						}
-						managed, err := openState(state)
+						managed, resolver, err := openState(state)
 						if err != nil {
 							return err
 						}
-						if err := filesystem.UpsertSessionAt(state.SessionID, route, managed); err != nil {
+						if err := filesystem.UpsertSessionAtOwned(state.SessionID, route, managed, resolver); err != nil {
 							return err
 						}
 						known[state.SessionID] = state.Generation
 						knownRoutes[state.SessionID] = route
+						knownPacks[state.SessionID] = resolver.Generation()
 						if err := writeMountAcknowledgement(store, state.SessionID, state.Generation, route); err != nil {
 							return err
 						}
 						continue
 					}
-					if known[state.SessionID] == state.Generation {
+					if known[state.SessionID] == state.Generation && knownPacks[state.SessionID] == currentPack {
 						continue
 					}
-					managed, err := openState(state)
+					managed, resolver, err := openState(state)
 					if err != nil {
 						return err
 					}
-					if err := filesystem.UpsertSession(state.SessionID, managed); err != nil {
+					if err := filesystem.UpsertSessionOwned(state.SessionID, managed, resolver); err != nil {
 						return err
 					}
 					known[state.SessionID] = state.Generation
+					knownPacks[state.SessionID] = resolver.Generation()
 				}
 				for sessionID := range known {
 					if _, exists := seen[sessionID]; exists {
@@ -614,12 +666,15 @@ func newFSServeCommand() *cobra.Command {
 					}
 					delete(known, sessionID)
 					delete(knownRoutes, sessionID)
+					delete(knownPacks, sessionID)
 				}
 				return nil
 			}
 			if err := load(); err != nil {
 				return err
 			}
+			storageMaintenanceDone := startStorageMaintenance(ctx, command.ErrOrStderr(), store, startupStorageGC)
+			runtimeMemoryMaintenanceDone := startRuntimeMemoryMaintenance(ctx, filesystem)
 			watcherDone := make(chan struct{})
 			watcherErrors := make(chan error, 1)
 			go func() {
@@ -643,12 +698,15 @@ func newFSServeCommand() *cobra.Command {
 			if frontend == "native-fskit" {
 				mountErr = mountfs.ServeNativeFSKit(ctx, filesystem, mountfs.NativeFSKitServerOptions{
 					SocketPath: nativeFSKitSocket, ResourcePath: nativeFSKitResource, Recorder: operationRecorder,
+					PrewarmSharedMemoryWindows: 4,
 				})
 			} else {
 				mountErr = mountfs.Mount(ctx, mountfs.HostOptions{MountPoint: mount, Filesystem: filesystem, Foreground: foreground, OperationRecorder: operationRecorder})
 			}
 			cancel()
 			<-watcherDone
+			<-storageMaintenanceDone
+			<-runtimeMemoryMaintenanceDone
 			if enrollmentDone != nil {
 				<-enrollmentDone
 			}
@@ -659,14 +717,12 @@ func newFSServeCommand() *cobra.Command {
 					nativeWatcherErr = nil
 				}
 			}
-			for _, closer := range closers {
-				_ = closer.Close()
-			}
+			sessionCloseErr := filesystem.CloseSessions()
 			select {
 			case watcherErr := <-watcherErrors:
-				return watcherErr
+				return errors.Join(watcherErr, sessionCloseErr)
 			default:
-				return errors.Join(mountErr, nativeWatcherErr)
+				return errors.Join(mountErr, nativeWatcherErr, sessionCloseErr)
 			}
 		},
 	}
@@ -711,7 +767,9 @@ func syncCanonicalRetirement(
 	routeExists bool,
 	known map[string]uint64,
 	knownRoutes map[string]string,
-	openState func(vfs.SessionState) (*vfs.Session, error),
+	knownPacks map[string]string,
+	currentPack string,
+	openState func(vfs.SessionState) (*vfs.Session, *pack.Resolver, error),
 ) (bool, error) {
 	retirement, retiring, err := readRetirementRequest(store, state.SessionID)
 	if err != nil {
@@ -729,17 +787,18 @@ func syncCanonicalRetirement(
 		return reject("retirement request does not match the current session route")
 	}
 	generation := known[state.SessionID]
-	if generation != state.Generation || knownRoutes[state.SessionID] != route {
-		managed, err := openState(state)
+	if generation != state.Generation || knownRoutes[state.SessionID] != route || knownPacks[state.SessionID] != currentPack {
+		managed, resolver, err := openState(state)
 		if err != nil {
 			return true, err
 		}
-		if err := filesystem.UpsertSessionAt(state.SessionID, route, managed); err != nil {
+		if err := filesystem.UpsertSessionAtOwned(state.SessionID, route, managed, resolver); err != nil {
 			return true, err
 		}
 		generation = managed.State().Generation
 		known[state.SessionID] = generation
 		knownRoutes[state.SessionID] = route
+		knownPacks[state.SessionID] = resolver.Generation()
 	}
 	if retirement.Generation != generation {
 		return reject("retirement request generation does not match the current session state")
@@ -808,6 +867,9 @@ func newFSMigrateCommand() *cobra.Command {
 				if err != nil {
 					return err
 				}
+			}
+			if _, err := mountfs.ValidateNativeRollout(command.Context(), sourcePath); err != nil {
+				return fmt.Errorf("native rollout is not eligible for transparent routing: %w", err)
 			}
 			shadow, err := fsctl.Shadow(command.Context(), sourcePath, view, fsctl.ShadowOptions{RandomReads: 10000, Seed: 1})
 			if err != nil {
@@ -879,15 +941,7 @@ func newFSMigrateCommand() *cobra.Command {
 						}
 						return cause
 					}
-					if _, err := os.Stat(filepath.Join(store, "fs", "sessions", session.ID)); err == nil {
-						if _, retireErr := retireManagedState(store, session.ID); retireErr != nil {
-							return errors.Join(cause, retireErr)
-						}
-					}
-					if err := restoreCanonicalSnapshotSource(canonicalSource, native.Path); err != nil {
-						return errors.Join(cause, err)
-					}
-					return cause
+					return rollbackCanonicalMigration(store, session.ID, canonicalSource, native.Path, cause)
 				}
 				managed, migrationLease, err := vfs.OpenSessionWithWriter(command.Context(), vfs.SessionOptions{Root: store, ManifestPath: fold.ManifestPath(store, session.ID), Manifest: manifest, Reader: resolver, NativeSnapshot: native})
 				if err != nil {
@@ -956,6 +1010,24 @@ func newFSMigrateCommand() *cobra.Command {
 	addCompatibilityFlags(command, &compatibility)
 	command.Flags().BoolVar(&jsonOutput, "json", false, "Emit JSON output")
 	return command
+}
+
+func rollbackCanonicalMigration(store string, sessionID string, sourcePath string, retainedPath string, cause error) error {
+	// Keep the managed route live until an exact native source is available.
+	// If restoration fails, retiring state here would remove both recovery paths.
+	if err := restoreCanonicalSnapshotSource(sourcePath, retainedPath); err != nil {
+		return errors.Join(cause, err)
+	}
+	stateDirectory := filepath.Join(filepath.Clean(store), "fs", "sessions", sessionID)
+	if _, err := os.Stat(stateDirectory); errors.Is(err, os.ErrNotExist) {
+		return cause
+	} else if err != nil {
+		return errors.Join(cause, err)
+	}
+	if _, err := retireManagedState(store, sessionID); err != nil {
+		return errors.Join(cause, err)
+	}
+	return cause
 }
 
 func newFSRollbackCommand() *cobra.Command {
@@ -1359,7 +1431,7 @@ func newFSRecoverCommand() *cobra.Command {
 	return command
 }
 
-func recoverInterruptedCanonicalMigration(home string, store string, nativeRoot string, state vfs.SessionState) (bool, error) {
+func recoverInterruptedCanonicalMigration(home string, store string, nativeRoot string, state vfs.SessionState) (recovered bool, resultErr error) {
 	retainedPath := filepath.Join(store, "fs", "snapshots", state.SessionID, "native.jsonl")
 	if filepath.Clean(state.NativeSnapshot.Path) != filepath.Clean(retainedPath) {
 		return false, nil
@@ -1369,6 +1441,14 @@ func recoverInterruptedCanonicalMigration(home string, store string, nativeRoot 
 	} else if pending {
 		return false, nil
 	}
+	guard, acquired, err := vfs.TryAcquireWriterLeaseGuard(store, state.SessionID)
+	if err != nil {
+		return false, err
+	}
+	if !acquired {
+		return false, nil
+	}
+	defer func() { resultErr = errors.Join(resultErr, guard.Close()) }()
 	sessions, err := codex.LoadSessions(home)
 	if err != nil {
 		return false, err
@@ -1597,10 +1677,57 @@ func startupStorageGC(ctx context.Context, store string) (storage.StorageGCResul
 	return result, true, err
 }
 
-func fsDoctor(ctx context.Context, home string, store string, mount string) fsctl.DoctorReport {
+func startStorageMaintenance(
+	ctx context.Context,
+	diagnostics io.Writer,
+	store string,
+	run func(context.Context, string) (storage.StorageGCResult, bool, error),
+) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer debug.FreeOSMemory()
+		_, _, err := run(ctx, store)
+		if err != nil && !errors.Is(err, context.Canceled) {
+			_, _ = fmt.Fprintf(diagnostics, "storage maintenance failed: %v\n", err)
+		}
+	}()
+	return done
+}
+
+func startRuntimeMemoryMaintenance(ctx context.Context, filesystem *mountfs.Filesystem) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if !filesystem.IOIdleFor(3 * time.Second) {
+					continue
+				}
+				var memory runtime.MemStats
+				runtime.ReadMemStats(&memory)
+				if runtimeMemoryReclaimable(memory, 64<<20) {
+					debug.FreeOSMemory()
+				}
+			}
+		}
+	}()
+	return done
+}
+
+func runtimeMemoryReclaimable(memory runtime.MemStats, threshold uint64) bool {
+	return memory.HeapIdle > memory.HeapReleased && memory.HeapIdle-memory.HeapReleased >= threshold
+}
+
+func fsDoctor(ctx context.Context, home string, store string, mount string, definitionPath string) fsctl.DoctorReport {
 	var serviceStatus service.Status
 	platform, platformErr := service.CurrentPlatform()
-	definition, definitionErr := resolveServiceDefinitionPath("")
+	definition, definitionErr := resolveServiceDefinitionPath(definitionPath)
 	if platformErr == nil && definitionErr == nil {
 		serviceStatus, platformErr = platformServiceStatus(ctx, platform, mount, definition)
 	}

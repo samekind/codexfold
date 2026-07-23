@@ -9,10 +9,23 @@ import (
 )
 
 const (
-	Version           uint16 = 2
-	HeaderSize               = 40
-	DefaultMaxPayload        = 16 << 20
-	OpenFlagSnapshot  uint32 = 1 << 31
+	Version                     uint16 = 2
+	HeaderSize                         = 40
+	DefaultMaxPayload                  = 32 << 20
+	OpenFlagSnapshot            uint32 = 1 << 31
+	CapabilityNativeReadFD      uint32 = 1 << 0
+	CapabilitySharedReadFD      uint32 = 1 << 1
+	CapabilitySharedWindow      uint32 = 1 << 2
+	CapabilitySharedFileWindow  uint32 = 1 << 3
+	CapabilityContentGeneration uint32 = 1 << 4
+	FlagNativeReadFD            uint32 = 1 << 0
+	FlagSharedReadFD            uint32 = 1 << 1
+	FlagSharedWindow            uint32 = 1 << 2
+	FlagSharedFileWindow        uint32 = 1 << 3
+	NativeReadFDMarker                 = byte(0x46)
+	SharedReadFDMarker                 = byte(0x53)
+	SharedWindowFDMarker               = byte(0x57)
+	SharedFileWindowFDMarker           = byte(0x52)
 )
 
 var (
@@ -125,11 +138,20 @@ func ReadFrame(reader io.Reader, maxPayload uint32) (Frame, error) {
 }
 
 func WriteFrame(writer io.Writer, frame Frame, maxPayload uint32) error {
+	if err := WriteFrameHeader(writer, frame, len(frame.Payload), maxPayload); err != nil {
+		return err
+	}
+	return WriteFramePayload(writer, frame.Payload)
+}
+
+// WriteFrameHeader writes only the fixed protocol header. The caller may then
+// stream the payload without first materializing it in a Go buffer.
+func WriteFrameHeader(writer io.Writer, frame Frame, payloadLength int, maxPayload uint32) error {
 	if maxPayload == 0 {
 		maxPayload = DefaultMaxPayload
 	}
-	if len(frame.Payload) > int(maxPayload) {
-		return fmt.Errorf("FSKit protocol payload %d exceeds limit %d", len(frame.Payload), maxPayload)
+	if payloadLength < 0 || uint64(payloadLength) > uint64(maxPayload) {
+		return fmt.Errorf("FSKit protocol payload %d exceeds limit %d", payloadLength, maxPayload)
 	}
 	header := make([]byte, HeaderSize)
 	copy(header[:4], frameMagic[:])
@@ -140,11 +162,12 @@ func WriteFrame(writer io.Writer, frame Frame, maxPayload uint32) error {
 	binary.LittleEndian.PutUint64(header[12:20], frame.RequestID)
 	binary.LittleEndian.PutUint64(header[20:28], frame.Generation)
 	binary.LittleEndian.PutUint32(header[28:32], uint32(frame.Status))
-	binary.LittleEndian.PutUint32(header[32:36], uint32(len(frame.Payload)))
-	if err := writeAll(writer, header); err != nil {
-		return err
-	}
-	return writeAll(writer, frame.Payload)
+	binary.LittleEndian.PutUint32(header[32:36], uint32(payloadLength))
+	return writeAll(writer, header)
+}
+
+func WriteFramePayload(writer io.Writer, payload []byte) error {
+	return writeAll(writer, payload)
 }
 
 func writeAll(writer io.Writer, data []byte) error {
@@ -162,20 +185,21 @@ func writeAll(writer io.Writer, data []byte) error {
 }
 
 type Entry struct {
-	Path        string
-	Name        string
-	NodeID      uint64
-	ParentID    uint64
-	Type        EntryType
-	Mode        uint32
-	UID         uint32
-	GID         uint32
-	Size        uint64
-	AllocSize   uint64
-	ModTime     time.Time
-	ChangeTime  time.Time
-	AccessTime  time.Time
-	NamespaceID uint64
+	Path              string
+	Name              string
+	NodeID            uint64
+	ParentID          uint64
+	Type              EntryType
+	Mode              uint32
+	UID               uint32
+	GID               uint32
+	Size              uint64
+	AllocSize         uint64
+	ModTime           time.Time
+	ChangeTime        time.Time
+	AccessTime        time.Time
+	NamespaceID       uint64
+	ContentGeneration uint64
 }
 
 type StatFS struct {

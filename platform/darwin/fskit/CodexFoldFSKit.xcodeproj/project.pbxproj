@@ -11,6 +11,7 @@
 		5A3E15ED0688984A0382281F /* Host.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0299A73CFDD46513958B3173 /* Host.swift */; };
 		AC5E7B1EB1279405828432A1 /* Wire.swift in Sources */ = {isa = PBXBuildFile; fileRef = 442319991E8D02494E8E8966 /* Wire.swift */; };
 		D146B22FE62339A25BA1F531 /* CodexFoldFSKitModule.appex in Embed ExtensionKit Extensions */ = {isa = PBXBuildFile; fileRef = 0EB68F3D6D26A8642A137511 /* CodexFoldFSKitModule.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		F5B87A303BF4BD2D5651CFF8 /* ReadCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = E70FB31455A1202A1C719C64 /* ReadCache.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -46,6 +47,7 @@
 		683C4E970391FE59129607C0 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		8B37F589115C048AA0DA2C76 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		A321270CF90754EFB5FB4F82 /* ProfileModule.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProfileModule.swift; sourceTree = "<group>"; };
+		E70FB31455A1202A1C719C64 /* ReadCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReadCache.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXGroup section */
@@ -82,6 +84,7 @@
 				45646F5D9CFE136ED2DC3D6E /* CodexFoldFSKitModule.entitlements */,
 				683C4E970391FE59129607C0 /* Info.plist */,
 				A321270CF90754EFB5FB4F82 /* ProfileModule.swift */,
+				E70FB31455A1202A1C719C64 /* ReadCache.swift */,
 				442319991E8D02494E8E8966 /* Wire.swift */,
 			);
 			path = Extension;
@@ -179,6 +182,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				54CC8E546672A2B2EB8778AE /* ProfileModule.swift in Sources */,
+				F5B87A303BF4BD2D5651CFF8 /* ReadCache.swift in Sources */,
 				AC5E7B1EB1279405828432A1 /* Wire.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -262,6 +266,7 @@
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				CODE_SIGN_STYLE = Automatic;
 				COPY_PHASE_STRIP = NO;
+				CURRENT_PROJECT_VERSION = 102;
 				DEBUG_INFORMATION_FORMAT = dwarf;
 				DEVELOPMENT_TEAM = Y987FUR837;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
@@ -281,6 +286,7 @@
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 27.0;
+				MARKETING_VERSION = 0.1.1;
 				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
 				MTL_FAST_MATH = YES;
 				ONLY_ACTIVE_ARCH = YES;
@@ -344,6 +350,7 @@
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				CODE_SIGN_STYLE = Automatic;
 				COPY_PHASE_STRIP = NO;
+				CURRENT_PROJECT_VERSION = 102;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
 				DEVELOPMENT_TEAM = Y987FUR837;
 				ENABLE_NS_ASSERTIONS = NO;
@@ -357,6 +364,7 @@
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 27.0;
+				MARKETING_VERSION = 0.1.1;
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
 				PRODUCT_NAME = "$(TARGET_NAME)";

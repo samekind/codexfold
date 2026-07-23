@@ -13,24 +13,37 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/jstar0/codexfold/internal/service"
+	"golang.org/x/sys/unix"
 )
 
 const launchServicesRegister = "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
 
+var runFSKitLaunchServicesCommand = func(ctx context.Context, args ...string) ([]byte, error) {
+	return exec.CommandContext(ctx, launchServicesRegister, args...).CombinedOutput()
+}
+
+const (
+	codexFoldFSKitModuleProcessName = "CodexFoldFSKitModule"
+	fsKitRegistrationWait           = 15 * time.Second
+	fsKitModuleShutdownWait         = 10 * time.Second
+)
+
 type darwinFSKitAppTransaction struct {
-	target       string
-	source       string
-	stageRoot    string
-	backupRoot   string
-	backupPath   string
-	appGroupPath string
-	changed      bool
-	hadTarget    bool
+	target          string
+	source          string
+	stageRoot       string
+	stagePath       string
+	appGroupPath    string
+	changed         bool
+	hadTarget       bool
+	contentsSwapped bool
+	appInstalled    bool
 }
 
 func prepareFSKitAppPlatform(ctx context.Context, source string, target string) (fsKitAppTransaction, error) {
@@ -39,7 +52,7 @@ func prepareFSKitAppPlatform(ctx context.Context, source string, target string) 
 	}
 	target = filepath.Clean(target)
 	if source == "" {
-		appGroup, err := validateAndEnableFSKitApp(ctx, target)
+		appGroup, err := refreshFSKitApp(ctx, target)
 		if err != nil {
 			return nil, err
 		}
@@ -50,7 +63,7 @@ func prepareFSKitAppPlatform(ctx context.Context, source string, target string) 
 	}
 	source = filepath.Clean(source)
 	if source == target {
-		appGroup, err := validateAndEnableFSKitApp(ctx, target)
+		appGroup, err := refreshFSKitApp(ctx, target)
 		if err != nil {
 			return nil, err
 		}
@@ -63,14 +76,22 @@ func prepareFSKitAppPlatform(ctx context.Context, source string, target string) 
 	if err != nil {
 		return nil, err
 	}
-	if targetDigest, targetErr := hashAppBundle(target); targetErr == nil && targetDigest == sourceDigest {
-		unregisterFSKitApp(ctx, source)
-		appGroup, err := validateAndEnableFSKitApp(ctx, target)
-		if err != nil {
+	targetDigest, targetErr := hashAppBundle(target)
+	if targetErr == nil {
+		if targetDigest == sourceDigest {
+			if err := quiesceFSKitAppForUpdate(ctx); err != nil {
+				return nil, fmt.Errorf("quiesce existing FSKit app: %w", err)
+			}
+			appGroup, err := refreshFSKitApp(ctx, target)
+			if err != nil {
+				return nil, err
+			}
+			return &darwinFSKitAppTransaction{target: target, appGroupPath: appGroup}, nil
+		}
+		if err := requireNewerFSKitAppVersion(ctx, source, target); err != nil {
 			return nil, err
 		}
-		return &darwinFSKitAppTransaction{target: target, appGroupPath: appGroup}, nil
-	} else if targetErr != nil && !errors.Is(targetErr, os.ErrNotExist) {
+	} else if !errors.Is(targetErr, os.ErrNotExist) {
 		return nil, targetErr
 	}
 
@@ -83,6 +104,7 @@ func prepareFSKitAppPlatform(ctx context.Context, source string, target string) 
 	}
 	transaction := &darwinFSKitAppTransaction{target: target, source: source, stageRoot: stageRoot, changed: true}
 	stagePath := filepath.Join(stageRoot, filepath.Base(target))
+	transaction.stagePath = stagePath
 	if output, err := exec.CommandContext(ctx, "/usr/bin/ditto", source, stagePath).CombinedOutput(); err != nil {
 		_ = transaction.Commit()
 		return nil, commandOutputError("stage FSKit app", output, err)
@@ -98,32 +120,27 @@ func prepareFSKitAppPlatform(ctx context.Context, source string, target string) 
 		}
 		return nil, errors.New("staged FSKit app does not match the source bundle")
 	}
-	if _, err := os.Stat(target); err == nil {
-		transaction.hadTarget = true
-		transaction.backupRoot, err = os.MkdirTemp(filepath.Dir(target), ".codexfold-fskit-backup-*")
-		if err != nil {
+	if targetErr == nil {
+		if err := quiesceFSKitAppForUpdate(ctx); err != nil {
+			_, restoreErr := refreshFSKitApp(ctx, target)
 			_ = transaction.Commit()
-			return nil, err
+			return nil, errors.Join(fmt.Errorf("quiesce existing FSKit app: %w", err), restoreErr)
 		}
-		transaction.backupPath = filepath.Join(transaction.backupRoot, filepath.Base(target))
-		if err := os.Rename(target, transaction.backupPath); err != nil {
-			_ = transaction.Commit()
-			return nil, err
-		}
-	} else if !errors.Is(err, os.ErrNotExist) {
-		_ = transaction.Commit()
-		return nil, err
 	}
-	if err := os.Rename(stagePath, target); err != nil {
+	if err := transaction.promoteStagedApp(); err != nil {
 		rollbackErr := transaction.Rollback(ctx)
 		return nil, errors.Join(err, rollbackErr)
 	}
-	if err := syncDirectory(filepath.Dir(target)); err != nil {
+	installedDigest, err := hashAppBundle(target)
+	if err != nil {
 		rollbackErr := transaction.Rollback(ctx)
 		return nil, errors.Join(err, rollbackErr)
 	}
-	unregisterFSKitApp(ctx, source)
-	appGroup, err := validateAndEnableFSKitApp(ctx, target)
+	if installedDigest != sourceDigest {
+		rollbackErr := transaction.Rollback(ctx)
+		return nil, errors.Join(errors.New("installed FSKit app does not match the source bundle"), rollbackErr)
+	}
+	appGroup, err := refreshFSKitApp(ctx, target)
 	if err != nil {
 		rollbackErr := transaction.Rollback(ctx)
 		return nil, errors.Join(err, rollbackErr)
@@ -132,36 +149,287 @@ func prepareFSKitAppPlatform(ctx context.Context, source string, target string) 
 	return transaction, nil
 }
 
-func unregisterFSKitApp(ctx context.Context, appPath string) {
-	if module, err := service.FSKitModulePath(appPath); err == nil {
-		_, _ = exec.CommandContext(ctx, "/usr/bin/pluginkit", "-r", module).CombinedOutput()
+func refreshFSKitApp(ctx context.Context, appPath string) (string, error) {
+	return validateAndEnableFSKitApp(ctx, appPath)
+}
+
+func quiesceFSKitAppForUpdate(ctx context.Context) error {
+	return stopCodexFoldFSKitModuleProcesses(ctx)
+}
+
+func unregisterStaleFSKitApps(ctx context.Context, appPath string) error {
+	targetModule, err := service.FSKitModulePath(appPath)
+	if err != nil {
+		return err
 	}
-	_, _ = exec.CommandContext(ctx, launchServicesRegister, "-u", appPath).CombinedOutput()
+	paths, err := registeredFSKitModulePaths(ctx)
+	if err != nil {
+		return err
+	}
+	for _, modulePath := range staleFSKitModulePaths(paths, targetModule) {
+		parentApp, ok := fsKitParentAppPath(modulePath)
+		if !ok {
+			return fmt.Errorf("FSKit module path has no parent app: %s", modulePath)
+		}
+		if err := unregisterFSKitAppRegistration(ctx, parentApp); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// FSKit keeps a user-level activation state keyed by module identity. Removing
+// a module through pluginkit can leave that state disabled until the next login.
+// Update cleanup therefore removes only a temporary app registration, never the
+// installed module itself.
+func unregisterFSKitAppRegistration(ctx context.Context, appPath string) error {
+	output, err := runFSKitLaunchServicesCommand(ctx, "-u", appPath)
+	if err != nil {
+		return commandOutputError("unregister stale FSKit app registration", output, err)
+	}
+	return nil
+}
+
+func registeredFSKitModulePaths(ctx context.Context) ([]string, error) {
+	output, err := exec.CommandContext(
+		ctx,
+		"/usr/bin/pluginkit",
+		"-m", "-A", "-D", "-v", "-i", service.FSKitModuleIdentifier,
+	).CombinedOutput()
+	if err != nil {
+		return nil, commandOutputError("list FSKit module registrations", output, err)
+	}
+	return parseFSKitModulePaths(output), nil
+}
+
+func parseFSKitModulePaths(output []byte) []string {
+	seen := make(map[string]struct{})
+	var paths []string
+	for _, line := range strings.Split(string(output), "\n") {
+		separator := strings.LastIndexByte(line, '\t')
+		if separator < 0 {
+			continue
+		}
+		candidate := filepath.Clean(strings.TrimSpace(line[separator+1:]))
+		if !filepath.IsAbs(candidate) || filepath.Ext(candidate) != ".appex" {
+			continue
+		}
+		if _, exists := seen[candidate]; exists {
+			continue
+		}
+		seen[candidate] = struct{}{}
+		paths = append(paths, candidate)
+	}
+	return paths
+}
+
+func normalizedFSKitModulePaths(paths []string) []string {
+	seen := make(map[string]struct{}, len(paths))
+	result := make([]string, 0, len(paths))
+	for _, path := range paths {
+		path = filepath.Clean(path)
+		if path == "." || path == "" {
+			continue
+		}
+		if _, exists := seen[path]; exists {
+			continue
+		}
+		seen[path] = struct{}{}
+		result = append(result, path)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func sameFSKitModulePaths(left []string, right []string) bool {
+	return strings.Join(normalizedFSKitModulePaths(left), "\x00") == strings.Join(normalizedFSKitModulePaths(right), "\x00")
+}
+
+func staleFSKitModulePaths(paths []string, target string) []string {
+	target = filepath.Clean(target)
+	var stale []string
+	for _, path := range normalizedFSKitModulePaths(paths) {
+		if path != target {
+			stale = append(stale, path)
+		}
+	}
+	return stale
+}
+
+func waitForFSKitModulePath(ctx context.Context, target string, timeout time.Duration) error {
+	target = filepath.Clean(target)
+	if timeout <= 0 {
+		timeout = fsKitRegistrationWait
+	}
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	var last []string
+	var lastErr error
+	for {
+		paths, err := registeredFSKitModulePaths(ctx)
+		if err == nil {
+			last = paths
+			lastErr = nil
+			for _, path := range paths {
+				if filepath.Clean(path) == target {
+					return nil
+				}
+			}
+		} else {
+			lastErr = err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-deadline.C:
+			if lastErr != nil {
+				return fmt.Errorf("FSKit module registration query failed: %w", lastErr)
+			}
+			return fmt.Errorf("FSKit module registration did not include %s: got %v", target, normalizedFSKitModulePaths(last))
+		case <-ticker.C:
+		}
+	}
+}
+
+func waitForFSKitModulePaths(ctx context.Context, want []string, timeout time.Duration) error {
+	if timeout <= 0 {
+		timeout = fsKitRegistrationWait
+	}
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	var last []string
+	var lastErr error
+	for {
+		paths, err := registeredFSKitModulePaths(ctx)
+		if err == nil {
+			last = paths
+			lastErr = nil
+			if sameFSKitModulePaths(paths, want) {
+				return nil
+			}
+		} else {
+			lastErr = err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-deadline.C:
+			if lastErr != nil {
+				return fmt.Errorf("FSKit module registration query failed: %w", lastErr)
+			}
+			return fmt.Errorf("FSKit module registration did not converge: got %v, want %v", normalizedFSKitModulePaths(last), normalizedFSKitModulePaths(want))
+		case <-ticker.C:
+		}
+	}
+}
+
+func fsKitParentAppPath(modulePath string) (string, bool) {
+	extensions := filepath.Dir(filepath.Clean(modulePath))
+	if filepath.Base(extensions) != "Extensions" {
+		return "", false
+	}
+	contents := filepath.Dir(extensions)
+	if filepath.Base(contents) != "Contents" {
+		return "", false
+	}
+	app := filepath.Dir(contents)
+	if filepath.Ext(app) != ".app" {
+		return "", false
+	}
+	return app, true
 }
 
 func (t *darwinFSKitAppTransaction) AppGroupPath() string { return t.appGroupPath }
 func (t *darwinFSKitAppTransaction) Changed() bool        { return t.changed }
 
-func (t *darwinFSKitAppTransaction) Rollback(ctx context.Context) error {
-	if t == nil || !t.changed {
+// promoteStagedApp preserves an existing app bundle root because macOS can
+// attach launch authorization to that directory's inode. Swapping Contents is
+// atomic on APFS and keeps the previous version in stagePath for rollback.
+func (t *darwinFSKitAppTransaction) promoteStagedApp() error {
+	if t == nil || t.target == "" || t.stagePath == "" {
+		return errors.New("FSKit app transaction is incomplete")
+	}
+	if info, err := os.Stat(t.target); err == nil {
+		if !info.IsDir() {
+			return errors.New("installed FSKit app path is not a directory")
+		}
+		t.hadTarget = true
+		targetContents := filepath.Join(t.target, "Contents")
+		stagedContents := filepath.Join(t.stagePath, "Contents")
+		if info, err := os.Stat(targetContents); err != nil {
+			return fmt.Errorf("inspect installed FSKit app Contents: %w", err)
+		} else if !info.IsDir() {
+			return errors.New("installed FSKit app Contents is not a directory")
+		}
+		if info, err := os.Stat(stagedContents); err != nil {
+			return fmt.Errorf("inspect staged FSKit app Contents: %w", err)
+		} else if !info.IsDir() {
+			return errors.New("staged FSKit app Contents is not a directory")
+		}
+		if err := unix.RenamexNp(stagedContents, targetContents, unix.RENAME_SWAP); err != nil {
+			return fmt.Errorf("atomically replace FSKit app Contents: %w", err)
+		}
+		t.contentsSwapped = true
+		return syncDirectories(t.target, t.stagePath)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := os.Rename(t.stagePath, t.target); err != nil {
+		return err
+	}
+	t.appInstalled = true
+	return syncDirectory(filepath.Dir(t.target))
+}
+
+func (t *darwinFSKitAppTransaction) rollbackStagedApp() error {
+	if t == nil {
 		return nil
 	}
+	if t.contentsSwapped {
+		targetContents := filepath.Join(t.target, "Contents")
+		stagedContents := filepath.Join(t.stagePath, "Contents")
+		if err := unix.RenamexNp(stagedContents, targetContents, unix.RENAME_SWAP); err != nil {
+			return fmt.Errorf("restore FSKit app Contents: %w", err)
+		}
+		t.contentsSwapped = false
+		return syncDirectories(t.target, t.stagePath)
+	}
+	if t.appInstalled {
+		if err := os.RemoveAll(t.target); err != nil {
+			return err
+		}
+		t.appInstalled = false
+		return syncDirectory(filepath.Dir(t.target))
+	}
+	return nil
+}
+
+func (t *darwinFSKitAppTransaction) Rollback(ctx context.Context) error {
+	if t == nil {
+		return nil
+	}
+	if !t.changed {
+		_, err := refreshFSKitApp(ctx, t.target)
+		return err
+	}
 	var result error
-	if t.source != "" {
-		unregisterFSKitApp(ctx, t.source)
+	if err := quiesceFSKitAppForUpdate(ctx); err != nil {
+		return err
 	}
-	_, _ = exec.CommandContext(ctx, launchServicesRegister, "-u", t.target).CombinedOutput()
-	if err := os.RemoveAll(t.target); err != nil {
-		result = errors.Join(result, err)
+	if err := t.rollbackStagedApp(); err != nil {
+		// Preserve the staged previous app for an operator-visible recovery rather
+		// than deleting the only rollback material after a failed restore.
+		return errors.Join(result, err)
 	}
-	if t.hadTarget && t.backupPath != "" {
-		if err := os.Rename(t.backupPath, t.target); err != nil {
-			result = errors.Join(result, err)
-		} else if _, err := validateAndEnableFSKitApp(ctx, t.target); err != nil {
+	if t.hadTarget {
+		if _, err := refreshFSKitApp(ctx, t.target); err != nil {
 			result = errors.Join(result, err)
 		}
 	}
-	result = errors.Join(result, syncDirectory(filepath.Dir(t.target)))
 	t.changed = false
 	return errors.Join(result, t.Commit())
 }
@@ -171,7 +439,7 @@ func (t *darwinFSKitAppTransaction) Commit() error {
 		return nil
 	}
 	var result error
-	for _, path := range []string{t.stageRoot, t.backupRoot} {
+	for _, path := range []string{t.stageRoot} {
 		if path == "" {
 			continue
 		}
@@ -180,8 +448,7 @@ func (t *darwinFSKitAppTransaction) Commit() error {
 		}
 	}
 	t.stageRoot = ""
-	t.backupRoot = ""
-	t.backupPath = ""
+	t.stagePath = ""
 	return errors.Join(result, syncDirectory(filepath.Dir(t.target)))
 }
 
@@ -189,22 +456,28 @@ func validateAndEnableFSKitApp(ctx context.Context, appPath string) (string, err
 	if err := validateFSKitApp(ctx, appPath); err != nil {
 		return "", err
 	}
-	if output, err := exec.CommandContext(ctx, launchServicesRegister, "-f", "-R", "-trusted", appPath).CombinedOutput(); err != nil {
+	targetModule, err := service.FSKitModulePath(appPath)
+	if err != nil {
+		return "", err
+	}
+	if output, err := runFSKitLaunchServicesCommand(ctx, "-f", "-R", "-trusted", appPath); err != nil {
 		return "", commandOutputError("register FSKit app", output, err)
 	}
-	if output, err := exec.CommandContext(ctx, "/usr/bin/pluginkit", "-e", "use", "-p", "com.apple.fskit.fsmodule", "-i", service.FSKitModuleIdentifier).CombinedOutput(); err != nil {
-		return "", commandOutputError("enable FSKit extension election", output, err)
+	if err := waitForFSKitModulePath(ctx, targetModule, fsKitRegistrationWait); err != nil {
+		return "", err
+	}
+	if err := unregisterStaleFSKitApps(ctx, appPath); err != nil {
+		return "", err
+	}
+	if err := waitForFSKitModulePaths(ctx, []string{targetModule}, fsKitRegistrationWait); err != nil {
+		return "", fmt.Errorf("FSKit module registration is ambiguous: %w", err)
 	}
 	if _, err := ensureFSKitModuleEnabled(service.FSKitModuleIdentifier); err != nil {
 		return "", err
 	}
-	// FSKit may retain the previous extension endpoint across a same-bundle-ID
-	// app replacement. Stop the agent first so it cannot immediately respawn the
-	// stale module while the LaunchServices and preferences caches are refreshed.
-	killUserProcess("fskit_agent")
-	killUserProcess("CodexFoldFSKitModule")
-	killUserProcess("cfprefsd")
-	time.Sleep(time.Second)
+	if output, err := exec.CommandContext(ctx, "/usr/bin/pluginkit", "-e", "use", "-p", "com.apple.fskit.fsmodule", "-i", service.FSKitModuleIdentifier).CombinedOutput(); err != nil {
+		return "", commandOutputError("enable FSKit extension election", output, err)
+	}
 	launcher, err := service.FSKitHostLauncherPath(appPath)
 	if err != nil {
 		return "", err
@@ -281,6 +554,84 @@ func validateFSKitApp(ctx context.Context, appPath string) error {
 	return nil
 }
 
+func requireNewerFSKitAppVersion(ctx context.Context, source string, target string) error {
+	sourceVersion, err := readFSKitAppVersion(ctx, source)
+	if err != nil {
+		return err
+	}
+	targetVersion, err := readFSKitAppVersion(ctx, target)
+	if err != nil {
+		return err
+	}
+	comparison, err := compareFSKitBundleVersions(sourceVersion, targetVersion)
+	if err != nil {
+		return err
+	}
+	if comparison <= 0 {
+		return fmt.Errorf("FSKit app candidate CFBundleVersion %s must exceed installed version %s when bundle contents differ", sourceVersion, targetVersion)
+	}
+	return nil
+}
+
+func readFSKitAppVersion(ctx context.Context, appPath string) (string, error) {
+	infoPath := filepath.Join(appPath, "Contents", "Info.plist")
+	output, err := exec.CommandContext(ctx, "/usr/bin/plutil", "-extract", "CFBundleVersion", "raw", infoPath).CombinedOutput()
+	if err != nil {
+		return "", commandOutputError("read FSKit app version", output, err)
+	}
+	version := strings.TrimSpace(string(output))
+	if _, err := parseFSKitBundleVersion(version); err != nil {
+		return "", err
+	}
+	return version, nil
+}
+
+func compareFSKitBundleVersions(left string, right string) (int, error) {
+	leftParts, err := parseFSKitBundleVersion(left)
+	if err != nil {
+		return 0, err
+	}
+	rightParts, err := parseFSKitBundleVersion(right)
+	if err != nil {
+		return 0, err
+	}
+	for index := 0; index < max(len(leftParts), len(rightParts)); index++ {
+		var leftPart, rightPart uint64
+		if index < len(leftParts) {
+			leftPart = leftParts[index]
+		}
+		if index < len(rightParts) {
+			rightPart = rightParts[index]
+		}
+		if leftPart < rightPart {
+			return -1, nil
+		}
+		if leftPart > rightPart {
+			return 1, nil
+		}
+	}
+	return 0, nil
+}
+
+func parseFSKitBundleVersion(version string) ([]uint64, error) {
+	parts := strings.Split(strings.TrimSpace(version), ".")
+	if len(parts) == 0 || len(parts) > 3 {
+		return nil, fmt.Errorf("invalid FSKit CFBundleVersion %q", version)
+	}
+	parsed := make([]uint64, len(parts))
+	for index, part := range parts {
+		if part == "" {
+			return nil, fmt.Errorf("invalid FSKit CFBundleVersion %q", version)
+		}
+		value, err := strconv.ParseUint(part, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid FSKit CFBundleVersion %q: %w", version, err)
+		}
+		parsed[index] = value
+	}
+	return parsed, nil
+}
+
 func ensureFSKitModuleEnabled(moduleID string) (bool, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -310,18 +661,68 @@ func ensureFSKitModuleEnabled(moduleID string) (bool, error) {
 	return true, nil
 }
 
-func killUserProcess(name string) {
-	output, err := exec.Command("/usr/bin/pgrep", "-u", strconv.Itoa(os.Getuid()), "-x", name).Output()
+func userProcessIDs(ctx context.Context, name string) ([]int, error) {
+	output, err := exec.CommandContext(ctx, "/usr/bin/pgrep", "-u", strconv.Itoa(os.Getuid()), "-x", name).Output()
 	if err != nil {
-		return
-	}
-	for _, field := range strings.Fields(string(output)) {
-		pid, err := strconv.Atoi(field)
-		if err != nil || pid <= 1 {
-			continue
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+			return nil, nil
 		}
-		if process, err := os.FindProcess(pid); err == nil {
-			_ = process.Kill()
+		return nil, err
+	}
+	var result []int
+	for _, field := range strings.Fields(string(output)) {
+		pid, parseErr := strconv.Atoi(field)
+		if parseErr == nil && pid > 1 {
+			result = append(result, pid)
+		}
+	}
+	return result, nil
+}
+
+func stopCodexFoldFSKitModuleProcesses(ctx context.Context) error {
+	pids, err := userProcessIDs(ctx, codexFoldFSKitModuleProcessName)
+	if err != nil {
+		return fmt.Errorf("inspect CodexFold FSKit module processes: %w", err)
+	}
+	for _, pid := range pids {
+		if err := unix.Kill(pid, unix.SIGTERM); err != nil && !errors.Is(err, unix.ESRCH) {
+			return fmt.Errorf("stop CodexFold FSKit module process %d: %w", pid, err)
+		}
+	}
+	if err := waitForNoCodexFoldFSKitModuleProcesses(ctx, fsKitModuleShutdownWait); err != nil {
+		for _, pid := range pids {
+			if killErr := unix.Kill(pid, unix.SIGKILL); killErr != nil && !errors.Is(killErr, unix.ESRCH) {
+				return errors.Join(err, fmt.Errorf("force-stop CodexFold FSKit module process %d: %w", pid, killErr))
+			}
+		}
+		return waitForNoCodexFoldFSKitModuleProcesses(ctx, fsKitModuleShutdownWait)
+	}
+	return nil
+}
+
+func waitForNoCodexFoldFSKitModuleProcesses(ctx context.Context, timeout time.Duration) error {
+	if timeout <= 0 {
+		timeout = fsKitModuleShutdownWait
+	}
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		pids, err := userProcessIDs(ctx, codexFoldFSKitModuleProcessName)
+		if err != nil {
+			return fmt.Errorf("inspect CodexFold FSKit module processes: %w", err)
+		}
+		if len(pids) == 0 {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-deadline.C:
+			return fmt.Errorf("CodexFold FSKit module processes remain: %v", pids)
+		case <-ticker.C:
 		}
 	}
 }
@@ -377,6 +778,20 @@ func syncDirectory(path string) error {
 	}
 	defer directory.Close()
 	return directory.Sync()
+}
+
+func syncDirectories(paths ...string) error {
+	seen := make(map[string]struct{}, len(paths))
+	var result error
+	for _, path := range paths {
+		path = filepath.Clean(path)
+		if _, ok := seen[path]; ok {
+			continue
+		}
+		seen[path] = struct{}{}
+		result = errors.Join(result, syncDirectory(path))
+	}
+	return result
 }
 
 func commandOutputError(action string, output []byte, err error) error {

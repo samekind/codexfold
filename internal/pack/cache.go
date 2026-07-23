@@ -40,6 +40,11 @@ func (c *blockCache) put(key string, data []byte) {
 	if int64(len(data)) > c.budget || c.budget == 0 {
 		return
 	}
+	if cap(data) != len(data) {
+		owned := make([]byte, len(data))
+		copy(owned, data)
+		data = owned
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if existing, ok := c.items[key]; ok {

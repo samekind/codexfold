@@ -12,16 +12,22 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
+	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/jstar0/codexfold/internal/fskitproto"
 	"golang.org/x/sys/unix"
 )
 
 const (
-	nativeFSKitMountEnv      = "CODEXFOLD_NATIVE_FSKIT_MOUNT"
-	nativeFSKitNativeRootEnv = "CODEXFOLD_NATIVE_FSKIT_NATIVE_ROOT"
+	nativeFSKitMountEnv                = "CODEXFOLD_NATIVE_FSKIT_MOUNT"
+	nativeFSKitNativeRootEnv           = "CODEXFOLD_NATIVE_FSKIT_NATIVE_ROOT"
+	nativeFSKitResourceEnv             = "CODEXFOLD_NATIVE_FSKIT_RESOURCE"
+	nativeFSKitVirtualFileEnv          = "CODEXFOLD_NATIVE_FSKIT_VIRTUAL_FILE"
+	nativeFSKitVirtualReferenceFileEnv = "CODEXFOLD_NATIVE_FSKIT_VIRTUAL_REFERENCE_FILE"
 )
 
 func TestNativeFSKitMountedMetadataAndXattrs(t *testing.T) {
@@ -149,6 +155,7 @@ func TestNativeFSKitMountedWritesAndFullSync(t *testing.T) {
 	base := []byte("{\"record\":0}\n")
 	first := []byte("{\"record\":1}\n")
 	second := []byte("{\"record\":2}\n")
+	third := []byte("{\"record\":3}\n")
 	writeMountedTestFile(t, oldEOF, base)
 	oldEOFFile, err := os.OpenFile(oldEOF, os.O_RDWR, 0)
 	if err != nil {
@@ -162,17 +169,55 @@ func TestNativeFSKitMountedWritesAndFullSync(t *testing.T) {
 		oldEOFFile.Close()
 		t.Fatalf("second old-EOF write: %v", err)
 	}
+	if _, err := oldEOFFile.WriteAt(third, int64(len(base))); err != nil {
+		oldEOFFile.Close()
+		t.Fatalf("third old-EOF write after cache revoke: %v", err)
+	}
 	if err := oldEOFFile.Close(); err != nil {
 		t.Fatal(err)
 	}
-	want := append(append(append([]byte(nil), base...), first...), second...)
+	want := append(append(append(append([]byte(nil), base...), first...), second...), third...)
+	assertNativeFSKitBackingContent(t, oldEOF, want)
 	assertMountedTestContent(t, oldEOF, want)
+}
+
+func TestNativeFSKitMountedOverlappingOpenLifetime(t *testing.T) {
+	root := nativeFSKitMountedTestRoot(t)
+	target := filepath.Join(root, "overlapping-open.jsonl")
+	writeMountedTestFile(t, target, []byte("{\"record\":0}\n"))
+
+	first, err := os.OpenFile(target, os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := os.OpenFile(target, os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		first.Close()
+		t.Fatal(err)
+	}
+	if err := first.Close(); err != nil {
+		second.Close()
+		t.Fatal(err)
+	}
+	appended := []byte("{\"record\":1}\n")
+	if _, err := second.Write(appended); err != nil {
+		second.Close()
+		t.Fatalf("write through surviving open descriptor: %v", err)
+	}
+	if err := second.Sync(); err != nil {
+		second.Close()
+		t.Fatalf("sync through surviving open descriptor: %v", err)
+	}
+	if err := second.Close(); err != nil {
+		t.Fatal(err)
+	}
+	assertMountedTestContent(t, target, append([]byte("{\"record\":0}\n"), appended...))
 }
 
 func TestNativeFSKitMountedNamespaceOperations(t *testing.T) {
 	root := nativeFSKitMountedTestRoot(t)
-	source := filepath.Join(root, "source.bin")
-	destination := filepath.Join(root, "destination.bin")
+	source := filepath.Join(root, "source.jsonl")
+	destination := filepath.Join(root, "destination.jsonl")
 	writeMountedTestFile(t, source, []byte("source\n"))
 	writeMountedTestFile(t, destination, []byte("destination\n"))
 	if err := os.Rename(source, destination); err != nil {
@@ -199,6 +244,28 @@ func TestNativeFSKitMountedNamespaceOperations(t *testing.T) {
 	}
 	if err := os.Link(destination, filepath.Join(root, "hard")); !isNotSupported(err) {
 		t.Fatalf("hardlink error = %v, want ENOTSUP", err)
+	}
+}
+
+func TestNativeFSKitMountedSamePathRecreate(t *testing.T) {
+	root := nativeFSKitMountedTestRoot(t)
+	target := filepath.Join(root, "same-path.jsonl")
+	for round := 1; round <= 20; round++ {
+		first := []byte(fmt.Sprintf("{\"round\":%d,\"phase\":\"first\"}\n", round))
+		second := []byte(fmt.Sprintf("{\"round\":%d,\"phase\":\"second\"}\n", round))
+		writeMountedTestFile(t, target, first)
+		assertMountedTestContent(t, target, first)
+		if err := os.Remove(target); err != nil {
+			t.Fatalf("round %d remove first generation: %v", round, err)
+		}
+		if _, err := os.Stat(target); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("round %d removed path stat = %v, want ENOENT", round, err)
+		}
+		writeMountedTestFile(t, target, second)
+		assertMountedTestContent(t, target, second)
+		if err := os.Remove(target); err != nil {
+			t.Fatalf("round %d remove second generation: %v", round, err)
+		}
 	}
 }
 
@@ -257,7 +324,7 @@ func TestNativeFSKitMountedArchiveRoundTripAndMmap(t *testing.T) {
 
 func TestNativeFSKitMountedOpenUnlink(t *testing.T) {
 	root := nativeFSKitMountedTestRoot(t)
-	target := filepath.Join(root, "open-unlink.bin")
+	target := filepath.Join(root, "open-unlink.jsonl")
 	writeMountedTestFile(t, target, []byte("before"))
 
 	file, err := os.OpenFile(target, os.O_RDWR, 0)
@@ -302,23 +369,107 @@ func TestNativeFSKitMountedExternalNamespaceRefresh(t *testing.T) {
 	relative := filepath.Join("sessions", "2099", "12", "31", fmt.Sprintf("external-%d.bin", time.Now().UnixNano()))
 	nativePath := filepath.Join(nativeRoot, relative)
 	mountedPath := filepath.Join(mountPoint, relative)
+	parentRoute := "/" + filepath.ToSlash(filepath.Dir(relative))
+	version, observeVersion := nativeFSKitMountedNamespaceVersion(t)
 	if err := os.MkdirAll(filepath.Dir(nativePath), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.Remove(nativePath) })
+	// Prime the mounted kernel's negative name cache before the native-side
+	// creator appears. This is the path a real Codex restart or file watcher
+	// hits after observing a session path before its rollout exists.
+	if _, err := os.Stat(mountedPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("uncreated mounted path stat = %v, want not exist", err)
+	}
 	if err := os.WriteFile(nativePath, []byte("external-one\n"), 0o600); err != nil {
 		t.Fatal(err)
+	}
+	if observeVersion {
+		version = waitForNativeFSKitNamespaceAdvance(t, version, 3*time.Second)
+		logNativeFSKitMountedEntry(t, "after create", parentRoute)
 	}
 	waitForMountedContent(t, mountedPath, []byte("external-one\n"), 3*time.Second)
 
 	if err := os.Remove(nativePath); err != nil {
 		t.Fatal(err)
 	}
+	if observeVersion {
+		version = waitForNativeFSKitNamespaceAdvance(t, version, 3*time.Second)
+		logNativeFSKitMountedEntry(t, "after remove", parentRoute)
+	}
 	waitForMountedAbsence(t, mountedPath, 3*time.Second)
 	if err := os.WriteFile(nativePath, []byte("external-two\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	if observeVersion {
+		version = waitForNativeFSKitNamespaceAdvance(t, version, 3*time.Second)
+		logNativeFSKitMountedEntry(t, "after recreate", parentRoute)
+		t.Logf("native namespace reached version %d after external recreation", version)
+	}
 	waitForMountedContent(t, mountedPath, []byte("external-two\n"), 3*time.Second)
+}
+
+func TestNativeFSKitMountedExternalDirectoryNamespaceRefresh(t *testing.T) {
+	mountPoint := nativeFSKitMountPoint(t)
+	nativeRoot := os.Getenv(nativeFSKitNativeRootEnv)
+	if nativeRoot == "" {
+		t.Skipf("set %s to run external directory refresh", nativeFSKitNativeRootEnv)
+	}
+	relative := filepath.Join("sessions", "2099", "12", "31", fmt.Sprintf("external-directory-%d", time.Now().UnixNano()))
+	nativeDirectory := filepath.Join(nativeRoot, relative)
+	mountedDirectory := filepath.Join(mountPoint, relative)
+	mountedChild := filepath.Join(mountedDirectory, "child.jsonl")
+	if _, err := os.Stat(mountedDirectory); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("uncreated mounted directory stat = %v, want not exist", err)
+	}
+	if _, err := os.Stat(mountedChild); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("uncreated mounted child stat = %v, want not exist", err)
+	}
+
+	version, observeVersion := nativeFSKitMountedNamespaceVersion(t)
+	if err := os.MkdirAll(nativeDirectory, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	nativeChild := filepath.Join(nativeDirectory, "child.jsonl")
+	want := []byte("external-directory-content\n")
+	if err := os.WriteFile(nativeChild, want, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(nativeChild)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(nativeDirectory) })
+	if observeVersion {
+		version = waitForNativeFSKitNamespaceAdvance(t, version, 3*time.Second)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if info, statErr := os.Stat(mountedDirectory); statErr == nil && info.IsDir() {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if info, err := os.Stat(mountedDirectory); err != nil || !info.IsDir() {
+		t.Fatalf("mounted external directory = %v, want a directory", err)
+	}
+	waitForMountedContent(t, mountedChild, want, 3*time.Second)
+	mountedInfo, err := os.Stat(mountedChild)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mountedInfo.Mode().Perm() != before.Mode().Perm() || mountedInfo.Size() != before.Size() {
+		t.Fatalf("mounted child metadata mode=%#o size=%d, want mode=%#o size=%d", mountedInfo.Mode().Perm(), mountedInfo.Size(), before.Mode().Perm(), before.Size())
+	}
+
+	if err := os.RemoveAll(nativeDirectory); err != nil {
+		t.Fatal(err)
+	}
+	if observeVersion {
+		version = waitForNativeFSKitNamespaceAdvance(t, version, 3*time.Second)
+	}
+	waitForMountedAbsence(t, mountedChild, 3*time.Second)
+	waitForMountedAbsence(t, mountedDirectory, 3*time.Second)
 }
 
 func TestNativeFSKitMountedPerformance(t *testing.T) {
@@ -335,9 +486,29 @@ func TestNativeFSKitMountedPerformance(t *testing.T) {
 	mountedPath := filepath.Join(root, "performance.bin")
 	nativePath := filepath.Join(nativeRoot, relativeRoot, "performance.bin")
 	const sourceBytes = int64(256 << 20)
+	versionBefore, observeVersion := nativeFSKitMountedNamespaceVersion(t)
 	if err := writePerformanceFixture(nativePath, sourceBytes); err != nil {
 		t.Fatal(err)
 	}
+	nativeInfo, err := os.Stat(nativePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	versionAfterWrite, _ := nativeFSKitMountedNamespaceVersion(t)
+	mountedInfo, mountedErr := os.Stat(mountedPath)
+	t.Logf(
+		"native-fskit performance fixture native_size=%d mounted_size=%d mounted_err=%v namespace_before=%d namespace_after_write=%d observe_version=%t",
+		nativeInfo.Size(), fileInfoSize(mountedInfo), mountedErr, versionBefore, versionAfterWrite, observeVersion,
+	)
+	logNativeFSKitMountedEntry(t, "performance-after-write", mountedPath)
+	time.Sleep(time.Second)
+	versionAfterSettle, _ := nativeFSKitMountedNamespaceVersion(t)
+	mountedInfo, mountedErr = os.Stat(mountedPath)
+	t.Logf(
+		"native-fskit performance settle mounted_size=%d mounted_err=%v namespace_after_settle=%d",
+		fileInfoSize(mountedInfo), mountedErr, versionAfterSettle,
+	)
+	logNativeFSKitMountedEntry(t, "performance-after-settle", mountedPath)
 	waitForMountedSize(t, mountedPath, sourceBytes, 5*time.Second)
 
 	nativeCold, nativeBypass, err := sequentialReadMetric(nativePath, true)
@@ -367,6 +538,13 @@ func TestNativeFSKitMountedPerformance(t *testing.T) {
 	if nativeHash != mountedHash {
 		t.Fatal("mounted performance file differs from the native source")
 	}
+	t.Logf(
+		"native-fskit performance pre-gate bytes=%d cold_native=%.2fMiB/s cold_mounted=%.2fMiB/s cold_ratio=%.3f warm_native=%.2fMiB/s warm_mounted=%.2fMiB/s warm_ratio=%.3f native_nocache=%t mounted_nocache=%t",
+		sourceBytes,
+		nativeCold/(1<<20), mountedCold/(1<<20), mountedCold/nativeCold,
+		nativeWarm/(1<<20), mountedWarm/(1<<20), mountedWarm/nativeWarm,
+		nativeBypass, mountedBypass,
+	)
 	const minimumThroughput = float64(500 << 20)
 	if mountedCold < minimumThroughput || mountedWarm < minimumThroughput {
 		t.Fatalf("mounted throughput below 500 MiB/s: cold=%.2f MiB/s warm=%.2f MiB/s", mountedCold/(1<<20), mountedWarm/(1<<20))
@@ -427,12 +605,21 @@ func TestNativeFSKitMountedReadAheadCoherency(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mountedPath := filepath.Join(root, "read-ahead.bin")
-	nativePath := filepath.Join(nativeRoot, relativeRoot, "read-ahead.bin")
+	mountedPath := filepath.Join(root, "read-ahead.jsonl")
+	nativePath := filepath.Join(nativeRoot, relativeRoot, "read-ahead.jsonl")
 	const blockSize = 1 << 20
-	content := make([]byte, 2*blockSize+257)
-	for index := range content {
-		content[index] = byte((index*31 + index/251) % 251)
+	const lineSize = 4096
+	prefix := []byte("{\"payload\":\"")
+	suffix := []byte("\"}\n")
+	line := make([]byte, lineSize)
+	copy(line, prefix)
+	for index := len(prefix); index < len(line)-len(suffix); index++ {
+		line[index] = byte('a' + index%26)
+	}
+	copy(line[len(line)-len(suffix):], suffix)
+	content := bytes.Repeat(line, 4*blockSize/lineSize)
+	if !completeJSONL(content) {
+		t.Fatal("read-ahead fixture is not valid JSONL")
 	}
 	writeMountedTestFile(t, mountedPath, content)
 
@@ -454,6 +641,32 @@ func TestNativeFSKitMountedReadAheadCoherency(t *testing.T) {
 		assertOpenFileRange(t, reader, content, testCase.offset, testCase.length)
 	}
 
+	const concurrentReaders = 8
+	const concurrentRounds = 64
+	const concurrentReadBytes = 32 << 10
+	concurrentErrors := make(chan error, concurrentReaders)
+	var concurrent sync.WaitGroup
+	for worker := 0; worker < concurrentReaders; worker++ {
+		concurrent.Add(1)
+		go func(worker int) {
+			defer concurrent.Done()
+			for round := 0; round < concurrentRounds; round++ {
+				offset := int64((worker*7919 + round*65537) % (len(content) - concurrentReadBytes))
+				buffer := make([]byte, concurrentReadBytes)
+				n, readErr := reader.ReadAt(buffer, offset)
+				if readErr != nil || n != len(buffer) || !bytes.Equal(buffer, content[offset:offset+int64(len(buffer))]) {
+					concurrentErrors <- fmt.Errorf("worker=%d round=%d offset=%d bytes=%d error=%v", worker, round, offset, n, readErr)
+					return
+				}
+			}
+		}(worker)
+	}
+	concurrent.Wait()
+	close(concurrentErrors)
+	for concurrentErr := range concurrentErrors {
+		t.Fatal(concurrentErr)
+	}
+
 	eofOffset := int64(len(content) - 100)
 	eofBuffer := make([]byte, 4096)
 	n, err := reader.ReadAt(eofBuffer, eofOffset)
@@ -461,8 +674,8 @@ func TestNativeFSKitMountedReadAheadCoherency(t *testing.T) {
 		t.Fatalf("EOF read n=%d err=%v", n, err)
 	}
 
-	writeOffset := int64(128 << 10)
-	replacement := bytes.Repeat([]byte{0xa5}, 8192)
+	writeOffset := int64(128<<10 + len(prefix) + 64)
+	replacement := bytes.Repeat([]byte{'Z'}, 512)
 	writer, err := os.OpenFile(mountedPath, os.O_RDWR, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -479,21 +692,27 @@ func TestNativeFSKitMountedReadAheadCoherency(t *testing.T) {
 		t.Fatal(err)
 	}
 	copy(content[writeOffset:], replacement)
+	if !completeJSONL(content) {
+		t.Fatal("mounted overwrite made the fixture invalid JSONL")
+	}
 	assertOpenFileRange(t, reader, content, writeOffset, len(replacement))
 
-	truncateSize := int64(blockSize + 123)
+	truncateSize := int64(blockSize + lineSize)
 	if err := os.Truncate(mountedPath, truncateSize); err != nil {
 		t.Fatalf("mounted truncate: %v", err)
 	}
 	truncated := content[:truncateSize]
+	if !completeJSONL(truncated) {
+		t.Fatal("truncated fixture is not valid JSONL")
+	}
 	truncateBuffer := make([]byte, 4096)
 	n, err = reader.ReadAt(truncateBuffer, truncateSize-100)
 	if !errors.Is(err, io.EOF) || n != 100 || !bytes.Equal(truncateBuffer[:n], truncated[truncateSize-100:]) {
 		t.Fatalf("post-truncate read n=%d err=%v", n, err)
 	}
 
-	externalOffset := int64(64 << 10)
-	externalReplacement := bytes.Repeat([]byte{0x3c}, 4096)
+	externalOffset := int64(64<<10 + len(prefix) + 32)
+	externalReplacement := bytes.Repeat([]byte{'X'}, 256)
 	native, err := os.OpenFile(nativePath, os.O_RDWR, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -510,14 +729,259 @@ func TestNativeFSKitMountedReadAheadCoherency(t *testing.T) {
 		t.Fatal(err)
 	}
 	copy(truncated[externalOffset:], externalReplacement)
+	if !completeJSONL(truncated) {
+		t.Fatal("external overwrite made the fixture invalid JSONL")
+	}
 	waitForOpenFileRange(t, reader, truncated, externalOffset, len(externalReplacement), 3*time.Second)
 
-	renamedPath := filepath.Join(root, "read-ahead-renamed.bin")
+	renamedPath := filepath.Join(root, "read-ahead-renamed.jsonl")
 	if err := os.Rename(mountedPath, renamedPath); err != nil {
 		t.Fatalf("rename cached file: %v", err)
 	}
 	assertOpenFileRange(t, reader, truncated, 0, 8192)
 	assertMountedTestContent(t, renamedPath, truncated)
+}
+
+func TestNativeFSKitMountedVirtualConcurrentReadAhead(t *testing.T) {
+	virtualPath := os.Getenv(nativeFSKitVirtualFileEnv)
+	referencePath := os.Getenv(nativeFSKitVirtualReferenceFileEnv)
+	if virtualPath == "" || referencePath == "" {
+		t.Skipf("set %s and %s to run packed virtual concurrent reads", nativeFSKitVirtualFileEnv, nativeFSKitVirtualReferenceFileEnv)
+	}
+	if !filepath.IsAbs(virtualPath) || !filepath.IsAbs(referencePath) {
+		t.Fatal("packed virtual and reference paths must be absolute")
+	}
+	virtual, err := os.Open(virtualPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer virtual.Close()
+	reference, err := os.Open(referencePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reference.Close()
+	referenceInfo, err := reference.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	virtualInfo, err := virtual.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	const readers = 8
+	const rounds = 8
+	const readBytes = 32 << 10
+	if referenceInfo.Size() < readBytes || virtualInfo.Size() < referenceInfo.Size() {
+		t.Fatalf("virtual bytes=%d reference bytes=%d", virtualInfo.Size(), referenceInfo.Size())
+	}
+
+	errorsByReader := make(chan error, readers)
+	var concurrent sync.WaitGroup
+	for worker := 0; worker < readers; worker++ {
+		concurrent.Add(1)
+		go func(worker int) {
+			defer concurrent.Done()
+			for round := 0; round < rounds; round++ {
+				limit := referenceInfo.Size() - readBytes
+				offset := int64(worker*104729+round*15485863) % (limit + 1)
+				got := make([]byte, readBytes)
+				want := make([]byte, readBytes)
+				gotN, gotErr := virtual.ReadAt(got, offset)
+				wantN, wantErr := reference.ReadAt(want, offset)
+				if gotErr != nil || wantErr != nil || gotN != readBytes || wantN != readBytes || !bytes.Equal(got, want) {
+					errorsByReader <- fmt.Errorf("worker=%d round=%d offset=%d virtual=%d/%v reference=%d/%v", worker, round, offset, gotN, gotErr, wantN, wantErr)
+					return
+				}
+			}
+		}(worker)
+	}
+	concurrent.Wait()
+	close(errorsByReader)
+	for readErr := range errorsByReader {
+		t.Fatal(readErr)
+	}
+}
+
+func TestNativeFSKitMountedManagedPerformance(t *testing.T) {
+	virtualPath := os.Getenv(nativeFSKitVirtualFileEnv)
+	referencePath := os.Getenv(nativeFSKitVirtualReferenceFileEnv)
+	if virtualPath == "" || referencePath == "" {
+		t.Skipf("set %s and %s to run packed virtual performance", nativeFSKitVirtualFileEnv, nativeFSKitVirtualReferenceFileEnv)
+	}
+	if !filepath.IsAbs(virtualPath) || !filepath.IsAbs(referencePath) {
+		t.Fatal("packed virtual and reference paths must be absolute")
+	}
+
+	referenceInfo, err := os.Stat(referencePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	virtualInfo, err := os.Stat(virtualPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if virtualInfo.Size() != referenceInfo.Size() {
+		t.Fatalf("virtual bytes=%d reference bytes=%d", virtualInfo.Size(), referenceInfo.Size())
+	}
+	coldReferencePath, copyBypass, err := uncachedReferenceCopy(referencePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.Remove(coldReferencePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("remove uncached reference copy: %v", err)
+		}
+	})
+	if !copyBypass {
+		t.Fatal("F_NOCACHE was not applied while creating the cold reference copy")
+	}
+
+	nativeCold, nativeBypass, err := sequentialReadMetric(coldReferencePath, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	virtualCold, virtualBypass, err := sequentialReadMetric(virtualPath, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nativeWarm, err := medianSequentialThroughput(coldReferencePath, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	virtualWarm, err := medianSequentialThroughput(virtualPath, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nativeHash, err := streamingSHA256(coldReferencePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	virtualHash, err := streamingSHA256(virtualPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nativeHash != virtualHash {
+		t.Fatal("mounted managed file differs from its retained native snapshot")
+	}
+
+	coldRatio := virtualCold / nativeCold
+	warmRatio := virtualWarm / nativeWarm
+	t.Logf(
+		"native-fskit managed performance bytes=%d cold_native=%.2fMiB/s cold_virtual=%.2fMiB/s cold_ratio=%.3f warm_native=%.2fMiB/s warm_virtual=%.2fMiB/s warm_ratio=%.3f native_nocache=%t virtual_nocache=%t",
+		referenceInfo.Size(),
+		nativeCold/(1<<20), virtualCold/(1<<20), coldRatio,
+		nativeWarm/(1<<20), virtualWarm/(1<<20), warmRatio,
+		nativeBypass, virtualBypass,
+	)
+	if !nativeBypass || !virtualBypass {
+		t.Fatal("F_NOCACHE was not applied to both cold-read paths")
+	}
+	if coldRatio < 0.70 {
+		t.Fatalf("managed cold throughput ratio %.3f is below 0.70", coldRatio)
+	}
+	if warmRatio < 0.80 {
+		t.Fatalf("managed warm throughput ratio %.3f is below 0.80", warmRatio)
+	}
+}
+
+func TestNativeFSKitMountedManagedCacheSurvivesUnrelatedNamespaceChange(t *testing.T) {
+	virtualPath := os.Getenv(nativeFSKitVirtualFileEnv)
+	referencePath := os.Getenv(nativeFSKitVirtualReferenceFileEnv)
+	if virtualPath == "" || referencePath == "" {
+		t.Skipf("set %s and %s to run managed cache coherency", nativeFSKitVirtualFileEnv, nativeFSKitVirtualReferenceFileEnv)
+	}
+	root := nativeFSKitMountedTestRoot(t)
+	// Let setup namespace changes drain before establishing the cache baseline.
+	time.Sleep(750 * time.Millisecond)
+	for index := 0; index < 2; index++ {
+		if _, _, err := sequentialReadMetric(virtualPath, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeMountedTestFile(t, filepath.Join(root, "unrelated.bin"), []byte("unrelated namespace change\n"))
+	time.Sleep(750 * time.Millisecond)
+
+	nativeWarm, err := medianSequentialThroughput(referencePath, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	virtualWarm, _, err := sequentialReadMetric(virtualPath, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ratio := virtualWarm / nativeWarm
+	t.Logf(
+		"native-fskit managed cache after unrelated namespace change native=%.2fMiB/s virtual=%.2fMiB/s ratio=%.3f",
+		nativeWarm/(1<<20), virtualWarm/(1<<20), ratio,
+	)
+	if ratio < 0.80 {
+		t.Fatalf("unrelated namespace change reduced managed warm throughput ratio to %.3f", ratio)
+	}
+}
+
+func uncachedReferenceCopy(sourcePath string) (string, bool, error) {
+	source, err := os.Open(sourcePath)
+	if err != nil {
+		return "", false, fmt.Errorf("open cold reference source: %w", err)
+	}
+	defer source.Close()
+	sourceBypass := false
+	if _, err := unix.FcntlInt(source.Fd(), unix.F_NOCACHE, 1); err == nil {
+		sourceBypass = true
+	}
+
+	destination, err := os.CreateTemp(filepath.Dir(sourcePath), ".codexfold-cold-reference-*.jsonl")
+	if err != nil {
+		return "", false, fmt.Errorf("create cold reference copy: %w", err)
+	}
+	destinationPath := destination.Name()
+	keep := false
+	defer func() {
+		_ = destination.Close()
+		if !keep {
+			_ = os.Remove(destinationPath)
+		}
+	}()
+	destinationBypass := false
+	if _, err := unix.FcntlInt(destination.Fd(), unix.F_NOCACHE, 1); err == nil {
+		destinationBypass = true
+	}
+
+	buffer := make([]byte, 4<<20)
+	for {
+		count, readErr := source.Read(buffer)
+		if count > 0 {
+			written := 0
+			for written < count {
+				amount, writeErr := destination.Write(buffer[written:count])
+				if writeErr != nil {
+					return "", sourceBypass && destinationBypass, fmt.Errorf("write cold reference copy: %w", writeErr)
+				}
+				if amount == 0 {
+					return "", sourceBypass && destinationBypass, io.ErrShortWrite
+				}
+				written += amount
+			}
+		}
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
+		if readErr != nil {
+			return "", sourceBypass && destinationBypass, fmt.Errorf("read cold reference source: %w", readErr)
+		}
+		if count == 0 {
+			return "", sourceBypass && destinationBypass, io.ErrNoProgress
+		}
+	}
+	if err := destination.Sync(); err != nil {
+		return "", sourceBypass && destinationBypass, fmt.Errorf("sync cold reference copy: %w", err)
+	}
+	if err := destination.Close(); err != nil {
+		return "", sourceBypass && destinationBypass, fmt.Errorf("close cold reference copy: %w", err)
+	}
+	keep = true
+	return destinationPath, sourceBypass && destinationBypass, nil
 }
 
 func writePerformanceFixture(path string, size int64) error {
@@ -554,10 +1018,23 @@ func sequentialReadMetric(path string, bypassCache bool) (float64, bool, error) 
 			bypassApplied = true
 		}
 	}
+	// io.CopyBuffer would let io.Discard.ReadFrom ignore this buffer and turn
+	// the bulk metric into thousands of tiny FSKit calls.
+	buffer := make([]byte, 4<<20)
 	started := time.Now()
-	read, err := io.CopyBuffer(io.Discard, file, make([]byte, 4<<20))
-	if err != nil {
-		return 0, bypassApplied, err
+	var read int64
+	for {
+		count, readErr := file.Read(buffer)
+		read += int64(count)
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
+		if readErr != nil {
+			return 0, bypassApplied, readErr
+		}
+		if count == 0 {
+			return 0, bypassApplied, io.ErrNoProgress
+		}
 	}
 	duration := time.Since(started)
 	if duration <= 0 {
@@ -719,6 +1196,27 @@ func assertMountedTestContent(t *testing.T, path string, want []byte) {
 	}
 }
 
+func assertNativeFSKitBackingContent(t *testing.T, mountedPath string, want []byte) {
+	t.Helper()
+	mountPoint := nativeFSKitMountPoint(t)
+	nativeRoot := os.Getenv(nativeFSKitNativeRootEnv)
+	if nativeRoot == "" {
+		t.Skipf("set %s to verify native backing content", nativeFSKitNativeRootEnv)
+	}
+	relative, err := filepath.Rel(mountPoint, mountedPath)
+	if err != nil {
+		t.Fatalf("resolve native backing path: %v", err)
+	}
+	path := filepath.Join(nativeRoot, relative)
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read native backing %s: %v", path, err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("native backing %s = %q, want %q", path, got, want)
+	}
+}
+
 func mountedTestXattr(t *testing.T, path string, attribute string) []byte {
 	t.Helper()
 	value, err := readMountedTestXattr(path, attribute)
@@ -793,4 +1291,85 @@ func waitForMountedAbsence(t *testing.T, path string, timeout time.Duration) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Fatalf("mounted path %s remained visible: %v", path, lastErr)
+}
+
+func nativeFSKitMountedNamespaceVersion(t *testing.T) (uint64, bool) {
+	t.Helper()
+	resource := os.Getenv(nativeFSKitResourceEnv)
+	if resource == "" {
+		return 0, false
+	}
+	client, err := fskitproto.DialResource(resource, time.Second)
+	if err != nil {
+		t.Fatalf("dial native FSKit resource: %v", err)
+	}
+	defer client.Close()
+	payload, err := client.Call(fskitproto.OpNamespaceVersion, nil)
+	if err != nil {
+		t.Fatalf("read native FSKit namespace version: %v", err)
+	}
+	decoder := fskitproto.NewDecoder(payload)
+	version, err := decoder.Uint64()
+	if err != nil || decoder.Done() != nil {
+		t.Fatalf("decode native FSKit namespace version: %v", err)
+	}
+	return version, true
+}
+
+func logNativeFSKitMountedEntry(t *testing.T, stage string, path string) {
+	t.Helper()
+	resource := os.Getenv(nativeFSKitResourceEnv)
+	if resource == "" {
+		return
+	}
+	if filepath.IsAbs(path) && !canonicalNamespacePath(path) {
+		relative, err := filepath.Rel(nativeFSKitMountPoint(t), path)
+		if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+			t.Fatalf("resolve native FSKit entry route %s: %v", path, err)
+		}
+		path = "/" + filepath.ToSlash(relative)
+	}
+	client, err := fskitproto.DialResource(resource, time.Second)
+	if err != nil {
+		t.Fatalf("dial native FSKit resource: %v", err)
+	}
+	defer client.Close()
+	request := fskitproto.NewEncoder(len(path) + 8)
+	request.String(path)
+	payload, err := client.Call(fskitproto.OpGetattr, request.Data())
+	if err != nil {
+		t.Fatalf("get native FSKit entry %s: %v", path, err)
+	}
+	decoder := fskitproto.NewDecoder(payload)
+	entry, err := decoder.Entry()
+	if err != nil || decoder.Done() != nil {
+		t.Fatalf("decode native FSKit entry %s: %v", path, err)
+	}
+	t.Logf(
+		"%s path=%s node=%d size=%d namespace=%d mtime=%d.%09d ctime=%d.%09d",
+		stage, path, entry.NodeID, entry.Size, entry.NamespaceID,
+		entry.ModTime.Unix(), entry.ModTime.Nanosecond(),
+		entry.ChangeTime.Unix(), entry.ChangeTime.Nanosecond(),
+	)
+}
+
+func fileInfoSize(info os.FileInfo) int64 {
+	if info == nil {
+		return -1
+	}
+	return info.Size()
+}
+
+func waitForNativeFSKitNamespaceAdvance(t *testing.T, previous uint64, timeout time.Duration) uint64 {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		version, _ := nativeFSKitMountedNamespaceVersion(t)
+		if version > previous {
+			return version
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf("native FSKit namespace version did not advance beyond %d", previous)
+	return previous
 }

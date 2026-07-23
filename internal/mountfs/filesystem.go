@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path"
@@ -24,13 +25,15 @@ import (
 )
 
 type Attr struct {
-	Mode       uint32    `json:"mode"`
-	UID        uint32    `json:"uid"`
-	GID        uint32    `json:"gid"`
-	Size       int64     `json:"size"`
-	ModTime    time.Time `json:"mod_time"`
-	ChangeTime time.Time `json:"change_time"`
-	AccessTime time.Time `json:"access_time"`
+	Mode                uint32    `json:"mode"`
+	UID                 uint32    `json:"uid"`
+	GID                 uint32    `json:"gid"`
+	Size                int64     `json:"size"`
+	ModTime             time.Time `json:"mod_time"`
+	ChangeTime          time.Time `json:"change_time"`
+	AccessTime          time.Time `json:"access_time"`
+	ObjectID            string    `json:"-"`
+	DirectoryGeneration uint64    `json:"-"`
 }
 
 type SetAttrRequest struct {
@@ -42,10 +45,81 @@ type SetAttrRequest struct {
 	ModTime    time.Time
 }
 
+type sessionOwner struct {
+	mu         sync.Mutex
+	closer     io.Closer
+	references int
+	retired    bool
+	closeOnce  sync.Once
+	closeErr   error
+}
+
+func newSessionOwner(closer io.Closer) *sessionOwner {
+	return &sessionOwner{closer: closer}
+}
+
+func (o *sessionOwner) acquire() bool {
+	if o == nil {
+		return true
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.retired {
+		return false
+	}
+	o.references++
+	return true
+}
+
+func (o *sessionOwner) release() error {
+	if o == nil {
+		return nil
+	}
+	o.mu.Lock()
+	if o.references <= 0 {
+		o.mu.Unlock()
+		return errors.New("session owner reference underflow")
+	}
+	o.references--
+	ready := o.retired && o.references == 0
+	o.mu.Unlock()
+	if ready {
+		return o.close()
+	}
+	return nil
+}
+
+func (o *sessionOwner) retire() error {
+	if o == nil {
+		return nil
+	}
+	o.mu.Lock()
+	o.retired = true
+	ready := o.references == 0
+	o.mu.Unlock()
+	if ready {
+		return o.close()
+	}
+	return nil
+}
+
+func (o *sessionOwner) close() error {
+	if o == nil {
+		return nil
+	}
+	o.closeOnce.Do(func() {
+		if o.closer != nil {
+			o.closeErr = o.closer.Close()
+		}
+	})
+	return o.closeErr
+}
+
 type fileHandle struct {
 	mu           sync.Mutex
 	path         string
 	session      *vfs.Session
+	owner        *sessionOwner
 	native       *os.File
 	nativePath   string
 	nativeAppend *nativeAppendState
@@ -57,40 +131,120 @@ type fileHandle struct {
 	appendOffset int64
 }
 
+type directoryState struct {
+	generation uint64
+	changedAt  time.Time
+}
+
 type Filesystem struct {
 	mu                sync.RWMutex
 	loadMu            sync.Mutex
 	sessions          map[string]*vfs.Session
+	owners            map[string]*sessionOwner
 	paths             map[string]string
 	retained          map[string]string
 	nativeFirst       map[string]struct{}
 	directories       map[string]struct{}
+	directoryStates   map[string]directoryState
 	handles           map[uint64]*fileHandle
 	next              uint64
-	loader            func(string) (*vfs.Session, error)
+	loader            func(string) (*vfs.Session, io.Closer, error)
 	canonical         bool
 	nativeRoot        string
 	nativeJournalRoot string
 	nativeAppends     map[string]*nativeAppendState
-	namespaceVersion  atomic.Uint64
+	// nativeNamespaceRefreshMount is the live FSKit mount used only to make
+	// externally-created native paths visible after macOS cached a negative
+	// lookup. The in-flight map prevents that refresh probe from ever creating
+	// a path if its native source disappears during the probe.
+	nativeNamespaceRefreshMount    string
+	nativeNamespaceRefreshInFlight map[string]uint32
+	nativeMutationMu               sync.Mutex
+	nativeInternalMutations        map[string]time.Time
+	namespaceVersion               atomic.Uint64
+	activeIO                       atomic.Int64
+	lastIO                         atomic.Int64
 }
 
 func New() *Filesystem {
-	filesystem := &Filesystem{sessions: make(map[string]*vfs.Session), handles: make(map[uint64]*fileHandle), next: 1}
+	now := time.Now()
+	filesystem := &Filesystem{
+		sessions: make(map[string]*vfs.Session), owners: make(map[string]*sessionOwner),
+		directoryStates: map[string]directoryState{"/": {generation: 1, changedAt: now}},
+		handles:         make(map[uint64]*fileHandle), next: 1,
+	}
 	filesystem.namespaceVersion.Store(1)
+	filesystem.lastIO.Store(time.Now().UnixNano())
 	return filesystem
 }
 
 func NewCanonical() *Filesystem {
+	now := time.Now()
 	filesystem := &Filesystem{
-		sessions: make(map[string]*vfs.Session), paths: make(map[string]string),
+		sessions: make(map[string]*vfs.Session), owners: make(map[string]*sessionOwner), paths: make(map[string]string),
 		retained: make(map[string]string), nativeFirst: make(map[string]struct{}),
 		directories: map[string]struct{}{`/`: {}, `/sessions`: {}, `/archived_sessions`: {}},
-		handles:     make(map[uint64]*fileHandle), nativeAppends: make(map[string]*nativeAppendState),
-		next: 1, canonical: true,
+		directoryStates: map[string]directoryState{
+			`/`:                  {generation: 1, changedAt: now},
+			`/sessions`:          {generation: 1, changedAt: now},
+			`/archived_sessions`: {generation: 1, changedAt: now},
+		},
+		handles: make(map[uint64]*fileHandle), nativeAppends: make(map[string]*nativeAppendState),
+		nativeNamespaceRefreshInFlight: make(map[string]uint32),
+		nativeInternalMutations:        make(map[string]time.Time),
+		next:                           1, canonical: true,
 	}
 	filesystem.namespaceVersion.Store(1)
+	filesystem.lastIO.Store(time.Now().UnixNano())
 	return filesystem
+}
+
+func (f *Filesystem) IOIdleFor(duration time.Duration) bool {
+	if f.activeIO.Load() != 0 {
+		return false
+	}
+	last := f.lastIO.Load()
+	return last == 0 || time.Since(time.Unix(0, last)) >= duration
+}
+
+func (f *Filesystem) beginIO() func() {
+	f.activeIO.Add(1)
+	return func() {
+		f.lastIO.Store(time.Now().UnixNano())
+		f.activeIO.Add(-1)
+	}
+}
+
+const nativeInternalMutationSuppressionWindow = 2 * time.Second
+
+func (f *Filesystem) markNativeInternalMutation(nativePath string) {
+	if nativePath == "" {
+		return
+	}
+	f.nativeMutationMu.Lock()
+	if f.nativeInternalMutations == nil {
+		f.nativeInternalMutations = make(map[string]time.Time)
+	}
+	f.nativeInternalMutations[filepath.Clean(nativePath)] = time.Now()
+	f.nativeMutationMu.Unlock()
+}
+
+func (f *Filesystem) nativeInternalMutationSuppressed(nativePath string) bool {
+	if nativePath == "" {
+		return false
+	}
+	cleaned := filepath.Clean(nativePath)
+	f.nativeMutationMu.Lock()
+	defer f.nativeMutationMu.Unlock()
+	changedAt, exists := f.nativeInternalMutations[cleaned]
+	if !exists {
+		return false
+	}
+	if time.Since(changedAt) <= nativeInternalMutationSuppressionWindow {
+		return true
+	}
+	delete(f.nativeInternalMutations, cleaned)
+	return false
 }
 
 func (f *Filesystem) NamespaceVersion() uint64 {
@@ -99,6 +253,77 @@ func (f *Filesystem) NamespaceVersion() uint64 {
 
 func (f *Filesystem) bumpNamespaceVersion() {
 	f.namespaceVersion.Add(1)
+}
+
+func (f *Filesystem) bumpDirectoryGeneration(name string) {
+	f.mu.Lock()
+	f.bumpDirectoryGenerationLocked(cleanPath(name), time.Now())
+	f.mu.Unlock()
+}
+
+func (f *Filesystem) bumpDirectoryGenerations(names []string) {
+	if len(names) == 0 {
+		return
+	}
+	now := time.Now()
+	f.mu.Lock()
+	for _, name := range names {
+		f.bumpDirectoryGenerationLocked(cleanPath(name), now)
+	}
+	f.mu.Unlock()
+}
+
+func (f *Filesystem) bumpDirectoryGenerationLocked(name string, changedAt time.Time) {
+	if name == "" || name == "." {
+		name = "/"
+	}
+	state := f.ensureDirectoryStateLocked(name, changedAt)
+	state.generation++
+	if !changedAt.After(state.changedAt) {
+		changedAt = state.changedAt.Add(time.Nanosecond)
+	}
+	state.changedAt = changedAt
+	f.directoryStates[name] = state
+}
+
+func (f *Filesystem) ensureDirectoryStateLocked(name string, changedAt time.Time) directoryState {
+	if f.directoryStates == nil {
+		f.directoryStates = make(map[string]directoryState)
+	}
+	if state, exists := f.directoryStates[name]; exists {
+		return state
+	}
+	if changedAt.IsZero() {
+		changedAt = time.Now()
+	}
+	state := directoryState{generation: 1, changedAt: changedAt}
+	f.directoryStates[name] = state
+	return state
+}
+
+func (f *Filesystem) directoryAttr(name string, attribute Attr) Attr {
+	cleaned := cleanPath(name)
+	initialTime := attribute.ChangeTime
+	if initialTime.IsZero() {
+		initialTime = attribute.ModTime
+	}
+	f.mu.Lock()
+	state := f.ensureDirectoryStateLocked(cleaned, initialTime)
+	f.mu.Unlock()
+	if attribute.ObjectID == "" {
+		attribute.ObjectID = "synthetic:" + cleaned
+	}
+	attribute.DirectoryGeneration = state.generation
+	if attribute.ModTime.IsZero() || attribute.ModTime.Before(state.changedAt) {
+		attribute.ModTime = state.changedAt
+	}
+	if attribute.ChangeTime.IsZero() || attribute.ChangeTime.Before(state.changedAt) {
+		attribute.ChangeTime = state.changedAt
+	}
+	if attribute.AccessTime.IsZero() {
+		attribute.AccessTime = state.changedAt
+	}
+	return attribute
 }
 
 func (f *Filesystem) SetNativeRoot(root string) {
@@ -123,6 +348,114 @@ func (f *Filesystem) SetNativeRoot(root string) {
 	f.mu.Unlock()
 }
 
+// SetNativeNamespaceRefreshMount installs the mounted namespace used by the
+// Darwin watcher to repair a negative kernel lookup after an external native
+// path appears. It never changes where session bytes are stored.
+func (f *Filesystem) SetNativeNamespaceRefreshMount(mount string) {
+	if mount != "" {
+		mount = filepath.Clean(mount)
+	}
+	f.mu.Lock()
+	f.nativeNamespaceRefreshMount = mount
+	f.mu.Unlock()
+}
+
+func (f *Filesystem) nativeNamespaceRefreshMountPath() string {
+	f.mu.RLock()
+	mount := f.nativeNamespaceRefreshMount
+	f.mu.RUnlock()
+	return mount
+}
+
+func (f *Filesystem) beginNativeNamespaceRefresh(name string) func() {
+	cleaned := cleanPath(name)
+	if cleaned == "" || !canonicalNamespacePath(cleaned) {
+		return func() {}
+	}
+	f.mu.Lock()
+	if f.nativeNamespaceRefreshInFlight == nil {
+		f.nativeNamespaceRefreshInFlight = make(map[string]uint32)
+	}
+	f.nativeNamespaceRefreshInFlight[cleaned]++
+	f.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			f.mu.Lock()
+			if count := f.nativeNamespaceRefreshInFlight[cleaned]; count <= 1 {
+				delete(f.nativeNamespaceRefreshInFlight, cleaned)
+			} else {
+				f.nativeNamespaceRefreshInFlight[cleaned] = count - 1
+			}
+			f.mu.Unlock()
+		})
+	}
+}
+
+func (f *Filesystem) nativeNamespaceRefreshActive(name string) bool {
+	cleaned := cleanPath(name)
+	if cleaned == "" {
+		return false
+	}
+	f.mu.RLock()
+	active := f.nativeNamespaceRefreshInFlight[cleaned] != 0
+	f.mu.RUnlock()
+	return active
+}
+
+func (f *Filesystem) refreshNativeNamespacePath(name string, directory bool) error {
+	cleaned := cleanPath(name)
+	if cleaned == "" || !canonicalNamespacePath(cleaned) {
+		return nil
+	}
+	mount := f.nativeNamespaceRefreshMountPath()
+	if mount == "" {
+		return nil
+	}
+	f.mu.RLock()
+	root := f.nativeRoot
+	f.mu.RUnlock()
+	if root == "" {
+		return nil
+	}
+	nativePath := nativePathFromRoot(root, cleaned)
+	info, err := os.Lstat(nativePath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if info.IsDir() != directory {
+		return nil
+	}
+	release := f.beginNativeNamespaceRefresh(cleaned)
+	defer release()
+	mountedPath := nativePathFromRoot(mount, cleaned)
+	if directory {
+		err = os.Mkdir(mountedPath, 0o700)
+	} else {
+		var file *os.File
+		file, err = os.OpenFile(mountedPath, os.O_RDONLY|os.O_CREATE, 0)
+		if file != nil {
+			closeErr := file.Close()
+			if err == nil {
+				err = closeErr
+			}
+		}
+	}
+	if err == nil && !directory {
+		return nil
+	}
+	if err == nil {
+		return fmt.Errorf("native namespace refresh unexpectedly created %s", cleaned)
+	}
+	if errors.Is(err, os.ErrExist) || errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
+}
+
 func (f *Filesystem) RecoverNativeAppendTransactions() error {
 	f.mu.RLock()
 	root := f.nativeRoot
@@ -141,60 +474,93 @@ func (f *Filesystem) RecoverNativeAppendTransactions() error {
 }
 
 func (f *Filesystem) AddSession(sessionID string, session *vfs.Session) error {
+	return f.AddSessionOwned(sessionID, session, nil)
+}
+
+// AddSessionOwned transfers ownership of closer to the filesystem, including
+// when validation or insertion fails.
+func (f *Filesystem) AddSessionOwned(sessionID string, session *vfs.Session, closer io.Closer) error {
+	owner := newSessionOwner(closer)
 	if sessionID == "" || strings.ContainsAny(sessionID, "/\\\x00") || session == nil {
-		return errors.New("safe session ID and session are required")
+		return errors.Join(errors.New("safe session ID and session are required"), owner.retire())
 	}
 	f.mu.Lock()
 	if _, exists := f.sessions[sessionID]; exists {
 		f.mu.Unlock()
-		return errors.New("session is already mounted")
+		return errors.Join(errors.New("session is already mounted"), owner.retire())
 	}
 	f.sessions[sessionID] = session
+	f.owners[sessionID] = owner
 	f.mu.Unlock()
 	f.bumpNamespaceVersion()
 	return nil
 }
 
 func (f *Filesystem) UpsertSession(sessionID string, session *vfs.Session) error {
+	return f.UpsertSessionOwned(sessionID, session, nil)
+}
+
+// UpsertSessionOwned transfers ownership of closer to the filesystem. An old
+// owner is retired after the replacement becomes visible and stays alive only
+// while existing file handles still reference it.
+func (f *Filesystem) UpsertSessionOwned(sessionID string, session *vfs.Session, closer io.Closer) error {
+	owner := newSessionOwner(closer)
 	if sessionID == "" || strings.ContainsAny(sessionID, "/\\\x00") || session == nil {
-		return errors.New("safe session ID and session are required")
+		return errors.Join(errors.New("safe session ID and session are required"), owner.retire())
 	}
 	f.mu.Lock()
+	previous := f.owners[sessionID]
 	f.sessions[sessionID] = session
+	f.owners[sessionID] = owner
+	f.mu.Unlock()
+	f.bumpNamespaceVersion()
+	return previous.retire()
+}
+
+func (f *Filesystem) AddSessionAt(sessionID string, name string, session *vfs.Session) error {
+	return f.AddSessionAtOwned(sessionID, name, session, nil)
+}
+
+// AddSessionAtOwned is the canonical-namespace form of AddSessionOwned.
+func (f *Filesystem) AddSessionAtOwned(sessionID string, name string, session *vfs.Session, closer io.Closer) error {
+	owner := newSessionOwner(closer)
+	cleaned := cleanPath(name)
+	if !f.canonical || !safeSessionID(sessionID) || session == nil || !canonicalSessionPath(cleaned) {
+		return errors.Join(errors.New("canonical filesystem, safe session ID, path, and session are required"), owner.retire())
+	}
+	f.mu.Lock()
+	if _, exists := f.sessions[sessionID]; exists {
+		f.mu.Unlock()
+		return errors.Join(errors.New("session is already mounted"), owner.retire())
+	}
+	if _, exists := f.paths[cleaned]; exists {
+		f.mu.Unlock()
+		return errors.Join(errors.New("session path is already mounted"), owner.retire())
+	}
+	f.ensureDirectoryChainLocked(path.Dir(cleaned))
+	f.sessions[sessionID] = session
+	f.owners[sessionID] = owner
+	f.paths[cleaned] = sessionID
+	f.bumpDirectoryGenerationLocked(path.Dir(cleaned), time.Now())
+	delete(f.nativeFirst, sessionID)
+	f.registerRetainedPathLocked(sessionID, session)
 	f.mu.Unlock()
 	f.bumpNamespaceVersion()
 	return nil
 }
 
-func (f *Filesystem) AddSessionAt(sessionID string, name string, session *vfs.Session) error {
-	cleaned := cleanPath(name)
-	if !f.canonical || !safeSessionID(sessionID) || session == nil || !canonicalSessionPath(cleaned) {
-		return errors.New("canonical filesystem, safe session ID, path, and session are required")
-	}
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if _, exists := f.sessions[sessionID]; exists {
-		return errors.New("session is already mounted")
-	}
-	if _, exists := f.paths[cleaned]; exists {
-		return errors.New("session path is already mounted")
-	}
-	f.ensureDirectoryChainLocked(path.Dir(cleaned))
-	f.sessions[sessionID] = session
-	f.paths[cleaned] = sessionID
-	delete(f.nativeFirst, sessionID)
-	f.registerRetainedPathLocked(sessionID, session)
-	f.bumpNamespaceVersion()
-	return nil
+func (f *Filesystem) UpsertSessionAt(sessionID string, name string, session *vfs.Session) error {
+	return f.UpsertSessionAtOwned(sessionID, name, session, nil)
 }
 
-func (f *Filesystem) UpsertSessionAt(sessionID string, name string, session *vfs.Session) error {
+// UpsertSessionAtOwned is the canonical-namespace form of UpsertSessionOwned.
+func (f *Filesystem) UpsertSessionAtOwned(sessionID string, name string, session *vfs.Session, closer io.Closer) error {
+	owner := newSessionOwner(closer)
 	cleaned := cleanPath(name)
 	if !f.canonical || !safeSessionID(sessionID) || session == nil || !canonicalSessionPath(cleaned) {
-		return errors.New("canonical filesystem, safe session ID, path, and session are required")
+		return errors.Join(errors.New("canonical filesystem, safe session ID, path, and session are required"), owner.retire())
 	}
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.ensureDirectoryChainLocked(path.Dir(cleaned))
 	var previousPath string
 	for route, currentID := range f.paths {
@@ -207,14 +573,25 @@ func (f *Filesystem) UpsertSessionAt(sessionID string, name string, session *vfs
 		if previousPath != "" {
 			f.paths[previousPath] = sessionID
 		}
-		return err
+		f.mu.Unlock()
+		return errors.Join(err, owner.retire())
 	}
+	previous := f.owners[sessionID]
 	f.sessions[sessionID] = session
+	f.owners[sessionID] = owner
 	f.paths[cleaned] = sessionID
+	if previousPath != cleaned {
+		now := time.Now()
+		if previousPath != "" {
+			f.bumpDirectoryGenerationLocked(path.Dir(previousPath), now)
+		}
+		f.bumpDirectoryGenerationLocked(path.Dir(cleaned), now)
+	}
 	delete(f.nativeFirst, sessionID)
 	f.registerRetainedPathLocked(sessionID, session)
+	f.mu.Unlock()
 	f.bumpNamespaceVersion()
-	return nil
+	return previous.retire()
 }
 
 func (f *Filesystem) MoveSessionAt(sessionID string, name string) error {
@@ -242,6 +619,13 @@ func (f *Filesystem) MoveSessionAt(sessionID string, name string) error {
 		return err
 	}
 	f.paths[cleaned] = sessionID
+	if previousPath != cleaned {
+		now := time.Now()
+		if previousPath != "" {
+			f.bumpDirectoryGenerationLocked(path.Dir(previousPath), now)
+		}
+		f.bumpDirectoryGenerationLocked(path.Dir(cleaned), now)
+	}
 	f.bumpNamespaceVersion()
 	return nil
 }
@@ -264,15 +648,18 @@ func (f *Filesystem) RemoveSession(sessionID string) error {
 		return errors.New("safe session ID is required")
 	}
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	if _, exists := f.sessions[sessionID]; !exists {
+		f.mu.Unlock()
 		return os.ErrNotExist
 	}
+	owner := f.owners[sessionID]
 	delete(f.sessions, sessionID)
+	delete(f.owners, sessionID)
 	delete(f.nativeFirst, sessionID)
 	for route, currentID := range f.paths {
 		if currentID == sessionID {
 			delete(f.paths, route)
+			f.bumpDirectoryGenerationLocked(path.Dir(route), time.Now())
 		}
 	}
 	for retained, currentID := range f.retained {
@@ -280,11 +667,52 @@ func (f *Filesystem) RemoveSession(sessionID string) error {
 			delete(f.retained, retained)
 		}
 	}
+	f.mu.Unlock()
 	f.bumpNamespaceVersion()
-	return nil
+	return owner.retire()
+}
+
+// CloseSessions retires every mounted session owner. Resources referenced by
+// already-open file handles remain valid until those handles are released.
+func (f *Filesystem) CloseSessions() error {
+	f.mu.Lock()
+	owners := make([]*sessionOwner, 0, len(f.owners))
+	for _, owner := range f.owners {
+		owners = append(owners, owner)
+	}
+	f.sessions = make(map[string]*vfs.Session)
+	f.owners = make(map[string]*sessionOwner)
+	for route := range f.paths {
+		f.bumpDirectoryGenerationLocked(path.Dir(route), time.Now())
+		delete(f.paths, route)
+	}
+	for retained := range f.retained {
+		delete(f.retained, retained)
+	}
+	for sessionID := range f.nativeFirst {
+		delete(f.nativeFirst, sessionID)
+	}
+	f.mu.Unlock()
+	f.bumpNamespaceVersion()
+	var result error
+	for _, owner := range owners {
+		result = errors.Join(result, owner.retire())
+	}
+	return result
 }
 
 func (f *Filesystem) SetSessionLoader(loader func(string) (*vfs.Session, error)) {
+	if loader == nil {
+		f.SetOwnedSessionLoader(nil)
+		return
+	}
+	f.SetOwnedSessionLoader(func(sessionID string) (*vfs.Session, io.Closer, error) {
+		session, err := loader(sessionID)
+		return session, nil, err
+	})
+}
+
+func (f *Filesystem) SetOwnedSessionLoader(loader func(string) (*vfs.Session, io.Closer, error)) {
 	f.mu.Lock()
 	f.loader = loader
 	f.mu.Unlock()
@@ -365,10 +793,10 @@ func (f *Filesystem) Getattr(name string) (Attr, syscall.Errno) {
 	if cleaned == "/" {
 		if nativePath, ok := f.nativeMetadataPath(cleaned); ok {
 			if info, err := os.Lstat(nativePath); err == nil {
-				return attrFromFileInfo(info, 0), 0
+				return f.directoryAttr(cleaned, attrFromFileInfo(info, 0)), 0
 			}
 		}
-		return syntheticAttr(syscall.S_IFDIR | 0o700), 0
+		return f.directoryAttr(cleaned, syntheticAttr(syscall.S_IFDIR|0o700)), 0
 	}
 	if f.canonical {
 		f.mu.RLock()
@@ -377,36 +805,40 @@ func (f *Filesystem) Getattr(name string) (Attr, syscall.Errno) {
 		if directory {
 			if nativePath, ok := f.nativeMetadataPath(cleaned); ok {
 				if info, err := os.Lstat(nativePath); err == nil {
-					return attrFromFileInfo(info, 0), 0
+					return f.directoryAttr(cleaned, attrFromFileInfo(info, 0)), 0
 				}
 			}
-			return syntheticAttr(syscall.S_IFDIR | 0o700), 0
+			return f.directoryAttr(cleaned, syntheticAttr(syscall.S_IFDIR|0o700)), 0
 		}
-		if session, errno := f.sessionForPath(cleaned); errno == 0 {
-			return sessionAttr(session)
+		if session, _, errno := f.sessionForPath(cleaned); errno == 0 {
+			return sessionAttr(session, f.managedObjectID(cleaned))
 		}
 		if nativePath, ok := f.nativePath(cleaned); ok {
 			info, err := os.Lstat(nativePath)
 			if err == nil {
 				size := info.Size()
 				if state := f.nativeAppendState(nativePath); state != nil {
-					size = state.VisibleSize()
+					size = state.VisibleSizeForBacking(size)
 				}
-				return attrFromFileInfo(info, size), 0
+				attribute := attrFromFileInfo(info, size)
+				if info.IsDir() {
+					attribute = f.directoryAttr(cleaned, attribute)
+				}
+				return attribute, 0
 			}
 			if !errors.Is(err, os.ErrNotExist) {
 				return Attr{}, errnoFor(err)
 			}
 		}
 	}
-	session, errno := f.sessionForPath(cleaned)
+	session, _, errno := f.sessionForPath(cleaned)
 	if errno != 0 {
 		return Attr{}, errno
 	}
-	return sessionAttr(session)
+	return sessionAttr(session, "")
 }
 
-func sessionAttr(session *vfs.Session) (Attr, syscall.Errno) {
+func sessionAttr(session *vfs.Session, objectID string) (Attr, syscall.Errno) {
 	info, err := session.VisibleInfo()
 	if err != nil {
 		return Attr{}, errnoFor(err)
@@ -415,7 +847,19 @@ func sessionAttr(session *vfs.Session) (Attr, syscall.Errno) {
 	if err != nil {
 		return Attr{}, errnoFor(err)
 	}
-	return attrFromFileInfo(metadata, info.Size), 0
+	attribute := attrFromFileInfo(metadata, info.Size)
+	attribute.ObjectID = objectID
+	return attribute, 0
+}
+
+func (f *Filesystem) managedObjectID(name string) string {
+	f.mu.RLock()
+	sessionID := f.paths[name]
+	f.mu.RUnlock()
+	if sessionID == "" {
+		return ""
+	}
+	return "managed:" + sessionID
 }
 
 func (f *Filesystem) SetAttributes(name string, request SetAttrRequest) syscall.Errno {
@@ -514,10 +958,8 @@ func (f *Filesystem) ListXattrs(name string) ([]string, syscall.Errno) {
 }
 
 func syntheticAttr(mode uint32) Attr {
-	now := time.Now()
 	return Attr{
 		Mode: mode, UID: uint32(os.Getuid()), GID: uint32(os.Getgid()),
-		ModTime: now, ChangeTime: now, AccessTime: now,
 	}
 }
 
@@ -538,11 +980,12 @@ func attrFromFileInfo(info os.FileInfo, size int64) Attr {
 	return Attr{
 		Mode: mode, UID: uid, GID: gid, Size: size,
 		ModTime: info.ModTime(), ChangeTime: changeTime, AccessTime: accessTime,
+		ObjectID: fileObjectIdentity(info),
 	}
 }
 
 func (f *Filesystem) Open(name string, flags int) (uint64, syscall.Errno) {
-	session, errno := f.sessionForPath(name)
+	session, owner, errno := f.acquireSessionForPath(name)
 	if errno != 0 {
 		if !f.canonical {
 			return 0, errno
@@ -584,7 +1027,13 @@ func (f *Filesystem) Open(name string, flags int) (uint64, syscall.Errno) {
 		f.mu.Unlock()
 		return handleID, 0
 	}
-	handle := &fileHandle{path: cleanPath(name), session: session, append: flags&os.O_APPEND != 0}
+	releaseOwner := true
+	defer func() {
+		if releaseOwner {
+			_ = owner.release()
+		}
+	}()
+	handle := &fileHandle{path: cleanPath(name), session: session, owner: owner, append: flags&os.O_APPEND != 0}
 	access := flags & (os.O_WRONLY | os.O_RDWR)
 	if access != os.O_WRONLY {
 		reader, err := session.OpenReader()
@@ -617,10 +1066,13 @@ func (f *Filesystem) Open(name string, flags int) (uint64, syscall.Errno) {
 	f.next++
 	f.handles[handleID] = handle
 	f.mu.Unlock()
+	releaseOwner = false
 	return handleID, 0
 }
 
 func (f *Filesystem) Read(handleID uint64, destination []byte, offset int64) (int, syscall.Errno) {
+	endIO := f.beginIO()
+	defer endIO()
 	handle, errno := f.handle(handleID)
 	if errno != 0 {
 		return 0, syscall.EBADF
@@ -644,7 +1096,148 @@ func (f *Filesystem) Read(handleID uint64, destination []byte, offset int64) (in
 	return n, 0
 }
 
+// StreamNativeRead exposes only a stable, ordinary native file range to the
+// Darwin FSKit transport. Virtual sessions and files with a pending append
+// deliberately return handled=false so the caller can use the normal buffered
+// path.
+func (f *Filesystem) StreamNativeRead(handleID uint64, offset int64, length int, stream func(*os.File, int64, int) (int, error)) (handled bool, n int, err error) {
+	if offset < 0 || length < 0 || stream == nil {
+		return true, 0, errors.New("invalid native stream read")
+	}
+	handle, errno := f.handle(handleID)
+	if errno != 0 {
+		return true, 0, errno
+	}
+	handle.mu.Lock()
+	defer handle.mu.Unlock()
+	if handle.native == nil || handle.nativeAppend == nil {
+		return false, 0, nil
+	}
+	info, statErr := handle.native.Stat()
+	if statErr != nil {
+		return true, 0, statErr
+	}
+	if !info.Mode().IsRegular() {
+		return false, 0, nil
+	}
+	if err := handle.nativeAppend.RefreshIfIdle(); err != nil {
+		return true, 0, err
+	}
+	n, err = handle.nativeAppend.StreamRead(handle.native, offset, length, stream)
+	if errors.Is(err, errNativeAppendPending) || errors.Is(err, errNativeReadStale) {
+		return false, 0, nil
+	}
+	return true, n, err
+}
+
+// StreamBufferedRead keeps the file handle stable while emitting a bounded
+// sequence of chunks. The callback receives the complete response length on
+// every call so transports can write their framing before the first chunk.
+func (f *Filesystem) StreamBufferedRead(handleID uint64, offset int64, length int, chunkBytes int, stream func(total int, chunk []byte) error) (n int, err error) {
+	if offset < 0 || length < 0 || chunkBytes <= 0 || stream == nil {
+		return 0, errors.New("invalid buffered stream read")
+	}
+	endIO := f.beginIO()
+	defer endIO()
+	handle, errno := f.handle(handleID)
+	if errno != 0 {
+		return 0, errno
+	}
+	handle.mu.Lock()
+	defer handle.mu.Unlock()
+
+	var size int64
+	if handle.native != nil {
+		if handle.nativeAppend == nil {
+			return 0, syscall.EBADF
+		}
+		if err := handle.nativeAppend.RefreshIfIdle(); err != nil {
+			return 0, err
+		}
+		size = handle.nativeAppend.VisibleSize()
+	} else {
+		if handle.read == nil {
+			return 0, syscall.EBADF
+		}
+		size = handle.read.Size()
+	}
+
+	total := length
+	if offset >= size {
+		total = 0
+	} else if remaining := size - offset; int64(total) > remaining {
+		total = int(remaining)
+	}
+	if total == 0 {
+		return 0, stream(0, nil)
+	}
+	if chunkBytes > total {
+		chunkBytes = total
+	}
+	buffer := make([]byte, chunkBytes)
+	for n < total {
+		need := min(len(buffer), total-n)
+		var count int
+		var readErr error
+		if handle.native != nil {
+			count, readErr = handle.nativeAppend.ReadAt(handle.native, buffer[:need], offset+int64(n))
+		} else {
+			count, readErr = handle.read.ReadAt(context.Background(), buffer[:need], offset+int64(n))
+		}
+		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			return n, readErr
+		}
+		if count <= 0 || count > need {
+			return n, io.ErrUnexpectedEOF
+		}
+		if err := stream(total, buffer[:count]); err != nil {
+			return n, err
+		}
+		n += count
+		if count != need {
+			return n, io.ErrUnexpectedEOF
+		}
+	}
+	return n, nil
+}
+
+// WithNativeReadFD keeps the handle and append-state locks held while the
+// caller transfers a read-only native descriptor to a cooperating transport.
+// The callback must not retain the *os.File; the receiver owns the duplicated
+// descriptor created by the OS descriptor-transfer operation.
+func (f *Filesystem) WithNativeReadFD(handleID uint64, send func(*os.File) error) (handled bool, err error) {
+	if send == nil {
+		return true, errors.New("native descriptor callback is required")
+	}
+	handle, errno := f.handle(handleID)
+	if errno != 0 {
+		return true, errno
+	}
+	handle.mu.Lock()
+	defer handle.mu.Unlock()
+	if handle.native == nil || handle.nativeAppend == nil {
+		return false, nil
+	}
+	if info, statErr := handle.native.Stat(); statErr != nil {
+		return true, statErr
+	} else if !info.Mode().IsRegular() {
+		return false, nil
+	}
+	if err := handle.nativeAppend.RefreshIfIdle(); err != nil {
+		return true, err
+	}
+	if _, err := handle.nativeAppend.StreamRead(handle.native, 0, 0, func(file *os.File, _ int64, _ int) (int, error) {
+		return 0, send(file)
+	}); errors.Is(err, errNativeAppendPending) || errors.Is(err, errNativeReadStale) {
+		return false, nil
+	} else {
+		return true, err
+	}
+}
+
 func (f *Filesystem) Write(handleID uint64, data []byte, offset int64) (int, syscall.Errno) {
+	endIO := f.beginIO()
+	defer endIO()
 	handle, errno := f.handle(handleID)
 	if errno != 0 {
 		return 0, syscall.EBADF
@@ -657,13 +1250,8 @@ func (f *Filesystem) Write(handleID uint64, data []byte, offset int64) (int, sys
 		if handle.append {
 			n, err = handle.nativeAppend.Stage(data, offset)
 		} else {
-			if handle.nativeAppend.HasPending() {
-				return 0, syscall.EBUSY
-			}
-			n, err = handle.native.WriteAt(data, offset)
-			if err == nil {
-				err = handle.nativeAppend.Refresh()
-			}
+			f.markNativeInternalMutation(handle.nativePath)
+			n, err = handle.nativeAppend.WriteAt(handle.native, data, offset)
 		}
 		return n, errnoFor(err)
 	}
@@ -719,6 +1307,7 @@ func (f *Filesystem) UseRandomWrites(handleID uint64) syscall.Errno {
 	handle.mu.Lock()
 	defer handle.mu.Unlock()
 	if handle.native != nil && handle.append {
+		f.markNativeInternalMutation(handle.nativePath)
 		if err := handle.nativeAppend.Commit(); err != nil {
 			return errnoFor(err)
 		}
@@ -736,6 +1325,7 @@ func (f *Filesystem) Truncate(handleID uint64, size int64) syscall.Errno {
 	handle.mu.Lock()
 	defer handle.mu.Unlock()
 	if handle.native != nil {
+		f.markNativeInternalMutation(handle.nativePath)
 		return errnoFor(handle.nativeAppend.Truncate(size))
 	}
 	if handle.write == nil {
@@ -754,7 +1344,7 @@ func (f *Filesystem) Truncate(handleID uint64, size int64) syscall.Errno {
 }
 
 func (f *Filesystem) TruncatePath(name string, size int64) syscall.Errno {
-	session, errno := f.sessionForPath(name)
+	session, owner, errno := f.acquireSessionForPath(name)
 	if errno != 0 {
 		if f.canonical {
 			if nativePath, ok := f.nativePath(cleanPath(name)); ok {
@@ -762,11 +1352,13 @@ func (f *Filesystem) TruncatePath(name string, size int64) syscall.Errno {
 				if err != nil {
 					return errnoFor(err)
 				}
+				f.markNativeInternalMutation(nativePath)
 				return errnoFor(state.Truncate(size))
 			}
 		}
 		return errno
 	}
+	defer owner.release()
 	if handle := f.lockActiveWriter(session); handle != nil {
 		defer handle.mu.Unlock()
 		if err := handle.write.Truncate(context.Background(), size); err != nil {
@@ -827,6 +1419,7 @@ func (f *Filesystem) Fsync(handleID uint64) syscall.Errno {
 	defer handle.mu.Unlock()
 	if handle.native != nil {
 		if handle.append {
+			f.markNativeInternalMutation(handle.nativePath)
 			return errnoFor(handle.nativeAppend.CommitAvailable())
 		}
 		return errnoFor(handle.native.Sync())
@@ -845,6 +1438,7 @@ func (f *Filesystem) Flush(handleID uint64) syscall.Errno {
 	handle.mu.Lock()
 	defer handle.mu.Unlock()
 	if handle.native != nil && handle.append {
+		f.markNativeInternalMutation(handle.nativePath)
 		if f.nativeAppendIsLastWriter(handleID, handle.nativeAppend) {
 			return errnoFor(handle.nativeAppend.Commit())
 		}
@@ -870,6 +1464,7 @@ func (f *Filesystem) Release(handleID uint64) syscall.Errno {
 	if handle.native != nil {
 		var commitErr error
 		if handle.append {
+			f.markNativeInternalMutation(handle.nativePath)
 			if lastNativeWriter {
 				commitErr = handle.nativeAppend.Commit()
 			} else {
@@ -878,18 +1473,19 @@ func (f *Filesystem) Release(handleID uint64) syscall.Errno {
 		}
 		return errnoFor(errors.Join(commitErr, handle.native.Close()))
 	}
-	var result syscall.Errno
+	var result error
 	if handle.read != nil {
 		if err := handle.read.Close(); err != nil {
-			result = errnoFor(err)
+			result = errors.Join(result, err)
 		}
 	}
 	if handle.write != nil {
-		if err := handle.write.Close(); err != nil && result == 0 {
-			result = errnoFor(err)
+		if err := handle.write.Close(); err != nil {
+			result = errors.Join(result, err)
 		}
 	}
-	return result
+	result = errors.Join(result, handle.owner.release())
+	return errnoFor(result)
 }
 
 func (f *Filesystem) nativeAppendIsLastWriter(handleID uint64, state *nativeAppendState) bool {
@@ -953,6 +1549,8 @@ func (f *Filesystem) Mkdir(name string, _ uint32) syscall.Errno {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.directories[cleaned] = struct{}{}
+	f.ensureDirectoryStateLocked(cleaned, time.Now())
+	f.bumpDirectoryGenerationLocked(path.Dir(cleaned), time.Now())
 	f.bumpNamespaceVersion()
 	return 0
 }
@@ -972,10 +1570,6 @@ func (f *Filesystem) Rename(oldName string, newName string) syscall.Errno {
 		if _, hidden := f.retained[oldPath]; hidden {
 			f.mu.Unlock()
 			return syscall.ENOENT
-		}
-		if f.nativePathBusyLocked(oldPath) && !openUnlinkRename {
-			f.mu.Unlock()
-			return syscall.EBUSY
 		}
 		root := f.nativeRoot
 		oldNative := nativePathFromRoot(root, oldPath)
@@ -1027,6 +1621,11 @@ func (f *Filesystem) Rename(oldName string, newName string) syscall.Errno {
 	}
 	delete(f.paths, oldPath)
 	f.paths[newPath] = sessionID
+	now := time.Now()
+	f.bumpDirectoryGenerationLocked(path.Dir(oldPath), now)
+	if path.Dir(newPath) != path.Dir(oldPath) {
+		f.bumpDirectoryGenerationLocked(path.Dir(newPath), now)
+	}
 	for _, handle := range f.handles {
 		if handle.path == oldPath {
 			handle.path = newPath
@@ -1050,6 +1649,7 @@ func (f *Filesystem) Unlink(name string) syscall.Errno {
 			f.mu.Lock()
 			delete(f.paths, cleaned)
 			delete(f.retained, cleaned)
+			f.bumpDirectoryGenerationLocked(path.Dir(cleaned), time.Now())
 			f.mu.Unlock()
 			f.bumpNamespaceVersion()
 			return 0
@@ -1098,6 +1698,8 @@ func (f *Filesystem) Rmdir(name string) syscall.Errno {
 	}
 	f.mu.Lock()
 	delete(f.directories, cleaned)
+	delete(f.directoryStates, cleaned)
+	f.bumpDirectoryGenerationLocked(path.Dir(cleaned), time.Now())
 	f.mu.Unlock()
 	f.bumpNamespaceVersion()
 	return 0
@@ -1168,66 +1770,92 @@ func (f *Filesystem) nativePathBusyLocked(name string) bool {
 	return false
 }
 
-func (f *Filesystem) sessionForPath(name string) (*vfs.Session, syscall.Errno) {
+func (f *Filesystem) sessionForPath(name string) (*vfs.Session, *sessionOwner, syscall.Errno) {
 	cleaned := cleanPath(name)
 	if f.canonical {
 		f.mu.RLock()
 		sessionID := f.paths[cleaned]
 		session := f.sessions[sessionID]
+		owner := f.owners[sessionID]
 		_, nativeFirst := f.nativeFirst[sessionID]
 		root := f.nativeRoot
 		_, retained := f.retained[cleaned]
 		f.mu.RUnlock()
 		if session == nil {
-			return nil, syscall.ENOENT
+			return nil, nil, syscall.ENOENT
 		}
 		if nativeFirst && root != "" && !retained {
 			if info, err := os.Stat(nativePathFromRoot(root, cleaned)); err == nil && !info.IsDir() {
-				return nil, syscall.ENOENT
+				return nil, nil, syscall.ENOENT
 			}
 		}
-		return session, 0
+		return session, owner, 0
 	}
 	if cleaned == "/" || strings.Count(cleaned, "/") != 1 || !strings.HasSuffix(cleaned, ".jsonl") {
-		return nil, syscall.ENOENT
+		return nil, nil, syscall.ENOENT
 	}
 	sessionID := strings.TrimSuffix(strings.TrimPrefix(cleaned, "/"), ".jsonl")
 	f.mu.RLock()
 	session := f.sessions[sessionID]
+	owner := f.owners[sessionID]
 	loader := f.loader
 	f.mu.RUnlock()
 	if session != nil {
-		return session, 0
+		return session, owner, 0
 	}
 	if loader == nil {
-		return nil, syscall.ENOENT
+		return nil, nil, syscall.ENOENT
 	}
 	f.loadMu.Lock()
 	defer f.loadMu.Unlock()
 	f.mu.RLock()
 	session = f.sessions[sessionID]
+	owner = f.owners[sessionID]
 	loader = f.loader
 	f.mu.RUnlock()
 	if session != nil {
-		return session, 0
+		return session, owner, 0
 	}
 	if loader == nil {
-		return nil, syscall.ENOENT
+		return nil, nil, syscall.ENOENT
 	}
-	loaded, err := loader(sessionID)
+	loaded, closer, err := loader(sessionID)
 	if err != nil {
-		return nil, errnoFor(err)
+		return nil, nil, errnoFor(err)
 	}
 	if loaded == nil {
-		return nil, syscall.EIO
+		_ = newSessionOwner(closer).retire()
+		return nil, nil, syscall.EIO
 	}
+	loadedOwner := newSessionOwner(closer)
 	f.mu.Lock()
 	if session = f.sessions[sessionID]; session == nil {
 		f.sessions[sessionID] = loaded
+		f.owners[sessionID] = loadedOwner
 		session = loaded
+		owner = loadedOwner
+		loadedOwner = nil
+	} else {
+		owner = f.owners[sessionID]
 	}
 	f.mu.Unlock()
-	return session, 0
+	if err := loadedOwner.retire(); err != nil {
+		return nil, nil, errnoFor(err)
+	}
+	return session, owner, 0
+}
+
+func (f *Filesystem) acquireSessionForPath(name string) (*vfs.Session, *sessionOwner, syscall.Errno) {
+	for attempt := 0; attempt < 4; attempt++ {
+		session, owner, errno := f.sessionForPath(name)
+		if errno != 0 {
+			return nil, nil, errno
+		}
+		if owner != nil && owner.acquire() {
+			return session, owner, 0
+		}
+	}
+	return nil, nil, syscall.EAGAIN
 }
 
 func safeSessionID(sessionID string) bool {
@@ -1296,11 +1924,24 @@ func moveManagedXattrCarrier(root string, oldPath string, newPath string) error 
 }
 
 func (f *Filesystem) ensureDirectoryChainLocked(directory string) {
+	chain := make([]string, 0, strings.Count(directory, "/"))
 	for directory != "." && directory != "/" && directory != "" {
-		f.directories[directory] = struct{}{}
+		chain = append(chain, directory)
 		directory = path.Dir(directory)
 	}
 	f.directories["/"] = struct{}{}
+	f.ensureDirectoryStateLocked("/", time.Now())
+	now := time.Now()
+	for index := len(chain) - 1; index >= 0; index-- {
+		current := chain[index]
+		if _, exists := f.directories[current]; exists {
+			f.ensureDirectoryStateLocked(current, now)
+			continue
+		}
+		f.directories[current] = struct{}{}
+		f.ensureDirectoryStateLocked(current, now)
+		f.bumpDirectoryGenerationLocked(path.Dir(current), now)
+	}
 }
 
 func (f *Filesystem) handle(handleID uint64) (*fileHandle, syscall.Errno) {
@@ -1351,7 +1992,7 @@ func (f *Filesystem) nativeMetadataPath(name string) (string, bool) {
 
 func (f *Filesystem) metadataPath(name string) (string, bool, syscall.Errno) {
 	cleaned := cleanPath(name)
-	if session, errno := f.sessionForPath(cleaned); errno == 0 {
+	if session, _, errno := f.sessionForPath(cleaned); errno == 0 {
 		return session.MetadataPath(), true, 0
 	}
 	if nativePath, ok := f.nativeMetadataPath(cleaned); ok {
@@ -1365,7 +2006,7 @@ func (f *Filesystem) metadataPath(name string) (string, bool, syscall.Errno) {
 
 func (f *Filesystem) xattrPath(name string, create bool) (string, bool, syscall.Errno) {
 	cleaned := cleanPath(name)
-	if _, errno := f.sessionForPath(cleaned); errno == 0 {
+	if _, _, errno := f.sessionForPath(cleaned); errno == 0 {
 		f.mu.RLock()
 		root := f.nativeRoot
 		f.mu.RUnlock()
@@ -1437,6 +2078,8 @@ func errnoFor(err error) syscall.Errno {
 	}
 	switch {
 	case errors.Is(err, vfs.ErrWriterBusy):
+		return syscall.EBUSY
+	case errors.Is(err, errNativeAppendPending):
 		return syscall.EBUSY
 	case errors.Is(err, os.ErrNotExist):
 		return syscall.ENOENT

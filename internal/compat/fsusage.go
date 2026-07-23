@@ -2,6 +2,7 @@ package compat
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -31,11 +32,10 @@ func ParseFSUsage(reader io.Reader, options ContractOptions) (Contract, error) {
 		line := scanner.Bytes()
 		_, _ = hasher.Write(line)
 		_, _ = hasher.Write([]byte{'\n'})
-		match := operationPattern.FindSubmatch(line)
-		if len(match) == 0 {
+		name := fsUsageOperationName(line)
+		if name == "" {
 			continue
 		}
-		name := strings.ToLower(string(match[1]))
 		if counts[name] == 0 {
 			names = append(names, name)
 		}
@@ -70,4 +70,47 @@ func ParseFSUsage(reader io.Reader, options ContractOptions) (Contract, error) {
 		return Contract{}, err
 	}
 	return contract, nil
+}
+
+func fsUsageOperationName(line []byte) string {
+	fields := bytes.Fields(line)
+	if len(fields) > 1 {
+		token := strings.ToLower(string(fields[1]))
+		if strings.HasPrefix(token, "operation=") {
+			return nativeFSKitOperationName(strings.TrimPrefix(token, "operation="))
+		}
+		if strings.HasPrefix(token, "io=") {
+			return ""
+		}
+		switch {
+		case token == "rddata" || strings.HasPrefix(token, "rddata["):
+			return "read"
+		case token == "wrdata" || strings.HasPrefix(token, "wrdata["):
+			return "write"
+		case token == "getdirentries64":
+			return "readdir"
+		case token == "statfs64" || token == "fstatfs64":
+			return "statfs"
+		case token == "fstatat64":
+			return "fstat"
+		case token == "open_dprotected":
+			return "open"
+		}
+	}
+	match := operationPattern.FindSubmatch(line)
+	if len(match) == 0 {
+		return ""
+	}
+	return strings.ToLower(string(match[1]))
+}
+
+func nativeFSKitOperationName(name string) string {
+	if name == "sync" {
+		return "fsync"
+	}
+	match := operationPattern.FindStringSubmatch(name)
+	if len(match) == 0 || match[0] != name {
+		return ""
+	}
+	return strings.ToLower(match[1])
 }

@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -24,47 +25,74 @@ import (
 )
 
 type NativeFSKitServerOptions struct {
-	SocketPath   string
-	ResourcePath string
-	Token        []byte
-	Generation   uint64
-	MaxPayload   uint32
-	BuildSHA256  string
-	Recorder     func(string)
+	SocketPath                 string
+	ResourcePath               string
+	Token                      []byte
+	Generation                 uint64
+	MaxPayload                 uint32
+	BuildSHA256                string
+	Recorder                   func(string)
+	PrewarmSharedMemoryWindows int
+	PrewarmSharedFileWindows   int
 }
 
+const (
+	nativeFSKitBufferedReadChunkBytes = 4 << 20
+	nativeFSKitSocketBufferBytes      = 4 << 20
+	nativeFSKitSharedReadMinimumBytes = 4 << 20
+	nativeFSKitSharedWindowBytes      = 16 << 20
+	nativeFSKitMaximumPrewarmWindows  = 4
+)
+
 type nativeFSKitServer struct {
-	filesystem *Filesystem
-	token      []byte
-	generation uint64
-	maxPayload uint32
-	recorder   func(string)
-	health     []byte
-	startedAt  time.Time
-	nodes      nativeFSKitNodes
+	filesystem          *Filesystem
+	token               []byte
+	generation          uint64
+	maxPayload          uint32
+	recorder            func(string)
+	health              []byte
+	startedAt           time.Time
+	nodes               nativeFSKitNodes
+	sharedMemoryWindows nativeSharedFileWindowPool
+	sharedFileWindows   nativeSharedFileWindowPool
+}
+
+type nativeSharedFileWindowPool struct {
+	mu          sync.Mutex
+	windows     []*nativeSharedReadWindow
+	limit       int
+	windowBytes int
 }
 
 type nativeFSKitNodes struct {
 	mu      sync.Mutex
 	version uint64
 	next    uint64
-	byPath  map[string]uint64
+	byPath  map[string]nativeFSKitNode
+}
+
+type nativeFSKitNode struct {
+	id       uint64
+	objectID string
 }
 
 type nativeFSKitConnection struct {
-	server     *nativeFSKitServer
-	conn       net.Conn
-	handles    map[uint64]*nativeFSKitHandle
-	nextHandle uint64
+	server       *nativeFSKitServer
+	conn         net.Conn
+	handles      map[uint64]*nativeFSKitHandle
+	nextHandle   uint64
+	capabilities uint32
 }
 
 type nativeFSKitHandle struct {
-	coreHandle    uint64
-	path          string
-	flags         int
-	snapshotWrite bool
-	snapshotFloor int64
-	health        bool
+	coreHandle       uint64
+	path             string
+	flags            int
+	snapshotWrite    bool
+	snapshotFloor    int64
+	health           bool
+	sharedWindow     *nativeSharedReadWindow
+	sharedWindowFlag uint32
 }
 
 func ServeNativeFSKit(ctx context.Context, filesystem *Filesystem, options NativeFSKitServerOptions) error {
@@ -88,6 +116,12 @@ func ServeNativeFSKit(ctx context.Context, filesystem *Filesystem, options Nativ
 	}
 	if options.MaxPayload == 0 {
 		options.MaxPayload = fskitproto.DefaultMaxPayload
+	}
+	if options.PrewarmSharedMemoryWindows < 0 || options.PrewarmSharedMemoryWindows > nativeFSKitMaximumPrewarmWindows {
+		return fmt.Errorf("FSKit shared-memory window prewarm count must be between 0 and %d", nativeFSKitMaximumPrewarmWindows)
+	}
+	if options.PrewarmSharedFileWindows < 0 || options.PrewarmSharedFileWindows > nativeFSKitMaximumPrewarmWindows {
+		return fmt.Errorf("FSKit shared-file window prewarm count must be between 0 and %d", nativeFSKitMaximumPrewarmWindows)
 	}
 	if len(options.Token) == 0 {
 		options.Token = make([]byte, 32)
@@ -136,17 +170,6 @@ func ServeNativeFSKit(ctx context.Context, filesystem *Filesystem, options Nativ
 	if err := os.Chmod(options.SocketPath, 0o600); err != nil {
 		return fmt.Errorf("restrict FSKit socket: %w", err)
 	}
-	descriptor, err := fskitproto.EncodeDescriptor(fskitproto.Descriptor{
-		Generation: options.Generation,
-		SocketPath: options.SocketPath,
-		Token:      options.Token,
-	})
-	if err != nil {
-		return err
-	}
-	if err := writeNativeFSKitResource(options.ResourcePath, descriptor); err != nil {
-		return err
-	}
 	server := &nativeFSKitServer{
 		filesystem: filesystem,
 		token:      append([]byte(nil), options.Token...),
@@ -158,8 +181,31 @@ func ServeNativeFSKit(ctx context.Context, filesystem *Filesystem, options Nativ
 		nodes: nativeFSKitNodes{
 			version: filesystem.NamespaceVersion(),
 			next:    4,
-			byPath:  map[string]uint64{"/": 2},
+			byPath:  map[string]nativeFSKitNode{"/": {id: 2}},
 		},
+	}
+	windowBytes := min(nativeFSKitSharedWindowBytes, int(options.MaxPayload)-4)
+	if err := server.prewarmSharedMemoryWindows(options.PrewarmSharedMemoryWindows, windowBytes); err != nil {
+		server.record(fmt.Sprintf("io=shared_window_prewarm_error error=%q", err.Error()))
+	}
+	if err := server.prewarmSharedFileWindows(options.PrewarmSharedFileWindows, windowBytes); err != nil {
+		server.record(fmt.Sprintf("io=shared_file_window_prewarm_error error=%q", err.Error()))
+	}
+	defer func() {
+		if err := errors.Join(server.closePrewarmedSharedMemoryWindows(), server.closePrewarmedSharedFileWindows()); err != nil {
+			server.record(fmt.Sprintf("io=shared_file_window_pool_close_error error=%q", err.Error()))
+		}
+	}()
+	descriptor, err := fskitproto.EncodeDescriptor(fskitproto.Descriptor{
+		Generation: options.Generation,
+		SocketPath: options.SocketPath,
+		Token:      options.Token,
+	})
+	if err != nil {
+		return err
+	}
+	if err := writeNativeFSKitResource(options.ResourcePath, descriptor); err != nil {
+		return err
 	}
 	go func() {
 		<-ctx.Done()
@@ -173,8 +219,22 @@ func ServeNativeFSKit(ctx context.Context, filesystem *Filesystem, options Nativ
 			}
 			return fmt.Errorf("accept FSKit connection: %w", err)
 		}
+		if err := configureNativeFSKitSocket(connection); err != nil {
+			server.record(fmt.Sprintf("connection_buffer_error error=%q", err.Error()))
+		}
 		go (&nativeFSKitConnection{server: server, conn: connection, handles: make(map[uint64]*nativeFSKitHandle), nextHandle: 1}).serve()
 	}
+}
+
+func configureNativeFSKitSocket(connection net.Conn) error {
+	unixConnection, ok := connection.(*net.UnixConn)
+	if !ok {
+		return nil
+	}
+	return errors.Join(
+		unixConnection.SetReadBuffer(nativeFSKitSocketBufferBytes),
+		unixConnection.SetWriteBuffer(nativeFSKitSocketBufferBytes),
+	)
 }
 
 func removeStaleUnixSocket(socketPath string) error {
@@ -276,7 +336,34 @@ func (c *nativeFSKitConnection) serve() {
 		} else if request.Generation != c.server.generation {
 			response.Status = int32(syscall.ESTALE)
 		} else {
-			response.Payload, response.Status = c.dispatch(request.Op, request.Payload)
+			c.recordReadRequest(request.Payload, request.Op)
+			streamed, responseWritten, streamStatus, streamErr := c.streamRead(request)
+			if streamErr != nil {
+				if responseWritten {
+					return
+				}
+				response.Status = int32(errnoFor(streamErr))
+			} else if streamed && responseWritten {
+				c.server.record(fmt.Sprintf("operation=%s request=%d status=%d payload=%d", nativeFSKitOperationName(request.Op), request.RequestID, 0, len(request.Payload)))
+				continue
+			} else if streamed {
+				response.Status = streamStatus
+			} else {
+				response.Payload, response.Status = c.dispatch(request.Op, request.Payload)
+			}
+		}
+		if response.Status == 0 && request.Op == fskitproto.OpOpen && authenticated {
+			handled, responseWritten, transferErr := c.writeOpenResponseWithOptimizedFD(response)
+			if transferErr != nil {
+				if responseWritten {
+					return
+				}
+				response.Status = int32(errnoFor(transferErr))
+				response.Payload = nil
+			} else if handled && responseWritten {
+				c.server.record(fmt.Sprintf("operation=%s request=%d status=%d payload=%d", nativeFSKitOperationName(request.Op), request.RequestID, 0, len(request.Payload)))
+				continue
+			}
 		}
 		c.server.record(fmt.Sprintf("operation=%s request=%d status=%d payload=%d", nativeFSKitOperationName(request.Op), request.RequestID, response.Status, len(request.Payload)))
 		if err := fskitproto.WriteFrame(c.conn, response, c.server.maxPayload); err != nil {
@@ -288,16 +375,414 @@ func (c *nativeFSKitConnection) serve() {
 	}
 }
 
+// streamRead writes successful read responses without copying the payload
+// through the generic frame encoder. Stable native files use sendfile; virtual
+// files and pending native appends use bounded chunks.
+func (c *nativeFSKitConnection) streamRead(request fskitproto.Frame) (handled bool, responseWritten bool, status int32, err error) {
+	if request.Op != fskitproto.OpRead {
+		return false, false, 0, nil
+	}
+	decoder := fskitproto.NewDecoder(request.Payload)
+	handle, offset, length, errno := decodeRead(decoder, c.server.maxPayload)
+	if errno != 0 {
+		return false, false, 0, nil
+	}
+	handleState, exists := c.handles[handle]
+	if !exists || handleState.health {
+		return false, false, 0, nil
+	}
+	response := fskitproto.Frame{
+		Kind:       fskitproto.KindResponse,
+		Op:         request.Op,
+		RequestID:  request.RequestID,
+		Generation: c.server.generation,
+	}
+	started := false
+	startedAt := time.Now()
+	handled = false
+	n := 0
+	var streamErr error
+	if nativeFileStreamingAvailable() {
+		handled, n, streamErr = c.server.filesystem.StreamNativeRead(handleState.coreHandle, offset, length, func(file *os.File, fileOffset int64, count int) (int, error) {
+			started = true
+			if err := fskitproto.WriteFrameHeader(c.conn, response, 4+count, c.server.maxPayload); err != nil {
+				return 0, err
+			}
+			var lengthPrefix [4]byte
+			binary.LittleEndian.PutUint32(lengthPrefix[:], uint32(count))
+			if err := fskitproto.WriteFramePayload(c.conn, lengthPrefix[:]); err != nil {
+				return 0, err
+			}
+			return sendNativeFile(c.conn, file, fileOffset, count)
+		})
+	}
+	if !handled {
+		if handleState.sharedWindow != nil && handleState.sharedWindowFlag != 0 && length <= handleState.sharedWindow.capacity {
+			windowHandled, windowWritten, windowBytes, windowErr := c.streamSharedReadWindow(
+				response,
+				handleState,
+				offset,
+				length,
+			)
+			if windowHandled {
+				transport := "shared_window"
+				if handleState.sharedWindowFlag == fskitproto.FlagSharedFileWindow {
+					transport = "shared_file_window"
+				}
+				c.server.record(fmt.Sprintf("io=read_result handle=%d offset=%d bytes=%d duration_ns=%d transport=%s", handle, offset, windowBytes, time.Since(startedAt).Nanoseconds(), transport))
+				return true, windowWritten, 0, windowErr
+			}
+		}
+		if c.capabilities&fskitproto.CapabilitySharedReadFD != 0 &&
+			nativeSharedReadFDAvailable() && length >= nativeFSKitSharedReadMinimumBytes {
+			sharedHandled, sharedWritten, sharedBytes, sharedErr := c.streamSharedReadFD(
+				response,
+				handleState.coreHandle,
+				offset,
+				length,
+			)
+			if sharedHandled {
+				c.server.record(fmt.Sprintf("io=read_result handle=%d offset=%d bytes=%d duration_ns=%d transport=shared_fd", handle, offset, sharedBytes, time.Since(startedAt).Nanoseconds()))
+				return true, sharedWritten, 0, sharedErr
+			}
+		}
+		startedAt = time.Now()
+		n, streamErr = c.server.filesystem.StreamBufferedRead(handleState.coreHandle, offset, length, nativeFSKitBufferedReadChunkBytes, func(total int, chunk []byte) error {
+			if !started {
+				if err := fskitproto.WriteFrameHeader(c.conn, response, 4+total, c.server.maxPayload); err != nil {
+					return err
+				}
+				var lengthPrefix [4]byte
+				binary.LittleEndian.PutUint32(lengthPrefix[:], uint32(total))
+				if err := fskitproto.WriteFramePayload(c.conn, lengthPrefix[:]); err != nil {
+					return err
+				}
+				started = true
+			}
+			return fskitproto.WriteFramePayload(c.conn, chunk)
+		})
+		c.server.record(fmt.Sprintf("io=read_result handle=%d offset=%d bytes=%d duration_ns=%d", handle, offset, n, time.Since(startedAt).Nanoseconds()))
+		if streamErr != nil {
+			return true, started, 0, streamErr
+		}
+		return true, started, 0, nil
+	}
+	c.server.record(fmt.Sprintf("io=read_result handle=%d offset=%d bytes=%d duration_ns=%d", handle, offset, n, time.Since(startedAt).Nanoseconds()))
+	if streamErr != nil {
+		return true, started, 0, streamErr
+	}
+	return true, started, 0, nil
+}
+
+func (c *nativeFSKitConnection) streamSharedReadWindow(response fskitproto.Frame, handle *nativeFSKitHandle, offset int64, length int) (handled bool, responseWritten bool, n int, err error) {
+	if length < 0 || length > handle.sharedWindow.capacity {
+		return true, false, 0, errors.New("shared window read exceeded negotiated capacity")
+	}
+	n, readErrno := c.server.filesystem.Read(handle.coreHandle, handle.sharedWindow.mapping[:length], offset)
+	if readErrno != 0 {
+		return true, false, n, readErrno
+	}
+	if n < 0 || n > length {
+		return true, false, n, errors.New("shared window returned an invalid byte count")
+	}
+	encoder := fskitproto.NewEncoder(4)
+	encoder.Uint32(uint32(n))
+	if handle.sharedWindowFlag != fskitproto.FlagSharedWindow && handle.sharedWindowFlag != fskitproto.FlagSharedFileWindow {
+		return true, false, n, errors.New("shared window has an invalid transport flag")
+	}
+	response.Flags |= handle.sharedWindowFlag
+	response.Payload = encoder.Data()
+	if err := fskitproto.WriteFrame(c.conn, response, c.server.maxPayload); err != nil {
+		return true, true, n, err
+	}
+	return true, true, n, nil
+}
+
+func (c *nativeFSKitConnection) streamSharedReadFD(response fskitproto.Frame, coreHandle uint64, offset int64, length int) (handled bool, responseWritten bool, n int, err error) {
+	file, n, prepareErr := prepareNativeSharedReadFD(length, func(mapping []byte) (int, error) {
+		read, readErrno := c.server.filesystem.Read(coreHandle, mapping, offset)
+		if readErrno != 0 {
+			return read, readErrno
+		}
+		if read < 0 || read > len(mapping) {
+			return read, errors.New("shared read returned an invalid byte count")
+		}
+		return read, nil
+	})
+	if prepareErr != nil {
+		c.server.record(fmt.Sprintf("io=shared_read_fallback offset=%d bytes=%d error=%q", offset, length, prepareErr.Error()))
+		return false, false, 0, nil
+	}
+	defer file.Close()
+	encoder := fskitproto.NewEncoder(4)
+	encoder.Uint32(uint32(n))
+	response.Payload = encoder.Data()
+	if n == 0 {
+		if err := fskitproto.WriteFrame(c.conn, response, c.server.maxPayload); err != nil {
+			return true, true, 0, err
+		}
+		return true, true, 0, nil
+	}
+	response.Flags |= fskitproto.FlagSharedReadFD
+	if err := fskitproto.WriteFrame(c.conn, response, c.server.maxPayload); err != nil {
+		return true, true, n, err
+	}
+	if err := sendSharedReadFD(c.conn, file); err != nil {
+		return true, true, n, err
+	}
+	return true, true, n, nil
+}
+
+func (c *nativeFSKitConnection) recordReadRequest(payload []byte, operation fskitproto.Op) {
+	if operation != fskitproto.OpRead {
+		return
+	}
+	decoder := fskitproto.NewDecoder(payload)
+	handle, offset, length, errno := decodeRead(decoder, c.server.maxPayload)
+	if errno == 0 {
+		c.server.record(fmt.Sprintf("io=read handle=%d offset=%d bytes=%d", handle, offset, length))
+	}
+}
+
 func (c *nativeFSKitConnection) hello(payload []byte) ([]byte, int32) {
 	decoder := fskitproto.NewDecoder(payload)
 	token, err := decoder.Bytes(256)
-	if err != nil || decoder.Done() != nil || len(token) != len(c.server.token) || subtle.ConstantTimeCompare(token, c.server.token) != 1 {
+	if err != nil || len(token) != len(c.server.token) || subtle.ConstantTimeCompare(token, c.server.token) != 1 {
 		return nil, int32(syscall.EACCES)
 	}
+	var capabilities uint32
+	if decoder.Remaining() != 0 {
+		capabilities, err = decoder.Uint32()
+		if err != nil {
+			return nil, int32(syscall.EINVAL)
+		}
+	}
+	if decoder.Done() != nil {
+		return nil, int32(syscall.EINVAL)
+	}
+	c.capabilities = capabilities
 	encoder := fskitproto.NewEncoder(16)
 	encoder.Uint32(c.server.maxPayload)
 	encoder.Uint64(c.server.filesystem.NamespaceVersion())
+	if capabilities&fskitproto.CapabilityContentGeneration != 0 {
+		encoder.Uint32(capabilities & fskitproto.CapabilityContentGeneration)
+	}
 	return encoder.Data(), 0
+}
+
+func (c *nativeFSKitConnection) writeOpenResponseWithNativeFD(response fskitproto.Frame) (handled bool, responseWritten bool, err error) {
+	if c.capabilities&fskitproto.CapabilityNativeReadFD == 0 {
+		return false, false, nil
+	}
+	decoder := fskitproto.NewDecoder(response.Payload)
+	wireHandle, decodeErr := decoder.Uint64()
+	if decodeErr != nil || decoder.Done() != nil {
+		return false, false, nil
+	}
+	handleState, exists := c.handles[wireHandle]
+	if !exists || handleState.health || handleState.flags&(os.O_WRONLY|os.O_RDWR) != 0 {
+		return false, false, nil
+	}
+	started := false
+	handled, transferErr := c.server.filesystem.WithNativeReadFD(handleState.coreHandle, func(file *os.File) error {
+		started = true
+		response.Flags |= fskitproto.FlagNativeReadFD
+		if err := fskitproto.WriteFrame(c.conn, response, c.server.maxPayload); err != nil {
+			return err
+		}
+		return sendNativeReadFD(c.conn, file)
+	})
+	if !handled {
+		return false, false, nil
+	}
+	if transferErr != nil && !started {
+		return false, false, nil
+	}
+	return true, started, transferErr
+}
+
+func (c *nativeFSKitConnection) writeOpenResponseWithOptimizedFD(response fskitproto.Frame) (handled bool, responseWritten bool, err error) {
+	handled, responseWritten, err = c.writeOpenResponseWithNativeFD(response)
+	if handled || err != nil {
+		return handled, responseWritten, err
+	}
+	if c.capabilities&(fskitproto.CapabilitySharedWindow|fskitproto.CapabilitySharedFileWindow) == 0 || !nativeSharedReadFDAvailable() {
+		return false, false, nil
+	}
+	decoder := fskitproto.NewDecoder(response.Payload)
+	wireHandle, decodeErr := decoder.Uint64()
+	if decodeErr != nil || decoder.Done() != nil {
+		return false, false, nil
+	}
+	handleState, exists := c.handles[wireHandle]
+	if !exists || handleState.health || handleState.flags&(os.O_WRONLY|os.O_RDWR) != 0 {
+		return false, false, nil
+	}
+	windowBytes := min(nativeFSKitSharedWindowBytes, int(c.server.maxPayload)-4)
+	var window *nativeSharedReadWindow
+	var windowFlag uint32
+	if c.capabilities&fskitproto.CapabilitySharedWindow != 0 {
+		sharedWindow, prewarmed, createErr := c.server.acquireSharedMemoryWindow(windowBytes)
+		if createErr != nil {
+			c.server.record(fmt.Sprintf("io=shared_window_fallback error=%q", createErr.Error()))
+		} else {
+			window = sharedWindow
+			windowFlag = fskitproto.FlagSharedWindow
+			if prewarmed {
+				c.server.record("io=shared_window_pool_hit")
+			}
+		}
+	}
+	if window == nil && c.capabilities&fskitproto.CapabilitySharedFileWindow != 0 && nativeSharedFileWindowAvailable() {
+		fileWindow, prewarmed, createErr := c.server.acquireSharedFileWindow(windowBytes)
+		if createErr != nil {
+			c.server.record(fmt.Sprintf("io=shared_file_window_fallback error=%q", createErr.Error()))
+		} else {
+			window = fileWindow
+			windowFlag = fskitproto.FlagSharedFileWindow
+			if prewarmed {
+				c.server.record("io=shared_file_window_pool_hit")
+			}
+		}
+	}
+	if window == nil {
+		return false, false, nil
+	}
+	handleState.sharedWindow = window
+	handleState.sharedWindowFlag = windowFlag
+	encoder := fskitproto.NewEncoder(12)
+	encoder.Uint64(wireHandle)
+	encoder.Uint32(uint32(window.capacity))
+	response.Payload = encoder.Data()
+	response.Flags |= windowFlag
+	if err := fskitproto.WriteFrame(c.conn, response, c.server.maxPayload); err != nil {
+		return true, true, err
+	}
+	var transferErr error
+	if windowFlag == fskitproto.FlagSharedFileWindow {
+		transferErr = sendSharedFileWindowFD(c.conn, window.file)
+	} else {
+		transferErr = sendSharedWindowFD(c.conn, window.file)
+	}
+	if transferErr != nil {
+		return true, true, transferErr
+	}
+	return true, true, nil
+}
+
+func (s *nativeFSKitServer) prewarmSharedFileWindows(count int, length int) error {
+	if count == 0 || !nativeSharedFileWindowAvailable() {
+		return nil
+	}
+	return s.sharedFileWindows.prewarm(count, length, newNativeSharedFileWindow, "shared-file")
+}
+
+func (s *nativeFSKitServer) acquireSharedFileWindow(length int) (*nativeSharedReadWindow, bool, error) {
+	return s.sharedFileWindows.acquire(length, newNativeSharedFileWindow)
+}
+
+func (s *nativeFSKitServer) recycleSharedFileWindow(window *nativeSharedReadWindow) bool {
+	return s.sharedFileWindows.recycle(window)
+}
+
+func (s *nativeFSKitServer) closePrewarmedSharedFileWindows() error {
+	return s.sharedFileWindows.close()
+}
+
+func (s *nativeFSKitServer) prewarmSharedMemoryWindows(count int, length int) error {
+	if count == 0 || !nativeSharedReadFDAvailable() {
+		return nil
+	}
+	return s.sharedMemoryWindows.prewarm(count, length, newNativeSharedReadWindow, "shared-memory")
+}
+
+func (s *nativeFSKitServer) acquireSharedMemoryWindow(length int) (*nativeSharedReadWindow, bool, error) {
+	return s.sharedMemoryWindows.acquire(length, newNativeSharedReadWindow)
+}
+
+func (s *nativeFSKitServer) recycleSharedMemoryWindow(window *nativeSharedReadWindow) bool {
+	return s.sharedMemoryWindows.recycle(window)
+}
+
+func (s *nativeFSKitServer) closePrewarmedSharedMemoryWindows() error {
+	return s.sharedMemoryWindows.close()
+}
+
+type nativeSharedWindowFactory func(int) (*nativeSharedReadWindow, error)
+
+func (p *nativeSharedFileWindowPool) prewarm(count int, length int, create nativeSharedWindowFactory, kind string) error {
+	if length <= 0 || create == nil {
+		return fmt.Errorf("invalid %s window prewarm request", kind)
+	}
+	windows := make([]*nativeSharedReadWindow, 0, count)
+	for index := 0; index < count; index++ {
+		window, err := create(length)
+		if err != nil {
+			var closeErr error
+			for _, created := range windows {
+				closeErr = errors.Join(closeErr, created.Close())
+			}
+			return errors.Join(fmt.Errorf("prewarm %s window %d: %w", kind, index, err), closeErr)
+		}
+		clear(window.mapping)
+		windows = append(windows, window)
+	}
+	p.mu.Lock()
+	p.limit = count
+	p.windowBytes = length
+	p.windows = append(p.windows, windows...)
+	p.mu.Unlock()
+	return nil
+}
+
+func (p *nativeSharedFileWindowPool) acquire(length int, create nativeSharedWindowFactory) (*nativeSharedReadWindow, bool, error) {
+	p.mu.Lock()
+	for index := len(p.windows) - 1; index >= 0; index-- {
+		window := p.windows[index]
+		if window.capacity != length {
+			continue
+		}
+		p.windows = append(p.windows[:index], p.windows[index+1:]...)
+		p.mu.Unlock()
+		return window, true, nil
+	}
+	p.mu.Unlock()
+	window, err := create(length)
+	return window, false, err
+}
+
+func (p *nativeSharedFileWindowPool) recycle(window *nativeSharedReadWindow) bool {
+	if window == nil {
+		return false
+	}
+	p.mu.Lock()
+	recycle := p.limit > 0 &&
+		len(p.windows) < p.limit &&
+		window.capacity == p.windowBytes &&
+		window.file != nil &&
+		window.mapping != nil
+	if recycle {
+		p.windows = append(p.windows, window)
+	}
+	p.mu.Unlock()
+	if !recycle {
+		_ = window.Close()
+	}
+	return recycle
+}
+
+func (p *nativeSharedFileWindowPool) close() error {
+	p.mu.Lock()
+	windows := p.windows
+	p.windows = nil
+	p.limit = 0
+	p.windowBytes = 0
+	p.mu.Unlock()
+	var result error
+	for _, window := range windows {
+		result = errors.Join(result, window.Close())
+	}
+	return result
 }
 
 func (c *nativeFSKitConnection) dispatch(operation fskitproto.Op, payload []byte) ([]byte, int32) {
@@ -319,7 +804,7 @@ func (c *nativeFSKitConnection) dispatch(operation fskitproto.Op, payload []byte
 			return nil, int32(errno)
 		}
 		encoder := fskitproto.NewEncoder(160)
-		encoder.Entry(entry)
+		encoder.EntryForCapabilities(entry, c.capabilities)
 		return encoder.Data(), 0
 	case fskitproto.OpReadDir:
 		name, errno := decodePath(decoder)
@@ -333,7 +818,7 @@ func (c *nativeFSKitConnection) dispatch(operation fskitproto.Op, payload []byte
 		encoder := fskitproto.NewEncoder(16 + len(entries)*160)
 		encoder.Uint32(uint32(len(entries)))
 		for _, entry := range entries {
-			encoder.Entry(entry)
+			encoder.EntryForCapabilities(entry, c.capabilities)
 		}
 		return encoder.Data(), 0
 	case fskitproto.OpOpen:
@@ -364,8 +849,12 @@ func (c *nativeFSKitConnection) dispatch(operation fskitproto.Op, payload []byte
 		if errno != 0 {
 			return nil, int32(errno)
 		}
-		if _, existing := c.server.filesystem.Getattr(name); existing == 0 {
+		_, existing := c.server.filesystem.Getattr(name)
+		if existing == 0 {
 			return nil, int32(syscall.EEXIST)
+		}
+		if c.server.filesystem.nativeNamespaceRefreshActive(name) {
+			return nil, int32(existing)
 		}
 		openFlags := int(flags&^fskitproto.OpenFlagSnapshot) | os.O_CREATE | os.O_EXCL
 		coreHandle, errno := c.server.filesystem.Open(name, openFlags)
@@ -383,11 +872,10 @@ func (c *nativeFSKitConnection) dispatch(operation fskitproto.Op, payload []byte
 		}
 		encoder := fskitproto.NewEncoder(176)
 		encoder.Uint64(handle)
-		encoder.Entry(entry)
+		encoder.EntryForCapabilities(entry, c.capabilities)
 		return encoder.Data(), 0
 	case fskitproto.OpRead:
 		handle, offset, length, errno := decodeRead(decoder, c.server.maxPayload)
-		c.server.record(fmt.Sprintf("io=read handle=%d offset=%d bytes=%d", handle, offset, length))
 		handleState, exists := c.handles[handle]
 		if errno != 0 || !exists {
 			if errno == 0 {
@@ -407,7 +895,9 @@ func (c *nativeFSKitConnection) dispatch(operation fskitproto.Op, payload []byte
 			return encoder.Data(), 0
 		}
 		buffer := make([]byte, length)
+		started := time.Now()
 		n, errno := c.server.filesystem.Read(handleState.coreHandle, buffer, offset)
+		c.server.record(fmt.Sprintf("io=read_result handle=%d offset=%d bytes=%d duration_ns=%d", handle, offset, n, time.Since(started).Nanoseconds()))
 		if errno != 0 {
 			return nil, int32(errno)
 		}
@@ -456,6 +946,7 @@ func (c *nativeFSKitConnection) dispatch(operation fskitproto.Op, payload []byte
 		case fskitproto.OpFlush:
 			errno = c.server.filesystem.Flush(handleState.coreHandle)
 		case fskitproto.OpRelease:
+			c.releaseSharedWindow(handleState)
 			errno = c.server.filesystem.Release(handleState.coreHandle)
 			delete(c.handles, handle)
 		}
@@ -478,6 +969,13 @@ func (c *nativeFSKitConnection) dispatch(operation fskitproto.Op, payload []byte
 		mode, err := decoder.Uint32()
 		if err != nil || decoder.Done() != nil {
 			return nil, int32(syscall.EINVAL)
+		}
+		if c.server.filesystem.nativeNamespaceRefreshActive(name) {
+			_, existing := c.server.filesystem.Getattr(name)
+			if existing == 0 {
+				return nil, int32(syscall.EEXIST)
+			}
+			return nil, int32(existing)
 		}
 		errno = c.server.filesystem.Mkdir(name, mode)
 		if errno == 0 {
@@ -608,10 +1106,28 @@ func (c *nativeFSKitConnection) dispatch(operation fskitproto.Op, payload []byte
 
 func (c *nativeFSKitConnection) releaseHandles() {
 	for _, handle := range c.handles {
+		c.releaseSharedWindow(handle)
 		if !handle.health {
 			_ = c.server.filesystem.Release(handle.coreHandle)
 		}
 	}
+}
+
+func (c *nativeFSKitConnection) releaseSharedWindow(handle *nativeFSKitHandle) {
+	window := handle.sharedWindow
+	flag := handle.sharedWindowFlag
+	handle.sharedWindow = nil
+	handle.sharedWindowFlag = 0
+	if window == nil {
+		return
+	}
+	if flag == fskitproto.FlagSharedWindow && c.server.recycleSharedMemoryWindow(window) {
+		return
+	}
+	if flag == fskitproto.FlagSharedFileWindow && c.server.recycleSharedFileWindow(window) {
+		return
+	}
+	_ = window.Close()
 }
 
 func (c *nativeFSKitConnection) addHandle(coreHandle uint64, name string, flags int, snapshotWrite bool) uint64 {
@@ -740,11 +1256,14 @@ func (s *nativeFSKitServer) entry(name string) (fskitproto.Entry, syscall.Errno)
 			Type: fskitproto.EntryFile, Mode: 0o400, UID: uint32(os.Getuid()), GID: uint32(os.Getgid()),
 			Size: uint64(len(s.health)), AllocSize: uint64((len(s.health) + 4095) &^ 4095),
 			ModTime: s.startedAt, ChangeTime: s.startedAt, AccessTime: s.startedAt,
-			NamespaceID: s.filesystem.NamespaceVersion(),
+			NamespaceID: s.filesystem.NamespaceVersion(), ContentGeneration: 0,
 		}, 0
 	}
 	attribute, errno := s.filesystem.Getattr(cleaned)
 	if errno != 0 {
+		if errno == syscall.ENOENT {
+			s.nodes.forget(cleaned)
+		}
 		return fskitproto.Entry{}, errno
 	}
 	entryType := fskitproto.EntryUnknown
@@ -756,12 +1275,17 @@ func (s *nativeFSKitServer) entry(name string) (fskitproto.Entry, syscall.Errno)
 	case syscall.S_IFLNK:
 		entryType = fskitproto.EntrySymlink
 	}
-	nodeID := s.nodes.node(cleaned)
+	nodeID := s.nodes.node(cleaned, attribute.ObjectID)
 	parentID := uint64(1)
 	if cleaned == "/" {
 		parentID = 1
 	} else {
-		parentID = s.nodes.node(path.Dir(cleaned))
+		parentPath := path.Dir(cleaned)
+		if parentAttribute, parentErrno := s.filesystem.Getattr(parentPath); parentErrno == 0 {
+			parentID = s.nodes.node(parentPath, parentAttribute.ObjectID)
+		} else {
+			parentID = s.nodes.node(parentPath, "")
+		}
 	}
 	allocated := uint64(0)
 	if attribute.Size > 0 {
@@ -772,7 +1296,7 @@ func (s *nativeFSKitServer) entry(name string) (fskitproto.Entry, syscall.Errno)
 		Type: entryType, Mode: attribute.Mode & 0o7777, UID: attribute.UID, GID: attribute.GID,
 		Size: uint64(max(attribute.Size, 0)), AllocSize: allocated,
 		ModTime: attribute.ModTime, ChangeTime: attribute.ChangeTime, AccessTime: attribute.AccessTime,
-		NamespaceID: s.filesystem.NamespaceVersion(),
+		NamespaceID: s.filesystem.NamespaceVersion(), ContentGeneration: attribute.DirectoryGeneration,
 	}, 0
 }
 
@@ -785,14 +1309,7 @@ func (s *nativeFSKitServer) record(message string) {
 func (n *nativeFSKitNodes) syncVersion(version uint64) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	if n.version == version {
-		return
-	}
 	n.version = version
-	// FSKit object IDs must not be reused while the volume remains mounted.
-	// Namespace refreshes invalidate path mappings, but the kernel can still
-	// hold references to the old items until reclaim callbacks arrive.
-	n.byPath = map[string]uint64{"/": 2}
 }
 
 func (n *nativeFSKitNodes) acceptVersion(version uint64) {
@@ -801,25 +1318,37 @@ func (n *nativeFSKitNodes) acceptVersion(version uint64) {
 	n.mu.Unlock()
 }
 
-func (n *nativeFSKitNodes) node(name string) uint64 {
+func (n *nativeFSKitNodes) node(name string, objectID string) uint64 {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	if nodeID, exists := n.byPath[name]; exists {
-		return nodeID
+	if node, exists := n.byPath[name]; exists {
+		if node.objectID == "" && objectID != "" {
+			node.objectID = objectID
+			n.byPath[name] = node
+		}
+		if objectID == "" || node.objectID == objectID {
+			return node.id
+		}
 	}
 	nodeID := n.next
 	n.next++
-	n.byPath[name] = nodeID
+	n.byPath[name] = nativeFSKitNode{id: nodeID, objectID: objectID}
 	return nodeID
+}
+
+func (n *nativeFSKitNodes) forget(name string) {
+	n.mu.Lock()
+	delete(n.byPath, name)
+	n.mu.Unlock()
 }
 
 func (n *nativeFSKitNodes) rename(oldName string, newName string, version uint64) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	nodeID, exists := n.byPath[oldName]
+	node, exists := n.byPath[oldName]
 	if exists {
 		delete(n.byPath, oldName)
-		n.byPath[newName] = nodeID
+		n.byPath[newName] = node
 	}
 	n.version = version
 }

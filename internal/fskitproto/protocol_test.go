@@ -24,17 +24,37 @@ func TestFrameRoundTrip(t *testing.T) {
 	}
 }
 
+func TestFrameHeaderAndPayloadRoundTrip(t *testing.T) {
+	want := Frame{Kind: KindResponse, Op: OpRead, RequestID: 12, Generation: 34, Status: 0}
+	payload := []byte("streamed payload")
+	var buffer bytes.Buffer
+	if err := WriteFrameHeader(&buffer, want, len(payload), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteFramePayload(&buffer, payload); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ReadFrame(&buffer, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want.Payload = payload
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("frame = %#v, want %#v", got, want)
+	}
+}
+
 func TestEntryRoundTrip(t *testing.T) {
 	want := Entry{
 		Path: "/sessions/2026/07/session.jsonl", Name: "session.jsonl", NodeID: 9, ParentID: 8,
 		Type: EntryFile, Mode: 0o600, UID: 501, GID: 20, Size: 1234, AllocSize: 4096,
 		ModTime: time.Unix(1_700_000_000, 123), ChangeTime: time.Unix(1_700_000_001, 456),
-		AccessTime: time.Unix(1_700_000_002, 789), NamespaceID: 33,
+		AccessTime: time.Unix(1_700_000_002, 789), NamespaceID: 33, ContentGeneration: 7,
 	}
 	encoder := NewEncoder(256)
-	encoder.Entry(want)
+	encoder.EntryForCapabilities(want, CapabilityContentGeneration)
 	decoder := NewDecoder(encoder.Data())
-	got, err := decoder.Entry()
+	got, err := decoder.EntryForCapabilities(CapabilityContentGeneration)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -43,6 +63,31 @@ func TestEntryRoundTrip(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("entry = %#v, want %#v", got, want)
+	}
+}
+
+func TestEntryContentGenerationIsBackwardCompatible(t *testing.T) {
+	want := Entry{Path: "/sessions", Name: "sessions", Type: EntryDirectory, ContentGeneration: 9}
+	legacy := NewEncoder(128)
+	legacy.Entry(want)
+	legacyDecoder := NewDecoder(legacy.Data())
+	legacyEntry, err := legacyDecoder.Entry()
+	if err != nil || legacyDecoder.Done() != nil {
+		t.Fatalf("legacy entry decode: entry=%#v err=%v", legacyEntry, err)
+	}
+	if legacyEntry.ContentGeneration != 0 {
+		t.Fatalf("legacy content generation = %d, want 0", legacyEntry.ContentGeneration)
+	}
+
+	negotiated := NewEncoder(136)
+	negotiated.EntryForCapabilities(want, CapabilityContentGeneration)
+	negotiatedDecoder := NewDecoder(negotiated.Data())
+	negotiatedEntry, err := negotiatedDecoder.EntryForCapabilities(CapabilityContentGeneration)
+	if err != nil || negotiatedDecoder.Done() != nil {
+		t.Fatalf("negotiated entry decode: entry=%#v err=%v", negotiatedEntry, err)
+	}
+	if negotiatedEntry.ContentGeneration != want.ContentGeneration {
+		t.Fatalf("negotiated content generation = %d, want %d", negotiatedEntry.ContentGeneration, want.ContentGeneration)
 	}
 }
 
@@ -89,5 +134,42 @@ func TestReadFrameRejectsOversizedPayloadBeforeAllocation(t *testing.T) {
 	}
 	if _, err := ReadFrame(&buffer, 32); err == nil {
 		t.Fatal("ReadFrame unexpectedly accepted an oversized payload")
+	}
+}
+
+func TestDefaultFrameLimitSupportsBoundedReadAhead(t *testing.T) {
+	frame := Frame{Kind: KindResponse, Op: OpRead}
+	var accepted bytes.Buffer
+	if err := WriteFrameHeader(&accepted, frame, 31<<20, 0); err != nil {
+		t.Fatalf("31 MiB read-ahead frame: %v", err)
+	}
+	var rejected bytes.Buffer
+	if err := WriteFrameHeader(&rejected, frame, DefaultMaxPayload+1, 0); err == nil {
+		t.Fatal("default frame limit accepted a payload larger than its bound")
+	}
+}
+
+func TestTransferCapabilitiesAndFlagsRemainDistinct(t *testing.T) {
+	values := []uint32{
+		CapabilityNativeReadFD,
+		CapabilitySharedReadFD,
+		CapabilitySharedWindow,
+		CapabilitySharedFileWindow,
+		CapabilityContentGeneration,
+		FlagNativeReadFD,
+		FlagSharedReadFD,
+		FlagSharedWindow,
+		FlagSharedFileWindow,
+	}
+	for index, value := range values {
+		if value == 0 || value&(value-1) != 0 {
+			t.Fatalf("transfer value %d = %#x, want one bit", index, value)
+		}
+	}
+	if CapabilitySharedFileWindow == CapabilitySharedWindow {
+		t.Fatal("shared-file and POSIX shared-memory capabilities overlap")
+	}
+	if FlagSharedFileWindow == FlagSharedWindow {
+		t.Fatal("shared-file and POSIX shared-memory flags overlap")
 	}
 }

@@ -17,3 +17,5 @@ func defaultMountProbe(path string) error {
 	}
 	return nil
 }
+
+func MountPresent(string) (bool, error) { return false, nil }

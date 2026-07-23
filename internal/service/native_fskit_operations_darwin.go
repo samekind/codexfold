@@ -77,11 +77,15 @@ func (nativeFSKitOperations) Mount(ctx context.Context, resourcePath string, mou
 	if err := os.MkdirAll(mountPoint, 0o700); err != nil {
 		return err
 	}
-	output, err := exec.CommandContext(ctx, "/sbin/mount", "-t", "codexfoldnative", resourcePath, mountPoint).CombinedOutput()
+	output, err := exec.CommandContext(ctx, "/sbin/mount", nativeFSKitMountArguments(resourcePath, mountPoint)...).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(output)))
 	}
 	return nil
+}
+
+func nativeFSKitMountArguments(resourcePath string, mountPoint string) []string {
+	return []string{"-F", "-t", "codexfoldnative", resourcePath, mountPoint}
 }
 
 func (nativeFSKitOperations) Unmount(ctx context.Context, mountPoint string, force bool) error {

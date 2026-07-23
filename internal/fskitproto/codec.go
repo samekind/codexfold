@@ -61,6 +61,14 @@ func (e *Encoder) Time(value time.Time) {
 }
 
 func (e *Encoder) Entry(entry Entry) {
+	e.entry(entry, false)
+}
+
+func (e *Encoder) EntryForCapabilities(entry Entry, capabilities uint32) {
+	e.entry(entry, capabilities&CapabilityContentGeneration != 0)
+}
+
+func (e *Encoder) entry(entry Entry, includeContentGeneration bool) {
 	e.String(entry.Path)
 	e.String(entry.Name)
 	e.Uint64(entry.NodeID)
@@ -75,6 +83,9 @@ func (e *Encoder) Entry(entry Entry) {
 	e.Time(entry.ChangeTime)
 	e.Time(entry.AccessTime)
 	e.Uint64(entry.NamespaceID)
+	if includeContentGeneration {
+		e.Uint64(entry.ContentGeneration)
+	}
 }
 
 func (e *Encoder) StatFS(stat StatFS) {
@@ -96,6 +107,8 @@ type Decoder struct {
 func NewDecoder(data []byte) *Decoder { return &Decoder{data: data} }
 
 func (d *Decoder) remaining() int { return len(d.data) - d.offset }
+
+func (d *Decoder) Remaining() int { return d.remaining() }
 
 func (d *Decoder) Raw(length int) ([]byte, error) {
 	if length < 0 || d.remaining() < length {
@@ -181,6 +194,14 @@ func (d *Decoder) Time() (time.Time, error) {
 }
 
 func (d *Decoder) Entry() (Entry, error) {
+	return d.entry(false)
+}
+
+func (d *Decoder) EntryForCapabilities(capabilities uint32) (Entry, error) {
+	return d.entry(capabilities&CapabilityContentGeneration != 0)
+}
+
+func (d *Decoder) entry(includeContentGeneration bool) (Entry, error) {
 	var entry Entry
 	var err error
 	if entry.Path, err = d.String(1 << 20); err != nil {
@@ -226,6 +247,11 @@ func (d *Decoder) Entry() (Entry, error) {
 	}
 	if entry.NamespaceID, err = d.Uint64(); err != nil {
 		return Entry{}, err
+	}
+	if includeContentGeneration {
+		if entry.ContentGeneration, err = d.Uint64(); err != nil {
+			return Entry{}, err
+		}
 	}
 	return entry, nil
 }

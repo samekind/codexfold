@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -54,6 +55,63 @@ func TestParseFSUsageRecognizesSanitizedFuseAdapterOperations(t *testing.T) {
 	}
 	if len(contract.Operations) != 7 {
 		t.Fatalf("adapter operations = %#v", contract.Operations)
+	}
+}
+
+func TestParseFSUsageRecognizesNativeFSKitOperationsWithoutDoubleCountingIO(t *testing.T) {
+	trace := strings.Join([]string{
+		"1 operation=getattr request=1 status=0 payload=18",
+		"2 operation=read request=2 status=0 payload=20",
+		"3 io=read handle=1 offset=0 bytes=4096",
+		"4 operation=write request=3 status=0 payload=64",
+		"5 io=write handle=1 offset=4096 bytes=64",
+		"6 operation=sync request=4 status=0 payload=0",
+		"7 operation=statfs request=5 status=0 payload=0",
+		"8 operation=release request=6 status=0 payload=8",
+		"9 operation=hello request=1 status=0 payload=36",
+		"10 operation=namespace_version request=7 status=0 payload=0",
+	}, "\n")
+	contract, err := ParseFSUsage(strings.NewReader(trace), ContractOptions{Platform: "darwin", ClientKind: "desktop", ClientVersion: "26.1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []Operation{
+		{Name: "getattr", Count: 1},
+		{Name: "read", Count: 1},
+		{Name: "write", Count: 1},
+		{Name: "fsync", Count: 1},
+		{Name: "statfs", Count: 1},
+		{Name: "release", Count: 1},
+	}
+	if !reflect.DeepEqual(contract.Operations, want) {
+		t.Fatalf("native FSKit operations = %#v, want %#v", contract.Operations, want)
+	}
+}
+
+func TestParseFSUsageCanonicalizesDarwinKernelAliases(t *testing.T) {
+	trace := strings.Join([]string{
+		"12:00:00.000 RdData[S] D=1 B=0x1000 /tmp/session.jsonl codex.1",
+		"12:00:00.001 WrData[A] D=1 B=0x1000 /tmp/session.jsonl codex.1",
+		"12:00:00.002 statfs64 /tmp/session.jsonl codex.1",
+		"12:00:00.003 fstatfs64 F=4 codex.1",
+		"12:00:00.004 fstatat64 /tmp/session.jsonl codex.1",
+		"12:00:00.005 getdirentries64 F=4 codex.1",
+		"12:00:00.006 open_dprotected F=4 /tmp/session.jsonl codex.1",
+	}, "\n")
+	contract, err := ParseFSUsage(strings.NewReader(trace), ContractOptions{Platform: "darwin", ClientKind: "desktop", ClientVersion: "1.2.3"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []Operation{
+		{Name: "read", Count: 1},
+		{Name: "write", Count: 1},
+		{Name: "statfs", Count: 2},
+		{Name: "fstat", Count: 1},
+		{Name: "readdir", Count: 1},
+		{Name: "open", Count: 1},
+	}
+	if !reflect.DeepEqual(contract.Operations, want) {
+		t.Fatalf("Darwin operations = %#v, want %#v", contract.Operations, want)
 	}
 }
 

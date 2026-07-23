@@ -21,7 +21,11 @@ const (
 	maxNativeAppendPendingBytes = 256 << 20
 )
 
-var errNativeAppendGap = errors.New("native append transaction contains an unfilled offset gap")
+var (
+	errNativeAppendGap     = errors.New("native append transaction contains an unfilled offset gap")
+	errNativeAppendPending = errors.New("native append transaction has pending writes")
+	errNativeReadStale     = errors.New("native read source changed outside the append state")
+)
 
 // nativeAppendJournalCheckpoint is nil in production. Integration tests use it
 // in a subprocess to terminate exactly after the recovery journal is durable.
@@ -33,7 +37,7 @@ type nativeAppendSegment struct {
 }
 
 type nativeAppendState struct {
-	mu          sync.Mutex
+	mu          sync.RWMutex
 	path        string
 	journalRoot string
 	baseSize    int64
@@ -158,8 +162,8 @@ func (s *nativeAppendState) ReadAt(file *os.File, destination []byte, offset int
 	if offset < 0 {
 		return 0, errors.New("negative native read offset")
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	visibleEnd := s.contiguousEndLocked()
 	if offset >= visibleEnd {
 		return 0, io.EOF
@@ -196,15 +200,85 @@ func (s *nativeAppendState) ReadAt(file *os.File, destination []byte, offset int
 	return limit, nil
 }
 
-func (s *nativeAppendState) VisibleSize() int64 {
+// StreamRead holds the append-state read lock while the caller streams a
+// stable range from the backing descriptor. This prevents append commit,
+// truncate, and managed positional writes from changing the visible range
+// halfway through a response.
+func (s *nativeAppendState) StreamRead(file *os.File, offset int64, length int, callback func(*os.File, int64, int) (int, error)) (int, error) {
+	if file == nil || callback == nil || offset < 0 || length < 0 {
+		return 0, errors.New("invalid native stream read")
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if len(s.segments) != 0 {
+		return 0, errNativeAppendPending
+	}
+	info, err := file.Stat()
+	if err != nil {
+		return 0, err
+	}
+	if !info.Mode().IsRegular() {
+		return 0, errors.New("native stream source is not a regular file")
+	}
+	if info.Size() != s.baseSize {
+		return 0, errNativeReadStale
+	}
+	if offset >= s.baseSize || length == 0 {
+		return callback(file, offset, 0)
+	}
+	if remaining := s.baseSize - offset; int64(length) > remaining {
+		length = int(remaining)
+	}
+	written, err := callback(file, offset, length)
+	if written < 0 || written > length {
+		return written, errors.New("native stream callback returned an invalid byte count")
+	}
+	return written, err
+}
+
+// WriteAt serializes managed positional writes with StreamRead. Without this
+// lock a sendfile response could race a writer that has already passed the
+// pending-append check.
+func (s *nativeAppendState) WriteAt(file *os.File, data []byte, offset int64) (int, error) {
+	if file == nil || offset < 0 {
+		return 0, errors.New("invalid native positional write")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if len(s.segments) != 0 {
+		return 0, errNativeAppendPending
+	}
+	n, err := file.WriteAt(data, offset)
+	if err != nil {
+		return n, err
+	}
+	info, err := file.Stat()
+	if err != nil {
+		return n, err
+	}
+	s.baseSize = info.Size()
+	s.visibleEnd = info.Size()
+	return n, nil
+}
+
+func (s *nativeAppendState) VisibleSize() int64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.contiguousEndLocked()
+}
+
+func (s *nativeAppendState) VisibleSizeForBacking(backingSize int64) int64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if len(s.segments) == 0 {
+		return backingSize
+	}
 	return s.contiguousEndLocked()
 }
 
 func (s *nativeAppendState) HasPending() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return len(s.segments) != 0
 }
 

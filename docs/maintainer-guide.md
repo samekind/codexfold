@@ -36,6 +36,12 @@ git diff --check
 
 Native macOS FSKit changes additionally require an XcodeGen consistency check and Release build with the Xcode version declared by the project. Commit `project.yml` and the regenerated project together.
 
+Run `scripts/test-native-fskit-cache.sh` with the repository's Xcode toolchain. It compiles and executes the descriptor/read-ahead/cache lifecycle tests; a successful app build alone does not count as cache evidence.
+
+FSKit wire-protocol changes must remain capability-negotiated. A native descriptor may be sent only for a read-only handle, every received descriptor must be closed on all success and rejection paths, and unsupported peers must continue through the bounded byte-stream path. Run the descriptor-lifecycle, cache-invalidation, and mounted random-read suites together; none is a substitute for the others.
+
+Never use `pluginkit -r` for an installed FSKit module during an update. Apple keeps module-election state in the login session, and deregistration can leave an otherwise enabled module unavailable until the next login. Preserve the installed App bundle root, atomically swap `Contents`, register the target with LaunchServices, and use `lsregister -u` only to remove disposable candidate App registrations.
+
 Windows CI compiles every package and test binary but does not execute the full runtime suite. That is intentional until a real Windows/WinFsp host validates directory durability, locking, service, mount, and file-sharing semantics. A green Windows compile check is not Windows readiness evidence.
 
 ## Isolated Native FSKit Validation
@@ -51,6 +57,10 @@ go test ./internal/mountfs -run '^TestNativeFSKitMounted' -count=1 -v
 ```
 
 An app or binary update must use the transactional service command. The updater must stop both launchd jobs, wait for daemon and supervisor process locks to release, install staged definitions/app/binary, verify Host-child ancestry, mount health, and running build SHA, and restore the previous generation on failure. Do not replace an active extension bundle manually.
+
+Current-client approval requires a sanitized operation trace for the exact CLI or Desktop version. Normalize Darwin syscall spellings before contract evaluation, import the resulting operation set into the disposable store, and require both `fs compatibility` approval and a zero-issue `fs doctor` result before a real-client canary. A parser fixture or a contract from a different version is not current-client evidence.
+
+An isolated Codex Desktop process requires both `CODEX_ELECTRON_USER_DATA_PATH` and an explicit `--user-data-dir` argument. The environment variable isolates Codex state, while the Chromium argument prevents the disposable process from joining the production singleton. When a production Desktop is already running, launch the copy through LaunchServices with `open -n`; a direct executable launch may exit at the application-level singleton before Chromium applies its data-directory argument. Pass the isolated environment through launchd only for the launch window, clear it immediately afterward, and verify the child app-server's `CODEX_HOME`, Electron data path, and process ancestry before treating any Desktop action as canary evidence.
 
 ## Evidence Levels
 

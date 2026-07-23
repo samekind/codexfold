@@ -14,6 +14,7 @@ import (
 	"github.com/jstar0/codexfold/internal/enroll"
 	"github.com/jstar0/codexfold/internal/fold"
 	"github.com/jstar0/codexfold/internal/fsctl"
+	"github.com/jstar0/codexfold/internal/mountfs"
 	"github.com/jstar0/codexfold/internal/pack"
 	"github.com/jstar0/codexfold/internal/storage"
 	"github.com/jstar0/codexfold/internal/vfs"
@@ -151,6 +152,9 @@ func runEnrollmentCycle(ctx context.Context, flags enrollmentFlags) (FSEnrollmen
 			return false, nil
 		},
 		Apply: func(ctx context.Context, decision enroll.Decision) error {
+			if _, err := mountfs.ValidateNativeRollout(ctx, decision.RolloutPath); err != nil {
+				return fmt.Errorf("native rollout is not eligible for transparent routing: %w", err)
+			}
 			return applyEnrollmentCommands(ctx, home, store, mount, nativeRoot, decision.SessionID, flags.canary)
 		},
 	})

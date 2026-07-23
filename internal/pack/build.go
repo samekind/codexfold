@@ -121,17 +121,23 @@ func Build(ctx context.Context, storeDir string, options BuildOptions) (BuildRes
 				raw := buffer[:n]
 				_, _ = objectHash.Write(raw)
 				compressed := encoder.EncodeAll(raw, nil)
-				packName, packOffset, writeErr := writer.write(compressed)
+				stored := compressed
+				encoding := EncodingZstd
+				if preferRawBlock(raw, compressed) {
+					stored = raw
+					encoding = EncodingRaw
+				}
+				packName, packOffset, writeErr := writer.write(stored)
 				if writeErr != nil {
 					_ = stream.Close()
 					return BuildResult{}, writeErr
 				}
 				blockHash := sha256.Sum256(raw)
-				object.Blocks = append(object.Blocks, Block{Pack: packName, PackOffset: packOffset, StoredBytes: int64(len(compressed)), RawOffset: rawOffset, RawBytes: int64(n), SHA256: hex.EncodeToString(blockHash[:])})
+				object.Blocks = append(object.Blocks, Block{Pack: packName, PackOffset: packOffset, StoredBytes: int64(len(stored)), RawOffset: rawOffset, RawBytes: int64(n), SHA256: hex.EncodeToString(blockHash[:]), Encoding: encoding})
 				rawOffset += int64(n)
 				result.BlockCount++
 				result.RawBytes += int64(n)
-				result.StoredBytes += int64(len(compressed))
+				result.StoredBytes += int64(len(stored))
 			}
 			if errors.Is(readErr, io.EOF) || errors.Is(readErr, io.ErrUnexpectedEOF) {
 				break
@@ -176,6 +182,13 @@ func Build(ctx context.Context, storeDir string, options BuildOptions) (BuildRes
 	}
 	result.Storage = storage.CompleteAccounting(ctx, storageAssessment, storeDir)
 	return result, nil
+}
+
+func preferRawBlock(raw []byte, compressed []byte) bool {
+	if len(compressed) >= len(raw) {
+		return true
+	}
+	return len(raw) <= 16<<10 && len(compressed)*2 >= len(raw)
 }
 
 func estimatedGenerationBytes(refs []fold.ObjectRef) (int64, error) {

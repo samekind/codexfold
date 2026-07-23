@@ -81,6 +81,7 @@ func TestRenderLaunchdNativeFSKitSeparatesDaemonAndSupervisor(t *testing.T) {
 		"<string>" + launcher + "</string>", "<string>--run-helper</string>", "<string>" + binary + "</string>",
 		"<string>--frontend</string>", "<string>native-fskit</string>",
 		"<string>--fskit-resource</string>", options.FSKitResource,
+		"<key>ProcessType</key>\n  <string>Interactive</string>",
 	} {
 		if !strings.Contains(string(daemon), required) {
 			t.Fatalf("native daemon definition missing %q:\n%s", required, daemon)
@@ -90,6 +91,9 @@ func TestRenderLaunchdNativeFSKitSeparatesDaemonAndSupervisor(t *testing.T) {
 	supervisor, err := RenderLaunchdSupervisor(options)
 	if err != nil {
 		t.Fatalf("RenderLaunchdSupervisor: %v", err)
+	}
+	if !strings.Contains(string(supervisor), "<key>ProcessType</key>\n  <string>Background</string>") {
+		t.Fatalf("native supervisor is not background:\n%s", supervisor)
 	}
 	text := string(supervisor)
 	for _, required := range []string{
@@ -199,6 +203,43 @@ func TestManagerUsesOnlyPerUserLaunchctlAndSeparatesDaemonFromMount(t *testing.T
 	joined := strings.Join(runner.calls, "\n")
 	if strings.Contains(joined, "sudo") || !strings.Contains(joined, "launchctl bootstrap gui/501") || !strings.Contains(joined, "launchctl kickstart gui/501/com.codexfold.fs") {
 		t.Fatalf("unexpected lifecycle commands:\n%s", joined)
+	}
+}
+
+func TestManagerBootoutTreatsExplicitlyMissingJobAsAlreadyStopped(t *testing.T) {
+	root := t.TempDir()
+	plist := filepath.Join(root, "com.codexfold.test.plist")
+	if err := os.WriteFile(plist, renderLaunchdJob("com.codexfold.test", []string{"/tmp/codexfold"}, filepath.Join(root, "out.log"), filepath.Join(root, "err.log"), "Background"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	bootout := "launchctl bootout gui/501 " + plist
+	printJob := "launchctl print gui/501/com.codexfold.test"
+	runner := &recordingRunner{
+		outputs: map[string][]byte{printJob: []byte("Bad request.\nCould not find service \\\"com.codexfold.test\\\" in domain for user gui: 501\n")},
+		errors:  map[string]error{bootout: errors.New("exit status 5"), printJob: errors.New("exit status 113")},
+	}
+	if err := (Manager{UID: 501, Runner: runner}).Bootout(context.Background(), plist); err != nil {
+		t.Fatalf("Bootout missing job: %v", err)
+	}
+	if want := []string{bootout, printJob}; strings.Join(runner.calls, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("calls = %v, want %v", runner.calls, want)
+	}
+}
+
+func TestManagerBootoutDoesNotHideUnclassifiedLaunchdFailure(t *testing.T) {
+	root := t.TempDir()
+	plist := filepath.Join(root, "com.codexfold.test.plist")
+	if err := os.WriteFile(plist, renderLaunchdJob("com.codexfold.test", []string{"/tmp/codexfold"}, filepath.Join(root, "out.log"), filepath.Join(root, "err.log"), "Background"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	bootout := "launchctl bootout gui/501 " + plist
+	printJob := "launchctl print gui/501/com.codexfold.test"
+	runner := &recordingRunner{
+		outputs: map[string][]byte{printJob: []byte("Operation not permitted\n")},
+		errors:  map[string]error{bootout: errors.New("exit status 5"), printJob: errors.New("exit status 1")},
+	}
+	if err := (Manager{UID: 501, Runner: runner}).Bootout(context.Background(), plist); err == nil || !strings.Contains(err.Error(), "launchctl bootout") {
+		t.Fatalf("Bootout error = %v", err)
 	}
 }
 

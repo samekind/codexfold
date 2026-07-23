@@ -89,7 +89,54 @@ func TestViewPropagatesCancellation(t *testing.T) {
 	}
 }
 
+func TestViewReadsAdjacentRepeatedObjectsOncePerRequest(t *testing.T) {
+	object := bytes.Repeat([]byte("repeated-object-"), 4096)
+	digest := sha256.Sum256(object)
+	ref := fold.ObjectRef{
+		SHA256:   hex.EncodeToString(digest[:]),
+		RawBytes: int64(len(object)),
+	}
+	const repeats = 512
+	manifest := fold.Manifest{
+		Version: fold.ManifestVersion,
+		Kind:    fold.ManifestKind,
+		Source:  fold.ManifestSource{Bytes: int64(len(object) * repeats)},
+		Parts:   make([]fold.Part, repeats),
+	}
+	for index := range manifest.Parts {
+		manifest.Parts[index] = fold.Part{Kind: fold.PartResidual, Object: ref}
+	}
+	reader := &countingMemoryReader{objects: memoryReader{ref.SHA256: object}}
+	view, err := NewView(manifest, reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, len(object)*repeats)
+	if n, err := view.ReadAt(context.Background(), got, 0); err != nil || n != len(got) {
+		t.Fatalf("ReadAt repeated objects = %d, %v", n, err)
+	}
+	if reader.calls != 1 {
+		t.Fatalf("object reader calls = %d, want 1", reader.calls)
+	}
+	for index := 0; index < repeats; index++ {
+		start := index * len(object)
+		if !bytes.Equal(got[start:start+len(object)], object) {
+			t.Fatalf("repeated object %d changed", index)
+		}
+	}
+}
+
 type memoryReader map[string][]byte
+
+type countingMemoryReader struct {
+	objects memoryReader
+	calls   int
+}
+
+func (r *countingMemoryReader) ReadAt(ctx context.Context, ref fold.ObjectRef, destination []byte, offset int64) (int, error) {
+	r.calls++
+	return r.objects.ReadAt(ctx, ref, destination, offset)
+}
 
 func (r memoryReader) ReadAt(_ context.Context, ref fold.ObjectRef, destination []byte, offset int64) (int, error) {
 	data, ok := r[ref.SHA256]

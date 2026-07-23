@@ -92,7 +92,7 @@ func RenderLaunchd(options Options) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return renderLaunchdJob(options.Label, launchdProgramArguments(options, serveArguments), options.StdoutPath, options.StderrPath), nil
+	return renderLaunchdJob(options.Label, launchdProgramArguments(options, serveArguments), options.StdoutPath, options.StderrPath, "Interactive"), nil
 }
 
 func RenderLaunchdSupervisor(options Options) ([]byte, error) {
@@ -106,7 +106,7 @@ func RenderLaunchdSupervisor(options Options) ([]byte, error) {
 		"fs", "supervise", "--apply",
 		"--resource", options.FSKitResource, "--mount", options.MountPoint,
 	}
-	return renderLaunchdJob(options.Label+".supervisor", launchdProgramArguments(options, arguments), options.StdoutPath, options.StderrPath), nil
+	return renderLaunchdJob(options.Label+".supervisor", launchdProgramArguments(options, arguments), options.StdoutPath, options.StderrPath, "Background"), nil
 }
 
 func launchdProgramArguments(options Options, childArguments []string) []string {
@@ -117,7 +117,7 @@ func launchdProgramArguments(options Options, childArguments []string) []string 
 	return append([]string{options.BinaryPath}, childArguments...)
 }
 
-func renderLaunchdJob(label string, arguments []string, stdoutPath string, stderrPath string) []byte {
+func renderLaunchdJob(label string, arguments []string, stdoutPath string, stderrPath string, processType string) []byte {
 	var output bytes.Buffer
 	output.WriteString("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n")
 	output.WriteString("<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n")
@@ -134,7 +134,7 @@ func renderLaunchdJob(label string, arguments []string, stdoutPath string, stder
 	writePlistString(&output, "StandardErrorPath", stderrPath)
 	output.WriteString("  <key>RunAtLoad</key>\n  <true/>\n")
 	output.WriteString("  <key>KeepAlive</key>\n  <true/>\n")
-	output.WriteString("  <key>ProcessType</key>\n  <string>Background</string>\n")
+	writePlistString(&output, "ProcessType", processType)
 	output.WriteString("  <key>ThrottleInterval</key>\n  <integer>2</integer>\n")
 	output.WriteString("</dict>\n</plist>\n")
 	return output.Bytes()
@@ -228,11 +228,27 @@ func (m Manager) Bootout(ctx context.Context, plistPath string) error {
 	if !filepath.IsAbs(plistPath) {
 		return errors.New("absolute launchd plist path is required")
 	}
-	output, err := m.runner().Run(ctx, "launchctl", "bootout", m.domain(), plistPath)
+	runner := m.runner()
+	output, err := runner.Run(ctx, "launchctl", "bootout", m.domain(), plistPath)
 	if err != nil {
+		if launchdJobMissing(output) {
+			return nil
+		}
+		label, labelErr := DefinitionLabel(PlatformLaunchd, plistPath)
+		if labelErr == nil {
+			statusOutput, statusErr := runner.Run(ctx, "launchctl", "print", m.domain()+"/"+label)
+			if statusErr != nil && launchdJobMissing(statusOutput) {
+				return nil
+			}
+		}
 		return commandFailure("launchctl bootout", output, err)
 	}
 	return nil
+}
+
+func launchdJobMissing(output []byte) bool {
+	message := strings.ToLower(string(output))
+	return strings.Contains(message, "could not find") && strings.Contains(message, "service")
 }
 
 func (m Manager) Kickstart(ctx context.Context, label string) error {

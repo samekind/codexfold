@@ -91,60 +91,763 @@ final class CodexFoldFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations 
     }
 }
 
-private final class CodexFoldIO {
-    private static let readAheadBytes = 1 * 1024 * 1024
-
+private final class CodexFoldPrefetchChannel {
     let connection: WireConnection
     let handle: UInt64
-    let writable: Bool
-    private let cacheLock = NSLock()
-    private var readCacheOffset: Int64 = 0
-    private var readCache = Data()
+    let generation: UInt64
+    let sharedReadWindow: WireSharedReadWindow?
+    private(set) var nativeReadFD: Int32?
+    private var closed = false
 
-    init(connection: WireConnection, handle: UInt64, writable: Bool) {
+    init(connection: WireConnection, opened: WireOpenResult, generation: UInt64) {
         self.connection = connection
-        self.handle = handle
-        self.writable = writable
+        self.handle = opened.handle
+        self.generation = generation
+        self.nativeReadFD = opened.nativeReadFD
+        self.sharedReadWindow = opened.sharedReadWindow
     }
 
-    func read(client: DaemonClient, offset: Int64, length: Int) throws -> Data {
-        guard offset >= 0, length >= 0 else { throw POSIXError(.EINVAL) }
-        guard length > 0 else { return Data() }
-        if writable {
-            return try client.read(handle: handle, offset: offset, length: length, connection: connection)
+    func close(client: DaemonClient) {
+        guard !closed else { return }
+        closed = true
+        if let nativeReadFD {
+            Darwin.close(nativeReadFD)
+            self.nativeReadFD = nil
         }
-        if length >= Self.readAheadBytes {
-            return try client.read(handle: handle, offset: offset, length: length, connection: connection)
-        }
+        try? client.handleOperation(.release, handle: handle, connection: connection)
+        connection.close()
+    }
 
-        cacheLock.lock()
-        defer { cacheLock.unlock() }
-        if offset >= readCacheOffset {
-            let start = offset - readCacheOffset
-            if start <= Int64(readCache.count), Int64(length) <= Int64(readCache.count) - start {
-                let lower = Int(start)
-                return readCache.subdata(in: lower..<(lower + length))
+    deinit {
+        if let nativeReadFD {
+            Darwin.close(nativeReadFD)
+        }
+        connection.close()
+    }
+}
+
+private final class CodexFoldIO {
+    // Keep the cache bounded while amortizing the FSKit-to-daemon round trip.
+    // A 12 MiB block aligns with the mounted reader's 4 MiB requests and lets
+    // eight workers maintain a 96 MiB horizon when the kernel cache is off.
+
+    let client: DaemonClient
+    let connection: WireConnection
+    let handle: UInt64
+    let path: String
+    let writable: Bool
+    private let foregroundFetchLock = NSLock()
+    private let cacheLock = NSLock()
+    private let nativeFDLock = NSLock()
+    private let prefetchPoolLock = NSLock()
+    private let prefetchQueue: OperationQueue
+    private var cachedBlocks: [Int64: CodexFoldCachedReadBlock] = [:]
+    private var prefetchingBlocks: Set<Int64> = []
+    private var prefetchGroups: [Int64: DispatchGroup] = [:]
+    private var prefetchFrontier: Int64 = 0
+    private var sequentialHintBlockOffset: Int64?
+    private var cachePruneOffset: Int64 = 0
+    private var cacheGeneration: UInt64 = 1
+    private var fileSize: Int64
+    private var closed = false
+    private var nativeReadFD: Int32?
+    private let sharedReadWindow: WireSharedReadWindow?
+    private var idlePrefetchChannels: [CodexFoldPrefetchChannel] = []
+    private var prefetchChannelCount = 0
+    private var prefetchPoolGeneration: UInt64 = 1
+    private var prefetchPoolClosed = false
+    private let readAheadBytes: Int
+    private let concurrentPrefetchCount: Int
+    private let scheduledPrefetchCount: Int
+    private let maxCachedBlocks: Int
+
+    init(
+        client: DaemonClient,
+        connection: WireConnection,
+        handle: UInt64,
+        path: String,
+        writable: Bool,
+        size: UInt64,
+        nativeReadFD: Int32? = nil,
+        sharedReadWindow: WireSharedReadWindow? = nil
+    ) {
+        self.client = client
+        self.connection = connection
+        self.handle = handle
+        self.path = path
+        self.writable = writable
+        self.fileSize = Self.normalizedFileSize(size)
+        let readAheadPolicy = CodexFoldReadAheadPolicy(
+            negotiatedReadBytes: connection.maximumReadBytes
+        )
+        self.readAheadBytes = readAheadPolicy.readAheadBytes
+        self.concurrentPrefetchCount = readAheadPolicy.concurrentPrefetchCount
+        self.scheduledPrefetchCount = readAheadPolicy.scheduledPrefetchCount
+        self.maxCachedBlocks = readAheadPolicy.maxCachedBlocks
+        let prefetchQueue = OperationQueue()
+        prefetchQueue.name = "vip.jstar.codexfold.fskit.readahead.\(handle)"
+        prefetchQueue.qualityOfService = .userInitiated
+        prefetchQueue.maxConcurrentOperationCount = concurrentPrefetchCount
+        self.prefetchQueue = prefetchQueue
+        if writable {
+            if let nativeReadFD {
+                Darwin.close(nativeReadFD)
+            }
+            self.nativeReadFD = nil
+            self.sharedReadWindow = nil
+        } else {
+            self.nativeReadFD = nativeReadFD
+            self.sharedReadWindow = sharedReadWindow
+        }
+        primePrefetchChannelsIfBeneficial()
+        primeReadAheadIfBeneficial()
+    }
+
+    func read(
+        client: DaemonClient,
+        offset: Int64,
+        length: Int,
+        into buffer: FSMutableFileDataBuffer
+    ) throws -> Int {
+        guard offset >= 0, length >= 0, buffer.length >= length else {
+            throw POSIXError(.EINVAL)
+        }
+        guard length > 0 else { return 0 }
+        if !writable {
+            nativeFDLock.lock()
+            if let nativeReadFD {
+                defer { nativeFDLock.unlock() }
+                return try Self.readNativeDescriptor(
+                    nativeReadFD,
+                    offset: offset,
+                    length: length,
+                    into: buffer
+                )
+            }
+            nativeFDLock.unlock()
+        }
+        if !writable, length < readAheadBytes {
+            let blockSize = Int64(readAheadBytes)
+            let fetchOffset = offset / blockSize * blockSize
+            if let copied = copyCachedRange(offset: offset, length: length, into: buffer) {
+                schedulePrefetch(after: fetchOffset, generation: currentCacheGeneration())
+                return copied
+            }
+
+            foregroundFetchLock.lock()
+            defer { foregroundFetchLock.unlock() }
+            if let copied = copyCachedRange(offset: offset, length: length, into: buffer) {
+                schedulePrefetch(after: fetchOffset, generation: currentCacheGeneration())
+                return copied
+            }
+            waitForPrefetch(offset: fetchOffset)
+            if let copied = copyCachedRange(offset: offset, length: length, into: buffer) {
+                schedulePrefetch(after: fetchOffset, generation: currentCacheGeneration())
+                return copied
+            }
+            guard !isClosed() else { throw POSIXError(.EBADF) }
+
+            if readAheadLength(offset: fetchOffset) > 0 {
+                let generation = currentCacheGeneration()
+                schedulePrefetchBlock(offset: fetchOffset, generation: generation)
+                waitForPrefetch(offset: fetchOffset)
+                if let copied = copyCachedRange(offset: offset, length: length, into: buffer) {
+                    schedulePrefetch(after: fetchOffset, generation: generation)
+                    return copied
+                }
             }
         }
-
-        let blockSize = Int64(Self.readAheadBytes)
-        let fetchOffset = offset / blockSize * blockSize
-        let requestedEnd = offset - fetchOffset + Int64(length)
-        let fetchLength = Int(max(blockSize, requestedEnd))
-        let fetched = try client.read(handle: handle, offset: fetchOffset, length: fetchLength, connection: connection)
-        readCacheOffset = fetchOffset
-        readCache = fetched
-
-        let lower = Int(offset - fetchOffset)
-        guard lower < fetched.count else { return Data() }
-        return fetched.subdata(in: lower..<min(fetched.count, lower + length))
+        let data = try client.read(
+            handle: handle,
+            offset: offset,
+            length: length,
+            connection: connection,
+            sharedWindow: sharedReadWindow
+        )
+        return buffer.withUnsafeMutableBytes { destination in
+            _ = data.copyBytes(to: destination.bindMemory(to: UInt8.self))
+            return data.count
+        }
     }
 
     func invalidateReadCache() {
         cacheLock.lock()
-        readCacheOffset = 0
-        readCache.removeAll(keepingCapacity: false)
+        resetReadCacheLocked()
         cacheLock.unlock()
+        invalidatePrefetchChannels()
+    }
+
+    var usesNativeReadFD: Bool {
+        nativeFDLock.lock()
+        defer { nativeFDLock.unlock() }
+        return nativeReadFD != nil
+    }
+
+    func updateFileSize(_ size: UInt64) {
+        let updated = Self.normalizedFileSize(size)
+        var changed = false
+        cacheLock.lock()
+        if updated != fileSize {
+            fileSize = updated
+            resetReadCacheLocked()
+            changed = true
+        }
+        cacheLock.unlock()
+        if changed {
+            invalidatePrefetchChannels()
+        }
+    }
+
+    func shutdown() {
+        cacheLock.lock()
+        closed = true
+        resetReadCacheLocked()
+        cacheLock.unlock()
+        prefetchQueue.cancelAllOperations()
+        prefetchQueue.waitUntilAllOperationsAreFinished()
+
+        nativeFDLock.lock()
+        if let nativeReadFD {
+            Darwin.close(nativeReadFD)
+            self.nativeReadFD = nil
+        }
+        nativeFDLock.unlock()
+
+        closePrefetchPool()
+    }
+
+    private func readNativeDescriptorIfAvailable(offset: Int64, length: Int) throws -> Data? {
+        nativeFDLock.lock()
+        defer { nativeFDLock.unlock() }
+        guard let nativeReadFD else { return nil }
+        return try Self.readNativeDescriptor(nativeReadFD, offset: offset, length: length)
+    }
+
+    private static func normalizedFileSize(_ size: UInt64) -> Int64 {
+        size > UInt64(Int64.max) ? Int64.max : Int64(size)
+    }
+
+    private func resetReadCacheLocked() {
+        cacheGeneration &+= 1
+        cachedBlocks.removeAll(keepingCapacity: false)
+        prefetchingBlocks.removeAll(keepingCapacity: false)
+        prefetchGroups.removeAll(keepingCapacity: false)
+        prefetchFrontier = 0
+        sequentialHintBlockOffset = nil
+        cachePruneOffset = 0
+    }
+
+    private func checkoutPrefetchChannel() throws -> CodexFoldPrefetchChannel? {
+        prefetchPoolLock.lock()
+        if prefetchPoolClosed {
+            prefetchPoolLock.unlock()
+            return nil
+        }
+        if let channel = idlePrefetchChannels.popLast() {
+            prefetchPoolLock.unlock()
+            return channel
+        }
+        guard prefetchChannelCount < maxCachedBlocks else {
+            prefetchPoolLock.unlock()
+            return nil
+        }
+        let generation = prefetchPoolGeneration
+        prefetchChannelCount += 1
+        prefetchPoolLock.unlock()
+
+        let connection: WireConnection
+        do {
+            connection = try client.newConnection()
+        } catch {
+            releasePrefetchChannelReservation()
+            throw error
+        }
+        let channel: CodexFoldPrefetchChannel
+        do {
+            let opened = try client.open(path, flags: O_RDONLY, connection: connection)
+            channel = CodexFoldPrefetchChannel(
+                connection: connection,
+                opened: opened,
+                generation: generation
+            )
+        } catch {
+            connection.close()
+            releasePrefetchChannelReservation()
+            throw error
+        }
+
+        prefetchPoolLock.lock()
+        let accepted = !prefetchPoolClosed && generation == prefetchPoolGeneration
+        if !accepted {
+            prefetchChannelCount -= 1
+        }
+        prefetchPoolLock.unlock()
+        if !accepted {
+            channel.close(client: client)
+            return nil
+        }
+        return channel
+    }
+
+    private func primePrefetchChannelsIfBeneficial() {
+        guard shouldPrimeReadAhead else {
+            return
+        }
+
+        var channels: [CodexFoldPrefetchChannel] = []
+        channels.reserveCapacity(maxCachedBlocks)
+        for _ in 0..<maxCachedBlocks {
+            do {
+                guard let channel = try checkoutPrefetchChannel() else { break }
+                channels.append(channel)
+            } catch {
+                break
+            }
+        }
+        for channel in channels {
+            returnPrefetchChannel(channel, healthy: true)
+        }
+    }
+
+    private func primeReadAheadIfBeneficial() {
+        guard shouldPrimeReadAhead else {
+            return
+        }
+        let generation = currentCacheGeneration()
+        let blockSize = Int64(readAheadBytes)
+        for index in 0..<scheduledPrefetchCount {
+            schedulePrefetchBlock(offset: Int64(index) * blockSize, generation: generation)
+        }
+    }
+
+    private var shouldPrimeReadAhead: Bool {
+        !writable &&
+            nativeReadFD == nil &&
+            sharedReadWindow != nil &&
+            fileSize >= Int64(readAheadBytes * maxCachedBlocks)
+    }
+
+    private func returnPrefetchChannel(_ channel: CodexFoldPrefetchChannel, healthy: Bool) {
+        prefetchPoolLock.lock()
+        let retain = healthy &&
+            !prefetchPoolClosed &&
+            channel.generation == prefetchPoolGeneration
+        if retain {
+            idlePrefetchChannels.append(channel)
+        } else {
+            prefetchChannelCount -= 1
+        }
+        prefetchPoolLock.unlock()
+        if !retain {
+            channel.close(client: client)
+        }
+    }
+
+    private func releasePrefetchChannelReservation() {
+        prefetchPoolLock.lock()
+        prefetchChannelCount -= 1
+        prefetchPoolLock.unlock()
+    }
+
+    private func invalidatePrefetchChannels() {
+        prefetchPoolLock.lock()
+        prefetchPoolGeneration &+= 1
+        let channels = idlePrefetchChannels
+        idlePrefetchChannels.removeAll(keepingCapacity: false)
+        prefetchChannelCount -= channels.count
+        prefetchPoolLock.unlock()
+        for channel in channels {
+            channel.close(client: client)
+        }
+    }
+
+    private func closePrefetchPool() {
+        prefetchPoolLock.lock()
+        prefetchPoolClosed = true
+        prefetchPoolGeneration &+= 1
+        let channels = idlePrefetchChannels
+        idlePrefetchChannels.removeAll(keepingCapacity: false)
+        prefetchChannelCount -= channels.count
+        prefetchPoolLock.unlock()
+        for channel in channels {
+            channel.close(client: client)
+        }
+    }
+
+    private func readAheadLength(offset: Int64) -> Int {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        return readAheadLengthLocked(offset: offset)
+    }
+
+    private func readAheadLengthLocked(offset: Int64) -> Int {
+        guard offset >= 0, offset < fileSize else { return 0 }
+        return Int(min(Int64(readAheadBytes), fileSize - offset))
+    }
+
+    private static func readNativeDescriptor(_ descriptor: Int32, offset: Int64, length: Int) throws -> Data {
+        guard descriptor >= 0, offset >= 0, length >= 0 else {
+            throw POSIXError(.EINVAL)
+        }
+        var result = Data(count: length)
+        var completed = 0
+        while completed < length {
+            let amount = result.withUnsafeMutableBytes { bytes in
+                Darwin.pread(
+                    descriptor,
+                    bytes.baseAddress!.advanced(by: completed),
+                    length - completed,
+                    off_t(offset + Int64(completed))
+                )
+            }
+            if amount == 0 {
+                break
+            }
+            if amount < 0 {
+                if errno == EINTR { continue }
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+            completed += amount
+        }
+        if completed < result.count {
+            result.removeSubrange(completed..<result.count)
+        }
+        return result
+    }
+
+    private static func readNativeDescriptor(
+        _ descriptor: Int32,
+        offset: Int64,
+        length: Int,
+        into buffer: FSMutableFileDataBuffer
+    ) throws -> Int {
+        guard descriptor >= 0, offset >= 0, length >= 0, buffer.length >= length else {
+            throw POSIXError(.EINVAL)
+        }
+        return try buffer.withUnsafeMutableBytes { destination in
+            var completed = 0
+            while completed < length {
+                let amount = Darwin.pread(
+                    descriptor,
+                    destination.baseAddress!.advanced(by: completed),
+                    length - completed,
+                    off_t(offset + Int64(completed))
+                )
+                if amount == 0 {
+                    break
+                }
+                if amount < 0 {
+                    if errno == EINTR { continue }
+                    throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+                }
+                completed += amount
+            }
+            return completed
+        }
+    }
+
+    private func copyCachedRange(
+        offset: Int64,
+        length: Int,
+        into buffer: FSMutableFileDataBuffer
+    ) -> Int? {
+        cacheLock.lock()
+        guard !closed, offset >= 0, length >= 0, offset < fileSize else {
+            cacheLock.unlock()
+            return nil
+        }
+        let requestedEnd = Int64(length) > Int64.max - offset ? Int64.max : offset + Int64(length)
+        let end = min(fileSize, requestedEnd)
+        guard end >= offset, end - offset <= Int64(buffer.length) else {
+            cacheLock.unlock()
+            return nil
+        }
+        let blockSize = Int64(readAheadBytes)
+        let firstBlockOffset = offset / blockSize * blockSize
+        if let cached = cachedBlocks[firstBlockOffset] {
+            let lower = offset - firstBlockOffset
+            let available = Int64(cached.count) - lower
+            if lower >= 0, available >= end - offset {
+                pruneCacheLocked(before: firstBlockOffset)
+                cacheLock.unlock()
+                return copyCachedSpan(
+                    cached,
+                    sourceOffset: Int(lower),
+                    length: Int(end - offset),
+                    into: buffer
+                )
+            }
+        }
+
+        var spans: [(block: CodexFoldCachedReadBlock, offset: Int, length: Int)] = []
+        var current = offset
+        while current < end {
+            let blockOffset = current / blockSize * blockSize
+            guard let cached = cachedBlocks[blockOffset] else {
+                cacheLock.unlock()
+                return nil
+            }
+            let lower = current - blockOffset
+            guard lower >= 0, lower < Int64(cached.count) else {
+                cacheLock.unlock()
+                return nil
+            }
+            let available = min(Int64(cached.count) - lower, end - current)
+            guard available > 0 else {
+                cacheLock.unlock()
+                return nil
+            }
+            spans.append((cached, Int(lower), Int(available)))
+            current += available
+        }
+        pruneCacheLocked(before: firstBlockOffset)
+        cacheLock.unlock()
+
+        let written = buffer.withUnsafeMutableBytes { destination in
+            var written = 0
+            for span in spans {
+                guard span.block.copyBytes(
+                    from: span.offset,
+                    count: span.length,
+                    to: destination.baseAddress!.advanced(by: written)
+                ) else {
+                    return -1
+                }
+                written += span.length
+            }
+            return written
+        }
+        return written >= 0 ? written : nil
+    }
+
+    private func copyCachedSpan(
+        _ block: CodexFoldCachedReadBlock,
+        sourceOffset: Int,
+        length: Int,
+        into buffer: FSMutableFileDataBuffer
+    ) -> Int? {
+        let copied = buffer.withUnsafeMutableBytes { destination in
+            block.copyBytes(
+                from: sourceOffset,
+                count: length,
+                to: destination.baseAddress!
+            )
+        }
+        return copied ? length : nil
+    }
+
+    private func pruneCacheLocked(before offset: Int64) {
+        guard offset > cachePruneOffset else { return }
+        let staleOffsets = cachedBlocks.keys.filter { $0 < offset }
+        for staleOffset in staleOffsets {
+            cachedBlocks.removeValue(forKey: staleOffset)
+        }
+        cachePruneOffset = offset
+    }
+
+    private func currentCacheGeneration() -> UInt64 {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        return cacheGeneration
+    }
+
+    private func isClosed() -> Bool {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        return closed
+    }
+
+    private func waitForPrefetch(offset: Int64) {
+        cacheLock.lock()
+        let group = prefetchGroups[offset]
+        cacheLock.unlock()
+        guard let group else { return }
+        // Failed and cancelled prefetches also leave the group, allowing the
+        // foreground request to retry through the ordinary path.
+        _ = group.wait(timeout: .now() + .seconds(5))
+    }
+
+    private func trimCacheLocked() {
+        while cachedBlocks.count > maxCachedBlocks {
+            guard let oldest = cachedBlocks.keys.min() else { return }
+            cachedBlocks.removeValue(forKey: oldest)
+        }
+    }
+
+    private func schedulePrefetchBlock(offset: Int64, generation: UInt64) {
+        var request: (offset: Int64, group: DispatchGroup)?
+        cacheLock.lock()
+        if !closed,
+           generation == cacheGeneration,
+           readAheadLengthLocked(offset: offset) > 0,
+           cachedBlocks[offset] == nil,
+           !prefetchingBlocks.contains(offset),
+           prefetchingBlocks.count < scheduledPrefetchCount {
+            let group = DispatchGroup()
+            group.enter()
+            prefetchingBlocks.insert(offset)
+            prefetchGroups[offset] = group
+            request = (offset, group)
+        }
+        cacheLock.unlock()
+        guard let request else { return }
+        prefetchQueue.addOperation { [weak self] in
+            guard let self else {
+                request.group.leave()
+                return
+            }
+            self.prefetch(offset: request.offset, generation: generation, completion: request.group)
+        }
+    }
+
+    private func schedulePrefetch(after blockOffset: Int64, generation: UInt64) {
+        guard !writable else { return }
+        let blockSize = Int64(readAheadBytes)
+        var requests: [(offset: Int64, group: DispatchGroup)] = []
+        cacheLock.lock()
+        guard !closed, generation == cacheGeneration else {
+            cacheLock.unlock()
+            return
+        }
+        guard fileSize > 0 else {
+            cacheLock.unlock()
+            return
+        }
+        let lastBlockOffset = (fileSize - 1) / blockSize * blockSize
+        if blockOffset >= lastBlockOffset {
+            cacheLock.unlock()
+            return
+        }
+        if let previous = sequentialHintBlockOffset, blockOffset < previous {
+            // A backwards seek starts a new read-ahead horizon without invalidating
+            // already fetched blocks that may still satisfy another open reader.
+            prefetchFrontier = blockOffset + blockSize
+        }
+        sequentialHintBlockOffset = blockOffset
+        let span = Int64(scheduledPrefetchCount) * blockSize
+        let requestedHorizon = blockOffset > Int64.max - span ? Int64.max : blockOffset + span
+        let horizon = min(lastBlockOffset, requestedHorizon)
+        if prefetchFrontier <= blockOffset {
+            prefetchFrontier = blockOffset + blockSize
+        }
+        while prefetchingBlocks.count < scheduledPrefetchCount && prefetchFrontier <= horizon && prefetchFrontier < fileSize {
+            let offset = prefetchFrontier
+            prefetchFrontier = offset >= lastBlockOffset ? fileSize : offset + blockSize
+            if cachedBlocks[offset] != nil || prefetchingBlocks.contains(offset) {
+                continue
+            }
+            let group = DispatchGroup()
+            group.enter()
+            prefetchingBlocks.insert(offset)
+            prefetchGroups[offset] = group
+            requests.append((offset, group))
+        }
+        cacheLock.unlock()
+
+        for request in requests {
+            prefetchQueue.addOperation { [weak self] in
+                guard let self else {
+                    request.group.leave()
+                    return
+                }
+                self.prefetch(offset: request.offset, generation: generation, completion: request.group)
+            }
+        }
+    }
+
+    private func prefetch(offset: Int64, generation: UInt64, completion: DispatchGroup) {
+        var nextHint: Int64?
+        defer {
+            cacheLock.lock()
+            if prefetchGroups[offset] === completion {
+                prefetchingBlocks.remove(offset)
+                prefetchGroups.removeValue(forKey: offset)
+            }
+            if !closed && generation == cacheGeneration {
+                nextHint = sequentialHintBlockOffset
+            }
+            cacheLock.unlock()
+            completion.leave()
+            if let nextHint {
+                schedulePrefetch(after: nextHint, generation: generation)
+            }
+        }
+        cacheLock.lock()
+        let allowed = !closed && generation == cacheGeneration
+        let fetchLength = allowed ? readAheadLengthLocked(offset: offset) : 0
+        cacheLock.unlock()
+        guard allowed, fetchLength > 0 else { return }
+
+        do {
+            if let data = try readNativeDescriptorIfAvailable(offset: offset, length: fetchLength) {
+                cacheLock.lock()
+                if !closed && generation == cacheGeneration {
+                    cachedBlocks[offset] = CodexFoldCachedReadBlock(data: data)
+                    trimCacheLocked()
+                }
+                cacheLock.unlock()
+                return
+            }
+        } catch {
+            // The ordinary daemon path below remains the compatibility fallback.
+        }
+
+        var channel: CodexFoldPrefetchChannel?
+        var healthy = false
+        defer {
+            if let channel {
+                returnPrefetchChannel(channel, healthy: healthy)
+            }
+        }
+        do {
+            guard let checkedOut = try checkoutPrefetchChannel() else { return }
+            channel = checkedOut
+            let block: CodexFoldCachedReadBlock
+            if let nativeReadFD = checkedOut.nativeReadFD {
+                block = CodexFoldCachedReadBlock(
+                    data: try Self.readNativeDescriptor(nativeReadFD, offset: offset, length: fetchLength)
+                )
+            } else if let sharedWindow = checkedOut.sharedReadWindow {
+                let result = try client.readBorrowingSharedWindow(
+                    handle: checkedOut.handle,
+                    offset: offset,
+                    length: fetchLength,
+                    connection: checkedOut.connection,
+                    sharedWindow: sharedWindow
+                )
+                switch result {
+                case .copied(let data):
+                    block = CodexFoldCachedReadBlock(data: data)
+                case .sharedWindow(let count):
+                    block = try CodexFoldCachedReadBlock(
+                        sharedWindow: sharedWindow,
+                        count: count,
+                        release: { [weak self, checkedOut] in
+                            self?.returnPrefetchChannel(checkedOut, healthy: true)
+                        }
+                    )
+                    channel = nil
+                }
+            } else {
+                block = CodexFoldCachedReadBlock(
+                    data: try client.read(
+                        handle: checkedOut.handle,
+                        offset: offset,
+                        length: fetchLength,
+                        connection: checkedOut.connection
+                    )
+                )
+            }
+            healthy = true
+            cacheLock.lock()
+            if !closed && generation == cacheGeneration {
+                cachedBlocks[offset] = block
+                trimCacheLocked()
+            }
+            cacheLock.unlock()
+        } catch {
+            return
+        }
     }
 }
 
@@ -169,7 +872,9 @@ private final class CodexFoldItem: FSItem {
         lock.lock()
         storedEntry = entry
         deleted = false
+        let currentIO = storedIO
         lock.unlock()
+        currentIO?.updateFileSize(entry.size)
     }
 
     func markDeleted() {
@@ -201,6 +906,10 @@ private final class CodexFoldItem: FSItem {
 }
 
 private final class CodexFoldVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler, FSVolume.DataCacheHandler, FSVolume.XattrHandler {
+    private let logger = Logger(
+        subsystem: "vip.jstar.codexfold.fskitprofileprobe.module",
+        category: "coherency"
+    )
     private let client: DaemonClient
     private let itemLock = NSLock()
     private var items: [UInt64: CodexFoldItem] = [:]
@@ -222,10 +931,12 @@ private final class CodexFoldVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWr
         capabilities.supportsPersistentObjectIDs = false
         capabilities.supportsSymbolicLinks = false
         capabilities.supportsHardLinks = false
-        capabilities.supportsJournal = true
-        capabilities.supportsActiveJournal = true
+        capabilities.supportsJournal = false
+        capabilities.supportsActiveJournal = false
         capabilities.supportsSparseFiles = false
-        capabilities.supportsFastStatFS = true
+        // A statfs round trip crosses the extension/daemon boundary, so let
+        // FSKit cache it instead of treating it as a local constant-time call.
+        capabilities.supportsFastStatFS = false
         capabilities.supports2TBFiles = true
         capabilities.supports64BitObjectIDs = true
         capabilities.supportsHiddenFiles = true
@@ -403,7 +1114,7 @@ private final class CodexFoldVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWr
                     newItemName: FSFileName(string: entry.name),
                     newItemAttributes: attributes(for: entry),
                     directoryAttributes: attributes(for: directoryEntry),
-                    freeSpace: nil
+                    freeSpace: freeSpaceSnapshot()
                 ),
                 nil
             )
@@ -474,7 +1185,7 @@ private final class CodexFoldVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWr
                     sourceDirectoryAttributes: attributes(for: sourceEntry),
                     destinationDirectoryAttributes: attributes(for: destinationEntry),
                     overItemAttributes: nil,
-                    freeSpace: nil
+                    freeSpace: freeSpaceSnapshot()
                 ),
                 nil
             )
@@ -510,7 +1221,7 @@ private final class CodexFoldVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWr
                 FSRemoveItemResult(
                     itemAttributes: attributes(for: removedEntry),
                     directoryAttributes: attributes(for: directoryEntry),
-                    freeSpace: nil
+                    freeSpace: freeSpaceSnapshot()
                 ),
                 nil
             )
@@ -549,11 +1260,11 @@ private final class CodexFoldVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWr
             return
         }
         do {
-			item.invalidateReadCache()
+            item.invalidateReadCache()
             try applyAttributes(newAttributes, path: item.entry.path, type: itemType(item.entry.type))
             let entry = try client.getattr(item.entry.path)
             item.update(entry)
-            replyHandler(FSSetAttributesResult(attributes: attributes(for: entry), freeSpace: nil), nil)
+            replyHandler(FSSetAttributesResult(attributes: attributes(for: entry), freeSpace: freeSpaceSnapshot()), nil)
         } catch {
             replyHandler(nil, error)
         }
@@ -573,8 +1284,14 @@ private final class CodexFoldVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWr
             return
         }
         do {
+            let before = try client.getattr(directory.entry.path)
             let entries = try client.readDir(directory.entry.path)
-            let currentVersion = try client.namespaceVersion()
+            let after = try client.getattr(directory.entry.path)
+            guard before.contentGeneration == after.contentGeneration else {
+                throw POSIXError(.ESTALE)
+            }
+            directory.update(after)
+            let currentVersion = after.contentGeneration
             let start = Int(cookie.rawValue)
             guard start >= 0, start <= entries.count else {
                 throw POSIXError(.EINVAL)
@@ -645,7 +1362,7 @@ private final class CodexFoldVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWr
             if let entry = try? client.getattr(item.entry.path) {
                 item.update(entry)
             }
-            guard let result = FSSetXattrResult(freeSpace: nil) else {
+            guard let result = FSSetXattrResult(freeSpace: freeSpaceSnapshot()) else {
                 throw POSIXError(.EIO)
             }
             replyHandler(result, nil)
@@ -687,12 +1404,9 @@ private final class CodexFoldVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWr
         }
         do {
             let io = try ensureIO(item, writable: false)
-            let data = try io.read(client: client, offset: Int64(offset), length: length)
-            _ = buffer.withUnsafeMutableBytes { destination in
-                data.copyBytes(to: destination.bindMemory(to: UInt8.self))
-            }
+            let bytesRead = try io.read(client: client, offset: Int64(offset), length: length, into: buffer)
             let entry = item.entry
-            replyHandler(FSReadFileResult(bytesRead: data.count, itemAttributes: attributes(for: entry)), nil)
+            replyHandler(FSReadFileResult(bytesRead: bytesRead, itemAttributes: attributes(for: entry)), nil)
         } catch {
             replyHandler(nil, error)
         }
@@ -710,11 +1424,27 @@ private final class CodexFoldVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWr
         }
         do {
             let io = try ensureIO(item, writable: true)
-			io.invalidateReadCache()
+            let previousSize = item.entry.size
+            io.invalidateReadCache()
             let count = try client.write(handle: io.handle, offset: Int64(offset), data: contents, connection: io.connection)
             let entry = try client.getattr(item.entry.path)
+            let invalidateKernelCache = writeRequiresKernelCacheInvalidation(
+                previousSize: previousSize,
+                offset: Int64(offset),
+                writtenBytes: count,
+                visibleSize: entry.size
+            )
             item.update(entry)
-            replyHandler(FSWriteFileResult(bytesWritten: count, itemAttributes: attributes(for: entry), freeSpace: nil), nil)
+            replyHandler(FSWriteFileResult(bytesWritten: count, itemAttributes: attributes(for: entry), freeSpace: freeSpaceSnapshot()), nil)
+            if invalidateKernelCache,
+               let error = setCacheState(
+                   for: item,
+                   cacheMode: .none,
+                   coherencyType: .noCache,
+                   action: .revoke
+               ) {
+                logger.error("normalized write cache revoke failed: \(String(describing: error), privacy: .public)")
+            }
         } catch {
             replyHandler(nil, error)
         }
@@ -733,10 +1463,12 @@ private final class CodexFoldVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWr
         }
         do {
             let writable = modes.contains(.write)
+            var nativePassthrough = false
             if item.entry.type == .file {
-				_ = try ensureIO(item, writable: writable)
+                let fileIO = try ensureIO(item, writable: writable)
+                nativePassthrough = fileIO.usesNativeReadFD
             }
-			let coherency: FSVolume.KernelCacheCoherencyType = !writable && cacheMode != .none ? .readCache : .noCache
+            let coherency: FSVolume.KernelCacheCoherencyType = !writable && !nativePassthrough && cacheMode != .none ? .readCache : .noCache
             replyHandler(FSOpenItemResult(grantedCoherency: coherency), nil)
         } catch {
             replyHandler(nil, error)
@@ -745,14 +1477,13 @@ private final class CodexFoldVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWr
 
     func close(_ item: FSItem, context: FSContext, replyHandler: @escaping () -> Void) {
         if let item = item as? CodexFoldItem {
-			let closed = item.replaceIO(nil)
-			closeIO(closed)
-			if closed?.writable == true {
-				if let entry = try? client.getattr(item.entry.path) {
-					item.update(entry)
-				}
-				_ = setCacheState(for: item, cacheMode: .none, coherencyType: .noCache, action: .revoke)
-			}
+            let closed = item.replaceIO(nil)
+            closeIO(closed)
+            if closed?.writable == true {
+                if let entry = try? client.getattr(item.entry.path) {
+                    item.update(entry)
+                }
+            }
         }
         replyHandler()
     }
@@ -769,10 +1500,12 @@ private final class CodexFoldVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWr
         }
         do {
             let writable = cacheMode == .readWriteWithCache
+            var nativePassthrough = false
             if item.entry.type == .file {
-				_ = try ensureIO(item, writable: writable)
+                let fileIO = try ensureIO(item, writable: writable)
+                nativePassthrough = fileIO.usesNativeReadFD
             }
-			let coherency: FSVolume.KernelCacheCoherencyType = writable ? .noCache : .readCache
+            let coherency: FSVolume.KernelCacheCoherencyType = !writable && !nativePassthrough && cacheMode != .none ? .readCache : .noCache
             replyHandler(FSUpgradeItemResult(grantedCoherency: coherency), nil)
         } catch {
             replyHandler(nil, error)
@@ -808,11 +1541,20 @@ private final class CodexFoldVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWr
         var flags: Int32 = writable ? O_RDWR : O_RDONLY
         if writable && item.entry.path.hasSuffix(".jsonl") && !item.entry.name.hasPrefix("._") {
             flags |= O_APPEND
-			flags |= Int32(bitPattern: 1 << 31)
+            flags |= Int32(bitPattern: 1 << 31)
         }
         do {
-            let handle = try client.open(item.entry.path, flags: flags, connection: connection)
-            let io = CodexFoldIO(connection: connection, handle: handle, writable: writable)
+            let opened = try client.open(item.entry.path, flags: flags, connection: connection)
+            let io = CodexFoldIO(
+                client: client,
+                connection: connection,
+                handle: opened.handle,
+                path: item.entry.path,
+                writable: writable,
+                size: item.entry.size,
+                nativeReadFD: opened.nativeReadFD,
+                sharedReadWindow: opened.sharedReadWindow
+            )
             closeIO(item.replaceIO(io))
             return io
         } catch {
@@ -831,32 +1573,38 @@ private final class CodexFoldVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWr
             request.consumedAttributes.insert(.size)
         }
 
+        let hasMode = request.isValid(.mode)
+        let hasUID = request.isValid(.uid)
+        let hasGID = request.isValid(.gid)
+        let hasAccessTime = request.isValid(.accessTime)
+        let hasModifyTime = request.isValid(.modifyTime)
         var valid: UInt32 = 0
-        if request.isValid(.mode) { valid |= 1 << 0 }
-        if request.isValid(.uid) { valid |= 1 << 1 }
-        if request.isValid(.gid) { valid |= 1 << 2 }
-        if request.isValid(.accessTime) { valid |= 1 << 3 }
-        if request.isValid(.modifyTime) { valid |= 1 << 4 }
+        if hasMode { valid |= 1 << 0 }
+        if hasUID { valid |= 1 << 1 }
+        if hasGID { valid |= 1 << 2 }
+        if hasAccessTime { valid |= 1 << 3 }
+        if hasModifyTime { valid |= 1 << 4 }
         guard valid != 0 else { return }
 
         try client.setAttributes(
             path,
             valid: valid,
-            mode: request.mode,
-            uid: request.uid,
-            gid: request.gid,
-            accessTime: request.accessTime,
-            modifyTime: request.modifyTime
+            mode: hasMode ? request.mode : 0,
+            uid: hasUID ? request.uid : 0,
+            gid: hasGID ? request.gid : 0,
+            accessTime: hasAccessTime ? request.accessTime : timespec(),
+            modifyTime: hasModifyTime ? request.modifyTime : timespec()
         )
-        if request.isValid(.mode) { request.consumedAttributes.insert(.mode) }
-        if request.isValid(.uid) { request.consumedAttributes.insert(.uid) }
-        if request.isValid(.gid) { request.consumedAttributes.insert(.gid) }
-        if request.isValid(.accessTime) { request.consumedAttributes.insert(.accessTime) }
-        if request.isValid(.modifyTime) { request.consumedAttributes.insert(.modifyTime) }
+        if hasMode { request.consumedAttributes.insert(.mode) }
+        if hasUID { request.consumedAttributes.insert(.uid) }
+        if hasGID { request.consumedAttributes.insert(.gid) }
+        if hasAccessTime { request.consumedAttributes.insert(.accessTime) }
+        if hasModifyTime { request.consumedAttributes.insert(.modifyTime) }
     }
 
     private func closeIO(_ io: CodexFoldIO?) {
         guard let io else { return }
+        io.shutdown()
         if io.writable {
             try? client.handleOperation(.fsync, handle: io.handle, connection: io.connection)
         }
@@ -890,20 +1638,94 @@ private final class CodexFoldVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWr
     private func refreshNamespace() {
         guard let current = try? client.namespaceVersion() else { return }
         itemLock.lock()
+        let previousVersion = namespaceVersion
         if current == namespaceVersion {
             itemLock.unlock()
             return
         }
         namespaceVersion = current
-        let staleItems = items.values.filter { $0 !== rootItem }
-        items = [rootItem.entry.nodeID: rootItem]
+        let candidates = items.compactMap { nodeID, item -> (nodeID: UInt64, item: CodexFoldItem)? in
+            item === rootItem ? nil : (nodeID, item)
+        }
         itemLock.unlock()
+        let candidatePaths = candidates.map { $0.item.entry.path }.sorted().joined(separator: ",")
+        logger.info(
+            "namespace refresh previous=\(previousVersion) current=\(current) candidates=\(candidates.count) paths=\(candidatePaths, privacy: .public)"
+        )
         if let rootEntry = try? client.getattr("/") {
             rootItem.update(rootEntry)
         }
-        for item in staleItems {
-			item.invalidateReadCache()
-            _ = setCacheState(for: item, cacheMode: .none, coherencyType: .noCache, action: .revoke)
+
+        var changedItems: [CodexFoldItem] = []
+        var changedDirectories: [CodexFoldItem] = []
+        var staleItems: [(nodeID: UInt64, item: CodexFoldItem)] = []
+        for candidate in candidates {
+            let item = candidate.item
+            let previous = item.entry
+            guard let refreshed = try? client.getattr(previous.path),
+                  previous.hasSameObjectIdentity(as: refreshed) else {
+                staleItems.append((candidate.nodeID, item))
+                continue
+            }
+            if previous.type == .directory &&
+                !previous.hasSameCachedDirectoryContents(as: refreshed) {
+                item.update(refreshed)
+                changedDirectories.append(item)
+                continue
+            }
+            if previous.type == .file && !previous.hasSameCachedFileData(as: refreshed) {
+                changedItems.append(item)
+            }
+            item.update(refreshed)
+        }
+        let changedDirectoryPaths = changedDirectories.map { $0.entry.path }.sorted().joined(separator: ",")
+        logger.info(
+            "namespace delta directories=\(changedDirectories.count) directory_paths=\(changedDirectoryPaths, privacy: .public) files=\(changedItems.count) stale=\(staleItems.count)"
+        )
+
+        var removedItems: [CodexFoldItem] = []
+        itemLock.lock()
+        for stale in staleItems where items[stale.nodeID] === stale.item {
+            items.removeValue(forKey: stale.nodeID)
+            removedItems.append(stale.item)
+        }
+        itemLock.unlock()
+        for item in changedDirectories {
+            if let error = setCacheState(
+                for: item,
+                cacheMode: .none,
+                coherencyType: .noCache,
+                // The directory still exists. Revoke is reserved for an item
+                // that disappeared; invalidate asks the kernel to discard its
+                // cached directory state without invalidating the live vnode.
+                action: .invalidate
+            ) {
+                logger.error("directory contents cache invalidation failed: \(String(describing: error), privacy: .public)")
+            }
+        }
+        for item in changedItems {
+            item.invalidateReadCache()
+            if let error = setCacheState(
+                for: item,
+                cacheMode: .none,
+                coherencyType: .noCache,
+                // A plain data-cache invalidation does not evict stale vnode
+                // attributes after an external file-size change.
+                action: .revoke
+            ) {
+                logger.error("external change cache revoke failed: \(String(describing: error), privacy: .public)")
+            }
+        }
+        for item in removedItems {
+            item.invalidateReadCache()
+            if let error = setCacheState(
+                for: item,
+                cacheMode: .none,
+                coherencyType: .noCache,
+                action: .revoke
+            ) {
+                logger.error("external removal cache revoke failed: \(String(describing: error), privacy: .public)")
+            }
         }
     }
 
@@ -922,6 +1744,15 @@ private final class CodexFoldVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWr
         result.changeTime = entry.changeTime
         result.accessTime = entry.accessTime
         return result
+    }
+
+    private func freeSpaceSnapshot() -> FSFreeSpace {
+        guard let stat = try? client.statfs() else {
+            return FSFreeSpace.noUpdate
+        }
+        let freeSpace = FSFreeSpace()
+        freeSpace.populate(bytes: stat.availableBytes)
+        return freeSpace
     }
 
     private func itemType(_ type: WireEntryType) -> FSItem.ItemType {

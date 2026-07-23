@@ -9,13 +9,34 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/jstar0/codexfold/internal/fold"
 	"github.com/jstar0/codexfold/internal/vfs"
 )
+
+func TestFilesystemIOIdleRequiresNoActiveIOAndCompletedIdleWindow(t *testing.T) {
+	filesystem := New()
+	filesystem.lastIO.Store(time.Now().Add(-time.Second).UnixNano())
+	if !filesystem.IOIdleFor(500 * time.Millisecond) {
+		t.Fatal("filesystem did not report an elapsed idle window")
+	}
+	endIO := filesystem.beginIO()
+	if filesystem.IOIdleFor(0) {
+		t.Fatal("filesystem reported idle while I/O was active")
+	}
+	endIO()
+	if filesystem.IOIdleFor(time.Second) {
+		t.Fatal("filesystem reported idle immediately after I/O")
+	}
+	if !filesystem.IOIdleFor(0) {
+		t.Fatal("filesystem did not report idle with a zero window")
+	}
+}
 
 func TestFilesystemListsStatsReadsAndAppendsSession(t *testing.T) {
 	filesystem, source := mountFixture(t)
@@ -865,6 +886,93 @@ func TestCanonicalFilesystemPassesThroughNativeSessionFiles(t *testing.T) {
 	}
 }
 
+func TestCanonicalFilesystemNativeStreamReadFallsBackForVirtualAndPendingFiles(t *testing.T) {
+	root := t.TempDir()
+	pathName := "/sessions/2026/07/12/stream.jsonl"
+	nativePath := nativePathFromRoot(root, pathName)
+	if err := os.MkdirAll(filepath.Dir(nativePath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(nativePath, []byte("native-content\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	filesystem := NewCanonical()
+	filesystem.SetNativeRoot(root)
+	nativeHandle, errno := filesystem.Open(pathName, os.O_RDONLY)
+	if errno != 0 {
+		t.Fatalf("open native handle errno=%v", errno)
+	}
+	defer filesystem.Release(nativeHandle)
+	var streamed []byte
+	handled, n, err := filesystem.StreamNativeRead(nativeHandle, 7, 64, func(file *os.File, offset int64, length int) (int, error) {
+		streamed = make([]byte, length)
+		read, err := file.ReadAt(streamed, offset)
+		streamed = streamed[:read]
+		return read, err
+	})
+	if !handled || err != nil || n != len(streamed) || string(streamed) != "content\n" {
+		t.Fatalf("native stream handled=%t n=%d err=%v bytes=%q", handled, n, err, streamed)
+	}
+
+	writer, errno := filesystem.Open(pathName, os.O_WRONLY|os.O_APPEND)
+	if errno != 0 {
+		t.Fatalf("open append handle errno=%v", errno)
+	}
+	pending := []byte("{\"pending\":true}\n")
+	if written, errno := filesystem.Write(writer, pending, int64(len("native-content\n"))); errno != 0 || written != len(pending) {
+		t.Fatalf("stage append written=%d errno=%v", written, errno)
+	}
+	handled, _, err = filesystem.StreamNativeRead(nativeHandle, 0, 64, func(_ *os.File, _ int64, _ int) (int, error) {
+		t.Fatal("pending append unexpectedly used native stream")
+		return 0, nil
+	})
+	if handled || err != nil {
+		t.Fatalf("pending append stream handled=%t err=%v, want fallback", handled, err)
+	}
+	var pendingStream []byte
+	pendingTotals := make(map[int]struct{})
+	n, err = filesystem.StreamBufferedRead(nativeHandle, 0, 64, 4, func(total int, chunk []byte) error {
+		pendingTotals[total] = struct{}{}
+		pendingStream = append(pendingStream, chunk...)
+		return nil
+	})
+	wantPending := append([]byte("native-content\n"), pending...)
+	if err != nil || n != len(wantPending) || !bytes.Equal(pendingStream, wantPending) || len(pendingTotals) != 1 {
+		t.Fatalf("pending buffered stream n=%d err=%v totals=%v bytes=%q", n, err, pendingTotals, pendingStream)
+	}
+	if errno := filesystem.Release(writer); errno != 0 {
+		t.Fatalf("release append handle errno=%v", errno)
+	}
+
+	virtualPath := "/sessions/2026/07/12/virtual.jsonl"
+	if err := filesystem.AddSessionAt("virtual", virtualPath, mountSessionFixture(t, "virtual", []byte("virtual\n"))); err != nil {
+		t.Fatal(err)
+	}
+	virtualHandle, errno := filesystem.Open(virtualPath, os.O_RDONLY)
+	if errno != 0 {
+		t.Fatalf("open virtual handle errno=%v", errno)
+	}
+	defer filesystem.Release(virtualHandle)
+	handled, _, err = filesystem.StreamNativeRead(virtualHandle, 0, 64, func(_ *os.File, _ int64, _ int) (int, error) {
+		t.Fatal("virtual session unexpectedly used native stream")
+		return 0, nil
+	})
+	if handled || err != nil {
+		t.Fatalf("virtual stream handled=%t err=%v, want fallback", handled, err)
+	}
+	var virtualStream []byte
+	var virtualTotals []int
+	n, err = filesystem.StreamBufferedRead(virtualHandle, 1, 64, 3, func(total int, chunk []byte) error {
+		virtualTotals = append(virtualTotals, total)
+		virtualStream = append(virtualStream, chunk...)
+		return nil
+	})
+	if err != nil || n != len("irtual\n") || string(virtualStream) != "irtual\n" || !slices.Equal(virtualTotals, []int{7, 7, 7}) {
+		t.Fatalf("virtual buffered stream n=%d err=%v totals=%v bytes=%q", n, err, virtualTotals, virtualStream)
+	}
+}
+
 func TestCanonicalFilesystemSupportsFSKitOpenUnlinkStaging(t *testing.T) {
 	root := t.TempDir()
 	directory := filepath.Join(root, "sessions", "2026", "07", "12")
@@ -924,6 +1032,48 @@ func TestCanonicalFilesystemSupportsFSKitOpenUnlinkStaging(t *testing.T) {
 	}
 }
 
+func TestCanonicalFilesystemRenamesOpenNativeReader(t *testing.T) {
+	root := t.TempDir()
+	directory := filepath.Join(root, "sessions", "2026", "07", "12")
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "archived_sessions"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	filesystem := NewCanonical()
+	filesystem.SetNativeRoot(root)
+
+	original := "/sessions/2026/07/12/open-reader.jsonl"
+	renamed := "/sessions/2026/07/12/renamed-reader.jsonl"
+	want := []byte("{\"record\":0}\n")
+	if err := os.WriteFile(filepath.Join(directory, "open-reader.jsonl"), want, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	handle, errno := filesystem.Open(original, os.O_RDONLY)
+	if errno != 0 {
+		t.Fatalf("open errno=%v", errno)
+	}
+	defer filesystem.Release(handle)
+
+	if errno := filesystem.Rename(original, renamed); errno != 0 {
+		t.Fatalf("rename open reader errno=%v", errno)
+	}
+	if got, errno := filesystem.HandlePath(handle); errno != 0 || got != renamed {
+		t.Fatalf("handle path = %q errno=%v, want %q", got, errno, renamed)
+	}
+	buffer := make([]byte, len(want))
+	if n, errno := filesystem.Read(handle, buffer, 0); errno != 0 || n != len(want) || !bytes.Equal(buffer, want) {
+		t.Fatalf("read after rename = %q n=%d errno=%v, want %q", buffer, n, errno, want)
+	}
+	if _, err := os.Stat(filepath.Join(directory, "open-reader.jsonl")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("source remained after rename: %v", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(directory, "renamed-reader.jsonl")); err != nil || !bytes.Equal(got, want) {
+		t.Fatalf("renamed bytes = %q err=%v, want %q", got, err, want)
+	}
+}
+
 func TestFilesystemUpsertChangesNewOpensWithoutInvalidatingExistingHandles(t *testing.T) {
 	first := mountSessionFixture(t, "first-session", []byte("first"))
 	second := mountSessionFixture(t, "second-session", []byte("second"))
@@ -954,6 +1104,99 @@ func TestFilesystemUpsertChangesNewOpensWithoutInvalidatingExistingHandles(t *te
 	_ = filesystem.Release(newHandle)
 }
 
+func TestFilesystemOwnedGenerationClosesAfterItsLastHandle(t *testing.T) {
+	first := mountSessionFixture(t, "first-session", []byte("first"))
+	second := mountSessionFixture(t, "second-session", []byte("second"))
+	firstCloser := &countingCloser{}
+	secondCloser := &countingCloser{}
+	filesystem := New()
+	if err := filesystem.AddSessionOwned("session", first, firstCloser); err != nil {
+		t.Fatal(err)
+	}
+	oldHandle, errno := filesystem.Open("/session.jsonl", os.O_RDONLY)
+	if errno != 0 {
+		t.Fatalf("open old handle: %v", errno)
+	}
+	if err := filesystem.UpsertSessionOwned("session", second, secondCloser); err != nil {
+		t.Fatalf("upsert owned generation: %v", err)
+	}
+	if firstCloser.calls != 0 {
+		t.Fatal("old generation closed while its read handle remained open")
+	}
+	newHandle, errno := filesystem.Open("/session.jsonl", os.O_RDONLY)
+	if errno != 0 {
+		t.Fatalf("open new handle: %v", errno)
+	}
+	oldBytes := make([]byte, 5)
+	if n, errno := filesystem.Read(oldHandle, oldBytes, 0); errno != 0 || n != len(oldBytes) || string(oldBytes) != "first" {
+		t.Fatalf("old generation read: n=%d errno=%v bytes=%q", n, errno, oldBytes)
+	}
+	newBytes := make([]byte, 6)
+	if n, errno := filesystem.Read(newHandle, newBytes, 0); errno != 0 || n != len(newBytes) || string(newBytes) != "second" {
+		t.Fatalf("new generation read: n=%d errno=%v bytes=%q", n, errno, newBytes)
+	}
+	if err := filesystem.RemoveSession("session"); err != nil {
+		t.Fatalf("remove current generation: %v", err)
+	}
+	if secondCloser.calls != 0 {
+		t.Fatal("current generation closed while its read handle remained open")
+	}
+	if errno := filesystem.Release(oldHandle); errno != 0 {
+		t.Fatalf("release old handle: %v", errno)
+	}
+	if firstCloser.calls != 1 {
+		t.Fatalf("old generation close calls=%d, want 1", firstCloser.calls)
+	}
+	if errno := filesystem.Release(newHandle); errno != 0 {
+		t.Fatalf("release new handle: %v", errno)
+	}
+	if secondCloser.calls != 1 {
+		t.Fatalf("new generation close calls=%d, want 1", secondCloser.calls)
+	}
+}
+
+func TestFilesystemOwnedGenerationClosesImmediatelyWithoutHandles(t *testing.T) {
+	firstCloser := &countingCloser{}
+	secondCloser := &countingCloser{}
+	filesystem := New()
+	if err := filesystem.AddSessionOwned("session", mountSessionFixture(t, "first-session", []byte("first")), firstCloser); err != nil {
+		t.Fatal(err)
+	}
+	if err := filesystem.UpsertSessionOwned("session", mountSessionFixture(t, "second-session", []byte("second")), secondCloser); err != nil {
+		t.Fatal(err)
+	}
+	if firstCloser.calls != 1 {
+		t.Fatalf("replaced generation close calls=%d, want 1", firstCloser.calls)
+	}
+	if err := filesystem.CloseSessions(); err != nil {
+		t.Fatal(err)
+	}
+	if secondCloser.calls != 1 {
+		t.Fatalf("current generation close calls=%d, want 1", secondCloser.calls)
+	}
+}
+
+func TestFilesystemRejectedOwnedSessionClosesIncomingOwner(t *testing.T) {
+	closer := &countingCloser{}
+	filesystem := New()
+	err := filesystem.AddSessionOwned("", mountSessionFixture(t, "session", []byte("session")), closer)
+	if err == nil {
+		t.Fatal("invalid owned session was accepted")
+	}
+	if closer.calls != 1 {
+		t.Fatalf("rejected owner close calls=%d, want 1", closer.calls)
+	}
+}
+
+type countingCloser struct {
+	calls int
+}
+
+func (c *countingCloser) Close() error {
+	c.calls++
+	return nil
+}
+
 func TestMountWithoutFuseBuildReturnsPrerequisiteError(t *testing.T) {
 	if Available() {
 		t.Skip("FUSE-enabled builds are covered by the gated real mount test")
@@ -961,6 +1204,82 @@ func TestMountWithoutFuseBuildReturnsPrerequisiteError(t *testing.T) {
 	err := Mount(context.Background(), HostOptions{MountPoint: t.TempDir(), Filesystem: New()})
 	if !errors.Is(err, ErrPrerequisite) {
 		t.Fatalf("Mount error = %v, want ErrPrerequisite", err)
+	}
+}
+
+func TestCanonicalSyntheticDirectoryAttributesStayStableUntilContentsChange(t *testing.T) {
+	filesystem := NewCanonical()
+	first, errno := filesystem.Getattr("/sessions")
+	if errno != 0 {
+		t.Fatalf("first Getattr errno=%v", errno)
+	}
+	second, errno := filesystem.Getattr("/sessions")
+	if errno != 0 {
+		t.Fatalf("second Getattr errno=%v", errno)
+	}
+	if first.ObjectID != second.ObjectID || !first.ModTime.Equal(second.ModTime) || !first.ChangeTime.Equal(second.ChangeTime) {
+		t.Fatalf("unchanged synthetic directory attributes drifted: first=%#v second=%#v", first, second)
+	}
+
+	archived, errno := filesystem.Getattr("/archived_sessions")
+	if errno != 0 {
+		t.Fatalf("archived Getattr errno=%v", errno)
+	}
+	filesystem.bumpDirectoryGeneration("/sessions")
+	changed, errno := filesystem.Getattr("/sessions")
+	if errno != 0 {
+		t.Fatalf("changed Getattr errno=%v", errno)
+	}
+	if changed.ObjectID != first.ObjectID {
+		t.Fatalf("directory content change replaced stable object identity %q with %q", first.ObjectID, changed.ObjectID)
+	}
+	if changed.DirectoryGeneration <= first.DirectoryGeneration || !changed.ModTime.After(first.ModTime) || !changed.ChangeTime.After(first.ChangeTime) {
+		t.Fatalf("directory content generation did not advance attributes: first=%#v changed=%#v", first, changed)
+	}
+	archivedAfter, errno := filesystem.Getattr("/archived_sessions")
+	if errno != 0 {
+		t.Fatalf("archived Getattr after unrelated change errno=%v", errno)
+	}
+	if archivedAfter.ObjectID != archived.ObjectID {
+		t.Fatalf("unrelated directory identity changed from %q to %q", archived.ObjectID, archivedAfter.ObjectID)
+	}
+}
+
+func TestCanonicalNativeDirectoryObjectIdentityUsesExplicitContentGeneration(t *testing.T) {
+	root := t.TempDir()
+	directory := filepath.Join(root, "sessions", "2026", "07", "22")
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "archived_sessions"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	filesystem := NewCanonical()
+	filesystem.SetNativeRoot(root)
+	first, errno := filesystem.Getattr("/sessions/2026/07/22")
+	if errno != 0 {
+		t.Fatalf("first Getattr errno=%v", errno)
+	}
+	if err := os.WriteFile(filepath.Join(directory, "created.jsonl"), []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	beforeNotification, errno := filesystem.Getattr("/sessions/2026/07/22")
+	if errno != 0 {
+		t.Fatalf("pre-notification Getattr errno=%v", errno)
+	}
+	if beforeNotification.ObjectID != first.ObjectID {
+		t.Fatalf("native metadata alone changed object ID from %q to %q", first.ObjectID, beforeNotification.ObjectID)
+	}
+	filesystem.bumpDirectoryGeneration("/sessions/2026/07/22")
+	afterNotification, errno := filesystem.Getattr("/sessions/2026/07/22")
+	if errno != 0 {
+		t.Fatalf("post-notification Getattr errno=%v", errno)
+	}
+	if afterNotification.ObjectID != first.ObjectID {
+		t.Fatalf("explicit directory content generation replaced object ID %q with %q", first.ObjectID, afterNotification.ObjectID)
+	}
+	if afterNotification.DirectoryGeneration <= first.DirectoryGeneration {
+		t.Fatalf("directory generation did not advance: before=%d after=%d", first.DirectoryGeneration, afterNotification.DirectoryGeneration)
 	}
 }
 

@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -374,6 +373,20 @@ func TestFSServiceInstallRendersNativeFSKitDaemonAndSupervisor(t *testing.T) {
 	home, storeDir, _ := fsFixture(t, true)
 	definition := filepath.Join(home, "LaunchAgents", "com.codexfold.fs.plist")
 	fskitApp := filepath.Join(home, "Applications", "CodexFoldFSKit.app")
+	installedBinary := filepath.Join(home, "bin", "codexfold")
+	candidateBinary := filepath.Join(home, "build", "codexfold")
+	if err := os.MkdirAll(filepath.Dir(installedBinary), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(candidateBinary), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(installedBinary, []byte("installed"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(candidateBinary, []byte("candidate"), 0o700); err != nil {
+		t.Fatal(err)
+	}
 	root := NewRootCommand()
 	var output bytes.Buffer
 	root.SetOut(&output)
@@ -381,7 +394,7 @@ func TestFSServiceInstallRendersNativeFSKitDaemonAndSupervisor(t *testing.T) {
 	root.SetArgs([]string{
 		"fs", "service", "install", "--frontend", "native-fskit",
 		"--codex-home", home, "--store", storeDir, "--definition", definition,
-		"--fskit-app", fskitApp, "--json",
+		"--fskit-app", fskitApp, "--binary", installedBinary, "--binary-source", candidateBinary, "--json",
 	})
 	if err := root.Execute(); err != nil {
 		t.Fatalf("native FSKit service dry-run: %v", err)
@@ -402,6 +415,66 @@ func TestFSServiceInstallRendersNativeFSKitDaemonAndSupervisor(t *testing.T) {
 	launcher := filepath.Join(fskitApp, "Contents", "MacOS", "CodexFoldFSKit")
 	if result.FSKitAppPath != fskitApp || result.FSKitLauncherPath != launcher || result.FSKitResourcePath == "" {
 		t.Fatalf("native FSKit resolved paths = %#v", result)
+	}
+	if result.BinarySourcePath != candidateBinary || result.BinaryCurrentSHA256 == "" || result.BinaryCandidateSHA256 == "" || !result.BinaryChanged {
+		t.Fatalf("native FSKit binary transaction = %#v", result)
+	}
+	if content, err := os.ReadFile(installedBinary); err != nil || string(content) != "installed" {
+		t.Fatalf("dry-run changed installed binary: content=%q err=%v", content, err)
+	}
+}
+
+func TestFSServiceInstallCustomLabelUsesCustomDefinitionPath(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("custom LaunchAgent labels are macOS-only")
+	}
+	home, storeDir, _ := fsFixture(t, true)
+	label := "com.codexfold.native-service-e2e"
+	userHome, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defaultDefinition := filepath.Join(userHome, "Library", "LaunchAgents", "com.codexfold.fs.plist")
+	customDefinition := filepath.Join(userHome, "Library", "LaunchAgents", label+".plist")
+	defaultBefore, defaultErr := os.ReadFile(defaultDefinition)
+	defaultExists := defaultErr == nil
+	if defaultErr != nil && !errors.Is(defaultErr, os.ErrNotExist) {
+		t.Fatal(defaultErr)
+	}
+	customBefore, customErr := os.ReadFile(customDefinition)
+	customExists := customErr == nil
+	if customErr != nil && !errors.Is(customErr, os.ErrNotExist) {
+		t.Fatal(customErr)
+	}
+	root := NewRootCommand()
+	var output bytes.Buffer
+	root.SetOut(&output)
+	root.SetErr(&bytes.Buffer{})
+	root.SetArgs([]string{
+		"fs", "service", "install", "--frontend", "native-fskit",
+		"--label", label, "--codex-home", home, "--store", storeDir, "--json",
+	})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("custom native FSKit service dry-run: %v", err)
+	}
+	var result FSServiceInstallResult
+	if err := json.Unmarshal(output.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	wantSupervisor := filepath.Join(userHome, "Library", "LaunchAgents", label+".supervisor.plist")
+	if result.Path != customDefinition || result.SupervisorPath != wantSupervisor || !result.DryRun {
+		t.Fatalf("custom service install result = %#v", result)
+	}
+	defaultAfter, defaultErr := os.ReadFile(defaultDefinition)
+	if (defaultErr == nil) != defaultExists || (defaultExists && !bytes.Equal(defaultBefore, defaultAfter)) {
+		t.Fatalf("custom dry-run changed default definition %s", defaultDefinition)
+	}
+	customAfter, customErr := os.ReadFile(customDefinition)
+	if (customErr == nil) != customExists || (customExists && !bytes.Equal(customBefore, customAfter)) {
+		t.Fatalf("custom dry-run changed custom definition %s", customDefinition)
+	}
+	if _, err := os.Stat(wantSupervisor); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("custom dry-run wrote supervisor %s: %v", wantSupervisor, err)
 	}
 }
 
@@ -539,6 +612,41 @@ func TestFSMigrateIsDryRunByDefaultAndDoesNotChangeRoute(t *testing.T) {
 	}
 }
 
+func TestFSMigrateRejectsInvalidNativeRolloutBeforeCreatingManagedState(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		data []byte
+		want string
+	}{
+		{name: "invalid UTF-8", data: []byte{'{', '"', 'x', '"', ':', '"', 0xff, '"', '}', '\n'}, want: "not valid UTF-8"},
+		{name: "invalid JSON", data: []byte("not-json\n"), want: "not valid JSON"},
+		{name: "missing final newline", data: []byte("{\"record\":0}"), want: "missing its final newline"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			home, storeDir, nativePath := fsFixture(t, true)
+			if err := os.WriteFile(nativePath, test.data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			root := NewRootCommand()
+			root.SetOut(&bytes.Buffer{})
+			root.SetErr(&bytes.Buffer{})
+			root.SetArgs([]string{"fs", "migrate", "session", "--codex-home", home, "--store", storeDir, "--mount", filepath.Join(home, "mount")})
+			err := root.Execute()
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("migrate error = %v, want %q", err, test.want)
+			}
+			sessions, loadErr := codex.LoadSessions(home)
+			if loadErr != nil || len(sessions) != 1 || filepath.Clean(sessions[0].RolloutPath) != filepath.Clean(nativePath) {
+				t.Fatalf("invalid migration changed route: sessions=%#v err=%v", sessions, loadErr)
+			}
+			states, stateErr := vfs.DiscoverSessionStates(storeDir)
+			if stateErr != nil || len(states) != 0 {
+				t.Fatalf("invalid migration created managed state: states=%#v err=%v", states, stateErr)
+			}
+		})
+	}
+}
+
 func TestFSEnrollmentPlanRequiresTwoStableObservationsAndCanaryGate(t *testing.T) {
 	home, storeDir, _ := fsFixture(t, true)
 	allowEnrollmentWriterProbe(t)
@@ -622,6 +730,45 @@ func TestFSEnrollmentApplyRunsFoldPackMigrateAndStopsBeforeRouteOnFailure(t *tes
 	}
 	if data, err := os.ReadFile(nativePath); err != nil || len(data) == 0 {
 		t.Fatalf("failed enrollment changed source: bytes=%d err=%v", len(data), err)
+	}
+}
+
+func TestFSEnrollmentApplyRejectsInvalidNativeRolloutBeforeCommands(t *testing.T) {
+	home, storeDir, nativePath := fsFixture(t, true)
+	allowEnrollmentWriterProbe(t)
+	allowFixtureMount(t)
+	invalid := []byte{'{', '"', 'x', '"', ':', '"', 0xff, '"', '}', '\n'}
+	if err := os.WriteFile(nativePath, invalid, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(nativePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := enroll.SaveObservations(enrollmentObservationPath(storeDir), enroll.Observations{"session": {
+		Path: nativePath, Size: info.Size(), ModTimeUnixNano: info.ModTime().UnixNano(), StableSinceUnixNano: time.Now().Add(-time.Hour).UnixNano(),
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	oldRunner := runEnrollmentCommand
+	defer func() { runEnrollmentCommand = oldRunner }()
+	runEnrollmentCommand = func(context.Context, []string) error {
+		t.Fatal("invalid rollout reached an enrollment mutation command")
+		return nil
+	}
+	root := NewRootCommand()
+	root.SetOut(&bytes.Buffer{})
+	root.SetErr(&bytes.Buffer{})
+	root.SetArgs([]string{
+		"fs", "enroll", "apply", "--codex-home", home, "--store", storeDir, "--mount", filepath.Join(home, "mount"),
+		"--canonical-namespace", "--native-root", filepath.Join(home, "fold-native"), "--enrollment-canary", "--stable-for", "1ns", "--apply",
+	})
+	if err := root.Execute(); err == nil || !strings.Contains(err.Error(), "not valid UTF-8") {
+		t.Fatalf("enrollment error = %v", err)
+	}
+	states, err := vfs.DiscoverSessionStates(storeDir)
+	if err != nil || len(states) != 0 {
+		t.Fatalf("invalid enrollment created managed state: states=%#v err=%v", states, err)
 	}
 }
 
@@ -1005,6 +1152,74 @@ func TestFSMigrateCanonicalKeepsCodexRouteAndHidesRetainedSnapshot(t *testing.T)
 	}
 }
 
+func TestRollbackCanonicalMigrationRestoresNativeBeforeRetiringManagedState(t *testing.T) {
+	root := t.TempDir()
+	store := filepath.Join(root, "store")
+	stateDirectory := filepath.Join(store, "fs", "sessions", "session")
+	if err := os.MkdirAll(stateDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sourcePath := filepath.Join(root, "native", "archived_sessions", "rollout.jsonl")
+	retainedPath := filepath.Join(store, "fs", "snapshots", "session", "native.jsonl")
+	content := []byte("{\"restored\":true}\n")
+	if err := os.MkdirAll(filepath.Dir(retainedPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(retainedPath, content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cause := errors.New("force migration rollback")
+	if err := rollbackCanonicalMigration(store, "session", sourcePath, retainedPath, cause); !errors.Is(err, cause) {
+		t.Fatalf("rollback error = %v, want original cause", err)
+	}
+	if got, err := os.ReadFile(sourcePath); err != nil || !bytes.Equal(got, content) {
+		t.Fatalf("restored native source = %q err=%v", got, err)
+	}
+	if _, err := os.Stat(stateDirectory); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("managed state was not retired after native restoration: %v", err)
+	}
+	retired, err := filepath.Glob(filepath.Join(store, "fs", "retired", "session-*"))
+	if err != nil || len(retired) != 1 {
+		t.Fatalf("retired states = %v err=%v", retired, err)
+	}
+}
+
+func TestRollbackCanonicalMigrationKeepsManagedStateWhenNativeRestoreConflicts(t *testing.T) {
+	root := t.TempDir()
+	store := filepath.Join(root, "store")
+	stateDirectory := filepath.Join(store, "fs", "sessions", "session")
+	if err := os.MkdirAll(stateDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sourcePath := filepath.Join(root, "native", "archived_sessions", "rollout.jsonl")
+	retainedPath := filepath.Join(store, "fs", "snapshots", "session", "native.jsonl")
+	if err := os.MkdirAll(filepath.Dir(sourcePath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(retainedPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(sourcePath, []byte("{\"current\":true}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(retainedPath, []byte("{\"retained\":true}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := rollbackCanonicalMigration(store, "session", sourcePath, retainedPath, errors.New("force migration rollback")); err == nil {
+		t.Fatal("conflicting native restoration unexpectedly succeeded")
+	}
+	if _, err := os.Stat(stateDirectory); err != nil {
+		t.Fatalf("managed state was retired after native restore conflict: %v", err)
+	}
+	if _, err := os.Stat(retainedPath); err != nil {
+		t.Fatalf("retained snapshot was removed after native restore conflict: %v", err)
+	}
+	retired, err := filepath.Glob(filepath.Join(store, "fs", "retired", "session-*"))
+	if err != nil || len(retired) != 0 {
+		t.Fatalf("retired states after conflict = %v err=%v", retired, err)
+	}
+}
+
 func TestFSRecoverRetiresInterruptedCanonicalMigrationWithUnchangedSource(t *testing.T) {
 	fixture := interruptedCanonicalMigrationFixture(t)
 	_ = fixture.resolver.Close()
@@ -1016,6 +1231,31 @@ func TestFSRecoverRetiresInterruptedCanonicalMigrationWithUnchangedSource(t *tes
 	got, err := os.ReadFile(fixture.nativePath)
 	if err != nil || !bytes.Equal(got, fixture.source) {
 		t.Fatalf("recovery changed canonical source: got=%q err=%v", got, err)
+	}
+}
+
+func TestFSRecoverLeavesLiveCanonicalMigrationManaged(t *testing.T) {
+	fixture := interruptedCanonicalMigrationFixture(t)
+	defer fixture.resolver.Close()
+	writer, err := fixture.managed.OpenWriter()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+
+	state := fixture.managed.State()
+	recovered, err := recoverInterruptedCanonicalMigration(fixture.home, fixture.store, fixture.nativeRoot, state)
+	if err != nil || recovered {
+		t.Fatalf("live migration recovery = %t, %v", recovered, err)
+	}
+	if _, err := managedState(fixture.store, "session"); err != nil {
+		t.Fatalf("live migration state was retired: %v", err)
+	}
+	if got, err := os.ReadFile(fixture.nativePath); err != nil || !bytes.Equal(got, fixture.source) {
+		t.Fatalf("live migration source changed: got=%q err=%v", got, err)
+	}
+	if got, err := os.ReadFile(state.NativeSnapshot.Path); err != nil || !bytes.Equal(got, fixture.source) {
+		t.Fatalf("live migration snapshot changed: got=%q err=%v", got, err)
 	}
 }
 
@@ -1634,27 +1874,24 @@ func TestCanonicalRetirementColdLoadRestoresManagedFallbackBeforeNativePreferenc
 	filesystem.SetNativeRoot(nativeRoot)
 	known := make(map[string]uint64)
 	knownRoutes := make(map[string]string)
-	var closers []io.Closer
-	t.Cleanup(func() {
-		for _, closer := range closers {
-			_ = closer.Close()
-		}
-	})
+	knownPacks := make(map[string]string)
+	currentPack, err := pack.CurrentGeneration(storeDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = filesystem.CloseSessions() })
 	opens := 0
-	openState := func(state vfs.SessionState) (*vfs.Session, error) {
+	openState := func(state vfs.SessionState) (*vfs.Session, *pack.Resolver, error) {
 		opens++
 		current, nextResolver, err := openManagedSession(context.Background(), storeDir, state)
-		if err == nil {
-			closers = append(closers, nextResolver)
-		}
-		return current, err
+		return current, nextResolver, err
 	}
 	state, err := managedState(storeDir, "session")
 	if err != nil {
 		t.Fatal(err)
 	}
 	for attempt := 0; attempt < 2; attempt++ {
-		handled, err := syncCanonicalRetirement(storeDir, home, nativeRoot, filesystem, state, route, true, known, knownRoutes, openState)
+		handled, err := syncCanonicalRetirement(storeDir, home, nativeRoot, filesystem, state, route, true, known, knownRoutes, knownPacks, currentPack, openState)
 		if err != nil || !handled {
 			t.Fatalf("sync retirement attempt %d: handled=%t err=%v", attempt, handled, err)
 		}
@@ -1758,27 +1995,24 @@ func TestCanonicalRetirementDaemonRestartRejectsStaleNativeAcknowledgement(t *te
 		t.Fatal(err)
 	}
 
-	var closers []io.Closer
-	t.Cleanup(func() {
-		for _, closer := range closers {
-			_ = closer.Close()
-		}
-	})
 	opens := 0
-	openState := func(state vfs.SessionState) (*vfs.Session, error) {
+	openState := func(state vfs.SessionState) (*vfs.Session, *pack.Resolver, error) {
 		opens++
 		current, nextResolver, err := openManagedSession(context.Background(), storeDir, state)
-		if err == nil {
-			closers = append(closers, nextResolver)
-		}
-		return current, err
+		return current, nextResolver, err
 	}
 
 	firstDaemon := mountfs.NewCanonical()
 	firstDaemon.SetNativeRoot(nativeRoot)
+	t.Cleanup(func() { _ = firstDaemon.CloseSessions() })
 	firstKnown := make(map[string]uint64)
 	firstRoutes := make(map[string]string)
-	handled, err := syncCanonicalRetirement(storeDir, home, nativeRoot, firstDaemon, state, route, true, firstKnown, firstRoutes, openState)
+	firstPacks := make(map[string]string)
+	currentPack, err := pack.CurrentGeneration(storeDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handled, err := syncCanonicalRetirement(storeDir, home, nativeRoot, firstDaemon, state, route, true, firstKnown, firstRoutes, firstPacks, currentPack, openState)
 	if err != nil || !handled {
 		t.Fatalf("initial retirement sync: handled=%t err=%v", handled, err)
 	}
@@ -1791,9 +2025,11 @@ func TestCanonicalRetirementDaemonRestartRejectsStaleNativeAcknowledgement(t *te
 	}
 	restartedDaemon := mountfs.NewCanonical()
 	restartedDaemon.SetNativeRoot(nativeRoot)
+	t.Cleanup(func() { _ = restartedDaemon.CloseSessions() })
 	restartedKnown := make(map[string]uint64)
 	restartedRoutes := make(map[string]string)
-	handled, err = syncCanonicalRetirement(storeDir, home, nativeRoot, restartedDaemon, state, route, true, restartedKnown, restartedRoutes, openState)
+	restartedPacks := make(map[string]string)
+	handled, err = syncCanonicalRetirement(storeDir, home, nativeRoot, restartedDaemon, state, route, true, restartedKnown, restartedRoutes, restartedPacks, currentPack, openState)
 	if err != nil || !handled {
 		t.Fatalf("restart retirement sync: handled=%t err=%v", handled, err)
 	}
@@ -2278,6 +2514,121 @@ func TestFSReadOnlyCommandsRunWithoutClaimingMountHealth(t *testing.T) {
 	}
 }
 
+func TestFSBenchmarkUsesManagedVisibleBytesAfterAppendAndCompact(t *testing.T) {
+	home, storeDir, nativePath := fsFixture(t, true)
+	manifest, err := fold.LoadManifest(storeDir, "session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolver, err := pack.Open(storeDir, pack.OpenOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	native, err := hashPath(nativePath)
+	if err != nil {
+		_ = resolver.Close()
+		t.Fatal(err)
+	}
+	managed, err := vfs.OpenSession(context.Background(), vfs.SessionOptions{
+		Root: storeDir, ManifestPath: fold.ManifestPath(storeDir, "session"), Manifest: manifest,
+		Reader: resolver, NativeSnapshot: native,
+	})
+	if err != nil {
+		_ = resolver.Close()
+		t.Fatal(err)
+	}
+	writer, err := managed.OpenWriter()
+	if err != nil {
+		_ = resolver.Close()
+		t.Fatal(err)
+	}
+	if _, err := writer.Append(context.Background(), []byte("{\"benchmark\":\"append\"}\n")); err != nil {
+		_ = writer.Close()
+		_ = resolver.Close()
+		t.Fatal(err)
+	}
+	if err := writer.Sync(); err != nil {
+		_ = writer.Close()
+		_ = resolver.Close()
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		_ = resolver.Close()
+		t.Fatal(err)
+	}
+	if err := resolver.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	benchmark := func() fsctl.BenchmarkReport {
+		t.Helper()
+		root := NewRootCommand()
+		var output bytes.Buffer
+		root.SetOut(&output)
+		root.SetErr(&bytes.Buffer{})
+		root.SetArgs([]string{
+			"fs", "benchmark", "session", "--codex-home", home, "--store", storeDir,
+			"--sequential-block-bytes", "16", "--random-block-bytes", "8", "--random-reads", "10",
+			"--bypass-os-cache", "--json",
+		})
+		if err := root.Execute(); err != nil {
+			t.Fatalf("benchmark: %v", err)
+		}
+		var report fsctl.BenchmarkReport
+		if err := json.Unmarshal(output.Bytes(), &report); err != nil {
+			t.Fatalf("decode benchmark report: %v\n%s", err, output.String())
+		}
+		if !report.OSCacheBypassRequested {
+			t.Fatal("benchmark did not preserve --bypass-os-cache")
+		}
+		if report.Native.Bytes != report.Virtual.Bytes {
+			t.Fatalf("benchmark byte counts differ: native=%d virtual=%d", report.Native.Bytes, report.Virtual.Bytes)
+		}
+		return report
+	}
+
+	appended := benchmark()
+	if appended.Native.Bytes <= manifest.Source.Bytes {
+		t.Fatalf("benchmark ignored active delta: native=%d base=%d", appended.Native.Bytes, manifest.Source.Bytes)
+	}
+
+	executeFS(t, []string{"fs", "compact", "session", "--codex-home", home, "--store", storeDir, "--apply", "--json"})
+	compacted := benchmark()
+	if compacted.Native.Bytes != appended.Native.Bytes || compacted.Virtual.Bytes != appended.Virtual.Bytes {
+		t.Fatalf("benchmark changed visible size across compact: appended=%+v compacted=%+v", appended, compacted)
+	}
+}
+
+func TestFSDoctorUsesExplicitServiceDefinition(t *testing.T) {
+	home, storeDir, _ := fsFixture(t, true)
+	definition := filepath.Join(t.TempDir(), "isolated-service-definition")
+	root := NewRootCommand()
+	var output bytes.Buffer
+	root.SetOut(&output)
+	root.SetErr(&bytes.Buffer{})
+	root.SetArgs([]string{
+		"fs", "doctor", "--codex-home", home, "--store", storeDir,
+		"--definition", definition, "--json",
+	})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("fs doctor: %v", err)
+	}
+	var report fsctl.DoctorReport
+	if err := json.Unmarshal(output.Bytes(), &report); err != nil {
+		t.Fatalf("decode fs doctor: %v\n%s", err, output.String())
+	}
+	for _, issue := range report.Issues {
+		if issue.Component != fsctl.ComponentDaemon {
+			continue
+		}
+		if !strings.Contains(issue.Message, definition) {
+			t.Fatalf("daemon issue did not use explicit definition %q: %#v", definition, issue)
+		}
+		return
+	}
+	t.Fatalf("fs doctor did not report the missing explicit definition: %#v", report)
+}
+
 func TestFSStatusAndDoctorExposePhysicalStorageAccounting(t *testing.T) {
 	home, storeDir, _ := fsFixture(t, true)
 	for _, args := range [][]string{
@@ -2358,6 +2709,69 @@ func TestStartupStorageGCRunsOnlyAfterHealthyStoreVerification(t *testing.T) {
 	}
 	if ran || countPackGenerationDirectories(t, storeDir) != before {
 		t.Fatalf("unhealthy store was mutated: ran=%t before=%d after=%d", ran, before, countPackGenerationDirectories(t, storeDir))
+	}
+}
+
+func TestStartStorageMaintenanceDoesNotBlockAvailabilityOrCancelService(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	released := false
+	defer func() {
+		if !released {
+			close(release)
+		}
+	}()
+	var diagnostics bytes.Buffer
+	started := make(chan (<-chan struct{}), 1)
+	go func() {
+		started <- startStorageMaintenance(ctx, &diagnostics, "store", func(context.Context, string) (storage.StorageGCResult, bool, error) {
+			close(entered)
+			<-release
+			return storage.StorageGCResult{}, true, errors.New("maintenance failed")
+		})
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("storage maintenance did not start")
+	}
+	var done <-chan struct{}
+	select {
+	case done = <-started:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("storage maintenance blocked service availability")
+	}
+	select {
+	case <-ctx.Done():
+		t.Fatal("storage maintenance canceled the service")
+	default:
+	}
+
+	close(release)
+	released = true
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("storage maintenance did not finish")
+	}
+	if !strings.Contains(diagnostics.String(), "storage maintenance failed: maintenance failed") {
+		t.Fatalf("diagnostics = %q", diagnostics.String())
+	}
+}
+
+func TestRuntimeMemoryReclaimableUsesOnlyUnreleasedIdleHeap(t *testing.T) {
+	if runtimeMemoryReclaimable(runtime.MemStats{HeapIdle: 128 << 20, HeapReleased: 80 << 20}, 64<<20) {
+		t.Fatal("reclaimed below-threshold idle heap")
+	}
+	if !runtimeMemoryReclaimable(runtime.MemStats{HeapIdle: 160 << 20, HeapReleased: 80 << 20}, 64<<20) {
+		t.Fatal("did not reclaim above-threshold idle heap")
+	}
+	if runtimeMemoryReclaimable(runtime.MemStats{HeapIdle: 64 << 20, HeapReleased: 96 << 20}, 1) {
+		t.Fatal("underflowed released heap accounting")
 	}
 }
 

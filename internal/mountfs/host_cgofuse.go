@@ -384,7 +384,7 @@ func (f *fuseFilesystem) Removexattr(name string, attribute string) int {
 
 func (f *fuseFilesystem) xattrPath(name string, create bool) (string, int) {
 	cleaned := cleanPath(name)
-	if _, errno := f.core.sessionForPath(cleaned); errno == 0 {
+	if _, _, errno := f.core.sessionForPath(cleaned); errno == 0 {
 		f.core.mu.RLock()
 		root := f.core.nativeRoot
 		f.core.mu.RUnlock()
@@ -414,7 +414,7 @@ func (f *fuseFilesystem) xattrPath(name string, create bool) (string, int) {
 
 func (f *fuseFilesystem) metadataPath(name string) (string, bool, int) {
 	cleaned := cleanPath(name)
-	if _, errno := f.core.sessionForPath(cleaned); errno == 0 {
+	if _, _, errno := f.core.sessionForPath(cleaned); errno == 0 {
 		return "", true, 0
 	}
 	if native, ok := f.core.nativePath(cleaned); ok {

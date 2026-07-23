@@ -38,6 +38,34 @@ func TestNativeAppendGapFailsClosedAndCanRetry(t *testing.T) {
 	assertNativeBytes(t, nativePath, append(append([]byte(nil), base...), record...))
 }
 
+func TestNativeGetattrDoesNotHideExternalGrowthBehindIdleAppendState(t *testing.T) {
+	filesystem, route, nativePath, base := nativeAppendTestFilesystem(t, "external-growth")
+	handle, errno := filesystem.Open(route, os.O_RDONLY)
+	if errno != 0 {
+		t.Fatalf("open native reader: %v", errno)
+	}
+	defer filesystem.Release(handle)
+
+	tail := []byte("{\"record\":1}\n")
+	file, err := os.OpenFile(nativePath, os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.Write(tail); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	attribute, errno := filesystem.Getattr(route)
+	want := int64(len(base) + len(tail))
+	if errno != 0 || attribute.Size != want {
+		t.Fatalf("Getattr after external growth size=%d errno=%v, want %d", attribute.Size, errno, want)
+	}
+}
+
 func TestNativeAppendIntermediateFsyncKeepsPartialRecord(t *testing.T) {
 	filesystem, route, nativePath, base := nativeAppendTestFilesystem(t, "partial-fsync")
 	handle := openNativeAppendTestHandle(t, filesystem, route)

@@ -25,7 +25,7 @@ type DoctorResult struct {
 }
 
 func Doctor(ctx context.Context, storeDir string) (DoctorResult, error) {
-	resolver, err := Open(storeDir, OpenOptions{CacheBytes: 0})
+	resolver, err := Open(storeDir, OpenOptions{CacheBytes: -1})
 	if err != nil {
 		return DoctorResult{IssueCount: 1, Issues: []DoctorIssue{{Message: err.Error()}}}, nil
 	}

@@ -3,10 +3,19 @@
 package mountfs
 
 import (
+	"fmt"
 	"os"
 	"syscall"
 	"time"
 )
+
+func fileObjectIdentity(info os.FileInfo) string {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return ""
+	}
+	return fmt.Sprintf("native:%d:%d", stat.Dev, stat.Ino)
+}
 
 func fileOwnershipAndTimes(info os.FileInfo) (uint32, uint32, time.Time, time.Time) {
 	stat, ok := info.Sys().(*syscall.Stat_t)

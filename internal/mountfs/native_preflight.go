@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"unicode/utf8"
 )
 
@@ -34,6 +35,29 @@ func (f *Filesystem) ValidateNativeWriterRollouts(ctx context.Context) (NativePr
 
 func validateNativeWriterRollouts(ctx context.Context, nativeRoot string) (NativePreflightReport, error) {
 	return validateNativeWriterRolloutsCached(ctx, nativeRoot)
+}
+
+func ValidateNativeRollout(ctx context.Context, filePath string) (int64, error) {
+	path := filepath.Clean(filePath)
+	before, err := os.Lstat(path)
+	if err != nil {
+		return 0, fmt.Errorf("inspect native rollout %s: %w", path, err)
+	}
+	if !before.Mode().IsRegular() {
+		return 0, fmt.Errorf("native rollout %s is not a regular file", path)
+	}
+	validated, err := validateNativeJSONL(ctx, path)
+	if err != nil {
+		return validated, err
+	}
+	after, err := os.Lstat(path)
+	if err != nil {
+		return validated, fmt.Errorf("reinspect native rollout %s: %w", path, err)
+	}
+	if !after.Mode().IsRegular() || !os.SameFile(before, after) || before.Size() != after.Size() || before.ModTime() != after.ModTime() {
+		return validated, fmt.Errorf("native rollout changed during validation: %s", path)
+	}
+	return validated, nil
 }
 
 func validateNativeJSONL(ctx context.Context, filePath string) (int64, error) {

@@ -26,7 +26,11 @@ import (
 
 const serviceLabel = "com.codexfold.fs"
 
-const nativeFSKitStartupTimeout = 45 * time.Second
+// Re-registering a signed FSKit extension after an in-place app Contents swap
+// can take noticeably longer than an ordinary LaunchAgent restart. Keep the
+// update transaction bounded, but allow the system extension service enough
+// time to replace its prior endpoint before declaring a healthy mount failed.
+const nativeFSKitStartupTimeout = 120 * time.Second
 
 type operationTrace struct {
 	mu   sync.Mutex
@@ -72,15 +76,19 @@ type FSServiceActionResult struct {
 }
 
 type FSServiceInstallResult struct {
-	Path              string `json:"path"`
-	DryRun            bool   `json:"dry_run"`
-	Bytes             int    `json:"bytes"`
-	SupervisorPath    string `json:"supervisor_path,omitempty"`
-	SupervisorBytes   int    `json:"supervisor_bytes,omitempty"`
-	FSKitAppPath      string `json:"fskit_app_path,omitempty"`
-	FSKitLauncherPath string `json:"fskit_launcher_path,omitempty"`
-	FSKitResourcePath string `json:"fskit_resource_path,omitempty"`
-	FSKitAppChanged   bool   `json:"fskit_app_changed,omitempty"`
+	Path                  string `json:"path"`
+	DryRun                bool   `json:"dry_run"`
+	Bytes                 int    `json:"bytes"`
+	SupervisorPath        string `json:"supervisor_path,omitempty"`
+	SupervisorBytes       int    `json:"supervisor_bytes,omitempty"`
+	FSKitAppPath          string `json:"fskit_app_path,omitempty"`
+	FSKitLauncherPath     string `json:"fskit_launcher_path,omitempty"`
+	FSKitResourcePath     string `json:"fskit_resource_path,omitempty"`
+	FSKitAppChanged       bool   `json:"fskit_app_changed,omitempty"`
+	BinarySourcePath      string `json:"binary_source_path,omitempty"`
+	BinaryCurrentSHA256   string `json:"binary_current_sha256,omitempty"`
+	BinaryCandidateSHA256 string `json:"binary_candidate_sha256,omitempty"`
+	BinaryChanged         bool   `json:"binary_changed,omitempty"`
 }
 
 type FSServiceBinaryUpdateResult struct {
@@ -205,7 +213,7 @@ func newFSServiceUpdateBinaryCommand() *cobra.Command {
 }
 
 func newFSServiceInstallCommand() *cobra.Command {
-	var codexHome, storeDir, mountPoint, binaryPath, plistPath, logDir, nativeRoot, operationTracePath string
+	var codexHome, storeDir, mountPoint, binaryPath, binarySource, plistPath, logDir, nativeRoot, operationTracePath string
 	var frontend, fskitResource, fskitAppPath, fskitAppSource, label string
 	var enrollmentInterval, enrollmentStableFor time.Duration
 	var enrollmentBatchSize int
@@ -215,9 +223,30 @@ func newFSServiceInstallCommand() *cobra.Command {
 		Short: "Render and optionally start the native platform service",
 		Args:  cobra.NoArgs,
 		RunE: func(command *cobra.Command, _ []string) (runErr error) {
-			home, store, mount, binary, plist, logs, err := resolveServicePaths(codexHome, storeDir, mountPoint, binaryPath, plistPath, logDir)
+			if label == "" {
+				label = serviceLabel
+			}
+			home, store, mount, binary, plist, logs, err := resolveServicePaths(codexHome, storeDir, mountPoint, binaryPath, plistPath, logDir, label)
 			if err != nil {
 				return err
+			}
+			var binaryCurrentSHA256, binaryCandidateSHA256 string
+			if binarySource != "" {
+				binarySource, err = filepath.Abs(binarySource)
+				if err != nil {
+					return err
+				}
+				if filepath.Clean(binarySource) == filepath.Clean(binary) {
+					return errors.New("candidate binary must be separate from the installed target")
+				}
+				binaryCurrentSHA256, err = buildid.FileSHA256(binary)
+				if err != nil {
+					return err
+				}
+				binaryCandidateSHA256, err = buildid.FileSHA256(binarySource)
+				if err != nil {
+					return err
+				}
 			}
 			if apply {
 				if err := requireFilesystemActivationAllowed(home); err != nil {
@@ -230,9 +259,6 @@ func newFSServiceInstallCommand() *cobra.Command {
 			}
 			if frontend == "" {
 				frontend = "fuse"
-			}
-			if label == "" {
-				label = serviceLabel
 			}
 			if label != serviceLabel && platform != service.PlatformLaunchd {
 				return errors.New("custom service labels are supported only for macOS LaunchAgents")
@@ -266,6 +292,7 @@ func newFSServiceInstallCommand() *cobra.Command {
 				}
 			}
 			var appTransaction fsKitAppTransaction
+			var binaryUpdate *service.BinaryUpdate
 			var definitionUpdates []*service.DefinitionUpdate
 			rollbackInstall := false
 			restartPreviousService := false
@@ -276,7 +303,7 @@ func newFSServiceInstallCommand() *cobra.Command {
 				rollbackContext, cancel := context.WithTimeout(context.Background(), 2*nativeFSKitStartupTimeout+15*time.Second)
 				defer cancel()
 				runErr = errors.Join(runErr, rollbackFailedServiceInstall(
-					rollbackContext, platform, plist, mount, definitionUpdates, appTransaction,
+					rollbackContext, platform, plist, mount, definitionUpdates, appTransaction, binaryUpdate,
 					restartPreviousService, stopPlatformService, startPlatformService,
 				))
 			}()
@@ -287,6 +314,13 @@ func newFSServiceInstallCommand() *cobra.Command {
 				if err := waitPlatformServiceInactive(command.Context(), platform, plist, mount, 30*time.Second); err != nil {
 					return errors.Join(stopErr, err)
 				}
+			}
+			if apply && binarySource != "" {
+				binaryUpdate, err = service.StageBinaryUpdate(binarySource, binary)
+				if err != nil {
+					return err
+				}
+				rollbackInstall = true
 			}
 			if apply && frontend == "native-fskit" {
 				if fskitAppSource != "" {
@@ -374,7 +408,12 @@ func newFSServiceInstallCommand() *cobra.Command {
 			} else if _, err := service.WriteDefinition(plist, definition, false); err != nil {
 				return err
 			}
-			result := FSServiceInstallResult{Path: written.Path, DryRun: written.DryRun, Bytes: written.Bytes}
+			result := FSServiceInstallResult{
+				Path: written.Path, DryRun: written.DryRun, Bytes: written.Bytes,
+				BinarySourcePath: binarySource, BinaryCurrentSHA256: binaryCurrentSHA256,
+				BinaryCandidateSHA256: binaryCandidateSHA256,
+				BinaryChanged:         binarySource != "" && binaryCurrentSHA256 != binaryCandidateSHA256,
+			}
 			if frontend == "native-fskit" {
 				result.FSKitAppPath = fskitAppPath
 				result.FSKitLauncherPath = launcherPath
@@ -390,7 +429,6 @@ func newFSServiceInstallCommand() *cobra.Command {
 				if apply {
 					update, err := service.StageDefinitionUpdate(supervisorPath, supervisorDefinition)
 					if err != nil {
-						_ = commitDefinitionUpdates(definitionUpdates)
 						return err
 					}
 					definitionUpdates = append(definitionUpdates, update)
@@ -403,6 +441,11 @@ func newFSServiceInstallCommand() *cobra.Command {
 			if apply {
 				for _, update := range definitionUpdates {
 					if err := update.Promote(); err != nil {
+						return err
+					}
+				}
+				if binaryUpdate != nil {
+					if err := binaryUpdate.Promote(); err != nil {
 						return err
 					}
 				}
@@ -420,6 +463,11 @@ func newFSServiceInstallCommand() *cobra.Command {
 					cleanupErr = errors.Join(cleanupErr, fmt.Errorf("remove FSKit app rollback artifacts: %w", err))
 				}
 			}
+			if binaryUpdate != nil {
+				if err := binaryUpdate.Commit(); err != nil {
+					cleanupErr = errors.Join(cleanupErr, fmt.Errorf("remove filesystem binary rollback artifacts: %w", err))
+				}
+			}
 			if cleanupErr != nil {
 				return cleanupErr
 			}
@@ -431,6 +479,7 @@ func newFSServiceInstallCommand() *cobra.Command {
 		},
 	}
 	addServicePathFlags(command, &codexHome, &storeDir, &mountPoint, &binaryPath, &plistPath, &logDir)
+	command.Flags().StringVar(&binarySource, "binary-source", "", "Executable candidate to atomically install at --binary")
 	command.Flags().BoolVar(&canonicalNamespace, "canonical-namespace", false, "Start the service with the canonical Codex session namespace")
 	command.Flags().StringVar(&frontend, "frontend", "fuse", "Filesystem frontend: fuse or native-fskit")
 	command.Flags().StringVar(&label, "label", serviceLabel, "Service label; non-default labels are intended for isolated macOS validation")
@@ -474,6 +523,7 @@ func rollbackFailedServiceInstall(
 	mountPoint string,
 	definitionUpdates []*service.DefinitionUpdate,
 	appTransaction fsKitAppTransaction,
+	binaryUpdate *service.BinaryUpdate,
 	restartPreviousService bool,
 	stop stopServiceOperation,
 	start startServiceOperation,
@@ -486,6 +536,9 @@ func rollbackFailedServiceInstall(
 	result := rollbackDefinitionUpdates(definitionUpdates)
 	if appTransaction != nil {
 		result = errors.Join(result, appTransaction.Rollback(ctx))
+	}
+	if binaryUpdate != nil {
+		result = errors.Join(result, binaryUpdate.Rollback(), binaryUpdate.Commit())
 	}
 	if restartPreviousService {
 		if start == nil {
@@ -521,6 +574,8 @@ func waitPlatformServiceInactive(ctx context.Context, platform service.Platform,
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
 	var daemonLock, supervisorLock service.ProcessLockStatus
+	var mountPresent bool
+	var mountPresenceErr error
 	for {
 		status, err := platformServiceStatus(ctx, platform, mountPoint, definitionPath)
 		if err != nil {
@@ -535,8 +590,9 @@ func waitPlatformServiceInactive(ctx context.Context, platform service.Platform,
 			if err != nil {
 				return fmt.Errorf("inspect supervisor process lock: %w", err)
 			}
+			mountPresent, mountPresenceErr = service.MountPresent(mountPoint)
 		}
-		if !status.DaemonRunning && !status.SupervisorRunning && !status.MountHealthy && !daemonLock.Held && !supervisorLock.Held {
+		if nativeFSKitServiceInactive(status, daemonLock, supervisorLock, mountPresent, mountPresenceErr) {
 			return nil
 		}
 		select {
@@ -544,13 +600,26 @@ func waitPlatformServiceInactive(ctx context.Context, platform service.Platform,
 			return ctx.Err()
 		case <-deadline.C:
 			return fmt.Errorf(
-				"previous filesystem service did not stop cleanly: daemon=%t supervisor=%t mount=%t daemon_lock=%t daemon_lock_pid=%d supervisor_lock=%t supervisor_lock_pid=%d",
+				"previous filesystem service did not stop cleanly: daemon=%t supervisor=%t mount_healthy=%t mount_present=%t mount_presence_error=%q daemon_lock=%t daemon_lock_pid=%d supervisor_lock=%t supervisor_lock_pid=%d",
 				status.DaemonRunning, status.SupervisorRunning, status.MountHealthy,
+				mountPresent, errorString(mountPresenceErr),
 				daemonLock.Held, daemonLock.PID, supervisorLock.Held, supervisorLock.PID,
 			)
 		case <-ticker.C:
 		}
 	}
+}
+
+func nativeFSKitServiceInactive(status service.Status, daemonLock service.ProcessLockStatus, supervisorLock service.ProcessLockStatus, mountPresent bool, mountPresenceErr error) bool {
+	return !status.DaemonRunning && !status.SupervisorRunning && !status.MountHealthy &&
+		!mountPresent && mountPresenceErr == nil && !daemonLock.Held && !supervisorLock.Held
+}
+
+func errorString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 func newFSServiceStartCommand() *cobra.Command {
@@ -1636,7 +1705,7 @@ func addServiceDefinitionFlags(command *cobra.Command, definitionPath *string) {
 	command.Flags().StringVar(definitionPath, "plist", "", "LaunchAgent plist path (macOS compatibility alias)")
 }
 
-func resolveServicePaths(codexHome, storeDir, mountPoint, binaryPath, plistPath, logDir string) (string, string, string, string, string, string, error) {
+func resolveServicePaths(codexHome, storeDir, mountPoint, binaryPath, plistPath, logDir, label string) (string, string, string, string, string, string, error) {
 	home, err := codex.ResolveHome(codexHome)
 	if err != nil {
 		return "", "", "", "", "", "", err
@@ -1654,7 +1723,7 @@ func resolveServicePaths(codexHome, storeDir, mountPoint, binaryPath, plistPath,
 	if err != nil {
 		return "", "", "", "", "", "", err
 	}
-	plist, err := resolveServiceDefinitionPath(plistPath)
+	plist, err := resolveServiceDefinitionPathForLabel(plistPath, label)
 	if err != nil {
 		return "", "", "", "", "", "", err
 	}
@@ -1728,4 +1797,29 @@ func resolveServiceDefinitionPath(explicit string) (string, error) {
 	default:
 		return "", errors.New("unknown service platform")
 	}
+}
+
+func resolveServiceDefinitionPathForLabel(explicit, label string) (string, error) {
+	if explicit != "" || label == "" || label == serviceLabel {
+		return resolveServiceDefinitionPath(explicit)
+	}
+	for index, character := range label {
+		if (character >= 'a' && character <= 'z') ||
+			(character >= 'A' && character <= 'Z') ||
+			(character >= '0' && character <= '9') || character == '.' || character == '-' {
+			if index == 0 && character == '.' {
+				return "", errors.New("custom service label is not safe for a LaunchAgent path")
+			}
+			continue
+		}
+		return "", errors.New("custom service label is not safe for a LaunchAgent path")
+	}
+	if strings.HasSuffix(label, ".") {
+		return "", errors.New("custom service label is not safe for a LaunchAgent path")
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, "Library", "LaunchAgents", label+".plist"), nil
 }

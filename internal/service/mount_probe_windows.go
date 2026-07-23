@@ -16,3 +16,5 @@ func defaultMountProbe(path string) error {
 	}
 	return mountid.Validate(value)
 }
+
+func MountPresent(string) (bool, error) { return false, nil }

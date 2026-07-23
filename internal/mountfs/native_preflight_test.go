@@ -63,6 +63,21 @@ func TestNativeWriterPreflightRejectsMissingFinalNewline(t *testing.T) {
 	}
 }
 
+func TestValidateNativeRolloutRejectsNonRegularFiles(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "target.jsonl")
+	if err := os.WriteFile(target, []byte("{\"record\":0}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "link.jsonl")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ValidateNativeRollout(context.Background(), link); err == nil || !strings.Contains(err.Error(), "not a regular file") {
+		t.Fatalf("symlink validation error = %v", err)
+	}
+}
+
 func TestNativeWriterPreflightRejectsSymlink(t *testing.T) {
 	root, path := nativePreflightFixture(t, []byte("{\"record\":0}\n"))
 	link := filepath.Join(filepath.Dir(path), "rollout-link.jsonl")

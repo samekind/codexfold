@@ -47,6 +47,10 @@ type VisibleInfo struct {
 
 var ErrWriterBusy = errors.New("session writer lease is already held")
 
+type WriterLeaseGuard struct {
+	file *os.File
+}
+
 func OpenSession(ctx context.Context, options SessionOptions) (*Session, error) {
 	session, _, err := openSession(ctx, options, false)
 	return session, err
@@ -311,6 +315,39 @@ func acquireWriterLease(leasePath string) (*os.File, error) {
 		return nil, fmt.Errorf("sync writer lease: %w", err)
 	}
 	return lease, nil
+}
+
+// TryAcquireWriterLeaseGuard reserves the process-wide writer lease without
+// changing its diagnostic payload. Recovery uses it to distinguish an
+// abandoned transaction from one whose owner is still alive.
+func TryAcquireWriterLeaseGuard(root string, sessionID string) (*WriterLeaseGuard, bool, error) {
+	if root == "" || !safeSessionID(sessionID) {
+		return nil, false, errors.New("session root and safe session ID are required")
+	}
+	leasePath := filepath.Join(filepath.Clean(root), "fs", "sessions", sessionID, "writer.lease")
+	file, err := os.OpenFile(leasePath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, false, fmt.Errorf("open writer lease guard: %w", err)
+	}
+	locked, err := tryLockWriterFile(file)
+	if err != nil {
+		_ = file.Close()
+		return nil, false, err
+	}
+	if !locked {
+		_ = file.Close()
+		return nil, false, nil
+	}
+	return &WriterLeaseGuard{file: file}, true, nil
+}
+
+func (g *WriterLeaseGuard) Close() error {
+	if g == nil || g.file == nil {
+		return nil
+	}
+	file := g.file
+	g.file = nil
+	return errors.Join(unlockWriterFile(file), file.Close())
 }
 
 func (s *Session) ensureBacking(ctx context.Context) (string, error) {
