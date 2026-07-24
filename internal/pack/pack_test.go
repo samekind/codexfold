@@ -83,6 +83,103 @@ func TestBuildAndResolverReadExactRandomRanges(t *testing.T) {
 	}
 }
 
+func TestPackOnlyUnfoldAndFoldDoctor(t *testing.T) {
+	root := t.TempDir()
+	first := []byte("first packed object\n")
+	second := bytes.Repeat([]byte("second packed object\n"), 1000)
+	refs := putObjects(t, root, first, second)
+	writeManifest(t, root, "session", []fold.ObjectRef{refs[0], refs[1], refs[0]})
+	if _, err := Build(context.Background(), root, BuildOptions{BlockBytes: 4 << 10}); err != nil {
+		t.Fatal(err)
+	}
+	store := fold.NewObjectStore(root)
+	for _, ref := range refs {
+		if err := os.Remove(store.ObjectPath(ref.SHA256)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	resolver, err := Open(root, OpenOptions{CacheBytes: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resolver.Close()
+	target := filepath.Join(t.TempDir(), "restored.jsonl")
+	result, err := fold.UnfoldWithOptions(context.Background(), root, "session", fold.UnfoldOptions{TargetPath: target, Reader: resolver})
+	if err != nil || !result.Verified {
+		t.Fatalf("pack-only unfold: result=%#v err=%v", result, err)
+	}
+	want := append(append(append([]byte(nil), first...), second...), first...)
+	if got, err := os.ReadFile(target); err != nil || !bytes.Equal(got, want) {
+		t.Fatalf("restored bytes differ: err=%v", err)
+	}
+	doctor, err := fold.DoctorWithOptions(context.Background(), root, fold.DoctorOptions{Reader: resolver})
+	if err != nil || doctor.IssueCount != 0 || doctor.VerifiedManifestCount != 1 {
+		t.Fatalf("pack-only fold doctor: result=%#v err=%v", doctor, err)
+	}
+}
+
+func TestRetireLooseRequiresPackOnlyProofAndReportsActualReclamation(t *testing.T) {
+	root := t.TempDir()
+	refs := putObjects(t, root, bytes.Repeat([]byte("retire-loose-object"), 1000))
+	writeManifest(t, root, "session", refs)
+	if _, err := Build(context.Background(), root, BuildOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	dry, err := RetireLoose(context.Background(), root, RetireLooseOptions{})
+	if err != nil || !dry.DryRun || dry.CandidateCount != 1 || dry.RetiredCount != 0 {
+		t.Fatalf("retire loose dry run: result=%#v err=%v", dry, err)
+	}
+	if _, err := os.Stat(fold.NewObjectStore(root).ObjectPath(refs[0].SHA256)); err != nil {
+		t.Fatalf("dry-run removed loose object: %v", err)
+	}
+	applied, err := RetireLoose(context.Background(), root, RetireLooseOptions{Apply: true})
+	if err != nil || applied.RetiredCount != 1 || applied.RetiredBytes == 0 || applied.AuditPath == "" {
+		t.Fatalf("retire loose apply: result=%#v err=%v", applied, err)
+	}
+	if _, err := os.Stat(fold.NewObjectStore(root).ObjectPath(refs[0].SHA256)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("loose object remains after retire: %v", err)
+	}
+	if _, err := os.Stat(applied.AuditPath); err != nil {
+		t.Fatalf("retirement audit missing: %v", err)
+	}
+	resolver, err := Open(root, OpenOptions{CacheBytes: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resolver.Close()
+	target := filepath.Join(t.TempDir(), "restored.jsonl")
+	if _, err := fold.UnfoldWithOptions(context.Background(), root, "session", fold.UnfoldOptions{TargetPath: target, Reader: resolver}); err != nil {
+		t.Fatalf("unfold after loose retirement: %v", err)
+	}
+}
+
+func TestRetireLooseRefusesCorruptPackBeforeDeletion(t *testing.T) {
+	root := t.TempDir()
+	refs := putObjects(t, root, bytes.Repeat([]byte("corrupt-before-retire"), 1000))
+	writeManifest(t, root, "session", refs)
+	if _, err := Build(context.Background(), root, BuildOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	index := loadCurrentIndex(t, root)
+	block := index.Objects[0].Blocks[0]
+	path := filepath.Join(root, "packs", index.Generation, block.Pack)
+	file, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteAt([]byte{0xff}, block.PackOffset); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	_ = file.Close()
+	if _, err := RetireLoose(context.Background(), root, RetireLooseOptions{Apply: true}); err == nil {
+		t.Fatal("corrupt pack was accepted for loose retirement")
+	}
+	if _, err := os.Stat(fold.NewObjectStore(root).ObjectPath(refs[0].SHA256)); err != nil {
+		t.Fatalf("corrupt pack retirement removed loose recovery copy: %v", err)
+	}
+}
+
 func TestResolverReusesDecoderAcrossDistinctBlocks(t *testing.T) {
 	root := t.TempDir()
 	value := bytes.Repeat([]byte("decoder-pool-block-data"), 20000)

@@ -7,6 +7,7 @@ import (
 
 	"github.com/samekind/codexfold/internal/codex"
 	"github.com/samekind/codexfold/internal/fold"
+	"github.com/samekind/codexfold/internal/pack"
 	"github.com/spf13/cobra"
 )
 
@@ -77,7 +78,13 @@ func newUnfoldCommand(name string) *cobra.Command {
 				return err
 			}
 			storeDir = resolveFoldStore(home, storeDir)
-			result, err := fold.Unfold(command.Context(), storeDir, args[0], targetPath, overwrite)
+			var reader fold.ObjectReader
+			resolver, packErr := pack.Open(storeDir, pack.OpenOptions{})
+			if packErr == nil {
+				defer resolver.Close()
+				reader = resolver
+			}
+			result, err := fold.UnfoldWithOptions(command.Context(), storeDir, args[0], fold.UnfoldOptions{TargetPath: targetPath, Overwrite: overwrite, Reader: reader})
 			if err != nil {
 				return err
 			}
@@ -110,7 +117,13 @@ func newDoctorCommand() *cobra.Command {
 				return err
 			}
 			storeDir = resolveFoldStore(home, storeDir)
-			result, err := fold.Doctor(command.Context(), storeDir)
+			var reader fold.ObjectReader
+			resolver, packErr := pack.Open(storeDir, pack.OpenOptions{CacheBytes: -1})
+			if packErr == nil {
+				defer resolver.Close()
+				reader = resolver
+			}
+			result, err := fold.DoctorWithOptions(command.Context(), storeDir, fold.DoctorOptions{Reader: reader})
 			if err != nil {
 				return err
 			}

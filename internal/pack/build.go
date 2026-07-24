@@ -59,6 +59,11 @@ func Build(ctx context.Context, storeDir string, options BuildOptions) (BuildRes
 	if options.BlockBytes > int64(int(^uint(0)>>1)) {
 		return BuildResult{}, errors.New("pack block size exceeds platform integer size")
 	}
+	lock, err := storage.AcquireOperationLock(storeDir, "objects")
+	if err != nil {
+		return BuildResult{}, err
+	}
+	defer lock.Close()
 	refs, err := referencedObjects(storeDir)
 	if err != nil {
 		return BuildResult{}, err

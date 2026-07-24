@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 
@@ -24,6 +25,7 @@ type UnfoldOptions struct {
 	TargetPath string
 	Overwrite  bool
 	Budget     storage.Checker
+	Reader     ObjectReader
 }
 
 func Unfold(ctx context.Context, storeDir string, sessionID string, targetPath string, overwrite bool) (UnfoldResult, error) {
@@ -71,7 +73,7 @@ func UnfoldWithOptions(ctx context.Context, storeDir string, sessionID string, o
 	}
 	temporaryPath := temporary.Name()
 	defer func() { _ = os.Remove(temporaryPath) }()
-	store := NewObjectStore(storeDir)
+	reader := openObjectReader(storeDir, options.Reader)
 	hasher := sha256.New()
 	var bytesWritten int64
 	for _, part := range manifest.Parts {
@@ -79,17 +81,22 @@ func UnfoldWithOptions(ctx context.Context, storeDir string, sessionID string, o
 			_ = temporary.Close()
 			return UnfoldResult{}, err
 		}
-		data, err := store.Read(part.Object)
+		stream, err := reader.OpenObject(ctx, part.Object)
 		if err != nil {
 			_ = temporary.Close()
 			return UnfoldResult{}, err
 		}
-		if _, err := temporary.Write(data); err != nil {
+		written, copyErr := io.Copy(io.MultiWriter(temporary, hasher), stream)
+		closeErr := stream.Close()
+		if copyErr != nil {
 			_ = temporary.Close()
-			return UnfoldResult{}, fmt.Errorf("write restored object: %w", err)
+			return UnfoldResult{}, fmt.Errorf("write restored object: %w", copyErr)
 		}
-		_, _ = hasher.Write(data)
-		bytesWritten += int64(len(data))
+		if closeErr != nil {
+			_ = temporary.Close()
+			return UnfoldResult{}, closeErr
+		}
+		bytesWritten += written
 	}
 	if err := verifySourceDigest(hasher, bytesWritten, manifest.Source); err != nil {
 		_ = temporary.Close()

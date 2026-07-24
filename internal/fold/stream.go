@@ -1,6 +1,7 @@
 package fold
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -10,6 +11,10 @@ import (
 
 	"github.com/klauspost/compress/zstd"
 )
+
+func (s *ObjectStore) OpenObject(_ context.Context, ref ObjectRef) (io.ReadCloser, error) {
+	return s.OpenStream(ref)
+}
 
 type objectStream struct {
 	ref     ObjectRef

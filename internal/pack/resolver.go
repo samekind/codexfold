@@ -227,6 +227,11 @@ func (r *Resolver) OSCacheBypassApplied() bool { return r.bypassOSCacheApplied }
 
 func (r *Resolver) Generation() string { return r.index.Generation }
 
+func (r *Resolver) HasDigest(digest string) bool {
+	_, ok := r.objects[digest]
+	return ok
+}
+
 func (r *Resolver) ReadAt(ctx context.Context, ref fold.ObjectRef, destination []byte, offset int64) (int, error) {
 	if offset < 0 {
 		return 0, errors.New("negative object read offset")
@@ -271,6 +276,32 @@ func (r *Resolver) ReadAt(ctx context.Context, ref fold.ObjectRef, destination [
 	}
 	return written, nil
 }
+
+type objectStream struct {
+	ctx      context.Context
+	resolver *Resolver
+	ref      fold.ObjectRef
+	offset   int64
+}
+
+func (r *Resolver) OpenObject(ctx context.Context, ref fold.ObjectRef) (io.ReadCloser, error) {
+	object, ok := r.objects[ref.SHA256]
+	if !ok {
+		return nil, fmt.Errorf("object %s is not packed", ref.SHA256)
+	}
+	if object.RawBytes != ref.RawBytes {
+		return nil, fmt.Errorf("object %s raw size %d, want %d", ref.SHA256, object.RawBytes, ref.RawBytes)
+	}
+	return &objectStream{ctx: ctx, resolver: r, ref: ref}, nil
+}
+
+func (s *objectStream) Read(destination []byte) (int, error) {
+	n, err := s.resolver.ReadAt(s.ctx, s.ref, destination, s.offset)
+	s.offset += int64(n)
+	return n, err
+}
+
+func (s *objectStream) Close() error { return nil }
 
 func (r *Resolver) readBlock(objectDigest string, blockIndex int, block Block) ([]byte, error) {
 	key := fmt.Sprintf("%s:%d", objectDigest, blockIndex)

@@ -143,6 +143,11 @@ func Fold(ctx context.Context, session Session, options FoldOptions) (FoldResult
 		if err != nil {
 			return FoldResult{}, err
 		}
+		lock, err := storage.AcquireOperationLock(options.StoreDir, "objects")
+		if err != nil {
+			return FoldResult{}, err
+		}
+		defer lock.Close()
 	}
 
 	manifest := Manifest{
@@ -366,19 +371,26 @@ func verifyCurrentSource(path string, initial os.FileInfo, source ManifestSource
 	return nil
 }
 
-func verifyStoredManifest(ctx context.Context, store *ObjectStore, manifest Manifest) error {
+func verifyStoredManifest(ctx context.Context, reader ObjectReader, manifest Manifest) error {
 	hasher := sha256.New()
 	var bytesWritten int64
 	for _, part := range manifest.Parts {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		data, err := store.Read(part.Object)
+		stream, err := reader.OpenObject(ctx, part.Object)
 		if err != nil {
 			return err
 		}
-		_, _ = hasher.Write(data)
-		bytesWritten += int64(len(data))
+		written, copyErr := io.Copy(hasher, stream)
+		closeErr := stream.Close()
+		if copyErr != nil {
+			return copyErr
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		bytesWritten += written
 	}
 	return verifySourceDigest(hasher, bytesWritten, manifest.Source)
 }

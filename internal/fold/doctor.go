@@ -2,8 +2,11 @@ package fold
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -35,8 +38,17 @@ type loadedManifest struct {
 	Manifest Manifest
 }
 
+type DoctorOptions struct {
+	Reader ObjectReader
+}
+
 func Doctor(ctx context.Context, storeDir string) (DoctorResult, error) {
+	return DoctorWithOptions(ctx, storeDir, DoctorOptions{})
+}
+
+func DoctorWithOptions(ctx context.Context, storeDir string, options DoctorOptions) (DoctorResult, error) {
 	result := DoctorResult{StoreDir: storeDir, Issues: make([]DoctorIssue, 0)}
+	reader := openObjectReader(storeDir, options.Reader)
 	store := NewObjectStore(storeDir)
 	unique := make(map[string]ObjectRef)
 	err := walkManifestPaths(storeDir, func(path string) error {
@@ -53,7 +65,7 @@ func Doctor(ctx context.Context, storeDir string) (DoctorResult, error) {
 			result.ObjectReferenceCount++
 			unique[part.Object.SHA256] = part.Object
 		}
-		if err := verifyStoredManifest(ctx, store, manifest); err != nil {
+		if err := verifyStoredManifest(ctx, reader, manifest); err != nil {
 			result.Issues = append(result.Issues, DoctorIssue{
 				Scope: "manifest", Path: path, Error: err.Error(),
 			})
@@ -70,7 +82,17 @@ func Doctor(ctx context.Context, storeDir string) (DoctorResult, error) {
 		if err := ctx.Err(); err != nil {
 			return DoctorResult{}, err
 		}
-		if _, err := store.Read(ref); err != nil {
+		stream, err := reader.OpenObject(ctx, ref)
+		if err == nil {
+			hasher := sha256.New()
+			var bytesRead int64
+			bytesRead, err = io.Copy(hasher, stream)
+			err = errors.Join(err, stream.Close())
+			if err == nil && (bytesRead != ref.RawBytes || hex.EncodeToString(hasher.Sum(nil)) != ref.SHA256) {
+				err = fmt.Errorf("object reconstruction mismatch")
+			}
+		}
+		if err != nil {
 			result.Issues = append(result.Issues, DoctorIssue{
 				Scope: "object", Path: store.ObjectPath(digest), Error: err.Error(),
 			})

@@ -12,6 +12,39 @@ func newPackCommand() *cobra.Command {
 	command := &cobra.Command{Use: "pack", Short: "Build and verify packed object generations"}
 	command.AddCommand(newPackBuildCommand())
 	command.AddCommand(newPackDoctorCommand())
+	command.AddCommand(newPackRetireLooseCommand())
+	return command
+}
+
+func newPackRetireLooseCommand() *cobra.Command {
+	var codexHome string
+	var storeDir string
+	var apply bool
+	var jsonOutput bool
+	command := &cobra.Command{
+		Use:   "retire-loose",
+		Short: "Retire loose objects only after pack-only recovery verification",
+		Args:  cobra.NoArgs,
+		RunE: func(command *cobra.Command, _ []string) error {
+			home, err := codex.ResolveHome(codexHome)
+			if err != nil {
+				return err
+			}
+			result, err := pack.RetireLoose(command.Context(), resolveFoldStore(home, storeDir), pack.RetireLooseOptions{Apply: apply})
+			if err != nil {
+				return err
+			}
+			if jsonOutput {
+				return writeJSON(command, result)
+			}
+			_, err = fmt.Fprintf(command.OutOrStdout(), "generation=%s dry_run=%t candidates=%d candidate_bytes=%s retired=%d retired_bytes=%s actual_reclaimed=%s\n", result.Generation, result.DryRun, result.CandidateCount, formatBytes(result.CandidateBytes), result.RetiredCount, formatBytes(result.RetiredBytes), formatBytes(result.ActualReclaimedBytes))
+			return err
+		},
+	}
+	command.Flags().StringVar(&codexHome, "codex-home", "", "Codex home directory; defaults to CODEX_HOME or ~/.codex")
+	command.Flags().StringVar(&storeDir, "store", "", "Fold store directory; defaults to <codex-home>/fold-store")
+	command.Flags().BoolVar(&apply, "apply", false, "Delete eligible loose objects after pack-only verification")
+	command.Flags().BoolVar(&jsonOutput, "json", false, "Emit JSON output")
 	return command
 }
 
