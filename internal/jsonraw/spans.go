@@ -3,11 +3,14 @@ package jsonraw
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"strconv"
 	"strings"
 )
+
+var ErrMultipleValues = errors.New("multiple JSON values in one record")
 
 type StringSpan struct {
 	Path  string
@@ -24,7 +27,7 @@ func FindStringSpans(data []byte, minRawBytes int64) ([]StringSpan, error) {
 	}
 	if _, err := decoder.Token(); err != io.EOF {
 		if err == nil {
-			return nil, fmt.Errorf("multiple JSON values in one record")
+			return nil, ErrMultipleValues
 		}
 		return nil, err
 	}

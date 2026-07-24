@@ -1,6 +1,16 @@
 package jsonraw
 
-import "testing"
+import (
+	"errors"
+	"testing"
+)
+
+func TestFindStringSpansRejectsMultipleJSONValues(t *testing.T) {
+	_, err := FindStringSpans([]byte(`{"a":"one"}{"b":"two"}`), 1)
+	if !errors.Is(err, ErrMultipleValues) {
+		t.Fatalf("error = %v, want ErrMultipleValues", err)
+	}
+}
 
 func TestFindStringSpansReturnsExactNestedRawToken(t *testing.T) {
 	line := []byte(`{"payload":{"items":[{"text":"small"},{"text":"large\\nvalue"}]}}`)

@@ -587,7 +587,7 @@ func TestPackBuildAndDoctorCommandsUseFoldStore(t *testing.T) {
 		t.Fatalf("pack doctor: %v", err)
 	}
 	var doctor pack.DoctorResult
-	if err := json.Unmarshal(output.Bytes(), &doctor); err != nil || doctor.IssueCount != 0 {
+	if err := json.Unmarshal(output.Bytes(), &doctor); err != nil || doctor.IssueCount != 0 || doctor.ManifestCount != 1 || doctor.VerifiedManifestCount != 1 {
 		t.Fatalf("unexpected pack doctor: %#v err=%v output=%s", doctor, err, output.String())
 	}
 }

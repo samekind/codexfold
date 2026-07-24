@@ -37,18 +37,17 @@ type loadedManifest struct {
 
 func Doctor(ctx context.Context, storeDir string) (DoctorResult, error) {
 	result := DoctorResult{StoreDir: storeDir, Issues: make([]DoctorIssue, 0)}
-	manifests, loadIssues, err := loadAllManifests(storeDir)
-	if err != nil {
-		return DoctorResult{}, err
-	}
-	result.ManifestCount = len(manifests) + len(loadIssues)
-	result.Issues = append(result.Issues, loadIssues...)
 	store := NewObjectStore(storeDir)
 	unique := make(map[string]ObjectRef)
-	for _, loaded := range manifests {
-		manifest := loaded.Manifest
+	err := walkManifestPaths(storeDir, func(path string) error {
 		if err := ctx.Err(); err != nil {
-			return DoctorResult{}, err
+			return err
+		}
+		result.ManifestCount++
+		manifest, err := LoadManifestPath(path)
+		if err != nil {
+			result.Issues = append(result.Issues, DoctorIssue{Scope: "manifest", Path: path, Error: err.Error()})
+			return nil
 		}
 		for _, part := range manifest.Parts {
 			result.ObjectReferenceCount++
@@ -56,11 +55,15 @@ func Doctor(ctx context.Context, storeDir string) (DoctorResult, error) {
 		}
 		if err := verifyStoredManifest(ctx, store, manifest); err != nil {
 			result.Issues = append(result.Issues, DoctorIssue{
-				Scope: "manifest", Path: loaded.Path, Error: err.Error(),
+				Scope: "manifest", Path: path, Error: err.Error(),
 			})
 		} else {
 			result.VerifiedManifestCount++
 		}
+		return nil
+	})
+	if err != nil {
+		return DoctorResult{}, err
 	}
 	result.UniqueObjectCount = len(unique)
 	for digest, ref := range unique {
@@ -91,6 +94,26 @@ func Doctor(ctx context.Context, storeDir string) (DoctorResult, error) {
 	}
 	result.IssueCount = len(result.Issues)
 	return result, nil
+}
+
+func walkManifestPaths(storeDir string, visit func(path string) error) error {
+	manifestDir := filepath.Join(storeDir, "manifests")
+	err := filepath.WalkDir(manifestDir, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			return nil
+		}
+		return visit(path)
+	})
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read manifest directory: %w", err)
+	}
+	return nil
 }
 
 func loadAllManifests(storeDir string) ([]loadedManifest, []DoctorIssue, error) {

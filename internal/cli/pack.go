@@ -54,7 +54,7 @@ func newPackDoctorCommand() *cobra.Command {
 	var jsonOutput bool
 	command := &cobra.Command{
 		Use:   "doctor",
-		Short: "Verify the active packed object generation",
+		Short: "Verify packed objects and complete manifest reconstruction",
 		Args:  cobra.NoArgs,
 		RunE: func(command *cobra.Command, _ []string) error {
 			home, err := codex.ResolveHome(codexHome)
@@ -68,7 +68,7 @@ func newPackDoctorCommand() *cobra.Command {
 			if jsonOutput {
 				return writeJSON(command, result)
 			}
-			_, err = fmt.Fprintf(command.OutOrStdout(), "generation=%s objects=%d verified=%d issues=%d\n", result.Generation, result.ObjectCount, result.VerifiedCount, result.IssueCount)
+			_, err = fmt.Fprintf(command.OutOrStdout(), "generation=%s objects=%d verified=%d manifests=%d verified_manifests=%d issues=%d\n", result.Generation, result.ObjectCount, result.VerifiedCount, result.ManifestCount, result.VerifiedManifestCount, result.IssueCount)
 			return err
 		},
 	}

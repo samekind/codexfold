@@ -163,7 +163,7 @@ func scanDedupStream(r io.Reader, options DedupScanOptions, index *dedupIndex) (
 
 func isDedupJSONParseError(err error) bool {
 	var syntaxError *json.SyntaxError
-	return errors.As(err, &syntaxError) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF)
+	return errors.As(err, &syntaxError) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) || errors.Is(err, jsonraw.ErrMultipleValues)
 }
 
 func observeLargeJSONStrings(data []byte, minBytes int64, index *dedupIndex, stats *DedupFileStats) error {

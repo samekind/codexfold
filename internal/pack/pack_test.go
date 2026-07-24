@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	cryptorand "crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -317,11 +319,39 @@ func TestDoctorDoesNotPopulateActiveResolverCache(t *testing.T) {
 		t.Fatalf("new resolver cache bytes = %d", resolver.cache.used)
 	}
 	report, err := Doctor(context.Background(), root)
-	if err != nil || report.IssueCount != 0 {
+	if err != nil || report.IssueCount != 0 || report.ManifestCount != 1 || report.VerifiedManifestCount != 1 {
 		t.Fatalf("Doctor: report=%#v err=%v", report, err)
 	}
 	if resolver.cache.used != 0 {
 		t.Fatalf("doctor populated active resolver cache with %d bytes", resolver.cache.used)
+	}
+}
+
+func TestDoctorDetectsManifestOrderingCorruptionWithValidObjects(t *testing.T) {
+	root := t.TempDir()
+	refs := putObjects(t, root, []byte("first-object"), []byte("second-object"))
+	writeManifest(t, root, "session", refs)
+	if _, err := Build(context.Background(), root, BuildOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := fold.LoadManifest(root, "session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest.Parts[0], manifest.Parts[1] = manifest.Parts[1], manifest.Parts[0]
+	data, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(fold.ManifestPath(root, "session"), append(data, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	report, err := Doctor(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.IssueCount == 0 || report.VerifiedManifestCount != 0 {
+		t.Fatalf("manifest ordering corruption passed doctor: %#v", report)
 	}
 }
 
@@ -525,11 +555,18 @@ func writeManifest(t *testing.T, root string, sessionID string, refs []fold.Obje
 		Session: fold.ManifestSession{ID: sessionID, RolloutPath: filepath.Join(root, sessionID+".jsonl")},
 		Parts:   make([]fold.Part, 0, len(refs)),
 	}
+	hasher := sha256.New()
+	store := fold.NewObjectStore(root)
 	for _, ref := range refs {
 		manifest.Source.Bytes += ref.RawBytes
 		manifest.Parts = append(manifest.Parts, fold.Part{Kind: fold.PartResidual, Object: ref})
+		value, err := store.Read(ref)
+		if err != nil {
+			t.Fatalf("read manifest object: %v", err)
+		}
+		_, _ = hasher.Write(value)
 	}
-	manifest.Source.SHA256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	manifest.Source.SHA256 = hex.EncodeToString(hasher.Sum(nil))
 	data, err := json.Marshal(manifest)
 	if err != nil {
 		t.Fatalf("marshal manifest: %v", err)

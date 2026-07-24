@@ -25,12 +25,12 @@ type GCResult struct {
 
 func GC(ctx context.Context, storeDir string, apply bool) (GCResult, error) {
 	result := GCResult{StoreDir: storeDir, DryRun: !apply}
-	_, issues, err := loadAllManifests(storeDir)
+	_, invalidManifests, err := referencedManifestObjects(ctx, storeDir, false)
 	if err != nil {
 		return GCResult{}, err
 	}
-	if len(issues) > 0 {
-		return GCResult{}, fmt.Errorf("refusing GC with %d invalid manifest(s)", len(issues))
+	if invalidManifests > 0 {
+		return GCResult{}, fmt.Errorf("refusing GC with %d invalid manifest(s)", invalidManifests)
 	}
 	before, err := storage.Scan(ctx, storage.Options{StoreDir: storeDir, AllowMetadataIssues: true})
 	if err != nil {
@@ -42,18 +42,12 @@ func GC(ctx context.Context, storeDir string, apply bool) (GCResult, error) {
 	}
 	result.Storage = storageResult
 	result.ProjectedReclaimableBytes = storageResult.ProjectedReclaimableBytes
-	manifests, issues, err := loadAllManifests(storeDir)
+	referenced, invalidManifests, err := referencedManifestObjects(ctx, storeDir, true)
 	if err != nil {
 		return GCResult{}, err
 	}
-	if len(issues) > 0 {
-		return GCResult{}, fmt.Errorf("refusing loose-object GC with %d invalid manifest(s)", len(issues))
-	}
-	referenced := make(map[string]struct{})
-	for _, loaded := range manifests {
-		for _, part := range loaded.Manifest.Parts {
-			referenced[part.Object.SHA256] = struct{}{}
-		}
+	if invalidManifests > 0 {
+		return GCResult{}, fmt.Errorf("refusing loose-object GC with %d invalid manifest(s)", invalidManifests)
 	}
 	result.Referenced = len(referenced)
 	err = walkObjectFiles(storeDir, func(path string, info os.FileInfo) error {
@@ -87,4 +81,26 @@ func GC(ctx context.Context, storeDir string, apply bool) (GCResult, error) {
 		result.ActualReclaimedBytes = before.TotalPhysicalBytes - after.TotalPhysicalBytes
 	}
 	return result, nil
+}
+
+func referencedManifestObjects(ctx context.Context, storeDir string, collect bool) (map[string]struct{}, int, error) {
+	referenced := make(map[string]struct{})
+	invalid := 0
+	err := walkManifestPaths(storeDir, func(path string) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		manifest, err := LoadManifestPath(path)
+		if err != nil {
+			invalid++
+			return nil
+		}
+		if collect {
+			for _, part := range manifest.Parts {
+				referenced[part.Object.SHA256] = struct{}{}
+			}
+		}
+		return nil
+	})
+	return referenced, invalid, err
 }
