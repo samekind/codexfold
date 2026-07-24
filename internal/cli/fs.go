@@ -602,6 +602,11 @@ func newFSServeCommand() *cobra.Command {
 			if nativeFSKitSocket == "" {
 				nativeFSKitSocket = defaultNativeFSKitSocket(home, nativeFSKitResource)
 			}
+			if frontend == "native-fskit" {
+				if err := validateNativeFSKitSocketPath(nativeFSKitSocket); err != nil {
+					return err
+				}
+			}
 			result := FSServeResult{MountPoint: mount, ManagedSessions: len(states), Frontend: frontend, DryRun: !apply}
 			if frontend == "native-fskit" {
 				result.ResourcePath = nativeFSKitResource
@@ -908,6 +913,13 @@ func defaultNativeFSKitSocket(home string, resourcePath string) string {
 		return filepath.Join(userHome, "Library", "Containers", "vip.jstar.codexfold.fskitprofileprobe.module", "Data", "tmp", fmt.Sprintf("cf-%s.sock", hex.EncodeToString(digest[:4])))
 	}
 	return filepath.Join("/private/tmp", fmt.Sprintf("codexfold-fskit-%d-%s.sock", os.Getuid(), hex.EncodeToString(digest[:4])))
+}
+
+func validateNativeFSKitSocketPath(path string) error {
+	if len(path) >= 104 {
+		return errors.New("native FSKit Unix socket path exceeds the macOS limit; choose a shorter resource path")
+	}
+	return nil
 }
 
 func syncCanonicalRetirement(
@@ -1808,7 +1820,7 @@ func requireStorageHealth(ctx context.Context, store string) error {
 	if packReport.IssueCount != 0 {
 		return fmt.Errorf("pack doctor reported %d issues", packReport.IssueCount)
 	}
-	foldReport, err := fold.Doctor(ctx, store)
+	foldReport, err := doctorFoldStore(ctx, store)
 	if err != nil {
 		return err
 	}
@@ -1932,7 +1944,7 @@ func fsDoctor(ctx context.Context, home string, store string, mount string, defi
 			return nil
 		}},
 		{Component: fsctl.ComponentManifest, Run: func(ctx context.Context) error {
-			report, err := fold.Doctor(ctx, store)
+			report, err := doctorFoldStore(ctx, store)
 			if err != nil {
 				return err
 			}

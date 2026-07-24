@@ -54,6 +54,53 @@ func TestRootExposesPackAndFilesystemCommands(t *testing.T) {
 	}
 }
 
+func TestDoctorFoldStoreVerifiesPackOnlyManifests(t *testing.T) {
+	storeDir := t.TempDir()
+	source := filepath.Join(t.TempDir(), "rollout.jsonl")
+	data := bytes.Repeat([]byte("{\"pack_only\":true}\n"), 256)
+	if err := os.WriteFile(source, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fold.Fold(context.Background(), fold.Session{ID: "session", RolloutPath: source, Archived: true}, fold.FoldOptions{StoreDir: storeDir, Apply: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pack.Build(context.Background(), storeDir, pack.BuildOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pack.RetireLoose(context.Background(), storeDir, pack.RetireLooseOptions{Apply: true}); err != nil {
+		t.Fatal(err)
+	}
+	report, err := doctorFoldStore(context.Background(), storeDir)
+	if err != nil || report.IssueCount != 0 || report.VerifiedManifestCount != 1 {
+		t.Fatalf("pack-only fold doctor: report=%#v err=%v", report, err)
+	}
+}
+
+func TestDoctorFoldStoreDoesNotMaskBrokenCurrentPackWithLooseObjects(t *testing.T) {
+	storeDir := t.TempDir()
+	source := filepath.Join(t.TempDir(), "rollout.jsonl")
+	if err := os.WriteFile(source, []byte("{\"pack\":\"must remain authoritative\"}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fold.Fold(context.Background(), fold.Session{ID: "session", RolloutPath: source, Archived: true}, fold.FoldOptions{StoreDir: storeDir, Apply: true}); err != nil {
+		t.Fatal(err)
+	}
+	result, err := pack.Build(context.Background(), storeDir, pack.BuildOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	packFiles, err := filepath.Glob(filepath.Join(storeDir, "packs", result.Generation, "*.pack"))
+	if err != nil || len(packFiles) == 0 {
+		t.Fatalf("locate current pack: files=%v err=%v", packFiles, err)
+	}
+	if err := os.Remove(packFiles[0]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := doctorFoldStore(context.Background(), storeDir); err == nil || !strings.Contains(err.Error(), "open current pack") {
+		t.Fatalf("broken current pack error = %v", err)
+	}
+}
+
 func TestRetainCanonicalSnapshotBudgetRejectsBeforeCreatingSnapshot(t *testing.T) {
 	root := t.TempDir()
 	store := filepath.Join(root, "store")
@@ -421,6 +468,25 @@ func TestFSServiceInstallRendersNativeFSKitDaemonAndSupervisor(t *testing.T) {
 	}
 	if content, err := os.ReadFile(installedBinary); err != nil || string(content) != "installed" {
 		t.Fatalf("dry-run changed installed binary: content=%q err=%v", content, err)
+	}
+}
+
+func TestFSServiceInstallRejectsNativeFSKitResourceWithOverlongSocketPath(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("native FSKit services are macOS-only")
+	}
+	home, storeDir, _ := fsFixture(t, true)
+	resource := filepath.Join(string(filepath.Separator), strings.Repeat("a", 110))
+	root := NewRootCommand()
+	root.SetOut(&bytes.Buffer{})
+	root.SetErr(&bytes.Buffer{})
+	root.SetArgs([]string{
+		"fs", "service", "install", "--frontend", "native-fskit",
+		"--codex-home", home, "--store", storeDir, "--fskit-resource", resource,
+	})
+	err := root.Execute()
+	if err == nil || !strings.Contains(err.Error(), "Unix socket path exceeds the macOS limit") {
+		t.Fatalf("overlong native FSKit resource error = %v", err)
 	}
 }
 

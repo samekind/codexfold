@@ -346,6 +346,11 @@ func newFSServiceInstallCommand() *cobra.Command {
 				}
 				fskitResource = service.DefaultFSKitResourcePath(userHome)
 			}
+			if frontend == "native-fskit" {
+				if err := validateNativeFSKitSocketPath(defaultNativeFSKitSocket(home, fskitResource)); err != nil {
+					return err
+				}
+			}
 			if frontend == "native-fskit" && apply {
 				within, err := filepath.Rel(appTransaction.AppGroupPath(), filepath.Clean(fskitResource))
 				if err != nil || within == ".." || strings.HasPrefix(within, ".."+string(filepath.Separator)) {

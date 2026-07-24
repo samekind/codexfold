@@ -1,8 +1,11 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 
 	"github.com/samekind/codexfold/internal/codex"
@@ -134,13 +137,7 @@ func newDoctorCommand() *cobra.Command {
 				return err
 			}
 			storeDir = resolveFoldStore(home, storeDir)
-			var reader fold.ObjectReader
-			resolver, packErr := pack.Open(storeDir, pack.OpenOptions{CacheBytes: -1})
-			if packErr == nil {
-				defer resolver.Close()
-				reader = resolver
-			}
-			result, err := fold.DoctorWithOptions(command.Context(), storeDir, fold.DoctorOptions{Reader: reader})
+			result, err := doctorFoldStore(command.Context(), storeDir)
 			if err != nil {
 				return err
 			}
@@ -155,6 +152,21 @@ func newDoctorCommand() *cobra.Command {
 	command.Flags().StringVar(&storeDir, "store", "", "Fold store directory; defaults to <codex-home>/fold-store")
 	command.Flags().BoolVar(&jsonOutput, "json", false, "Emit JSON output")
 	return command
+}
+
+func doctorFoldStore(ctx context.Context, storeDir string) (fold.DoctorResult, error) {
+	resolver, err := pack.Open(storeDir, pack.OpenOptions{CacheBytes: -1})
+	if err == nil {
+		defer resolver.Close()
+		return fold.DoctorWithOptions(ctx, storeDir, fold.DoctorOptions{Reader: resolver})
+	}
+	current := filepath.Join(filepath.Clean(storeDir), "packs", "CURRENT")
+	if _, currentErr := os.Lstat(current); errors.Is(currentErr, os.ErrNotExist) {
+		return fold.Doctor(ctx, storeDir)
+	} else if currentErr != nil {
+		return fold.DoctorResult{}, currentErr
+	}
+	return fold.DoctorResult{}, fmt.Errorf("open current pack for fold verification: %w", err)
 }
 
 func newGCCommand() *cobra.Command {

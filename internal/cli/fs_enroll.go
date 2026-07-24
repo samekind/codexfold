@@ -12,7 +12,6 @@ import (
 
 	"github.com/samekind/codexfold/internal/codex"
 	"github.com/samekind/codexfold/internal/enroll"
-	"github.com/samekind/codexfold/internal/fold"
 	"github.com/samekind/codexfold/internal/fsctl"
 	"github.com/samekind/codexfold/internal/mountfs"
 	"github.com/samekind/codexfold/internal/pack"
@@ -261,7 +260,7 @@ func buildEnrollmentPlan(ctx context.Context, flags enrollmentFlags) (enroll.Pla
 }
 
 func requireEnrollmentStorageHealth(ctx context.Context, store string) error {
-	foldReport, err := fold.Doctor(ctx, store)
+	foldReport, err := doctorFoldStore(ctx, store)
 	if err != nil {
 		return err
 	}
