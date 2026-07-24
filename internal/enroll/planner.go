@@ -21,11 +21,12 @@ const (
 	ReasonAlreadyManaged     Reason = "already-managed"
 	ReasonNotArchived        Reason = "not-archived"
 	ReasonInvalidPath        Reason = "invalid-rollout-path"
+	ReasonNamespaceInactive  Reason = "canonical-namespace-inactive"
+	ReasonMountWarming       Reason = "mount-warming"
 	ReasonStabilityPending   Reason = "stability-observation-pending"
 	ReasonFileChanged        Reason = "rollout-changed"
 	ReasonWriterActive       Reason = "writer-active"
 	ReasonDoctorUnhealthy    Reason = "doctor-unhealthy"
-	ReasonCompatibility      Reason = "client-compatibility-unapproved"
 	ReasonMountUnhealthy     Reason = "mount-unhealthy"
 	ReasonNamespaceDisabled  Reason = "canonical-namespace-disabled"
 	ReasonPromotionStage     Reason = "promotion-stage-blocked"
@@ -40,11 +41,12 @@ type Policy struct {
 }
 
 type Gates struct {
-	DoctorHealthy         bool `json:"doctor_healthy"`
-	CompatibilityApproved bool `json:"compatibility_approved"`
-	MountHealthy          bool `json:"mount_healthy"`
-	CanonicalNamespace    bool `json:"canonical_namespace"`
-	EnrollmentAllowed     bool `json:"enrollment_allowed"`
+	DoctorHealthy      bool `json:"doctor_healthy"`
+	MountHealthy       bool `json:"mount_healthy"`
+	CanonicalNamespace bool `json:"canonical_namespace"`
+	NamespaceActive    bool `json:"namespace_active"`
+	NamespaceReady     bool `json:"namespace_ready"`
+	EnrollmentAllowed  bool `json:"enrollment_allowed"`
 }
 
 type Observation struct {
@@ -128,6 +130,29 @@ func Build(ctx context.Context, input Input) (Plan, error) {
 			plan.Decisions = append(plan.Decisions, decision)
 			continue
 		}
+		// A freshly restarted filesystem can report a healthy mount before its
+		// native namespace has republished every unmanaged path. Do not turn that
+		// transient state into a per-session invalid-path verdict.
+		if !input.Gates.MountHealthy {
+			decision.Reasons = append(decision.Reasons, ReasonMountUnhealthy)
+			plan.Decisions = append(plan.Decisions, decision)
+			continue
+		}
+		if !input.Gates.CanonicalNamespace {
+			decision.Reasons = append(decision.Reasons, ReasonNamespaceDisabled)
+			plan.Decisions = append(plan.Decisions, decision)
+			continue
+		}
+		if !input.Gates.NamespaceActive {
+			decision.Reasons = append(decision.Reasons, ReasonNamespaceInactive)
+			plan.Decisions = append(plan.Decisions, decision)
+			continue
+		}
+		if !input.Gates.NamespaceReady {
+			decision.Reasons = append(decision.Reasons, ReasonMountWarming)
+			plan.Decisions = append(plan.Decisions, decision)
+			continue
+		}
 		info, err := os.Lstat(session.RolloutPath)
 		if err != nil || !info.Mode().IsRegular() {
 			decision.Reasons = append(decision.Reasons, ReasonInvalidPath)
@@ -148,15 +173,6 @@ func Build(ctx context.Context, input Input) (Plan, error) {
 		}
 		if !input.Gates.DoctorHealthy {
 			decision.Reasons = append(decision.Reasons, ReasonDoctorUnhealthy)
-		}
-		if !input.Gates.CompatibilityApproved {
-			decision.Reasons = append(decision.Reasons, ReasonCompatibility)
-		}
-		if !input.Gates.MountHealthy {
-			decision.Reasons = append(decision.Reasons, ReasonMountUnhealthy)
-		}
-		if !input.Gates.CanonicalNamespace {
-			decision.Reasons = append(decision.Reasons, ReasonNamespaceDisabled)
 		}
 		if !input.Gates.EnrollmentAllowed {
 			decision.Reasons = append(decision.Reasons, ReasonPromotionStage)

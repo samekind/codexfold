@@ -23,7 +23,7 @@ func newFSCompatibilityImportCommand() *cobra.Command {
 	var apply, jsonOutput bool
 	command := &cobra.Command{
 		Use:   "compatibility-import",
-		Short: "Import a sanitized exact-version contract from a real filesystem trace",
+		Short: "Import sanitized client-specific regression evidence from a real filesystem trace",
 		Args:  cobra.NoArgs,
 		RunE: func(command *cobra.Command, _ []string) error {
 			if !filepath.IsAbs(tracePath) || (clientKind != "cli" && clientKind != "desktop") || clientVersion == "" || platform == "" {

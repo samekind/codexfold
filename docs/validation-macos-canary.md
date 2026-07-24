@@ -1,5 +1,43 @@
 # macOS Adapter And Canary Validation
 
+## Transparent Enrollment And Restart Readiness (2026-07-25)
+
+The isolated Apple-native FSKit canary now treats client version information as
+diagnostic metadata only. The current Desktop-bundled CLI
+`0.146.0-alpha.3.1` resumed managed sessions even though no exact compatibility
+contract existed. Service readiness now waits until every unmanaged entry in
+the native `sessions` and `archived_sessions` trees is visible through the
+mount; the first enrollment plan immediately after a real service restart
+reported zero `invalid-rollout-path`, zero `mount-warming`, and zero inactive
+namespace decisions.
+
+- Managed fork `019f94f4-093b-7b83-b67c-13b2c6de22bd` was automatically
+  discovered, folded, packed, migrated, and retired from native storage. A real
+  bundled-CLI resume recovered the inherited `SumPositiveChecked` overflow
+  guard, exact-`MaxInt` result, and overflow return value from the folded fork
+  history before appending a new turn through the delta.
+- FSKit `createItem` now removes a native file or directory when a later
+  attribute or metadata step fails. This prevents a half-created rollout from
+  converting the client's retry into `EEXIST`. After installing the signed
+  candidate transactionally, five consecutive real Codex task creations each
+  produced a SQLite thread row, a complete valid JSONL rollout, and no rollout
+  persistence warning.
+- Periodic enrollment launched its own fold, pack, migration, retirement, and
+  GC child commands without inheriting the outer FSKit Host parent-PID guard.
+  The live service then enrolled all 18 isolated sessions without a manual
+  `enroll apply`. A newly created target resumed from managed storage, recalled
+  its original marker, and appended 5,531 bytes to `delta.jsonl` with no native
+  snapshot, fallback, or writable backing.
+- Final doctor output reported all 11 components healthy and zero issues. The
+  store exposed 276,744,321 logical session bytes using 6,676,480 physical
+  bytes, with zero physical native sources, retained snapshots, or writable
+  backings.
+
+The real `~/.codex` namespace remained an ordinary directory tree throughout
+this validation. Production activation still requires the external quiescent
+cutover so that no Desktop, app-server, or CLI writer is active while the two
+canonical session directories are switched.
+
 ## Pack-Only Current-Client Canary (2026-07-24)
 
 The signed build 102 Apple-native FSKit App/extension and helper candidate

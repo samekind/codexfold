@@ -28,7 +28,7 @@ Every implementation plan, task, test report, release note, and control-plane st
 | `TF-012` | Core pack, read, append, copy-on-write, generation, journal, and recovery logic is platform-neutral; macOS, Linux, and Windows use separate adapters and independent readiness gates. |
 | `TF-013` | Capability claims use only the canonical status terms in this contract. |
 | `TF-014` | Native fallback deletion is disabled until platform production readiness and per-session retention gates pass. |
-| `TF-015` | A Codex client version without passing compatibility evidence enters compatibility quarantine: enrollment and destructive automation pause, and an already-routed session is automatically switched to a byte-verified current native writable backing before that client version may write. Routine client upgrades require no manual session preparation. |
+| `TF-015` | Codex client versions and build identities are diagnostic metadata, never filesystem write permission. A version change may schedule non-blocking regression validation, but it may not pause enrollment, reroute a session, or force native materialization. Runtime safety is determined by byte integrity, writer state, mount health, storage budget, journal recovery, and native-equivalent filesystem semantics. |
 | `TF-016` | Platform filesystem prerequisites requiring elevated or system-extension approval are installed only after explicit user authorization. |
 | `TF-017` | A canonical mount may never degrade into a writable ordinary directory or expose stale session files. The unmounted backing directory is empty and write-sealed, activation requires a live CodexFold mount identity, and service start succeeds only after the daemon, required platform mount policy, and operational mount probe are healthy. Desktop realpath rewrites from `CODEX_HOME/sessions` or `archived_sessions` into the mount alias are synchronously normalized in the Codex state database, and the route watcher accepts either spelling without exiting. |
 | `TF-018` | Fork-family classification and branch archival are conservative, evidence-driven, and dry-run-first. Fork ancestry, age, size, or title alone never proves that a branch is useless. An archive mutation requires explicit user selection or an explicit policy, revalidates current Codex state and rollout bytes, and preserves a recoverable session. |
@@ -80,7 +80,7 @@ Passing unit tests, successful materialization, a mounted filesystem, one succes
 - Serve normal regular-file paths to unmodified Codex Desktop and Codex CLI.
 - Support `stat`, `open`, sequential and random `read`, append, `fsync`, reopen, and EOF semantics.
 - Support append without materializing the complete base rollout.
-- Fall back to a complete copy-on-write backing file for truncate, random write, or unsupported mutation patterns.
+- Transition to a complete copy-on-write backing file for truncate, random write, or other non-append mutation patterns.
 - Preserve independent append histories for forked sessions while sharing identical base objects.
 - Keep active writer state out of background compaction.
 - Recover from daemon termination, host restart, interrupted pack commit, interrupted manifest generation, and interrupted migration.
@@ -317,7 +317,7 @@ A session migration is a two-phase state change:
 
 The retained native source is an immutable migration snapshot. Once virtual bytes diverge through append or mutation, that snapshot is stale and must not be routed as the current session.
 
-Rollback and compatibility fallback create or reuse a current native writable backing:
+Rollback creates or reuses a current native writable backing:
 
 1. Freeze new writers through the session writer lease.
 2. Stream the active visible generation, including delta or copy-on-write state, into a temporary native JSONL.
@@ -325,7 +325,7 @@ Rollback and compatibility fallback create or reuse a current native writable ba
 4. Atomically route Codex state to the verified native backing.
 5. Release the lease only after the native route is durable.
 
-The original snapshot may be reused only when its byte count and SHA-256 still equal the current visible session. Native fallback deletion is disabled until the target platform reaches `production-ready:<platform>` and the individual session passes its retention period without compatibility or recovery failures.
+The original snapshot may be reused only when its byte count and SHA-256 still equal the current visible session. Native fallback deletion is disabled until the target platform reaches `production-ready:<platform>` and the individual session passes its retention period without integrity or recovery failures.
 
 Automatic fallback is required when doctor detects an unreadable virtual generation, corrupt pack or manifest, an unresolved journal entry, or a mount that cannot be restored within the canary recovery threshold. It may route only a native backing proven equal to the latest committed visible bytes. If current bytes cannot be reconstructed and verified, it blocks the affected session and destructive automation for explicit recovery rather than silently routing a stale snapshot.
 
@@ -391,11 +391,9 @@ Logical duplicate savings and physical disk reclamation are distinct metrics. A 
 - A session with an active writer is never folded, removed, migrated, or rolled back.
 - A branch is never archived or removed solely from inferred fork ancestry, age, title, or size.
 - Budget preflight failure blocks the mutating operation before any full-size temporary file is created.
-- A detected Codex Desktop or CLI version change immediately enters compatibility quarantine and schedules the native-operation compatibility suite.
-- Quarantine pauses enrollment, migration, compaction that removes fallback state, fallback deletion, and GC.
-- Before an unapproved client version may write an already-routed session, the service automatically switches it to a verified current native writable backing. It never routes the stale migration snapshot as current data.
-- If that automatic switch cannot verify exact current bytes, the affected session is blocked for explicit recovery; other native or verified sessions remain available.
-- After compatibility passes, virtual routing may resume without per-session user preparation.
+- A detected Codex Desktop or CLI version change is recorded and may schedule the native-operation regression suite, but the version string never changes routes or filesystem availability.
+- `fs compatibility` and the client component of `fs doctor` are diagnostic surfaces. Missing or unknown version evidence is reported as a warning, not a storage-health failure.
+- Append uses the durable delta and non-append mutation uses complete writable backing according to the operation received by the filesystem, without a client-version or operation-name allowlist.
 
 No design can make a userspace filesystem mathematically as failure-free as a native filesystem. The production claim means all defined operations, failure tests, recovery gates, and upgrade checks pass; it does not hide the daemon as a new dependency.
 

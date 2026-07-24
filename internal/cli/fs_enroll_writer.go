@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"path/filepath"
 	"strings"
 
@@ -8,6 +9,24 @@ import (
 )
 
 var enrollmentWriterProbe = detectEnrollmentWriters
+
+// filesystemMigrationWriterProbe is kept injectable so migration tests can
+// exercise the destructive boundary without depending on the host lsof view.
+var filesystemMigrationWriterProbe = probeFilesystemMigrationWriter
+
+func probeFilesystemMigrationWriter(ctx context.Context, session codex.Session, aliases ...string) (bool, error) {
+	sessions := []codex.Session{session}
+	for _, alias := range aliases {
+		if alias != "" && filepath.Clean(alias) != filepath.Clean(session.RolloutPath) {
+			sessions = append(sessions, codex.Session{ID: session.ID, RolloutPath: alias})
+		}
+	}
+	writers, err := enrollmentWriterProbe(ctx, sessions)
+	if err != nil {
+		return false, err
+	}
+	return writers[session.ID], nil
+}
 
 func parseEnrollmentWriterSnapshot(output []byte, sessions []codex.Session) map[string]bool {
 	aliases := make(map[string][]string, len(sessions)*2)

@@ -4,7 +4,7 @@
 
 **Goal:** Make unmodified Codex Desktop and Codex CLI open, resume, fork, and continue managed JSONL sessions directly while exact duplicate bytes are stored once and current session writes remain durable and independently recoverable.
 
-**Architecture:** Extend Fold V1 with a block-addressable packed resolver, then place a platform-neutral exact-byte session engine above it. The engine composes an immutable manifest base with an append delta or verified writable backing; platform adapters only translate native file operations. Migration, compatibility quarantine, fallback, and promotion remain explicit journaled transactions, with real Codex routing disabled until shadow and platform gates pass.
+**Architecture:** Extend Fold V1 with a block-addressable packed resolver, then place a platform-neutral exact-byte session engine above it. The engine composes an immutable manifest base with an append delta or verified writable backing; platform adapters translate native file operations without a client-version allowlist. Migration, rollback, backing transitions, and promotion remain explicit journaled transactions, with real Codex routing disabled until shadow and platform gates pass.
 
 **Tech Stack:** Go 1.26, zstd, Cobra, modernc SQLite, an Apple-native Swift FSKit extension with versioned UDS IPC on macOS, FUSE3 on Linux, and WinFsp plus Windows SCM on Windows. FUSE-T remains historical validation evidence and a development fallback, not the terminal macOS architecture.
 
@@ -12,7 +12,7 @@
 
 ## Alignment Snapshot
 
-Current public status remains `fs-engine-preview`. Tasks 1 through 10 and 12 through 14 are implemented. Task 11 has substantial isolated and bounded real-home macOS evidence, including current-client compatibility, sleep/wake, process-interruption recovery, one idle retained-source managed CLI session surviving an actual host reboot, and a separate durable-journal partial-tail controlled host-interruption recovery. Linux FUSE3 now has real unprivileged operation, crash/restart, performance, mount-policy, and `systemd --user` lifecycle evidence. Windows WinFsp and SCM support are implemented and cross-compile, but lack a real Windows host. The dedicated retention window, seven incident-free days, Linux client/upgrade/rollback/retention gates, and all real Windows gates remain open.
+Current public status remains `fs-engine-preview`. Tasks 1 through 10 and 12 through 14 are implemented. Task 11 has substantial isolated and bounded real-home macOS evidence, including current-client regression traces, sleep/wake, process-interruption recovery, one idle retained-source managed CLI session surviving an actual host reboot, and a separate durable-journal partial-tail controlled host-interruption recovery. Linux FUSE3 now has real unprivileged operation, crash/restart, performance, mount-policy, and `systemd --user` lifecycle evidence. Windows WinFsp and SCM support are implemented and cross-compile, but lack a real Windows host. The dedicated retention window, Linux client/upgrade/rollback/retention validation, and all real Windows gates remain open.
 
 | Task | Status | Current evidence | Remaining work |
 | --- | --- | --- | --- |
@@ -21,16 +21,16 @@ Current public status remains `fs-engine-preview`. Tasks 1 through 10 and 12 thr
 | 3 | Complete | Commit `9a7f1e8`; append and COW tests | None in this task |
 | 4 | Complete | Commit `076d772`; journal, compaction, and fallback tests | None in this task |
 | 5 | Complete | Commit `35a53fc`; status, shadow, doctor, and benchmark tests | Platform evidence remains outside this task |
-| 6 | Complete | Commit `5be10d2`; exact-version compatibility and optimistic route tests | New installed client versions still require fresh contracts |
+| 6 | Complete | Commit `5be10d2`; version diagnostics and optimistic route tests | Client evidence remains diagnostic and never gates filesystem access |
 | 7 | Complete | Commit `3f51aa5`; neutral operations, real macOS FUSE-T, and real Linux FUSE3 adapter tests | Windows real-adapter evidence remains a separate product gate |
 | 8 | Complete | Standalone CLI, guarded lifecycle, bounded planner/apply loop, and isolated automatic-enrollment evidence | Production enablement remains gated by platform readiness |
 | 9 | Complete | Commit `4589ffa`; launchd, real `systemd --user`, Windows SCM compile, and update preflight tests | Windows service runtime and production update promotion remain platform-gated |
 | 10 | Complete | Commit `a1ac76e`; synthetic, crash, race, cross-compile, and 758 MiB evidence | This task proves only the shared engine preview |
-| 11 | Partial | Real macOS CLI/Desktop, FUSE-T, rollback, daemon restart, idle managed-session host reboot, durable-journal partial-tail host interruption, and quarantine evidence | Complete the retention gate |
-| 12 | Complete | Bounded planner/apply/service tests plus isolated canonical automatic enrollment, native-writer probing, restart, append, quarantine, and failed-cutover evidence | Real-home automatic apply remains promotion-gated |
+| 11 | Partial | Real macOS CLI/Desktop, FUSE-T, rollback, daemon restart, idle managed-session host reboot, durable-journal partial-tail host interruption, and client-version no-reroute evidence | Complete the retention gate |
+| 12 | Complete | Bounded planner/apply/service tests plus isolated canonical automatic enrollment, native-writer probing, restart, append, version diagnostics, and failed-cutover evidence | Explicit real-home activation remains externally quiesced |
 | 13 | Complete | Fork graph reports, exact content comparison, guarded official-compatible archive transactions, recovery, static content-change boundaries, and isolated native plus managed FUSE-T round trips | None in this task |
 | 14 | Complete | Physical inventory, hard mutation budgets, lease-aware bounded GC, and truthful projected/actual accounting | Destructive retention remains promotion-gated |
-| 15 | Partial | Current macOS client contracts plus restart and controlled in-flight interruption gates; real Linux FUSE3 operation, crash, performance, and systemd lifecycle; Windows WinFsp/SCM cross-compile | Retention windows, Linux client/upgrade/rollback gates, and all real Windows gates remain |
+| 15 | Partial | Current macOS client regression evidence plus restart and controlled in-flight interruption gates; real Linux FUSE3 operation, crash, performance, and systemd lifecycle; Windows WinFsp/SCM cross-compile | Retention windows, Linux client/upgrade/rollback validation, and all real Windows gates remain |
 
 ## Global Constraints
 
@@ -48,7 +48,7 @@ Current public status remains `fs-engine-preview`. Tasks 1 through 10 and 12 thr
 - `TF-012`: packed storage, byte views, write state, generations, doctor, and recovery remain platform-neutral; adapters are independent.
 - `TF-013`: status output uses only `storage-engine`, `fs-engine-preview`, `platform-canary`, `production-ready:<platform>`, and `cross-platform-ready`.
 - `TF-014`: a migration snapshot is not deleted before `production-ready:<platform>` and the per-session retention gate.
-- `TF-015`: unknown client versions enter compatibility quarantine and cannot write a virtual route before current bytes are automatically routed to verified native backing.
+- `TF-015`: client versions are non-blocking diagnostics; runtime access depends on filesystem semantics and integrity gates, not version approval.
 - `TF-016`: FUSE-T or another privileged prerequisite is not installed without explicit user authorization.
 - `TF-017`: canonical namespace activation requires a verified CodexFold mount identity, write-sealed unmounted backing, route normalization, and a watcher that tolerates canonical and mount-alias spellings.
 - `TF-018`: branch classification and archival are conservative, proof-first, explicitly selected, and recoverable.
@@ -416,12 +416,12 @@ git commit -m "feat: add shadow doctor benchmark and fs status"
 - Create: `internal/codex/routes_test.go`
 
 **Interfaces:**
-- Consumes: sanitized native operation traces, installed client versions, Codex SQLite state, and current-byte fallback.
-- Produces: compatibility results and optimistic `RouteSession`/`RestoreSession` transactions.
+- Consumes: sanitized native operation traces, installed client versions, Codex SQLite state, and current-byte recovery state.
+- Produces: non-blocking compatibility diagnostics and optimistic `RouteSession`/`RestoreSession` transactions.
 
 - [x] **Step 1: Write failing trace, version, and SQLite transaction tests**
 
-Cover sanitized `fs_usage` parsing, unknown-version quarantine, exact approved-version matching, optimistic route update, concurrent route change rejection, and rollback to a current backing rather than a stale migration snapshot.
+Cover sanitized `fs_usage` parsing, unknown-version diagnostics, exact evidence matching, optimistic route update, concurrent route change rejection, and rollback to a current backing rather than a stale migration snapshot.
 
 - [x] **Step 2: Run focused tests and verify missing API failures**
 
@@ -442,15 +442,15 @@ type Contract struct {
 }
 ```
 
-Store operation names, flags, and observed semantics without paths or contents. A version mismatch returns quarantine, never inferred compatibility.
+Store operation names, flags, and observed semantics without paths or contents. A version mismatch is reported as unknown evidence and never changes runtime permissions or routes.
 
 - [x] **Step 4: Implement optimistic Codex state routing**
 
 Use `BEGIN IMMEDIATE`, `busy_timeout`, and `update threads set rollout_path=? where id=? and rollout_path=?`. Verify exactly one row changes, commit, then re-read. Route only after shadow succeeds and current-byte fallback metadata is durable.
 
-- [x] **Step 5: Implement upgrade quarantine transaction**
+- [x] **Step 5: Implement non-blocking upgrade diagnostics**
 
-When a new client version is detected, pause enrollment and destructive operations, create and verify current native backing for routed sessions, then atomically route those sessions to native files before marking the version safe to launch writes.
+When a new client version is detected, record it and schedule regression validation. Do not pause enrollment, materialize current backing, retire managed state, or change routes based on the version string.
 
 - [x] **Step 6: Run focused, race, and complete tests**
 
@@ -555,7 +555,7 @@ Expose `pack build`, `pack doctor`, `fs status`, `fs doctor`, `fs compatibility`
 
 - [x] **Step 4: Implement guarded lifecycle commands**
 
-Expose `fs serve`, `fs migrate`, `fs rollback`, `fs compact`, and `fs recover`. Mutation commands are dry-run by default and require `--apply`. Migration requires clean doctor, passing shadow evidence, approved client version, and eligible session state.
+Expose `fs serve`, `fs migrate`, `fs rollback`, `fs compact`, and `fs recover`. Mutation commands are dry-run by default and require `--apply`. Migration requires clean storage health, passing shadow evidence, a fail-closed writer probe, an unchanged source fingerprint, mount acknowledgement, and eligible session state.
 
 - [ ] **Step 5: Implement bounded automatic discovery**
 
@@ -598,12 +598,12 @@ git commit -m "feat: expose transparent filesystem command surface"
 - Create: `internal/cli/fs_service_runtime_windows.go`
 
 **Interfaces:**
-- Consumes: built tagged binary, mount path, installed-client compatibility result, and doctor status.
+- Consumes: built tagged binary, mount path, installed-client diagnostics, and doctor status.
 - Produces: deterministic service definition, start/stop/status, and update preflight.
 
 - [x] **Step 1: Write failing service-render and update-guard tests**
 
-Assert launchd, systemd, and Windows SCM definitions use the same absolute `fs serve` arguments, logs contain no session content, daemon and mount health are separate, preview auto-update is rejected, and a client version change enters quarantine before restart.
+Assert launchd, systemd, and Windows SCM definitions use the same absolute `fs serve` arguments, logs contain no session content, daemon and mount health are separate, preview auto-update is rejected, and a client version change is reported without changing any session route.
 
 - [x] **Step 2: Run focused tests and verify missing service API**
 
@@ -615,9 +615,9 @@ Expected: FAIL because service APIs are absent.
 
 Render and manage launchd on macOS, `systemd --user` on Linux, and the native SCM host on Windows only after an explicit apply command. Detect FUSE-T, FUSE3, or WinFsp prerequisites but never install them, enable Linux linger, or request elevation from library code.
 
-- [x] **Step 4: Implement update compatibility guard**
+- [x] **Step 4: Implement update health guard and client diagnostics**
 
-Before service binary promotion, run doctor and compatibility against installed clients. Preview/canary versions require explicit promotion. Unknown client versions trigger Task 6 quarantine and current-byte native routing.
+Before service binary promotion, run doctor and report compatibility evidence for installed clients. Preview/canary CodexFold builds require explicit promotion. Unknown client versions remain diagnostic and never trigger native routing.
 
 - [x] **Step 5: Run focused and complete tests**
 
@@ -717,9 +717,9 @@ Select 5–10 archived sessions, fold and pack without source removal, compare e
 
 - [ ] **Step 5: Route retained-source canaries**
 
-Current state: isolated retained-source CLI and Desktop canaries passed direct open, resume, append, tool use, fork, archive/unarchive, daemon restart, rollback, re-migration, and quarantine. One idle retained-source managed CLI session also passed an actual host reboot, post-boot managed resume, exact rollback, and native resume. This step remains open because managed-session sleep/wake, host interruption during append/compaction/migration/rollback, current Desktop compatibility, and real-home retained-source canaries are not complete.
+Current state: isolated retained-source CLI and Desktop canaries passed direct open, resume, append, tool use, fork, archive/unarchive, daemon restart, rollback, re-migration, and client-version changes without rerouting. One idle retained-source managed CLI session also passed an actual host reboot, post-boot managed resume, exact rollback, and native resume. This step remains open at the public release level because retention evidence is not complete.
 
-After clean shadow and compatibility, migrate only the selected archived sessions. Verify Desktop direct click, CLI resume, history, message send, tool use, fork, archive, unarchive, daemon termination, mount restart, sleep/wake, host restart, rollback, and compatibility quarantine. Never delete native snapshots.
+After clean shadow and a fail-closed writer check, migrate selected writer-free sessions. Verify Desktop direct click, CLI resume, history, message send, tool use, fork, archive, unarchive, daemon termination, mount restart, sleep/wake, host restart, rollback, and client-version changes without rerouting. Never delete native snapshots before the retention gate.
 
 - [ ] **Step 6: Start seven-day canary retention**
 
@@ -744,11 +744,11 @@ No private path, session ID, trace content, credential, or control-plane name ma
 
 **Exact next work:**
 
-- [x] Add policy tests for existing sessions, newly created sessions, forks, active writers, changing files, archived eligibility, unknown client versions, failed doctor state, insufficient disk budget, bounded batches, restart idempotency, and failed cutover.
-- [x] Implement a read-only enrollment planner that consumes Codex state, rollout stability evidence, compatibility, doctor, writer state, promotion stage, and storage-budget preflight, and emits explicit eligible/ineligible reasons without changing routes.
+- [x] Add policy tests for existing sessions, newly created sessions, forks, active writers, changing files, active and archived eligibility, unknown client versions as non-blocking diagnostics, failed doctor state, insufficient disk budget, bounded batches, restart idempotency, and failed cutover.
+- [x] Implement a read-only enrollment planner that consumes Codex state, rollout stability evidence, storage doctor, writer state, namespace state, promotion stage, and storage-budget preflight, and emits explicit eligible/ineligible reasons without changing routes.
 - [x] Implement bounded apply transactions that fold, pack, shadow, stage at most one retained native snapshot, wait for exact mount acknowledgement, and only then update routing. A failure leaves the original native route and source unchanged.
 - [x] Integrate the planner into the standalone service with a bounded interval and batch size. Newly created sessions and forks remain native while active and need no per-session command when they later become eligible.
-- [x] Validate in an isolated Codex home across daemon restart, real CLI append, client-version quarantine, and failed canonical cutover before any real-home automatic enrollment is allowed.
+- [x] Validate in an isolated Codex home across daemon restart, real CLI append, client-version changes without route mutation, and failed canonical cutover before explicit real-home activation.
 
 ### Task 13: Conservative Branch Lifecycle And Content-Change Boundary
 
@@ -785,14 +785,14 @@ No private path, session ID, trace content, credential, or control-plane name ma
 
 **Exact next work:**
 
-- [x] Import exact compatibility contracts for the currently installed Codex Desktop and CLI versions and return the isolated canary doctor to a clean client state.
+- [x] Import diagnostic operation evidence for the tested Codex Desktop and CLI builds; unknown builds remain warnings and do not affect filesystem health.
 - [x] Run retained-source managed macOS canaries through sleep/wake and real host restart, including process-interrupted append, compaction, migration, and rollback cases required by the contract.
 - [x] Run a dedicated disposable native-append canary that durably persists one journal and a half-written tail, performs a `reboot -q` host interruption, rejects same-boot verification, and on the next boot proves exact base rollback, valid JSONL, and an empty journal. Verify the independent Pack-only FSKit canary remounts with `fs doctor` healthy.
 - [x] Implement the Linux FUSE3 adapter with explicit `fuse fuse3` build tags and execute real unprivileged read, append, copy-on-write, truncate, canonical rename, native fallback, `SIGKILL` stale-mount recovery, remount, performance, backing-seal, and `systemd --user` install/start/status/stop gates.
 - [x] Implement the Windows WinFsp adapter and native SCM service host, mount probe, configuration, start/stop/status, and restart policy; default and WinFsp binaries and tests cross-compile.
-- [ ] Continue only bounded real-home canary observation and complete seven incident-free days before any `platform-canary` promotion decision; general automatic apply remains disabled.
-- [ ] Execute Linux real-client compatibility, upgrade quarantine, rollback, and retention gates.
-- [ ] Execute Windows WinFsp operation, crash/restart, performance, real-client compatibility, upgrade quarantine, rollback, and retention gates on a real Windows host.
+- [ ] Continue bounded real-home canary observation before any stronger public capability claim; it does not block an explicitly approved deployment.
+- [ ] Execute Linux real-client operation validation, upgrade transparency, rollback, and retention gates.
+- [ ] Execute Windows WinFsp operation, crash/restart, performance, real-client operation validation, upgrade transparency, rollback, and retention gates on a real Windows host.
 
 ## Plan Self-Review
 
@@ -801,7 +801,7 @@ No private path, session ID, trace content, credential, or control-plane name ma
 - FUSE-T is the validated macOS host and FUSE3 is the native-gated Linux host; Windows remains implementation and cross-compile only until independent WinFsp execution passes.
 - The stale migration snapshot is never used as current fallback after virtual writes diverge.
 - The default build remains portable and does not require installed FUSE headers.
-- No task changes a real Codex route before shadow, compatibility, doctor, and explicit apply gates pass.
+- No task changes a real Codex route before shadow, writer/fingerprint, doctor, mount, and explicit apply gates pass; client-version evidence is diagnostic only.
 - Automatic enrollment remains blocked until Task 12 and Task 14 are complete.
 - Branch archival, exact-contained deletion, and content-changing repair remain separate operations.
 - No logical deduplication result is presented as physical reclamation without storage accounting.

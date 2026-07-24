@@ -31,6 +31,13 @@ type DoctorResult struct {
 func Doctor(ctx context.Context, storeDir string) (DoctorResult, error) {
 	resolver, err := Open(storeDir, OpenOptions{CacheBytes: -1})
 	if err != nil {
+		bootstrap, bootstrapErr := IsBootstrapStore(storeDir)
+		if bootstrapErr != nil {
+			return DoctorResult{}, bootstrapErr
+		}
+		if bootstrap {
+			return DoctorResult{}, nil
+		}
 		return DoctorResult{IssueCount: 1, Issues: []DoctorIssue{{Message: err.Error()}}}, nil
 	}
 	defer resolver.Close()
@@ -73,6 +80,26 @@ func Doctor(ctx context.Context, storeDir string) (DoctorResult, error) {
 	}
 	result.IssueCount = len(result.Issues)
 	return result, nil
+}
+
+// IsBootstrapStore reports whether the store has never committed fold data.
+// A transparent filesystem must be able to mount native passthrough before the
+// first session is folded, but partial objects or pack generations are never a
+// valid substitute for a committed CURRENT generation.
+func IsBootstrapStore(storeDir string) (bool, error) {
+	for _, root := range []string{"manifests", "objects", "packs"} {
+		entries, err := os.ReadDir(filepath.Join(filepath.Clean(storeDir), root))
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return false, err
+		}
+		if len(entries) != 0 {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 func verifyPackedManifests(ctx context.Context, storeDir string, resolver *Resolver, result *DoctorResult) error {

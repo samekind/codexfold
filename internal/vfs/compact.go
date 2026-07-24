@@ -42,7 +42,6 @@ func (s *Session) Compact(ctx context.Context, options CompactOptions) (CompactR
 		return CompactResult{}, errors.New("cannot compact while a writer lease is held")
 	}
 	s.writerOpen = true
-	state := s.state
 	s.mu.Unlock()
 	lease, err := acquireWriterLease(filepath.Join(s.directory, "writer.lease"))
 	if err != nil {
@@ -58,6 +57,13 @@ func (s *Session) Compact(ctx context.Context, options CompactOptions) (CompactR
 		s.writerOpen = false
 		s.mu.Unlock()
 	}()
+	s.mu.Lock()
+	if err := s.refreshNativeRetirementLocked(); err != nil {
+		s.mu.Unlock()
+		return CompactResult{}, err
+	}
+	state := s.state
+	s.mu.Unlock()
 	activePath := state.DeltaPath
 	if state.BackingPath != "" {
 		activePath = state.BackingPath

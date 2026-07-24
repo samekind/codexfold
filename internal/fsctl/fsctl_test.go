@@ -70,6 +70,26 @@ func TestDoctorRequiresEveryComponentAndSeparatesDaemonFromMount(t *testing.T) {
 	}
 }
 
+func TestDoctorReportsNonBlockingDiagnosticsWithoutFailingFilesystemHealth(t *testing.T) {
+	checks := make([]Check, 0, len(RequiredComponents))
+	for _, component := range RequiredComponents {
+		component := component
+		checks = append(checks, Check{Component: component, NonBlocking: component == ComponentClient, Run: func(context.Context) error {
+			if component == ComponentClient {
+				return errors.New("client version could not be detected")
+			}
+			return nil
+		}})
+	}
+	report := Doctor(context.Background(), checks)
+	if !report.Healthy || report.ComponentHealth[ComponentClient] || report.IssueCount != 1 {
+		t.Fatalf("non-blocking client diagnostic changed filesystem health: %#v", report)
+	}
+	if report.Issues[0].Severity != "warning" || report.Issues[0].Component != ComponentClient {
+		t.Fatalf("client diagnostic was not reported as a warning: %#v", report.Issues)
+	}
+}
+
 func TestBenchmarkMeasuresNativeAndVirtualReads(t *testing.T) {
 	root := t.TempDir()
 	data := bytes.Repeat([]byte("benchmark-data-"), 10000)

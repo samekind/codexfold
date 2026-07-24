@@ -48,3 +48,11 @@ func TestDuplicateRecordIndexAggregatesOccurrencesAcrossFiles(t *testing.T) {
 		t.Fatalf("unique record lookup = %t, %v", duplicate, err)
 	}
 }
+
+func TestNilDuplicateRecordIndexIsNotADuplicate(t *testing.T) {
+	var lookup *DuplicateRecordIndex
+	duplicate, err := lookup.IsDuplicateRecord(context.Background(), sha256.Sum256([]byte("record")), 6)
+	if err != nil || duplicate {
+		t.Fatalf("nil lookup = %t, %v", duplicate, err)
+	}
+}

@@ -1089,6 +1089,7 @@ private final class CodexFoldVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWr
             return
         }
         let itemPath = join(directory.entry.path, nameString)
+        var createdType: FSItem.ItemType?
         do {
             var entry: WireEntry
             switch type {
@@ -1096,9 +1097,11 @@ private final class CodexFoldVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWr
                 let created = try client.create(itemPath, flags: O_RDWR | O_APPEND)
                 try client.handleOperation(.release, handle: created.1, connection: created.0)
                 created.0.close()
+                createdType = .file
                 entry = created.2
             case .directory:
                 try client.mkdir(itemPath, mode: newAttributes.isValid(.mode) ? newAttributes.mode : 0o700)
+                createdType = .directory
                 entry = try client.getattr(itemPath)
             default:
                 throw POSIXError(.ENOTSUP)
@@ -1119,6 +1122,12 @@ private final class CodexFoldVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWr
                 nil
             )
         } catch {
+            // FSKit can retry createItem after a post-create metadata failure. Do
+            // not leave a half-created native entry that turns that retry into
+            // EEXIST and prevents the caller from persisting its session.
+            if let createdType {
+                try? client.remove(itemPath, directory: createdType == .directory)
+            }
             replyHandler(nil, error)
         }
     }

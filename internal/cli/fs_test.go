@@ -564,7 +564,7 @@ func TestFSServiceRestartIsExposedAsDryRun(t *testing.T) {
 	}
 }
 
-func TestFSUpdatePreflightQuarantineRoutesLatestVisibleBytesNative(t *testing.T) {
+func TestFSUpdatePreflightReportsUnknownClientWithoutChangingManagedRoute(t *testing.T) {
 	allowFixtureMount(t)
 	home, storeDir, nativePath := fsFixture(t, true)
 	approvedCLI := approvedCLIContract(t, storeDir, "1.2.3")
@@ -604,28 +604,42 @@ func TestFSUpdatePreflightQuarantineRoutesLatestVisibleBytesNative(t *testing.T)
 	var output bytes.Buffer
 	root.SetOut(&output)
 	root.SetErr(&bytes.Buffer{})
-	root.SetArgs([]string{"fs", "service", "update-preflight", "--codex-home", home, "--store", storeDir, "--cli", unknownCLI, "--desktop-app", "none", "--apply-quarantine", "--json"})
+	root.SetArgs([]string{"fs", "service", "update-preflight", "--codex-home", home, "--store", storeDir, "--cli", unknownCLI, "--desktop-app", "none", "--apply-quarantine", "--promote", "--json"})
 	if err := root.Execute(); err != nil {
 		t.Fatalf("update preflight: %v", err)
 	}
 	var result FSUpdatePreflightResult
-	if err := json.Unmarshal(output.Bytes(), &result); err != nil || !result.Decision.Quarantine || result.Decision.RequiresNativeFallback || result.QuarantinedSessions != 1 {
-		t.Fatalf("unexpected quarantine result: %#v err=%v output=%s", result, err, output.String())
+	if err := json.Unmarshal(output.Bytes(), &result); err != nil || !result.Decision.Allowed || result.Decision.Quarantine || result.Decision.RequiresNativeFallback || result.QuarantinedSessions != 0 || !result.Compatibility.Evaluation.Quarantine {
+		t.Fatalf("unexpected diagnostic result: %#v err=%v output=%s", result, err, output.String())
 	}
 	sessions, err := codex.LoadSessions(home)
+	if err != nil || len(sessions) != 1 || sessions[0].RolloutPath != target {
+		t.Fatalf("client diagnostic changed managed route: sessions=%#v err=%v", sessions, err)
+	}
+	state, err = managedState(storeDir, "session")
+	if err != nil {
+		t.Fatalf("client diagnostic retired managed state: %v", err)
+	}
+	managed, resolver, err = openManagedSession(context.Background(), storeDir, state)
 	if err != nil {
 		t.Fatal(err)
 	}
-	quarantineBytes, err := os.ReadFile(sessions[0].RolloutPath)
+	visiblePath := filepath.Join(t.TempDir(), "visible.jsonl")
+	_, materializeErr := managed.MaterializeCurrent(context.Background(), visiblePath, true)
+	_ = resolver.Close()
+	if materializeErr != nil {
+		t.Fatal(materializeErr)
+	}
+	visibleBytes, err := os.ReadFile(visiblePath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := append(append([]byte(nil), original...), tail...)
-	if !bytes.Equal(quarantineBytes, want) {
-		t.Fatalf("quarantine route is stale: got=%q want=%q", quarantineBytes, want)
+	if !bytes.Equal(visibleBytes, want) {
+		t.Fatalf("client diagnostic changed visible bytes: got=%q want=%q", visibleBytes, want)
 	}
-	if _, err := managedState(storeDir, "session"); err == nil {
-		t.Fatal("quarantine left the session managed")
+	if nativeBytes, err := os.ReadFile(nativePath); err != nil || !bytes.Equal(nativeBytes, original) {
+		t.Fatalf("client diagnostic changed native source: got=%q err=%v", nativeBytes, err)
 	}
 }
 
@@ -678,6 +692,21 @@ func TestFSMigrateIsDryRunByDefaultAndDoesNotChangeRoute(t *testing.T) {
 	}
 }
 
+func TestFSMigrateAcceptsAnActiveSessionForCanonicalRouting(t *testing.T) {
+	home, storeDir, nativePath := fsFixture(t, false)
+	root := NewRootCommand()
+	root.SetOut(&bytes.Buffer{})
+	root.SetErr(&bytes.Buffer{})
+	root.SetArgs([]string{"fs", "migrate", "session", "--codex-home", home, "--store", storeDir, "--mount", filepath.Join(home, "mount")})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("active-session migrate dry-run: %v", err)
+	}
+	sessions, err := codex.LoadSessions(home)
+	if err != nil || len(sessions) != 1 || sessions[0].RolloutPath != nativePath {
+		t.Fatalf("active migration dry-run changed route: sessions=%#v err=%v", sessions, err)
+	}
+}
+
 func TestFSMigrateRejectsInvalidNativeRolloutBeforeCreatingManagedState(t *testing.T) {
 	for _, test := range []struct {
 		name string
@@ -716,6 +745,7 @@ func TestFSMigrateRejectsInvalidNativeRolloutBeforeCreatingManagedState(t *testi
 func TestFSEnrollmentPlanRequiresTwoStableObservationsAndCanaryGate(t *testing.T) {
 	home, storeDir, _ := fsFixture(t, true)
 	allowEnrollmentWriterProbe(t)
+	allowEnrollmentNamespaceReadiness(t)
 	oldProbe := mountHealthProbe
 	mountHealthProbe = func(string) error { return nil }
 	t.Cleanup(func() { mountHealthProbe = oldProbe })
@@ -754,6 +784,7 @@ func TestFSEnrollmentPlanRequiresTwoStableObservationsAndCanaryGate(t *testing.T
 func TestFSEnrollmentApplyRunsFoldPackMigrateAndStopsBeforeRouteOnFailure(t *testing.T) {
 	home, storeDir, nativePath := fsFixture(t, true)
 	allowEnrollmentWriterProbe(t)
+	allowEnrollmentNamespaceReadiness(t)
 	oldProbe := mountHealthProbe
 	mountHealthProbe = func(string) error { return nil }
 	t.Cleanup(func() { mountHealthProbe = oldProbe })
@@ -838,6 +869,170 @@ func TestFSEnrollmentApplyRejectsInvalidNativeRolloutBeforeCommands(t *testing.T
 	}
 }
 
+func TestFSEnrollmentApplyRechecksWriterImmediatelyBeforeCommands(t *testing.T) {
+	home, storeDir, nativePath := fsFixture(t, false)
+	allowFixtureMount(t)
+	info, err := os.Stat(nativePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := enroll.SaveObservations(enrollmentObservationPath(storeDir), enroll.Observations{"session": {
+		Path: nativePath, Size: info.Size(), ModTimeUnixNano: info.ModTime().UnixNano(), StableSinceUnixNano: time.Now().Add(-time.Hour).UnixNano(),
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	previousProbe := enrollmentWriterProbe
+	probeCalls := 0
+	enrollmentWriterProbe = func(context.Context, []codex.Session) (map[string]bool, error) {
+		probeCalls++
+		if probeCalls >= 2 {
+			return map[string]bool{"session": true}, nil
+		}
+		return map[string]bool{}, nil
+	}
+	t.Cleanup(func() { enrollmentWriterProbe = previousProbe })
+	previousRunner := runEnrollmentCommand
+	runEnrollmentCommand = func(context.Context, []string) error {
+		t.Fatal("writer-active session reached an enrollment mutation command")
+		return nil
+	}
+	t.Cleanup(func() { runEnrollmentCommand = previousRunner })
+	result, err := runEnrollmentCycle(context.Background(), enrollmentFlags{
+		codexHome: home, storeDir: storeDir, mountPoint: filepath.Join(home, "mount"),
+		nativeRoot: filepath.Join(home, "fold-native"), canonicalNamespace: true,
+		stableFor: time.Nanosecond, batchSize: 1,
+	})
+	if err == nil || !strings.Contains(err.Error(), "active native writer after enrollment planning") {
+		t.Fatalf("writer recheck error = %v", err)
+	}
+	if probeCalls != 2 || len(result.Plan.Selected) != 1 || result.Apply.Applied != 0 {
+		t.Fatalf("writer recheck result=%#v probe_calls=%d", result, probeCalls)
+	}
+	states, stateErr := vfs.DiscoverSessionStates(storeDir)
+	if stateErr != nil || len(states) != 0 {
+		t.Fatalf("writer recheck created managed state: states=%#v err=%v", states, stateErr)
+	}
+}
+
+func TestEnrollmentMaintenanceRetiresNativeLooseAndOldGenerations(t *testing.T) {
+	previousDiscover := discoverEnrollmentSessionStates
+	discoverEnrollmentSessionStates = func(string) ([]vfs.SessionState, error) {
+		return []vfs.SessionState{
+			{SessionID: "retire", NativeSnapshot: vfs.NativeFile{Path: "/snapshot/retire.jsonl"}},
+			{SessionID: "busy", NativeSnapshot: vfs.NativeFile{Path: "/snapshot/busy.jsonl"}},
+			{SessionID: "done"},
+		}, nil
+	}
+	t.Cleanup(func() { discoverEnrollmentSessionStates = previousDiscover })
+	previousRunner := runEnrollmentCommand
+	var calls [][]string
+	runEnrollmentCommand = func(_ context.Context, args []string) error {
+		calls = append(calls, append([]string(nil), args...))
+		if len(args) >= 3 && args[0] == "fs" && args[1] == "retire-native" && args[2] == "busy" {
+			return errors.New("cannot retire native snapshot while the session has an active writer")
+		}
+		return nil
+	}
+	t.Cleanup(func() { runEnrollmentCommand = previousRunner })
+	previousGC := runEnrollmentStorageGC
+	runEnrollmentStorageGC = func(context.Context, string) (storage.StorageGCResult, error) {
+		return storage.StorageGCResult{RemovedCount: 3, ActualReclaimedBytes: 4096}, nil
+	}
+	t.Cleanup(func() { runEnrollmentStorageGC = previousGC })
+	result, err := runEnrollmentMaintenance(context.Background(), "/codex", "/store", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.NativeCandidates != 2 || result.NativeRetired != 1 || result.NativeDeferred != 1 || !result.LooseRetirementRan || result.StorageGC.RemovedCount != 3 {
+		t.Fatalf("maintenance result = %#v", result)
+	}
+	if len(result.DeferredSessionIDs) != 1 || result.DeferredSessionIDs[0] != "busy" {
+		t.Fatalf("maintenance deferred sessions = %#v", result.DeferredSessionIDs)
+	}
+	if len(calls) != 3 || calls[0][0] != "fs" || calls[0][1] != "retire-native" || calls[1][2] != "busy" || calls[2][0] != "pack" || calls[2][1] != "retire-loose" {
+		t.Fatalf("maintenance command sequence = %#v", calls)
+	}
+}
+
+func TestEnrollmentCycleSkipsMaintenanceAfterApplyFailure(t *testing.T) {
+	home, storeDir, nativePath := fsFixture(t, true)
+	allowEnrollmentWriterProbe(t)
+	allowEnrollmentNamespaceReadiness(t)
+	oldMountProbe := mountHealthProbe
+	mountHealthProbe = func(string) error { return nil }
+	t.Cleanup(func() { mountHealthProbe = oldMountProbe })
+	info, err := os.Stat(nativePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := enroll.SaveObservations(enrollmentObservationPath(storeDir), enroll.Observations{"session": {
+		Path: nativePath, Size: info.Size(), ModTimeUnixNano: info.ModTime().UnixNano(), StableSinceUnixNano: time.Now().Add(-time.Hour).UnixNano(),
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	previousRunner := runEnrollmentCommand
+	previousDiscover := discoverEnrollmentSessionStates
+	previousGC := runEnrollmentStorageGC
+	runEnrollmentCommand = func(_ context.Context, args []string) error {
+		if len(args) >= 2 && args[0] == "pack" && args[1] == "build" {
+			return errors.New("pack failed")
+		}
+		return nil
+	}
+	discoverEnrollmentSessionStates = func(string) ([]vfs.SessionState, error) {
+		t.Fatal("maintenance discovery ran after apply failure")
+		return nil, nil
+	}
+	runEnrollmentStorageGC = func(context.Context, string) (storage.StorageGCResult, error) {
+		t.Fatal("maintenance GC ran after apply failure")
+		return storage.StorageGCResult{}, nil
+	}
+	t.Cleanup(func() {
+		runEnrollmentCommand = previousRunner
+		discoverEnrollmentSessionStates = previousDiscover
+		runEnrollmentStorageGC = previousGC
+	})
+	result, err := runEnrollmentCycle(context.Background(), enrollmentFlags{
+		codexHome: home, storeDir: storeDir, mountPoint: filepath.Join(home, "mount"),
+		nativeRoot: filepath.Join(home, "fold-native"), canonicalNamespace: true, canary: true,
+		stableFor: time.Nanosecond, batchSize: 1,
+	})
+	if err == nil || !strings.Contains(err.Error(), "pack failed") {
+		t.Fatalf("apply failure = %v", err)
+	}
+	if result.Maintenance.NativeCandidates != 0 || result.Maintenance.LooseRetirementRan {
+		t.Fatalf("maintenance ran after apply failure: %#v", result.Maintenance)
+	}
+}
+
+func TestEnrollmentMaintenanceSurfacesVerificationFailure(t *testing.T) {
+	previousDiscover := discoverEnrollmentSessionStates
+	discoverEnrollmentSessionStates = func(string) ([]vfs.SessionState, error) {
+		return []vfs.SessionState{{SessionID: "broken", NativeSnapshot: vfs.NativeFile{Path: "/snapshot/broken.jsonl"}}}, nil
+	}
+	t.Cleanup(func() { discoverEnrollmentSessionStates = previousDiscover })
+	previousRunner := runEnrollmentCommand
+	runEnrollmentCommand = func(_ context.Context, args []string) error {
+		if args[0] == "fs" {
+			return errors.New("pack-only recovery proof failed")
+		}
+		return nil
+	}
+	t.Cleanup(func() { runEnrollmentCommand = previousRunner })
+	previousGC := runEnrollmentStorageGC
+	runEnrollmentStorageGC = func(context.Context, string) (storage.StorageGCResult, error) {
+		return storage.StorageGCResult{}, nil
+	}
+	t.Cleanup(func() { runEnrollmentStorageGC = previousGC })
+	result, err := runEnrollmentMaintenance(context.Background(), "/codex", "/store", 0)
+	if err == nil || !strings.Contains(err.Error(), "pack-only recovery proof failed") {
+		t.Fatalf("maintenance verification error = %v", err)
+	}
+	if result.NativeRetired != 0 || result.NativeDeferred != 1 || !result.LooseRetirementRan {
+		t.Fatalf("maintenance verification result = %#v", result)
+	}
+}
+
 func TestPeriodicEnrollmentLoopRunsSerialCyclesAndStopsWithContext(t *testing.T) {
 	oldRunner := runServiceEnrollmentCycle
 	defer func() { runServiceEnrollmentCycle = oldRunner }()
@@ -897,9 +1092,17 @@ func TestPeriodicEnrollmentLoopRunsSerialCyclesAndStopsWithContext(t *testing.T)
 	}
 }
 
+func TestEnrollmentChildEnvironmentDropsLauncherParentOnly(t *testing.T) {
+	got := enrollmentChildEnvironment([]string{"HOME=/tmp/home", "CODEXFOLD_LAUNCHER_PARENT_PID=42", "PATH=/usr/bin"})
+	if len(got) != 2 || got[0] != "HOME=/tmp/home" || got[1] != "PATH=/usr/bin" {
+		t.Fatalf("enrollment child environment = %#v", got)
+	}
+}
+
 func TestEnrollmentCycleInPreviewRecordsObservationsWithoutMutating(t *testing.T) {
 	home, storeDir, _ := fsFixture(t, true)
 	allowEnrollmentWriterProbe(t)
+	allowEnrollmentNamespaceReadiness(t)
 	oldProbe := mountHealthProbe
 	mountHealthProbe = func(string) error { return nil }
 	t.Cleanup(func() { mountHealthProbe = oldProbe })
@@ -952,6 +1155,26 @@ func TestEnrollmentStorageHealthAllowsBootstrapButRejectsBrokenCommittedPack(t *
 	}
 }
 
+func TestCurrentPackForStatesAllowsOnlyPristineBootstrapStore(t *testing.T) {
+	storeDir := t.TempDir()
+	current, err := currentPackForStates(storeDir, nil)
+	if err != nil || current != "" {
+		t.Fatalf("pristine current pack = %q, %v", current, err)
+	}
+	if _, err := currentPackForStates(storeDir, []vfs.SessionState{{SessionID: "session"}}); err == nil {
+		t.Fatal("managed state without a committed pack should fail")
+	}
+	if err := os.MkdirAll(filepath.Join(storeDir, "objects"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(storeDir, "objects", "partial.zst"), []byte("partial"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := currentPackForStates(storeDir, nil); err == nil {
+		t.Fatal("partial store without a committed pack should fail")
+	}
+}
+
 func TestFSMigrateApplyFailsClosedWithoutMountedTarget(t *testing.T) {
 	home, storeDir, nativePath := fsFixture(t, true)
 	root := NewRootCommand()
@@ -964,6 +1187,59 @@ func TestFSMigrateApplyFailsClosedWithoutMountedTarget(t *testing.T) {
 	sessions, _ := codex.LoadSessions(home)
 	if sessions[0].RolloutPath != nativePath {
 		t.Fatalf("failed apply changed route to %q", sessions[0].RolloutPath)
+	}
+}
+
+func TestFSMigrateApplyRejectsActiveNativeWriterBeforeMutation(t *testing.T) {
+	home, storeDir, nativePath := fsFixture(t, true)
+	previousProbe := filesystemMigrationWriterProbe
+	filesystemMigrationWriterProbe = func(context.Context, codex.Session, ...string) (bool, error) { return true, nil }
+	t.Cleanup(func() { filesystemMigrationWriterProbe = previousProbe })
+	root := NewRootCommand()
+	root.SetOut(&bytes.Buffer{})
+	root.SetErr(&bytes.Buffer{})
+	root.SetArgs([]string{"fs", "migrate", "session", "--codex-home", home, "--store", storeDir, "--mount", filepath.Join(home, "mount"), "--apply"})
+	err := root.Execute()
+	if err == nil || !strings.Contains(err.Error(), "active native writer") {
+		t.Fatalf("writer-active migration error = %v", err)
+	}
+	sessions, loadErr := codex.LoadSessions(home)
+	if loadErr != nil || len(sessions) != 1 || sessions[0].RolloutPath != nativePath {
+		t.Fatalf("writer-active migration changed route: sessions=%#v err=%v", sessions, loadErr)
+	}
+	states, stateErr := vfs.DiscoverSessionStates(storeDir)
+	if stateErr != nil || len(states) != 0 {
+		t.Fatalf("writer-active migration created managed state: states=%#v err=%v", states, stateErr)
+	}
+}
+
+func TestFSMigrateApplyRejectsSourceChangeDuringWriterProbe(t *testing.T) {
+	home, storeDir, nativePath := fsFixture(t, true)
+	previousProbe := filesystemMigrationWriterProbe
+	filesystemMigrationWriterProbe = func(_ context.Context, session codex.Session, _ ...string) (bool, error) {
+		file, err := os.OpenFile(session.RolloutPath, os.O_WRONLY|os.O_APPEND, 0)
+		if err != nil {
+			return false, err
+		}
+		_, writeErr := file.WriteString("{\"changed_during_probe\":true}\n")
+		return false, errors.Join(writeErr, file.Close())
+	}
+	t.Cleanup(func() { filesystemMigrationWriterProbe = previousProbe })
+	root := NewRootCommand()
+	root.SetOut(&bytes.Buffer{})
+	root.SetErr(&bytes.Buffer{})
+	root.SetArgs([]string{"fs", "migrate", "session", "--codex-home", home, "--store", storeDir, "--mount", filepath.Join(home, "mount"), "--apply"})
+	err := root.Execute()
+	if err == nil || !strings.Contains(err.Error(), "changed during writer probe") {
+		t.Fatalf("source-change migration error = %v", err)
+	}
+	sessions, loadErr := codex.LoadSessions(home)
+	if loadErr != nil || len(sessions) != 1 || sessions[0].RolloutPath != nativePath {
+		t.Fatalf("source-change migration changed route: sessions=%#v err=%v", sessions, loadErr)
+	}
+	states, stateErr := vfs.DiscoverSessionStates(storeDir)
+	if stateErr != nil || len(states) != 0 {
+		t.Fatalf("source-change migration created managed state: states=%#v err=%v", states, stateErr)
 	}
 }
 
@@ -1322,6 +1598,37 @@ func TestFSRecoverLeavesLiveCanonicalMigrationManaged(t *testing.T) {
 	}
 	if got, err := os.ReadFile(state.NativeSnapshot.Path); err != nil || !bytes.Equal(got, fixture.source) {
 		t.Fatalf("live migration snapshot changed: got=%q err=%v", got, err)
+	}
+}
+
+func TestFSRecoverDoesNotMisclassifyAProvenRetiredNativeSnapshot(t *testing.T) {
+	fixture := interruptedCanonicalMigrationFixture(t)
+	defer fixture.resolver.Close()
+	original := fixture.managed.State()
+	visible, err := fixture.managed.MaterializeCurrent(context.Background(), filepath.Join(fixture.home, "retirement-proof.jsonl"), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer, err := fixture.managed.OpenWriter()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.managed.RetireNativeSnapshot(original.NativeSnapshot, visible); err != nil {
+		_ = writer.Close()
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	stale := fixture.managed.State()
+	stale.Generation += 3
+	stale.NativeSnapshot = original.NativeSnapshot
+	recovered, err := recoverInterruptedCanonicalMigration(fixture.home, fixture.store, fixture.nativeRoot, stale)
+	if err != nil || recovered {
+		t.Fatalf("proven retirement migration recovery = %t, %v", recovered, err)
+	}
+	if _, err := managedState(fixture.store, "session"); err != nil {
+		t.Fatalf("proven retired snapshot caused managed state retirement: %v", err)
 	}
 }
 
@@ -2389,7 +2696,7 @@ func TestFSRollbackCanonicalRetiresHiddenSnapshot(t *testing.T) {
 	}
 }
 
-func TestFSUpdatePreflightPreservesNewerNativeFallbackAfterRollback(t *testing.T) {
+func TestFSUpdatePreflightReportsUnknownClientWithoutChangingNativeFallback(t *testing.T) {
 	allowFixtureMount(t)
 	home, storeDir, nativePath := fsFixture(t, true)
 	cliPath := approvedCLIContract(t, storeDir, "1.2.3")
@@ -2468,7 +2775,7 @@ func TestFSUpdatePreflightPreservesNewerNativeFallbackAfterRollback(t *testing.T
 	var output bytes.Buffer
 	root.SetOut(&output)
 	root.SetErr(&bytes.Buffer{})
-	root.SetArgs([]string{"fs", "service", "update-preflight", "--codex-home", home, "--store", storeDir, "--cli", unknownCLI, "--desktop-app", "none", "--apply-quarantine", "--json"})
+	root.SetArgs([]string{"fs", "service", "update-preflight", "--codex-home", home, "--store", storeDir, "--cli", unknownCLI, "--desktop-app", "none", "--apply-quarantine", "--promote", "--json"})
 	if err := root.Execute(); err != nil {
 		t.Fatalf("update preflight: %v", err)
 	}
@@ -2476,7 +2783,7 @@ func TestFSUpdatePreflightPreservesNewerNativeFallbackAfterRollback(t *testing.T
 	if err := json.Unmarshal(output.Bytes(), &result); err != nil {
 		t.Fatalf("decode preflight result: %v output=%s", err, output.String())
 	}
-	if !result.Decision.Quarantine || result.Decision.RequiresNativeFallback || result.QuarantinedSessions != 0 {
+	if !result.Decision.Allowed || result.Decision.Quarantine || result.Decision.RequiresNativeFallback || result.QuarantinedSessions != 0 || !result.Compatibility.Evaluation.Quarantine {
 		t.Fatalf("unexpected fallback preflight result: %#v output=%s", result, output.String())
 	}
 	sessions, err = codex.LoadSessions(home)
@@ -2517,7 +2824,9 @@ func TestFSCompactCommitsNewExactGeneration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := writer.Append(context.Background(), []byte("{\"tail\":2}\n")); err != nil {
+	longLine := append([]byte("{\"tail\":\""), bytes.Repeat([]byte("x"), 5<<10)...)
+	longLine = append(longLine, []byte("\"}\n")...)
+	if _, err := writer.Append(context.Background(), longLine); err != nil {
 		t.Fatal(err)
 	}
 	if err := writer.Sync(); err != nil {
@@ -2992,17 +3301,19 @@ func fsFixture(t *testing.T, archived bool) (string, string, string) {
 		t.Fatalf("write rollout: %v", err)
 	}
 	writeStateFixture(t, home, nativePath)
+	dbPath := filepath.Join(home, "state_5.sqlite")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open state: %v", err)
+	}
+	archivedValue := 0
 	if archived {
-		dbPath := filepath.Join(home, "state_5.sqlite")
-		db, err := sql.Open("sqlite", dbPath)
-		if err != nil {
-			t.Fatalf("open state: %v", err)
-		}
-		_, err = db.Exec(`update threads set archived = 1 where id = 'fixture'; update threads set id = 'session' where id = 'fixture'`)
-		_ = db.Close()
-		if err != nil {
-			t.Fatalf("archive fixture: %v", err)
-		}
+		archivedValue = 1
+	}
+	_, err = db.Exec(`update threads set archived = ?, id = 'session' where id = 'fixture'`, archivedValue)
+	_ = db.Close()
+	if err != nil {
+		t.Fatalf("update fixture session state: %v", err)
 	}
 	session := codex.Session{ID: "session", RolloutPath: nativePath, Archived: archived}
 	if _, err := fold.Fold(context.Background(), toFoldSession(session), fold.FoldOptions{StoreDir: storeDir, Apply: true, FieldThreshold: 8}); err != nil {
@@ -3170,4 +3481,41 @@ func allowFixtureMount(t *testing.T) {
 	previous := mountHealthProbe
 	mountHealthProbe = func(string) error { return nil }
 	t.Cleanup(func() { mountHealthProbe = previous })
+	allowEnrollmentNamespaceReadiness(t)
+}
+
+func allowEnrollmentNamespaceReadiness(t *testing.T) {
+	t.Helper()
+	previous := enrollmentCanonicalNamespaceReadinessProbe
+	enrollmentCanonicalNamespaceReadinessProbe = func(string, string, string) canonicalNamespaceReadiness {
+		return canonicalNamespaceReadiness{Active: true, Ready: true}
+	}
+	t.Cleanup(func() { enrollmentCanonicalNamespaceReadinessProbe = previous })
+}
+
+func TestCanonicalNativePassthroughProbeRequiresEveryNativeRoute(t *testing.T) {
+	root := t.TempDir()
+	mount := filepath.Join(root, "mount")
+	nativeRoot := filepath.Join(root, "native")
+	for _, base := range []string{mount, nativeRoot} {
+		for _, namespace := range []string{"sessions", "archived_sessions"} {
+			if err := os.MkdirAll(filepath.Join(base, namespace, "2026", "07"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	nativeFile := filepath.Join(nativeRoot, "sessions", "2026", "07", "unmanaged.jsonl")
+	if err := os.WriteFile(nativeFile, []byte("native\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := probeCanonicalNativePassthrough(mount, nativeRoot); err == nil {
+		t.Fatal("missing mounted native route passed readiness")
+	}
+	mountedFile := filepath.Join(mount, "sessions", "2026", "07", "unmanaged.jsonl")
+	if err := os.WriteFile(mountedFile, []byte("mounted\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := probeCanonicalNativePassthrough(mount, nativeRoot); err != nil {
+		t.Fatalf("complete native passthrough failed readiness: %v", err)
+	}
 }

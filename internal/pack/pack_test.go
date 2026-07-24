@@ -84,6 +84,32 @@ func TestBuildAndResolverReadExactRandomRanges(t *testing.T) {
 	}
 }
 
+func TestDoctorAcceptsPristineBootstrapStoreButRejectsPartialContent(t *testing.T) {
+	root := t.TempDir()
+	report, err := Doctor(context.Background(), root)
+	if err != nil || report.IssueCount != 0 || report.Generation != "" {
+		t.Fatalf("pristine store doctor = %#v, %v", report, err)
+	}
+	bootstrap, err := IsBootstrapStore(root)
+	if err != nil || !bootstrap {
+		t.Fatalf("pristine bootstrap state = %t, %v", bootstrap, err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "objects"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "objects", "partial.zst"), []byte("partial"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	bootstrap, err = IsBootstrapStore(root)
+	if err != nil || bootstrap {
+		t.Fatalf("partial bootstrap state = %t, %v", bootstrap, err)
+	}
+	report, err = Doctor(context.Background(), root)
+	if err != nil || report.IssueCount != 1 {
+		t.Fatalf("partial store doctor = %#v, %v", report, err)
+	}
+}
+
 func TestBuildWritesBoundedV3IndexAndResolverKeepsNoObjectMap(t *testing.T) {
 	root := t.TempDir()
 	values := make([][]byte, 0, 256)

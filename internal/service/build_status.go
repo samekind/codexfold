@@ -196,6 +196,37 @@ func DefinitionStore(platform Platform, definitionPath string) (string, error) {
 	return "", errors.New("launchd definition has no --store argument")
 }
 
+// DefinitionNativeRoot returns the retained native tree configured for a
+// canonical native-FSKit service. This is intentionally limited to launchd:
+// native FSKit is the macOS frontend and other service definitions do not yet
+// expose an equivalent introspection contract.
+func DefinitionNativeRoot(platform Platform, definitionPath string) (string, error) {
+	if !filepath.IsAbs(definitionPath) {
+		return "", errors.New("absolute service definition path is required")
+	}
+	if platform != PlatformLaunchd {
+		return "", errors.New("native root inspection is currently available only for launchd definitions")
+	}
+	definition, err := os.ReadFile(filepath.Clean(definitionPath))
+	if err != nil {
+		return "", err
+	}
+	arguments, err := launchdDefinitionArguments(definition)
+	if err != nil {
+		return "", err
+	}
+	for index := 0; index < len(arguments); index++ {
+		if arguments[index] != "--native-root" {
+			continue
+		}
+		if index+1 >= len(arguments) || !filepath.IsAbs(arguments[index+1]) {
+			return "", errors.New("launchd definition has an invalid --native-root argument")
+		}
+		return filepath.Clean(arguments[index+1]), nil
+	}
+	return "", errors.New("launchd definition has no --native-root argument")
+}
+
 func DefinitionLabel(platform Platform, definitionPath string) (string, error) {
 	if !filepath.IsAbs(definitionPath) {
 		return "", errors.New("absolute service definition path is required")

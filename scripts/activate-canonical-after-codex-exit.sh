@@ -80,8 +80,6 @@ wait_for_codex_drain() {
 
 service_status="$(${BIN} fs service status --json)"
 jq -e '.daemon_running == true and .mount_healthy == true' <<<"${service_status}" >/dev/null
-compatibility="$(${BIN} fs compatibility --codex-home "${CODEX_HOME}" --store "${STORE}" --json)"
-jq -e '.evaluation.approved == true and .evaluation.quarantine == false' <<<"${compatibility}" >/dev/null
 
 managed_count="$(find "${STORE}/fs/sessions" -type f -name state.json 2>/dev/null | wc -l | tr -d ' ')"
 [[ "${managed_count}" == "0" ]]

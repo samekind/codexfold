@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/samekind/codexfold/internal/compat"
 	"github.com/samekind/codexfold/internal/fsctl"
 )
 
@@ -341,22 +340,18 @@ func TestWaitHealthyRequiresRunningDaemonAndLiveMount(t *testing.T) {
 	}
 }
 
-func TestEvaluateUpdateQuarantinesUnknownVersionsAndRejectsPreviewAutomation(t *testing.T) {
-	unknown := EvaluateUpdate(UpdateInput{Capability: fsctl.StorageEngine, DoctorHealthy: true, Compatibility: compat.Evaluation{Quarantine: true}, NativeFallbackReady: false})
-	if unknown.Allowed || !unknown.Quarantine || !unknown.RequiresNativeFallback {
-		t.Fatalf("unknown version was not quarantined: %#v", unknown)
-	}
-	ready := EvaluateUpdate(UpdateInput{Capability: fsctl.StorageEngine, DoctorHealthy: true, Compatibility: compat.Evaluation{Quarantine: true}, NativeFallbackReady: true})
-	if ready.Allowed || !ready.Quarantine || ready.RequiresNativeFallback {
-		t.Fatalf("quarantine should remain blocked after fallback: %#v", ready)
-	}
-	automatic := EvaluateUpdate(UpdateInput{Capability: fsctl.FSEnginePreview, DoctorHealthy: true, Compatibility: compat.Evaluation{Approved: true}, Automatic: true})
+func TestEvaluateUpdateUsesFilesystemHealthAndPromotionPolicyOnly(t *testing.T) {
+	automatic := EvaluateUpdate(UpdateInput{Capability: fsctl.FSEnginePreview, DoctorHealthy: true, Automatic: true})
 	if automatic.Allowed {
 		t.Fatalf("preview automatic update should be rejected: %#v", automatic)
 	}
-	manual := EvaluateUpdate(UpdateInput{Capability: fsctl.FSEnginePreview, DoctorHealthy: true, Compatibility: compat.Evaluation{Approved: true}, ExplicitPromotion: true})
+	manual := EvaluateUpdate(UpdateInput{Capability: fsctl.FSEnginePreview, DoctorHealthy: true, ExplicitPromotion: true})
 	if !manual.Allowed {
 		t.Fatalf("explicit preview promotion should pass: %#v", manual)
+	}
+	unhealthy := EvaluateUpdate(UpdateInput{Capability: fsctl.CrossPlatformReady, DoctorHealthy: false})
+	if unhealthy.Allowed || unhealthy.Quarantine || unhealthy.RequiresNativeFallback {
+		t.Fatalf("unhealthy filesystem decision = %#v", unhealthy)
 	}
 }
 

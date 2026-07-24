@@ -272,16 +272,23 @@ func (s *Session) releaseReader(generation uint64) error {
 
 func (s *Session) OpenWriter() (*WriteHandle, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.writerOpen {
+		s.mu.Unlock()
 		return nil, ErrWriterBusy
 	}
 	leasePath := filepath.Join(s.directory, "writer.lease")
 	lease, err := acquireWriterLease(leasePath)
 	if err != nil {
+		s.mu.Unlock()
 		return nil, err
 	}
 	s.writerOpen = true
+	if err := s.refreshNativeRetirementLocked(); err != nil {
+		s.writerOpen = false
+		s.mu.Unlock()
+		return nil, errors.Join(err, unlockWriterFile(lease), lease.Close())
+	}
+	s.mu.Unlock()
 	return &WriteHandle{session: s, leasePath: leasePath, lease: lease}, nil
 }
 

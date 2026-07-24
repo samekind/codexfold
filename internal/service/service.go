@@ -13,7 +13,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/samekind/codexfold/internal/compat"
 	"github.com/samekind/codexfold/internal/fsctl"
 )
 
@@ -72,12 +71,10 @@ type Status struct {
 }
 
 type UpdateInput struct {
-	Capability          fsctl.Capability
-	DoctorHealthy       bool
-	Compatibility       compat.Evaluation
-	NativeFallbackReady bool
-	Automatic           bool
-	ExplicitPromotion   bool
+	Capability        fsctl.Capability
+	DoctorHealthy     bool
+	Automatic         bool
+	ExplicitPromotion bool
 }
 
 type UpdateDecision struct {
@@ -347,9 +344,6 @@ func ProbeMount(path string) error { return defaultMountProbe(path) }
 func EvaluateUpdate(input UpdateInput) UpdateDecision {
 	if !input.DoctorHealthy {
 		return UpdateDecision{Reason: "filesystem doctor is not healthy"}
-	}
-	if input.Compatibility.Quarantine || !input.Compatibility.Approved {
-		return UpdateDecision{Quarantine: true, RequiresNativeFallback: !input.NativeFallbackReady, Reason: "installed client version is not approved"}
 	}
 	if input.Automatic && (input.Capability == fsctl.FSEnginePreview || input.Capability == fsctl.PlatformCanary) {
 		return UpdateDecision{Reason: "automatic updates are disabled before platform production readiness"}

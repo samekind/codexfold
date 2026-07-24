@@ -62,6 +62,7 @@ func TestEnrollmentPlanBlocksSessionReportedByNativeWriterProbe(t *testing.T) {
 	oldMountProbe := mountHealthProbe
 	mountHealthProbe = func(string) error { return nil }
 	defer func() { mountHealthProbe = oldMountProbe }()
+	allowEnrollmentNamespaceReadiness(t)
 	info, err := os.Stat(nativePath)
 	if err != nil {
 		t.Fatal(err)

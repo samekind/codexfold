@@ -76,6 +76,9 @@ func prepareDuplicateRecordLookup(database *sql.DB) error {
 }
 
 func (i *DuplicateRecordIndex) IsDuplicateRecord(ctx context.Context, digest [sha256.Size]byte, size int64) (bool, error) {
+	if i == nil || i.database == nil {
+		return false, nil
+	}
 	var occurrences int64
 	err := i.database.QueryRowContext(ctx, `select coalesce(occurrences, 0) from duplicate_records where digest = ? and size = ?`, digest[:], size).Scan(&occurrences)
 	if err == sql.ErrNoRows {

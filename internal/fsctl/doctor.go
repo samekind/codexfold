@@ -24,8 +24,9 @@ const (
 var RequiredComponents = []string{ComponentDaemon, ComponentMount, ComponentPack, ComponentManifest, ComponentDelta, ComponentBacking, ComponentRoute, ComponentFallback, ComponentJournal, ComponentClient, ComponentStorage}
 
 type Check struct {
-	Component string
-	Run       func(context.Context) error
+	Component   string
+	NonBlocking bool
+	Run         func(context.Context) error
 }
 
 type Issue struct {
@@ -67,7 +68,11 @@ func Doctor(ctx context.Context, checks []Check) DoctorReport {
 		}
 		if err := check.Run(ctx); err != nil {
 			report.ComponentHealth[check.Component] = false
-			report.Issues = append(report.Issues, Issue{Component: check.Component, Severity: "error", Message: err.Error()})
+			severity := "error"
+			if check.NonBlocking {
+				severity = "warning"
+			}
+			report.Issues = append(report.Issues, Issue{Component: check.Component, Severity: severity, Message: err.Error()})
 		} else {
 			report.ComponentHealth[check.Component] = true
 		}
@@ -79,6 +84,12 @@ func Doctor(ctx context.Context, checks []Check) DoctorReport {
 		}
 	}
 	report.IssueCount = len(report.Issues)
-	report.Healthy = report.IssueCount == 0
+	report.Healthy = true
+	for _, issue := range report.Issues {
+		if issue.Severity == "error" {
+			report.Healthy = false
+			break
+		}
+	}
 	return report
 }

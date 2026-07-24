@@ -450,7 +450,10 @@ func (s *scanner) addExternalReferences() error {
 		}
 	}
 	nativePaths := make(map[string]struct{})
-	for _, manifest := range s.primaryManifests {
+	for sessionID, manifest := range s.primaryManifests {
+		if _, managed := s.managedStates[sessionID]; managed {
+			continue
+		}
 		if manifest.Session.RolloutPath != "" {
 			nativePaths[cleanAbsolutePath(manifest.Session.RolloutPath)] = struct{}{}
 		}

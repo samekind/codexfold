@@ -496,7 +496,7 @@ func newFSServiceInstallCommand() *cobra.Command {
 	command.Flags().DurationVar(&enrollmentInterval, "enrollment-interval", 0, "Periodic stable-session enrollment interval; zero disables the loop")
 	command.Flags().DurationVar(&enrollmentStableFor, "enrollment-stable-for", time.Hour, "Required unchanged interval before periodic enrollment")
 	command.Flags().IntVar(&enrollmentBatchSize, "enrollment-batch-size", 1, "Maximum sessions enrolled per periodic cycle")
-	command.Flags().BoolVar(&enrollmentCanary, "enrollment-canary", false, "Enable periodic apply only for an explicitly isolated Codex home while capability remains preview")
+	command.Flags().BoolVar(&enrollmentCanary, "enrollment-canary", false, "Enable additional isolated-home constraints for periodic validation")
 	command.Flags().BoolVar(&apply, "apply", false, "Write, install, and start the native platform service")
 	command.Flags().BoolVar(&jsonOutput, "json", false, "Emit JSON output")
 	return command
@@ -1013,26 +1013,41 @@ func waitLaunchdNativeFSKitHealthy(ctx context.Context, manager service.Manager,
 	if err != nil {
 		return err
 	}
+	nativeRoot, err := service.DefinitionNativeRoot(service.PlatformLaunchd, definitionPath)
+	if err != nil {
+		return err
+	}
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
 	var daemon, supervisor service.Status
+	var passthroughErr error
 	supervisorLabel := nativeFSKitSupervisorLabel(label)
 	for {
 		daemon = validateLaunchdChildProcess(manager.Status(ctx, label, mountPoint), lockPaths.daemon, "daemon")
 		supervisor = validateLaunchdChildProcess(manager.Status(ctx, supervisorLabel, mountPoint), lockPaths.supervisor, "supervisor")
 		if daemon.DaemonRunning && supervisor.DaemonRunning && daemon.MountHealthy {
-			return nil
+			passthroughErr = probeCanonicalNativePassthrough(mountPoint, nativeRoot)
+			if passthroughErr == nil {
+				return nil
+			}
 		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-deadline.C:
-			return fmt.Errorf("native FSKit service did not become healthy: daemon=%t supervisor=%t mount=%t daemon_error=%q supervisor_error=%q mount_error=%q", daemon.DaemonRunning, supervisor.DaemonRunning, daemon.MountHealthy, daemon.DaemonError, supervisor.DaemonError, daemon.MountError)
+			return fmt.Errorf("native FSKit service did not become healthy: daemon=%t supervisor=%t mount=%t daemon_error=%q supervisor_error=%q mount_error=%q passthrough_error=%q", daemon.DaemonRunning, supervisor.DaemonRunning, daemon.MountHealthy, daemon.DaemonError, supervisor.DaemonError, daemon.MountError, errorText(passthroughErr))
 		case <-ticker.C:
 		}
 	}
+}
+
+func errorText(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 func systemdServiceUnit(definitionPath string, label string) (string, error) {
@@ -1049,10 +1064,10 @@ func systemdServiceUnit(definitionPath string, label string) (string, error) {
 func newFSServiceUpdatePreflightCommand() *cobra.Command {
 	var codexHome, storeDir string
 	var compatibility compatibilityFlags
-	var automatic, promote, applyQuarantine, jsonOutput bool
+	var automatic, promote, jsonOutput bool
 	command := &cobra.Command{
 		Use:   "update-preflight",
-		Short: "Gate service updates and optionally route unknown-version sessions to current native bytes",
+		Short: "Check filesystem health before a service update and report client diagnostics",
 		Args:  cobra.NoArgs,
 		RunE: func(command *cobra.Command, _ []string) error {
 			home, err := codex.ResolveHome(codexHome)
@@ -1061,24 +1076,12 @@ func newFSServiceUpdatePreflightCommand() *cobra.Command {
 			}
 			store := resolveFoldStore(home, storeDir)
 			doctorErr := requireStorageHealth(command.Context(), store)
-			compatibilityResult, err := evaluateCompatibility(command.Context(), store, compatibility)
-			if err != nil {
-				return err
+			compatibilityResult, compatibilityErr := evaluateCompatibility(command.Context(), store, compatibility)
+			if compatibilityErr != nil {
+				compatibilityResult.DetectionErrors = append(compatibilityResult.DetectionErrors, compatibilityErr.Error())
 			}
-			fallbackReady, err := managedRoutesMatchCurrentBytes(command.Context(), home, store)
-			if err != nil {
-				fallbackReady = false
-			}
-			decision := service.EvaluateUpdate(service.UpdateInput{Capability: verifiedCapability(), DoctorHealthy: doctorErr == nil, Compatibility: compatibilityResult.Evaluation, NativeFallbackReady: fallbackReady, Automatic: automatic, ExplicitPromotion: promote})
+			decision := service.EvaluateUpdate(service.UpdateInput{Capability: verifiedCapability(), DoctorHealthy: doctorErr == nil, Automatic: automatic, ExplicitPromotion: promote})
 			result := FSUpdatePreflightResult{DoctorHealthy: doctorErr == nil, Compatibility: compatibilityResult, Decision: decision}
-			if decision.Quarantine && decision.RequiresNativeFallback && applyQuarantine {
-				count, err := quarantineManagedRoutes(command.Context(), home, store)
-				if err != nil {
-					return err
-				}
-				result.QuarantinedSessions = count
-				result.Decision = service.EvaluateUpdate(service.UpdateInput{Capability: verifiedCapability(), DoctorHealthy: doctorErr == nil, Compatibility: compatibilityResult.Evaluation, NativeFallbackReady: true, Automatic: automatic, ExplicitPromotion: promote})
-			}
 			if jsonOutput {
 				return writeJSON(command, result)
 			}
@@ -1091,93 +1094,9 @@ func newFSServiceUpdatePreflightCommand() *cobra.Command {
 	addCompatibilityFlags(command, &compatibility)
 	command.Flags().BoolVar(&automatic, "automatic", false, "Evaluate an unattended update")
 	command.Flags().BoolVar(&promote, "promote", false, "Explicitly approve preview or canary promotion")
-	command.Flags().BoolVar(&applyQuarantine, "apply-quarantine", false, "Route managed sessions to verified current native bytes when clients are unknown")
+	command.Flags().Bool("apply-quarantine", false, "Deprecated no-op; client version diagnostics never change session routes")
 	command.Flags().BoolVar(&jsonOutput, "json", false, "Emit JSON output")
 	return command
-}
-
-func managedRoutesMatchCurrentBytes(ctx context.Context, home string, store string) (bool, error) {
-	states, err := vfs.DiscoverSessionStates(store)
-	if err != nil {
-		return false, err
-	}
-	sessions, err := codex.LoadSessions(home)
-	if err != nil {
-		return false, err
-	}
-	byID := make(map[string]codex.Session, len(sessions))
-	for _, session := range sessions {
-		byID[session.ID] = session
-	}
-	for _, state := range states {
-		current, ok := byID[state.SessionID]
-		if !ok {
-			return false, fmt.Errorf("Codex route missing for managed session %s", state.SessionID)
-		}
-		if !isGeneratedNativeFallbackPath(current.RolloutPath, store, state.SessionID) {
-			return false, nil
-		}
-		if _, err := hashPath(current.RolloutPath); err != nil {
-			return false, err
-		}
-	}
-	return true, nil
-}
-
-func quarantineManagedRoutes(ctx context.Context, home string, store string) (int, error) {
-	states, err := vfs.DiscoverSessionStates(store)
-	if err != nil {
-		return 0, err
-	}
-	sessions, err := codex.LoadSessions(home)
-	if err != nil {
-		return 0, err
-	}
-	byID := make(map[string]codex.Session, len(sessions))
-	for _, session := range sessions {
-		byID[session.ID] = session
-	}
-	count := 0
-	for _, state := range states {
-		current, ok := byID[state.SessionID]
-		if !ok {
-			return count, fmt.Errorf("Codex route missing for managed session %s", state.SessionID)
-		}
-		if isGeneratedNativeFallbackPath(current.RolloutPath, store, state.SessionID) {
-			if _, err := hashPath(current.RolloutPath); err != nil {
-				return count, err
-			}
-			continue
-		}
-		managed, resolver, err := openManagedSession(ctx, store, state)
-		if err != nil {
-			return count, err
-		}
-		targetDirectory := filepath.Join(store, "fs", "fallbacks", state.SessionID)
-		if err := os.MkdirAll(targetDirectory, 0o700); err != nil {
-			return count, err
-		}
-		if err := os.Chmod(targetDirectory, 0o700); err != nil {
-			return count, err
-		}
-		targetPath := filepath.Join(targetDirectory, "quarantine-current.jsonl")
-		target, err := managed.MaterializeCurrent(ctx, targetPath, true)
-		_ = resolver.Close()
-		if err != nil {
-			return count, err
-		}
-		if filepath.Clean(current.RolloutPath) == filepath.Clean(target.Path) {
-			continue
-		}
-		if _, err := codex.RouteSession(ctx, codex.RouteOptions{CodexHome: home, SessionID: state.SessionID, ExpectedPath: current.RolloutPath, Target: codex.RouteTarget{Path: target.Path, Bytes: target.Bytes, SHA256: target.SHA256}}); err != nil {
-			return count, err
-		}
-		if _, err := retireManagedState(store, state.SessionID); err != nil {
-			return count, err
-		}
-		count++
-	}
-	return count, nil
 }
 
 func isGeneratedNativeFallbackPath(path string, store string, sessionID string) bool {

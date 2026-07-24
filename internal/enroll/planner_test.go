@@ -25,7 +25,7 @@ func TestPlannerRequiresStableArchivedSessionAndAllGlobalGates(t *testing.T) {
 	input := Input{
 		Sessions: []codex.Session{session}, Now: now,
 		Policy: Policy{StableFor: time.Hour, BatchSize: 1, ArchivedOnly: true},
-		Gates:  Gates{DoctorHealthy: true, CompatibilityApproved: true, MountHealthy: true, CanonicalNamespace: true, EnrollmentAllowed: true},
+		Gates:  Gates{DoctorHealthy: true, MountHealthy: true, CanonicalNamespace: true, NamespaceActive: true, NamespaceReady: true, EnrollmentAllowed: true},
 		Budget: allowingBudget{},
 	}
 	first, err := Build(context.Background(), input)
@@ -52,7 +52,6 @@ func TestPlannerRequiresStableArchivedSessionAndAllGlobalGates(t *testing.T) {
 		reason Reason
 	}{
 		"doctor":    {mutate: func(input *Input) { input.Gates.DoctorHealthy = false }, reason: ReasonDoctorUnhealthy},
-		"client":    {mutate: func(input *Input) { input.Gates.CompatibilityApproved = false }, reason: ReasonCompatibility},
 		"mount":     {mutate: func(input *Input) { input.Gates.MountHealthy = false }, reason: ReasonMountUnhealthy},
 		"namespace": {mutate: func(input *Input) { input.Gates.CanonicalNamespace = false }, reason: ReasonNamespaceDisabled},
 		"stage":     {mutate: func(input *Input) { input.Gates.EnrollmentAllowed = false }, reason: ReasonPromotionStage},
@@ -104,7 +103,7 @@ func TestPlannerSeparatesActiveChangingManagedWriterBudgetAndBatchCases(t *testi
 		Sessions: []codex.Session{active, changing, managed, writer, firstBatch, secondBatch, budgeted},
 		Managed:  map[string]struct{}{"managed": {}}, Previous: previous, Now: now,
 		Policy:       Policy{StableFor: time.Hour, BatchSize: 1, ArchivedOnly: true},
-		Gates:        Gates{DoctorHealthy: true, CompatibilityApproved: true, MountHealthy: true, CanonicalNamespace: true, EnrollmentAllowed: true},
+		Gates:        Gates{DoctorHealthy: true, MountHealthy: true, CanonicalNamespace: true, NamespaceActive: true, NamespaceReady: true, EnrollmentAllowed: true},
 		WriterActive: func(_ context.Context, session codex.Session) (bool, error) { return session.ID == "writer", nil },
 		Budget:       rejectingSessionBudget{sessionID: "budgeted"},
 	}
@@ -120,6 +119,37 @@ func TestPlannerSeparatesActiveChangingManagedWriterBudgetAndBatchCases(t *testi
 	assertDecisionReason(t, plan, "budgeted", ReasonInsufficientBudget)
 	if len(plan.Selected) != 1 || plan.Selected[0].SessionID != "batch-a" {
 		t.Fatalf("bounded selection = %#v", plan.Selected)
+	}
+}
+
+func TestPlannerSelectsStableWriterFreeActiveSessionWhenPolicyAllowsIt(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "active.jsonl")
+	if err := os.WriteFile(path, []byte("active\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Unix(25_000, 0)
+	if err := os.Chtimes(path, now.Add(-2*time.Hour), now.Add(-2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := codex.Session{ID: "active", RolloutPath: path, Archived: false, UpdatedAt: now.Add(-2 * time.Hour).Unix()}
+	plan, err := Build(context.Background(), Input{
+		Sessions: []codex.Session{session}, Now: now,
+		Previous:     Observations{"active": {Path: path, Size: info.Size(), ModTimeUnixNano: info.ModTime().UnixNano(), StableSinceUnixNano: now.Add(-2 * time.Hour).UnixNano()}},
+		Policy:       Policy{StableFor: time.Hour, BatchSize: 1, ArchivedOnly: false},
+		Gates:        Gates{DoctorHealthy: true, MountHealthy: true, CanonicalNamespace: true, NamespaceActive: true, NamespaceReady: true, EnrollmentAllowed: true},
+		WriterActive: func(context.Context, codex.Session) (bool, error) { return false, nil },
+		Budget:       allowingBudget{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Selected) != 1 || plan.Selected[0].SessionID != "active" {
+		t.Fatalf("stable writer-free active session was not selected: %#v", plan)
 	}
 }
 
@@ -140,7 +170,7 @@ func TestPlannerDiscoversExistingNewAndForkedSessionsAcrossCycles(t *testing.T) 
 	input := Input{
 		Sessions: []codex.Session{existing}, Now: now,
 		Policy: Policy{StableFor: time.Hour, BatchSize: 3, ArchivedOnly: true},
-		Gates:  Gates{DoctorHealthy: true, CompatibilityApproved: true, MountHealthy: true, CanonicalNamespace: true, EnrollmentAllowed: true},
+		Gates:  Gates{DoctorHealthy: true, MountHealthy: true, CanonicalNamespace: true, NamespaceActive: true, NamespaceReady: true, EnrollmentAllowed: true},
 		Budget: allowingBudget{},
 	}
 	first, err := Build(context.Background(), input)
@@ -171,6 +201,28 @@ func TestPlannerDiscoversExistingNewAndForkedSessionsAcrossCycles(t *testing.T) 
 	}
 	if len(third.Selected) != 2 || third.Selected[0].SessionID != "fork" || third.Selected[1].SessionID != "new" {
 		t.Fatalf("new and forked sessions were not selected after becoming stable: %#v", third.Selected)
+	}
+}
+
+func TestPlannerDefersMissingRoutesWhileCanonicalNamespaceWarms(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "not-visible-yet.jsonl")
+	plan, err := Build(context.Background(), Input{
+		Sessions: []codex.Session{{ID: "warming", RolloutPath: missing}},
+		Policy:   Policy{StableFor: time.Hour, BatchSize: 1},
+		Gates: Gates{
+			DoctorHealthy: true, MountHealthy: true, CanonicalNamespace: true,
+			NamespaceActive: true, NamespaceReady: false, EnrollmentAllowed: true,
+		},
+		Budget: allowingBudget{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertDecisionReason(t, plan, "warming", ReasonMountWarming)
+	for _, reason := range plan.Decisions[0].Reasons {
+		if reason == ReasonInvalidPath {
+			t.Fatalf("temporarily unavailable route was classified as invalid: %#v", plan.Decisions[0])
+		}
 	}
 }
 

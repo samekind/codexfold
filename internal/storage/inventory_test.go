@@ -74,7 +74,7 @@ func TestScanClassifiesManagedStorageAndDeduplicatesHardLinks(t *testing.T) {
 	}
 	assertUsage(t, "loose objects", inventory.UniqueLooseObjects, 1, 3)
 	assertUsage(t, "current packs", inventory.Packs, 2, 6)
-	assertUsage(t, "native sources", inventory.NativeSources, 3, 83)
+	assertUsage(t, "native sources", inventory.NativeSources, 1, 50)
 	assertUsage(t, "retained snapshots", inventory.RetainedSnapshots, 2, 33)
 	assertUsage(t, "current fallbacks", inventory.CurrentFallbacks, 1, 9)
 	assertUsage(t, "active deltas", inventory.ActiveDeltas, 1, 5)
@@ -87,8 +87,30 @@ func TestScanClassifiesManagedStorageAndDeduplicatesHardLinks(t *testing.T) {
 	if inventory.TotalPhysicalBytes <= 0 {
 		t.Fatalf("total physical bytes = %d", inventory.TotalPhysicalBytes)
 	}
-	if inventory.HardlinkAliases != 1 {
-		t.Fatalf("hard-link aliases = %d, want 1", inventory.HardlinkAliases)
+	if inventory.HardlinkAliases != 0 {
+		t.Fatalf("hard-link aliases = %d, want 0", inventory.HardlinkAliases)
+	}
+}
+
+func TestScanDoesNotCountManagedVirtualRouteAsNativeSource(t *testing.T) {
+	root := t.TempDir()
+	store := filepath.Join(root, "store")
+	virtualRoute := writeSizedFile(t, filepath.Join(root, "mount", "session.jsonl"), 64)
+	manifestPath := filepath.Join(store, "manifests", "session.json")
+	writeJSONFile(t, manifestPath, manifestFixture("session", virtualRoute, 64))
+	sessionRoot := filepath.Join(store, "fs", "sessions", "session")
+	delta := writeSizedFile(t, filepath.Join(sessionRoot, "delta.jsonl"), 3)
+	writeJSONFile(t, filepath.Join(sessionRoot, "state.json"), stateFixture("session", manifestPath, 64, delta, "", ""))
+
+	inventory, err := Scan(context.Background(), Options{StoreDir: store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inventory.NativeSources.Files != 0 || inventory.NativeSources.PhysicalBytes != 0 {
+		t.Fatalf("managed virtual route was counted as a native source: %#v", inventory.NativeSources)
+	}
+	if inventory.LogicalSessionBytes != 67 {
+		t.Fatalf("logical bytes = %d, want 67", inventory.LogicalSessionBytes)
 	}
 }
 

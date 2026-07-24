@@ -29,7 +29,7 @@ The purpose is to prevent implementation plans from replacing the requested outc
 | Promotion is Shadow, 5–10 archived Canary, Resume, Stable, General, then Active last | `TF-008`, `TF-009`, `TF-010`, Promotion Ladder | Corrected: the exact stage order and deletion policy were missing |
 | The stable workflow is automatic rather than one manual migrate per session | `TF-011`, Migration And Rollback | Corrected: automatic discovery and enrollment of existing sessions, new sessions, and forks was missing from the first spec |
 | Codex upgrades must not silently change supported file behavior | `TF-015`, Native Behavior Discovery, Behavioral Gates | Aligned |
-| Every Codex Desktop or CLI version change quarantines virtual writes until current bytes are automatically routed to verified native backing or compatibility passes | `TF-015`, Failure Semantics | Corrected: routine upgrades remain automatic without exposing unknown write behavior to virtual storage |
+| Every Codex Desktop or CLI version change is recorded without changing virtual writes or routes | `TF-015`, Failure Semantics | Corrected: routine upgrades remain automatic while runtime safety stays with filesystem semantics and integrity guards |
 | macOS, Linux, and Windows use independently validated platform adapters | `TF-012`, Platform Adapters | Aligned; FUSE-T, FUSE3, and WinFsp are current candidates, not product promises |
 | Shared storage, read, write, generation, doctor, and recovery behavior stays in the platform-neutral core | `TF-012`, Platform-Neutral Core Contract | Aligned as a responsibility boundary; internal formats and algorithms remain replaceable |
 | Each platform is certified independently | `TF-012`, Canonical Status Terms, Platform Adapters | Aligned |
@@ -47,8 +47,8 @@ The purpose is to prevent implementation plans from replacing the requested outc
 
 These questions require evidence during implementation. They are not permission to weaken a requirement:
 
-- The exact native Codex operation trace on each client version.
-- Whether the current FUSE-T adapter continues to satisfy every operation introduced by future Codex versions.
+- The native Codex operation set observed across representative client builds.
+- Whether each platform adapter continues to satisfy every filesystem operation introduced by future Codex builds.
 - The optimal immutable pack size and decompressed-cache admission policy within `TF-008` limits.
 - The idle window that prevents compaction from racing a resumed writer.
 - The maximum mount-recovery time that remains acceptable during canary.
@@ -68,7 +68,7 @@ The corrected contract matches the approved outcome. The intent-level review fou
 6. Common platform gates and target-platform canaries close the macOS-only readiness gap.
 7. Doctor, platform-neutral core, Windows mount behavior, automatic fallback, and mobile boundaries are explicit.
 8. Delivery now expresses evidence dependencies: native tracing gates adapter claims, while packed-storage research can proceed in parallel.
-9. Client upgrades enter compatibility quarantine and route current bytes to verified native writable backing before unknown writes.
+9. Client upgrades are diagnostic signals only; they schedule regression validation without pausing enrollment or changing routes.
 10. Adapter products and cache/index algorithms are reference choices rather than product promises.
 
 The 2026-07-14 alignment added the cleanup, physical-space, and standalone-product commitments that were present in the original product discussion but absent from the first review. After those additions, no known goal-level drift remains in the design contract. Implementation gaps remain, especially automatic enrollment, conservative branch classification and archive execution, hard disk-budget enforcement, real Linux and Windows adapters, managed-session host-restart and sleep/wake validation, and canary retention. This is a contract conclusion, not a claim that transparent filesystem implementation or production validation is complete.

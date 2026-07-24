@@ -38,6 +38,9 @@ func (s *Session) RetireNativeSnapshot(snapshot NativeFile, visible NativeFile) 
 	if visible.Path == "" || visible.Bytes < s.state.BaseBytes || len(visible.SHA256) != 64 {
 		return NativeRetirementProof{}, errors.New("verified current materialization is required")
 	}
+	if s.state.Generation == ^uint64(0) {
+		return NativeRetirementProof{}, errors.New("session generation cannot advance")
+	}
 	proof := NativeRetirementProof{
 		Version: nativeRetirementVersion, SessionID: s.state.SessionID,
 		StateGeneration: s.state.Generation, RetiredAt: time.Now().UTC().Format(time.RFC3339Nano),
@@ -48,6 +51,7 @@ func (s *Session) RetireNativeSnapshot(snapshot NativeFile, visible NativeFile) 
 		return NativeRetirementProof{}, err
 	}
 	next := s.state
+	next.Generation++
 	next.NativeSnapshot = NativeFile{}
 	if err := writeSessionState(s.statePath, next); err != nil {
 		_ = os.Remove(proofPath)
@@ -58,6 +62,45 @@ func (s *Session) RetireNativeSnapshot(snapshot NativeFile, visible NativeFile) 
 		return proof, err
 	}
 	return proof, nil
+}
+
+// refreshNativeRetirementLocked absorbs the one external state transition that
+// is safe for a still-serving session: retirement of its managed native
+// snapshot. The caller must already hold the session mutex and writer lease.
+// That lease ensures a retirement command cannot race a new COW or compact
+// commit after the persisted state has been observed.
+func (s *Session) refreshNativeRetirementLocked() error {
+	persisted, err := loadSessionState(s.statePath)
+	if err != nil {
+		return fmt.Errorf("reload session state before write: %w", err)
+	}
+	if persisted == s.state {
+		return nil
+	}
+	current := s.state
+	if current.Generation == ^uint64(0) || persisted.Generation != current.Generation+1 || current.NativeSnapshot.Path == "" || persisted.NativeSnapshot != (NativeFile{}) || !sameSessionStateExceptRetiredNative(current, persisted) {
+		return errors.New("persisted session state changed outside the serving session")
+	}
+	proofPath := filepath.Join(s.directory, NativeRetirementFilename)
+	proof, err := LoadNativeRetirementProof(proofPath)
+	if err != nil {
+		return fmt.Errorf("load native retirement proof before write: %w", err)
+	}
+	if proof.SessionID != current.SessionID || proof.StateGeneration != current.Generation || proof.Snapshot != current.NativeSnapshot {
+		return errors.New("native retirement proof does not match the serving session")
+	}
+	s.state = persisted
+	return nil
+}
+
+func sameSessionStateExceptRetiredNative(before SessionState, after SessionState) bool {
+	return before.Version == after.Version &&
+		before.SessionID == after.SessionID &&
+		before.ManifestPath == after.ManifestPath &&
+		before.BaseBytes == after.BaseBytes &&
+		before.BaseSHA256 == after.BaseSHA256 &&
+		before.DeltaPath == after.DeltaPath &&
+		before.BackingPath == after.BackingPath
 }
 
 func CompleteNativeSnapshotRetirement(storeRoot string, proof NativeRetirementProof) error {
@@ -84,6 +127,31 @@ func CompleteNativeSnapshotRetirement(storeRoot string, proof NativeRetirementPr
 		return err
 	}
 	return nil
+}
+
+// NativeSnapshotAlreadyRetired distinguishes a deliberately removed managed
+// snapshot from an unexplained missing fallback. It is intentionally strict:
+// rollback may skip moving a missing snapshot only when the durable proof
+// names the exact snapshot still referenced by state.
+func NativeSnapshotAlreadyRetired(storeRoot string, state SessionState) (bool, error) {
+	if state.NativeSnapshot.Path == "" {
+		return false, nil
+	}
+	if _, err := os.Stat(state.NativeSnapshot.Path); err == nil {
+		return false, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return false, fmt.Errorf("stat managed native snapshot: %w", err)
+	}
+	proofPath := filepath.Join(filepath.Clean(storeRoot), "fs", "sessions", state.SessionID, NativeRetirementFilename)
+	proof, err := LoadNativeRetirementProof(proofPath)
+	if err != nil {
+		return false, fmt.Errorf("load proof for missing native snapshot: %w", err)
+	}
+	expectedSnapshot := filepath.Join(filepath.Clean(storeRoot), "fs", "snapshots", state.SessionID, "native.jsonl")
+	if filepath.Clean(state.NativeSnapshot.Path) != expectedSnapshot || proof.SessionID != state.SessionID || proof.Snapshot != state.NativeSnapshot || proof.StateGeneration > state.Generation {
+		return false, errors.New("missing native snapshot does not match its retirement proof")
+	}
+	return true, nil
 }
 
 func LoadNativeRetirementProof(path string) (NativeRetirementProof, error) {

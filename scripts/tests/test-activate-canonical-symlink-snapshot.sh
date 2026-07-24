@@ -14,6 +14,7 @@ grep -Fq 'snapshot_critical "${NATIVE_ROOT}" "${RUN_ROOT}/critical.after"' "$scr
 grep -Fq 'app_servers_running()' "$script"
 grep -Fq 'real-home Codex app servers did not drain' "$script"
 grep -Fq 'Codex restarted during activation preflight; waiting again' "$script"
+! grep -Fq 'fs compatibility' "$script"
 
 stop_line=$(grep -n 'fs service stop --apply' "$script" | head -n 1 | cut -d: -f1)
 deactivate_line=$(grep -n 'fs namespace deactivate --apply' "$script" | head -n 1 | cut -d: -f1)
@@ -73,9 +74,6 @@ printf '%s\n' "$*" >>"$CODEXFOLD_FAKE_LOG"
 case "$*" in
   'fs service status --json')
     printf '%s\n' '{"daemon_running":true,"mount_healthy":true}'
-    ;;
-  fs\ compatibility*)
-    printf '%s\n' '{"evaluation":{"approved":true,"quarantine":false}}'
     ;;
   'fs namespace activate'*)
     printf '%s\n' '{"active":true}'

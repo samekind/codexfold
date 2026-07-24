@@ -412,7 +412,7 @@ func newFSCompatibilityCommand() *cobra.Command {
 	var jsonOutput bool
 	command := &cobra.Command{
 		Use:   "compatibility",
-		Short: "Evaluate installed Codex clients against exact-version contracts",
+		Short: "Report installed Codex client evidence for regression diagnostics",
 		Args:  cobra.NoArgs,
 		RunE: func(command *cobra.Command, _ []string) error {
 			home, err := codex.ResolveHome(codexHome)
@@ -695,10 +695,10 @@ func newFSServeCommand() *cobra.Command {
 							}
 							return
 						}
-						if len(result.Plan.Selected) == 0 && result.Apply.Applied == 0 {
+						if len(result.Plan.Selected) == 0 && result.Apply.Applied == 0 && result.Maintenance.NativeCandidates == 0 {
 							return
 						}
-						_, _ = fmt.Fprintf(command.ErrOrStderr(), "enrollment cycle sessions=%d selected=%d applied=%d\n", len(result.Plan.Decisions), len(result.Plan.Selected), result.Apply.Applied)
+						_, _ = fmt.Fprintf(command.ErrOrStderr(), "enrollment cycle sessions=%d selected=%d applied=%d native_retired=%d native_deferred=%d gc_removed=%d\n", len(result.Plan.Decisions), len(result.Plan.Selected), result.Apply.Applied, result.Maintenance.NativeRetired, result.Maintenance.NativeDeferred, result.Maintenance.StorageGC.RemovedCount)
 					})
 				}()
 			}
@@ -739,7 +739,7 @@ func newFSServeCommand() *cobra.Command {
 				if err != nil {
 					return err
 				}
-				currentPack, err := pack.CurrentGeneration(store)
+				currentPack, err := currentPackForStates(store, states)
 				if err != nil {
 					return err
 				}
@@ -898,7 +898,7 @@ func newFSServeCommand() *cobra.Command {
 	command.Flags().DurationVar(&enrollmentInterval, "enrollment-interval", 0, "Periodic stable-session enrollment interval; zero disables the loop")
 	command.Flags().DurationVar(&enrollmentStableFor, "enrollment-stable-for", time.Hour, "Required unchanged interval before periodic enrollment")
 	command.Flags().IntVar(&enrollmentBatchSize, "enrollment-batch-size", 1, "Maximum sessions enrolled per periodic cycle")
-	command.Flags().BoolVar(&enrollmentCanary, "enrollment-canary", false, "Allow periodic enrollment only in an explicitly isolated Codex home while capability remains preview")
+	command.Flags().BoolVar(&enrollmentCanary, "enrollment-canary", false, "Enable additional isolated-home constraints for periodic validation")
 	command.Flags().BoolVar(&jsonOutput, "json", false, "Emit JSON output for dry-run")
 	return command
 }
@@ -1014,9 +1014,6 @@ func newFSMigrateCommand() *cobra.Command {
 				return err
 			}
 			defer resolver.Close()
-			if !session.Archived {
-				return errors.New("only archived sessions are eligible for filesystem migration")
-			}
 			mount := defaultMountPoint(home, mountPoint)
 			sourcePath := session.RolloutPath
 			target := filepath.Join(mount, session.ID+".jsonl")
@@ -1043,6 +1040,20 @@ func newFSMigrateCommand() *cobra.Command {
 			native := vfs.NativeFile{Path: sourcePath, Bytes: shadow.Bytes, SHA256: shadow.SHA256}
 			result := FSMigrateResult{SessionID: session.ID, Native: native, Target: target, Shadow: shadow, DryRun: !apply}
 			if apply {
+				writerActive, err := filesystemMigrationWriterProbe(command.Context(), session, sourcePath)
+				if err != nil {
+					return fmt.Errorf("probe native session writer: %w", err)
+				}
+				if writerActive {
+					return fmt.Errorf("session %s has an active native writer; close Codex before migration", session.ID)
+				}
+				currentNative, err := hashPath(sourcePath)
+				if err != nil {
+					return fmt.Errorf("recheck native session after writer probe: %w", err)
+				}
+				if currentNative.Bytes != native.Bytes || currentNative.SHA256 != native.SHA256 {
+					return errors.New("native session changed during writer probe; migration was not applied")
+				}
 				if err := requireStorageHealth(command.Context(), store); err != nil {
 					return err
 				}
@@ -1053,14 +1064,6 @@ func newFSMigrateCommand() *cobra.Command {
 					}
 					if err := validateCompatibilityCanary(home, filepath.Join(userHome, ".codex"), store, canonicalNamespace, compatibility); err != nil {
 						return err
-					}
-				} else {
-					compatibilityResult, err := evaluateCompatibility(command.Context(), store, compatibility)
-					if err != nil {
-						return err
-					}
-					if len(compatibilityResult.DetectionErrors) != 0 || !compatibilityResult.Evaluation.Approved {
-						return errors.New("installed Codex client versions are not covered by compatibility contracts")
 					}
 				}
 				if err := mountHealthProbe(mount); err != nil {
@@ -1127,6 +1130,13 @@ func newFSMigrateCommand() *cobra.Command {
 					}
 					if _, err := waitForTargetMatch(command.Context(), target, vfs.NativeFile{Bytes: shadow.Bytes, SHA256: shadow.SHA256}, mountWait); err != nil {
 						return rollbackMigration(fmt.Errorf("verify managed target before canonical cutover: %w", err))
+					}
+					writerActive, err := filesystemMigrationWriterProbe(command.Context(), session, canonicalSource, native.Path)
+					if err != nil {
+						return rollbackMigration(fmt.Errorf("recheck native session writer before canonical cutover: %w", err))
+					}
+					if writerActive {
+						return rollbackMigration(fmt.Errorf("session %s acquired an active native writer during migration", session.ID))
 					}
 					if err := finalizeCanonicalSnapshotSource(canonicalSource, native); err != nil {
 						return rollbackMigration(err)
@@ -1274,6 +1284,13 @@ func newFSRollbackCommand() *cobra.Command {
 						return fmt.Errorf("canonical filesystem mount is not healthy: %w", err)
 					}
 				}
+				nativeSnapshotAlreadyRetired := false
+				if canonicalNamespace && state.NativeSnapshot.Path != "" {
+					nativeSnapshotAlreadyRetired, err = vfs.NativeSnapshotAlreadyRetired(store, state)
+					if err != nil {
+						return fmt.Errorf("verify canonical native snapshot retirement: %w", err)
+					}
+				}
 				managed, resolver, err := openManagedSession(command.Context(), store, state)
 				if err != nil {
 					return err
@@ -1381,7 +1398,7 @@ func newFSRollbackCommand() *cobra.Command {
 						return restoreManagedRoute(err, "", "")
 					}
 					var retiredSnapshot string
-					if state.NativeSnapshot.Path != "" {
+					if state.NativeSnapshot.Path != "" && !nativeSnapshotAlreadyRetired {
 						retiredSnapshot, err = retireCanonicalNativeSnapshot(store, nativeRoot, state.SessionID, state.NativeSnapshot.Path, target.Path, retiredState)
 						if err != nil {
 							return restoreManagedRoute(err, retiredState, "")
@@ -1494,9 +1511,11 @@ func newFSCompactCommand() *cobra.Command {
 					options := fold.FoldOptions{
 						StoreDir: store, ManifestPathOverride: manifestPath, Apply: true, Overwrite: true,
 						ExistingReader: resolver,
-						RecordIndex:    recordIndex,
 						FieldThreshold: currentManifest.Settings.FieldThreshold, MaxJSONLineBytes: currentManifest.Settings.MaxJSONLineBytes,
 						CDC: cdc.Options{MinBytes: currentManifest.Settings.CDCMinBytes, AverageBytes: currentManifest.Settings.CDCAverageBytes, MaxBytes: currentManifest.Settings.CDCMaxBytes},
+					}
+					if recordIndex != nil {
+						options.RecordIndex = recordIndex
 					}
 					if _, err := fold.Fold(ctx, fold.Session{ID: state.SessionID, Title: currentManifest.Session.Title, CWD: currentManifest.Session.CWD, RolloutPath: current.Path, Archived: true}, options); err != nil {
 						return vfs.PreparedGeneration{}, err
@@ -1614,6 +1633,11 @@ func newFSRecoverCommand() *cobra.Command {
 func recoverInterruptedCanonicalMigration(home string, store string, nativeRoot string, state vfs.SessionState) (recovered bool, resultErr error) {
 	retainedPath := filepath.Join(store, "fs", "snapshots", state.SessionID, "native.jsonl")
 	if filepath.Clean(state.NativeSnapshot.Path) != filepath.Clean(retainedPath) {
+		return false, nil
+	}
+	if retired, err := vfs.NativeSnapshotAlreadyRetired(store, state); err != nil {
+		return false, fmt.Errorf("verify native retirement before migration recovery: %w", err)
+	} else if retired {
 		return false, nil
 	}
 	if _, pending, err := readRetirementRequest(store, state.SessionID); err != nil {
@@ -1797,6 +1821,24 @@ func openManagedSession(ctx context.Context, store string, state vfs.SessionStat
 		return nil, nil, err
 	}
 	return managed, resolver, nil
+}
+
+func currentPackForStates(store string, states []vfs.SessionState) (string, error) {
+	current, err := pack.CurrentGeneration(store)
+	if err == nil {
+		return current, nil
+	}
+	if len(states) != 0 {
+		return "", err
+	}
+	bootstrap, bootstrapErr := pack.IsBootstrapStore(store)
+	if bootstrapErr != nil {
+		return "", bootstrapErr
+	}
+	if bootstrap {
+		return "", nil
+	}
+	return "", err
 }
 
 func managedState(store string, sessionID string) (vfs.SessionState, error) {
@@ -2036,13 +2078,13 @@ func fsDoctor(ctx context.Context, home string, store string, mount string, defi
 			}
 			return nil
 		}},
-		fsctl.Check{Component: fsctl.ComponentClient, Run: func(ctx context.Context) error {
+		fsctl.Check{Component: fsctl.ComponentClient, NonBlocking: true, Run: func(ctx context.Context) error {
 			result, err := evaluateCompatibility(ctx, store, defaultCompatibilityFlags())
 			if err != nil {
 				return err
 			}
-			if len(result.DetectionErrors) != 0 || !result.Evaluation.Approved {
-				return errors.New("installed Codex clients are not covered by exact compatibility contracts")
+			if len(result.DetectionErrors) != 0 {
+				return fmt.Errorf("detect installed Codex clients: %s", strings.Join(result.DetectionErrors, "; "))
 			}
 			return nil
 		}},

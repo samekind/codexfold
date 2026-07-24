@@ -139,6 +139,10 @@ func TestDefinitionFrontendParsesNativeFSKitLaunchdArguments(t *testing.T) {
 	if err != nil || gotStore != filepath.Join(root, "store") {
 		t.Fatalf("store = %q err=%v", gotStore, err)
 	}
+	gotNativeRoot, err := DefinitionNativeRoot(PlatformLaunchd, path)
+	if err != nil || gotNativeRoot != filepath.Join(root, "native") {
+		t.Fatalf("native root = %q err=%v", gotNativeRoot, err)
+	}
 	label, err := DefinitionLabel(PlatformLaunchd, path)
 	if err != nil || label != "com.codexfold.fs" {
 		t.Fatalf("label = %q err=%v", label, err)

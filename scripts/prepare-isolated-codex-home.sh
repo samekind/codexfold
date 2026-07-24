@@ -35,6 +35,15 @@ if [[ -f "$source_home/models_cache.json" ]]; then
   chmod 600 "$target_home/models_cache.json"
 fi
 
+# Current Codex configurations may reference a local model catalog by a relative
+# path. Keep that immutable input inside the isolated home as well.
+for catalog in cockpit-local-access-model-catalog.json; do
+  if [[ -f "$source_home/$catalog" ]]; then
+    cp -p "$source_home/$catalog" "$target_home/$catalog"
+    chmod 600 "$target_home/$catalog"
+  fi
+done
+
 mkdir -p "$target_home/sessions" "$target_home/archived_sessions"
 
 # These assets are immutable inputs for the canary. APFS clone avoids duplicating their
