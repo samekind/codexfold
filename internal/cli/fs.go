@@ -42,6 +42,20 @@ type FSMigrateResult struct {
 	Storage   *storage.MutationAccounting `json:"storage,omitempty"`
 }
 
+type FSRetireNativeResult struct {
+	SessionID            string                    `json:"session_id"`
+	DryRun               bool                      `json:"dry_run"`
+	AlreadyRetired       bool                      `json:"already_retired"`
+	SnapshotBytes        int64                     `json:"snapshot_bytes"`
+	VisibleBytes         int64                     `json:"visible_bytes"`
+	VisibleSHA256        string                    `json:"visible_sha256,omitempty"`
+	ProofPath            string                    `json:"proof_path,omitempty"`
+	ActualReclaimedBytes int64                     `json:"actual_reclaimed_bytes"`
+	StorageBefore        storage.Inventory         `json:"storage_before,omitempty"`
+	StorageAfter         storage.Inventory         `json:"storage_after,omitempty"`
+	Proof                vfs.NativeRetirementProof `json:"proof,omitempty"`
+}
+
 type FSCompatibilityResult struct {
 	Installed       []compat.ClientVersion `json:"installed,omitempty"`
 	Contracts       int                    `json:"contracts"`
@@ -110,12 +124,150 @@ func newFSCommand() *cobra.Command {
 	command.AddCommand(newFSMigrateCommand())
 	command.AddCommand(newFSRollbackCommand())
 	command.AddCommand(newFSCompactCommand())
+	command.AddCommand(newFSRetireNativeCommand())
 	command.AddCommand(newFSRecoverCommand())
 	command.AddCommand(newFSEnrollCommand())
 	command.AddCommand(newFSRepairRolloutCommand())
 	command.AddCommand(newFSReconcileRolloutCommand())
 	command.AddCommand(newFSNamespaceCommand())
 	command.AddCommand(newFSServiceCommand())
+	return command
+}
+
+func newFSRetireNativeCommand() *cobra.Command {
+	var codexHome string
+	var storeDir string
+	var apply bool
+	var jsonOutput bool
+	command := &cobra.Command{
+		Use:   "retire-native <session-id>",
+		Short: "Retire a canonical native snapshot after pack-only recovery proof",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(command *cobra.Command, args []string) error {
+			home, err := codex.ResolveHome(codexHome)
+			if err != nil {
+				return err
+			}
+			store := resolveFoldStore(home, storeDir)
+			state, err := managedState(store, args[0])
+			if err != nil {
+				return err
+			}
+			result := FSRetireNativeResult{SessionID: state.SessionID, DryRun: !apply, SnapshotBytes: state.NativeSnapshot.Bytes}
+			proofPath := filepath.Join(store, "fs", "sessions", state.SessionID, vfs.NativeRetirementFilename)
+			if state.NativeSnapshot.Path == "" {
+				proof, err := vfs.LoadNativeRetirementProof(proofPath)
+				if err != nil {
+					return fmt.Errorf("native snapshot is empty without a valid retirement proof: %w", err)
+				}
+				result.AlreadyRetired = true
+				result.SnapshotBytes = proof.Snapshot.Bytes
+				result.ProofPath = proofPath
+				result.Proof = proof
+				result.VisibleBytes = proof.Visible.Bytes
+				result.VisibleSHA256 = proof.Visible.SHA256
+				if apply {
+					result.StorageBefore, err = storage.Scan(command.Context(), storage.Options{StoreDir: store, AllowMetadataIssues: true})
+					if err != nil {
+						return err
+					}
+					if err := vfs.CompleteNativeSnapshotRetirement(store, proof); err != nil {
+						return err
+					}
+					result.StorageAfter, err = storage.Scan(command.Context(), storage.Options{StoreDir: store, AllowMetadataIssues: true})
+					if err != nil {
+						return err
+					}
+					if result.StorageBefore.TotalPhysicalBytes > result.StorageAfter.TotalPhysicalBytes {
+						result.ActualReclaimedBytes = result.StorageBefore.TotalPhysicalBytes - result.StorageAfter.TotalPhysicalBytes
+					}
+				}
+				if jsonOutput {
+					return writeJSON(command, result)
+				}
+				_, err = fmt.Fprintf(command.OutOrStdout(), "session=%s dry_run=%t already_retired=true reclaimed=%s proof=%s\n", result.SessionID, result.DryRun, formatBytes(result.ActualReclaimedBytes), result.ProofPath)
+				return err
+			}
+			expectedSnapshot := filepath.Join(store, "fs", "snapshots", state.SessionID, "native.jsonl")
+			if filepath.Clean(state.NativeSnapshot.Path) != filepath.Clean(expectedSnapshot) {
+				return errors.New("only the managed canonical snapshot can be retired")
+			}
+			packReport, err := pack.Doctor(command.Context(), store)
+			if err != nil {
+				return err
+			}
+			if packReport.IssueCount != 0 || packReport.VerifiedManifestCount != packReport.ManifestCount {
+				return fmt.Errorf("pack-only recovery proof failed: %d issue(s)", packReport.IssueCount)
+			}
+			managed, resolver, err := openManagedSession(command.Context(), store, state)
+			if err != nil {
+				return err
+			}
+			defer resolver.Close()
+			foldReport, err := fold.DoctorWithOptions(command.Context(), store, fold.DoctorOptions{Reader: resolver})
+			if err != nil {
+				return err
+			}
+			if foldReport.IssueCount != 0 || foldReport.VerifiedManifestCount != foldReport.ManifestCount {
+				return fmt.Errorf("fold pack-only recovery proof failed: %d issue(s)", foldReport.IssueCount)
+			}
+			writer, err := managed.OpenWriter()
+			if errors.Is(err, vfs.ErrWriterBusy) {
+				return errors.New("cannot retire native snapshot while the session has an active writer")
+			}
+			if err != nil {
+				return err
+			}
+			defer writer.Close()
+			beforeVisible, err := managed.VisibleInfo()
+			if err != nil {
+				return err
+			}
+			materializedPath := filepath.Join(store, "fs", "sessions", state.SessionID, fmt.Sprintf(".native-retirement-proof-%d.jsonl", time.Now().UnixNano()))
+			visible, err := managed.MaterializeCurrent(command.Context(), materializedPath, false)
+			if err != nil {
+				return err
+			}
+			defer os.Remove(materializedPath)
+			afterVisible, err := managed.VisibleInfo()
+			if err != nil {
+				return err
+			}
+			if beforeVisible != afterVisible || managed.State().Generation != state.Generation || managed.State().NativeSnapshot != state.NativeSnapshot {
+				return errors.New("managed session changed during native retirement proof")
+			}
+			result.VisibleBytes = visible.Bytes
+			result.VisibleSHA256 = visible.SHA256
+			result.ProofPath = proofPath
+			if apply {
+				result.StorageBefore, err = storage.Scan(command.Context(), storage.Options{StoreDir: store, AllowMetadataIssues: true})
+				if err != nil {
+					return err
+				}
+				result.Proof, err = managed.RetireNativeSnapshot(state.NativeSnapshot, visible)
+				if err != nil {
+					return err
+				}
+				result.StorageAfter, err = storage.Scan(command.Context(), storage.Options{StoreDir: store, AllowMetadataIssues: true})
+				if err != nil {
+					return err
+				}
+				if result.StorageBefore.TotalPhysicalBytes > result.StorageAfter.TotalPhysicalBytes {
+					result.ActualReclaimedBytes = result.StorageBefore.TotalPhysicalBytes - result.StorageAfter.TotalPhysicalBytes
+				}
+				result.DryRun = false
+			}
+			if jsonOutput {
+				return writeJSON(command, result)
+			}
+			_, err = fmt.Fprintf(command.OutOrStdout(), "session=%s dry_run=%t snapshot=%s visible=%s reclaimed=%s proof=%s\n", result.SessionID, result.DryRun, formatBytes(result.SnapshotBytes), formatBytes(result.VisibleBytes), formatBytes(result.ActualReclaimedBytes), result.ProofPath)
+			return err
+		},
+	}
+	command.Flags().StringVar(&codexHome, "codex-home", "", "Codex home directory; defaults to CODEX_HOME or ~/.codex")
+	command.Flags().StringVar(&storeDir, "store", "", "Fold store directory; defaults to <codex-home>/fold-store")
+	command.Flags().BoolVar(&apply, "apply", false, "Retire the verified managed canonical snapshot")
+	command.Flags().BoolVar(&jsonOutput, "json", false, "Emit JSON output")
 	return command
 }
 
@@ -1216,9 +1368,12 @@ func newFSRollbackCommand() *cobra.Command {
 					if err != nil {
 						return restoreManagedRoute(err, "", "")
 					}
-					retiredSnapshot, err := retireCanonicalNativeSnapshot(store, nativeRoot, state.SessionID, state.NativeSnapshot.Path, target.Path, retiredState)
-					if err != nil {
-						return restoreManagedRoute(err, retiredState, "")
+					var retiredSnapshot string
+					if state.NativeSnapshot.Path != "" {
+						retiredSnapshot, err = retireCanonicalNativeSnapshot(store, nativeRoot, state.SessionID, state.NativeSnapshot.Path, target.Path, retiredState)
+						if err != nil {
+							return restoreManagedRoute(err, retiredState, "")
+						}
 					}
 					if err := clearRetirementControl(retiredState); err != nil {
 						return restoreManagedRoute(err, retiredState, retiredSnapshot)
@@ -1839,7 +1994,17 @@ func fsDoctor(ctx context.Context, home string, store string, mount string, defi
 				return stateErr
 			}
 			for _, state := range states {
-				if _, err := os.Stat(state.NativeSnapshot.Path); err != nil {
+				if state.NativeSnapshot.Path != "" {
+					if _, err := os.Stat(state.NativeSnapshot.Path); err != nil {
+						return err
+					}
+					continue
+				}
+				proof, err := vfs.LoadNativeRetirementProof(filepath.Join(store, "fs", "sessions", state.SessionID, vfs.NativeRetirementFilename))
+				if err != nil || proof.SessionID != state.SessionID || proof.StateGeneration > state.Generation {
+					if err == nil {
+						err = errors.New("native retirement proof does not match managed state")
+					}
 					return err
 				}
 			}

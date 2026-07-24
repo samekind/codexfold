@@ -2480,6 +2480,142 @@ func TestFSCompactCommitsNewExactGeneration(t *testing.T) {
 	}
 }
 
+func TestFSRetireNativeIsDryRunFirstAndKeepsPackOnlyRestartReadable(t *testing.T) {
+	home, storeDir, nativePath := fsFixture(t, true)
+	manifest, err := fold.LoadManifest(storeDir, "session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := hashPath(nativePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retained, err := retainCanonicalSnapshot(context.Background(), storeDir, "session", source, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := finalizeCanonicalSnapshotSource(nativePath, retained); err != nil {
+		t.Fatal(err)
+	}
+	resolver, err := pack.Open(storeDir, pack.OpenOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := vfs.OpenSession(context.Background(), vfs.SessionOptions{
+		Root: storeDir, ManifestPath: fold.ManifestPath(storeDir, "session"), Manifest: manifest, Reader: resolver, NativeSnapshot: retained,
+	}); err != nil {
+		_ = resolver.Close()
+		t.Fatal(err)
+	}
+	_ = resolver.Close()
+	executeFS(t, []string{"fs", "retire-native", "session", "--codex-home", home, "--store", storeDir})
+	state, err := managedState(storeDir, "session")
+	if err != nil || state.NativeSnapshot != retained {
+		t.Fatalf("dry-run changed native snapshot: state=%#v err=%v", state, err)
+	}
+	if _, err := os.Stat(retained.Path); err != nil {
+		t.Fatalf("dry-run removed retained snapshot: %v", err)
+	}
+	retainedBytes, err := os.ReadFile(retained.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	executeFS(t, []string{"fs", "retire-native", "session", "--codex-home", home, "--store", storeDir, "--apply"})
+	state, err = managedState(storeDir, "session")
+	if err != nil || state.NativeSnapshot.Path != "" {
+		t.Fatalf("apply did not clear native snapshot: state=%#v err=%v", state, err)
+	}
+	if _, err := os.Stat(retained.Path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("retired snapshot still exists: %v", err)
+	}
+	proofPath := filepath.Join(storeDir, "fs", "sessions", "session", vfs.NativeRetirementFilename)
+	proof, err := vfs.LoadNativeRetirementProof(proofPath)
+	if err != nil || proof.Snapshot != retained || proof.Visible.SHA256 != manifest.Source.SHA256 {
+		t.Fatalf("native retirement proof = %#v err=%v", proof, err)
+	}
+	reopened, nextResolver, err := openManagedSession(context.Background(), storeDir, state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := reopened.MaterializeCurrent(context.Background(), filepath.Join(home, "pack-only-current.jsonl"), false)
+	_ = nextResolver.Close()
+	if err != nil || current.SHA256 != manifest.Source.SHA256 || current.Bytes != manifest.Source.Bytes {
+		t.Fatalf("pack-only restart materialization = %#v err=%v", current, err)
+	}
+	if err := os.MkdirAll(filepath.Dir(retained.Path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(retained.Path, retainedBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	executeFS(t, []string{"fs", "retire-native", "session", "--codex-home", home, "--store", storeDir, "--apply"})
+	if _, err := os.Stat(retained.Path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("retry did not remove a verified interrupted-retirement snapshot: %v", err)
+	}
+	rollbackPath := filepath.Join(home, "rollback-after-native-retirement.jsonl")
+	executeFS(t, []string{"fs", "rollback", "session", "--codex-home", home, "--store", storeDir, "--to", rollbackPath, "--apply"})
+	rolledBack, err := hashPath(rollbackPath)
+	if err != nil || rolledBack.SHA256 != manifest.Source.SHA256 || rolledBack.Bytes != manifest.Source.Bytes {
+		t.Fatalf("rollback after native retirement = %#v err=%v", rolledBack, err)
+	}
+	if _, err := os.Stat(filepath.Join(storeDir, "fs", "sessions", "session", "state.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("managed state remains after rollback: %v", err)
+	}
+}
+
+func TestFSRetireNativeRejectsActiveWriter(t *testing.T) {
+	home, storeDir, nativePath := fsFixture(t, true)
+	manifest, err := fold.LoadManifest(storeDir, "session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := hashPath(nativePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retained, err := retainCanonicalSnapshot(context.Background(), storeDir, "session", source, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := finalizeCanonicalSnapshotSource(nativePath, retained); err != nil {
+		t.Fatal(err)
+	}
+	resolver, err := pack.Open(storeDir, pack.OpenOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	managed, err := vfs.OpenSession(context.Background(), vfs.SessionOptions{
+		Root: storeDir, ManifestPath: fold.ManifestPath(storeDir, "session"), Manifest: manifest, Reader: resolver, NativeSnapshot: retained,
+	})
+	if err != nil {
+		_ = resolver.Close()
+		t.Fatal(err)
+	}
+	writer, err := managed.OpenWriter()
+	if err != nil {
+		_ = resolver.Close()
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	defer resolver.Close()
+
+	command := NewRootCommand()
+	command.SetOut(&bytes.Buffer{})
+	command.SetErr(&bytes.Buffer{})
+	command.SetArgs([]string{"fs", "retire-native", "session", "--codex-home", home, "--store", storeDir, "--apply"})
+	err = command.Execute()
+	if err == nil || err.Error() != "cannot retire native snapshot while the session has an active writer" {
+		t.Fatalf("retire-native active writer error = %v", err)
+	}
+	state, err := managedState(storeDir, "session")
+	if err != nil || state.NativeSnapshot != retained {
+		t.Fatalf("active-writer rejection changed state: %#v err=%v", state, err)
+	}
+	if _, err := os.Stat(retained.Path); err != nil {
+		t.Fatalf("active-writer rejection removed snapshot: %v", err)
+	}
+}
+
 func TestFSReadOnlyCommandsRunWithoutClaimingMountHealth(t *testing.T) {
 	home, storeDir, _ := fsFixture(t, true)
 	for _, args := range [][]string{

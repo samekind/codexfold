@@ -4,7 +4,7 @@
 
 CodexFold is an unofficial, local-first tool for measuring, deduplicating, storing, and recovering Codex session rollouts. The public project is standalone and has no private control-plane dependency.
 
-The optimization mechanisms and lifecycle boundaries are defined in [the fold taxonomy](fold-taxonomy.md). Real-corpus storage evidence is recorded separately in [the v0.3 validation](validation-real-corpus-v0.3.md). The bounded-memory production pack format and loose-object retirement gates are specified in [Pack V3](pack-v3.md). Optional exact-record promotion and its negative real-corpus result are specified in [Conservative Fold V2](fold-v2.md).
+The optimization mechanisms and lifecycle boundaries are defined in [the fold taxonomy](fold-taxonomy.md). Real-corpus storage evidence is recorded separately in [the v0.3 validation](validation-real-corpus-v0.3.md). The bounded-memory production pack format and loose-object retirement gates are specified in [Pack V3](pack-v3.md). Retained-source removal and pack-only rollback are specified in [Native Snapshot Retirement](native-snapshot-retirement.md). Optional exact-record promotion and its negative real-corpus result are specified in [Conservative Fold V2](fold-v2.md).
 
 The current release capability is `storage-engine`. Transparent normal-path session access is a separate product stage defined by `docs/superpowers/specs/2026-07-11-transparent-session-filesystem-design.md`.
 

@@ -231,6 +231,79 @@ func TestSessionBudgetRejectsMaterializeBeforeCreatingTarget(t *testing.T) {
 	}
 }
 
+func TestRetireNativeSnapshotKeepsManagedSessionReadableAndRestartable(t *testing.T) {
+	root := t.TempDir()
+	manifest, reader, source := sessionFixture(t, root)
+	hiddenSnapshot := filepath.Join(root, "fs", "snapshots", "session", "native.jsonl")
+	if err := os.MkdirAll(filepath.Dir(hiddenSnapshot), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(manifest.Session.RolloutPath, hiddenSnapshot); err != nil {
+		t.Fatal(err)
+	}
+	session, err := OpenSession(context.Background(), SessionOptions{
+		Root: root, ManifestPath: filepath.Join(root, "manifest.json"), Manifest: manifest, Reader: reader,
+		NativeSnapshot: NativeFile{Path: hiddenSnapshot, Bytes: manifest.Source.Bytes, SHA256: manifest.Source.SHA256},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := session.State().NativeSnapshot
+	proofFile := filepath.Join(root, "visible-proof.jsonl")
+	visible, err := session.MaterializeCurrent(context.Background(), proofFile, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.RetireNativeSnapshot(snapshot, visible); err == nil {
+		t.Fatal("native snapshot retirement succeeded without a writer lease")
+	}
+	writer, err := session.OpenWriter()
+	if err != nil {
+		t.Fatal(err)
+	}
+	proof, err := session.RetireNativeSnapshot(snapshot, visible)
+	if err != nil {
+		_ = writer.Close()
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if proof.Snapshot != snapshot || proof.Visible.SHA256 != digestBytes(source) || session.State().NativeSnapshot.Path != "" {
+		t.Fatalf("native retirement proof/state = %#v / %#v", proof, session.State())
+	}
+	proofPath := filepath.Join(root, "fs", "sessions", "session", NativeRetirementFilename)
+	loaded, err := LoadNativeRetirementProof(proofPath)
+	if err != nil || loaded.Snapshot != snapshot || loaded.Visible.SHA256 != digestBytes(source) {
+		t.Fatalf("load native retirement proof: proof=%#v err=%v", loaded, err)
+	}
+	if _, err := os.Stat(snapshot.Path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("retired snapshot still exists: %v", err)
+	}
+	handle, err := session.OpenReader()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := readHandle(t, handle); !bytes.Equal(got, source) {
+		t.Fatalf("managed bytes after native retirement = %q", got)
+	}
+	_ = handle.Close()
+	restarted, err := OpenSession(context.Background(), SessionOptions{
+		Root: root, ManifestPath: filepath.Join(root, "manifest.json"), Manifest: manifest, Reader: reader,
+	})
+	if err != nil {
+		t.Fatalf("restart without native snapshot: %v", err)
+	}
+	restartedHandle, err := restarted.OpenReader()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := readHandle(t, restartedHandle); !bytes.Equal(got, source) {
+		t.Fatalf("restarted managed bytes = %q", got)
+	}
+	_ = restartedHandle.Close()
+}
+
 func TestSessionTruncateTransitionsToBacking(t *testing.T) {
 	root := t.TempDir()
 	manifest, reader, source := sessionFixture(t, root)
