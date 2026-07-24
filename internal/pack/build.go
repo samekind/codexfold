@@ -119,7 +119,11 @@ func Build(ctx context.Context, storeDir string, options BuildOptions) (BuildRes
 	}
 	defer objectsFile.Close()
 	defer blocksFile.Close()
-	encoder, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedDefault))
+	encoder, err := zstd.NewWriter(nil,
+		zstd.WithEncoderLevel(zstd.SpeedDefault),
+		zstd.WithEncoderConcurrency(1),
+		zstd.WithLowerEncoderMem(true),
+	)
 	if err != nil {
 		return BuildResult{}, fmt.Errorf("create pack encoder: %w", err)
 	}

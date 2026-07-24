@@ -8,12 +8,14 @@ import (
 	"github.com/samekind/codexfold/internal/codex"
 	"github.com/samekind/codexfold/internal/fold"
 	"github.com/samekind/codexfold/internal/pack"
+	"github.com/samekind/codexfold/internal/scan"
 	"github.com/spf13/cobra"
 )
 
 func newFoldCommand() *cobra.Command {
 	var codexHome string
 	var jsonOutput bool
+	var recordIndexPath string
 	var options fold.FoldOptions
 	command := &cobra.Command{
 		Use:   "fold <session-id>",
@@ -38,6 +40,14 @@ func newFoldCommand() *cobra.Command {
 				defer resolver.Close()
 				options.ExistingReader = resolver
 			}
+			if recordIndexPath != "" {
+				recordIndex, err := scan.OpenDuplicateRecordIndex(recordIndexPath)
+				if err != nil {
+					return err
+				}
+				defer recordIndex.Close()
+				options.RecordIndex = recordIndex
+			}
 			result, err := fold.Fold(command.Context(), toFoldSession(session), options)
 			if err != nil {
 				return err
@@ -45,9 +55,9 @@ func newFoldCommand() *cobra.Command {
 			if jsonOutput {
 				return writeJSON(command, result)
 			}
-			_, err = fmt.Fprintf(command.OutOrStdout(), "session=%s verified=%t dry_run=%t parts=%d fields=%d residual=%d new=%s removed=%t manifest=%s\n",
+			_, err = fmt.Fprintf(command.OutOrStdout(), "session=%s verified=%t dry_run=%t parts=%d records=%d fields=%d residual=%d new=%s removed=%t manifest=%s\n",
 				result.SessionID, result.Verified, result.DryRun, result.PartCount,
-				result.FieldParts, result.ResidualParts, formatBytes(result.NewStoredBytes),
+				result.RecordParts, result.FieldParts, result.ResidualParts, formatBytes(result.NewStoredBytes),
 				result.RemovedSource, result.ManifestPath)
 			return err
 		},
@@ -63,6 +73,8 @@ func newFoldCommand() *cobra.Command {
 	command.Flags().Int64Var(&options.CDC.MinBytes, "cdc-min-bytes", 4*1024, "Minimum residual content-defined chunk bytes")
 	command.Flags().Int64Var(&options.CDC.AverageBytes, "cdc-average-bytes", 16*1024, "Target residual chunk bytes; must be a power of two")
 	command.Flags().Int64Var(&options.CDC.MaxBytes, "cdc-max-bytes", 64*1024, "Maximum residual content-defined chunk bytes")
+	command.Flags().StringVar(&recordIndexPath, "record-index", "", "Explicit record-layer scan index for conservative Fold V2")
+	command.Flags().Int64Var(&options.RecordThreshold, "record-threshold", 4*1024, "Minimum bytes for promoting a confirmed duplicate record")
 	command.Flags().BoolVar(&jsonOutput, "json", false, "Emit JSON output")
 	return command
 }

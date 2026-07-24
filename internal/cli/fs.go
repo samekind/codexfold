@@ -25,6 +25,7 @@ import (
 	"github.com/samekind/codexfold/internal/fskitproto"
 	"github.com/samekind/codexfold/internal/mountfs"
 	"github.com/samekind/codexfold/internal/pack"
+	"github.com/samekind/codexfold/internal/scan"
 	"github.com/samekind/codexfold/internal/service"
 	"github.com/samekind/codexfold/internal/storage"
 	"github.com/samekind/codexfold/internal/vfs"
@@ -1263,6 +1264,7 @@ func newFSCompactCommand() *cobra.Command {
 	var idleFor time.Duration
 	var apply bool
 	var jsonOutput bool
+	var recordIndexPath string
 	command := &cobra.Command{
 		Use:   "compact <session-id>",
 		Short: "Fold the latest visible bytes into a new verified immutable generation",
@@ -1284,6 +1286,14 @@ func newFSCompactCommand() *cobra.Command {
 					return err
 				}
 				defer resolver.Close()
+				var recordIndex *scan.DuplicateRecordIndex
+				if recordIndexPath != "" {
+					recordIndex, err = scan.OpenDuplicateRecordIndex(recordIndexPath)
+					if err != nil {
+						return err
+					}
+					defer recordIndex.Close()
+				}
 				visible, err := managed.VisibleInfo()
 				if err != nil {
 					return err
@@ -1317,6 +1327,7 @@ func newFSCompactCommand() *cobra.Command {
 					options := fold.FoldOptions{
 						StoreDir: store, ManifestPathOverride: manifestPath, Apply: true, Overwrite: true,
 						ExistingReader: resolver,
+						RecordIndex:    recordIndex,
 						FieldThreshold: currentManifest.Settings.FieldThreshold, MaxJSONLineBytes: currentManifest.Settings.MaxJSONLineBytes,
 						CDC: cdc.Options{MinBytes: currentManifest.Settings.CDCMinBytes, AverageBytes: currentManifest.Settings.CDCAverageBytes, MaxBytes: currentManifest.Settings.CDCMaxBytes},
 					}
@@ -1359,6 +1370,7 @@ func newFSCompactCommand() *cobra.Command {
 	command.Flags().StringVar(&codexHome, "codex-home", "", "Codex home directory; defaults to CODEX_HOME or ~/.codex")
 	command.Flags().StringVar(&storeDir, "store", "", "Fold store directory; defaults to <codex-home>/fold-store")
 	command.Flags().DurationVar(&idleFor, "idle-for", 0, "Minimum stable time before compaction")
+	command.Flags().StringVar(&recordIndexPath, "record-index", "", "Explicit record-layer scan index for conservative Fold V2")
 	command.Flags().BoolVar(&apply, "apply", false, "Commit the new compacted generation")
 	command.Flags().BoolVar(&jsonOutput, "json", false, "Emit JSON output")
 	return command

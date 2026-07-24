@@ -32,6 +32,8 @@ type FoldOptions struct {
 	CDC                  cdc.Options
 	Budget               storage.Checker
 	ExistingReader       ObjectReader
+	RecordIndex          DuplicateRecordIndex
+	RecordThreshold      int64
 	beforeCommit         func() error
 }
 
@@ -52,6 +54,7 @@ type FoldResult struct {
 	PartCount        int                         `json:"part_count"`
 	FieldParts       int                         `json:"field_parts"`
 	ResidualParts    int                         `json:"residual_parts"`
+	RecordParts      int                         `json:"record_parts"`
 	UniqueObjects    int                         `json:"unique_objects"`
 	ReusedObjects    int                         `json:"reused_objects"`
 	NewStoredBytes   int64                       `json:"new_stored_bytes"`
@@ -61,6 +64,16 @@ type FoldResult struct {
 	DryRun           bool                        `json:"dry_run"`
 	RemovedSource    bool                        `json:"removed_source"`
 	Storage          *storage.MutationAccounting `json:"storage,omitempty"`
+}
+
+type DuplicateRecordIndex interface {
+	IsDuplicateRecord(context.Context, [sha256.Size]byte, int64) (bool, error)
+}
+
+type plannedPart struct {
+	kind string
+	path string
+	data []byte
 }
 
 func Fold(ctx context.Context, session Session, options FoldOptions) (FoldResult, error) {
@@ -81,6 +94,9 @@ func Fold(ctx context.Context, session Session, options FoldOptions) (FoldResult
 	}
 	if options.CDC.MinBytes <= 0 {
 		options.CDC = cdc.Options{MinBytes: 4 * 1024, AverageBytes: 16 * 1024, MaxBytes: 64 * 1024}
+	}
+	if options.RecordThreshold <= 0 {
+		options.RecordThreshold = max(options.FieldThreshold, options.CDC.MinBytes)
 	}
 	manifestPath := ManifestPath(options.StoreDir, session.ID)
 	if options.ManifestPathOverride != "" {
@@ -151,9 +167,13 @@ func Fold(ctx context.Context, session Session, options FoldOptions) (FoldResult
 		defer lock.Close()
 	}
 
+	manifestVersion, manifestKind := ManifestVersion, ManifestKind
+	if options.RecordIndex != nil {
+		manifestVersion, manifestKind = ManifestVersionV2, ManifestKindV2
+	}
 	manifest := Manifest{
-		Version:   ManifestVersion,
-		Kind:      ManifestKind,
+		Version:   manifestVersion,
+		Kind:      manifestKind,
 		CreatedAt: newManifestTimestamp(),
 		Session: ManifestSession{
 			ID: session.ID, Title: session.Title, CWD: session.CWD,
@@ -163,6 +183,7 @@ func Fold(ctx context.Context, session Session, options FoldOptions) (FoldResult
 			FieldThreshold: options.FieldThreshold, MaxJSONLineBytes: options.MaxJSONLineBytes,
 			CDCMinBytes: options.CDC.MinBytes, CDCAverageBytes: options.CDC.AverageBytes,
 			CDCMaxBytes: options.CDC.MaxBytes, Compression: "zstd",
+			RecordThreshold: options.RecordThreshold,
 		},
 		Parts: make([]Part, 0),
 	}
@@ -198,6 +219,8 @@ func Fold(ctx context.Context, session Session, options FoldOptions) (FoldResult
 		reconstructionBytes += int64(len(data))
 		if kind == PartField {
 			result.FieldParts++
+		} else if kind == PartRecord {
+			result.RecordParts++
 		} else {
 			result.ResidualParts++
 		}
@@ -216,7 +239,57 @@ func Fold(ctx context.Context, session Session, options FoldOptions) (FoldResult
 		return FoldResult{}, err
 	}
 	flushResidual := func() error { return chunker.Finish() }
+	plannedStorageCost := func(parts []plannedPart) (int64, error) {
+		var total int64
+		for _, part := range parts {
+			ref, _, err := store.Put(part.data, false)
+			if err != nil {
+				return 0, err
+			}
+			reused := store.HasObject(ref) || (options.ExistingReader != nil && options.ExistingReader.HasObject(ref))
+			if !reused {
+				if total > math.MaxInt64-ref.StoredBytes {
+					return 0, errors.New("record component storage estimate overflow")
+				}
+				total += ref.StoredBytes
+			}
+		}
+		return total, nil
+	}
 	processLine := func(line []byte) error {
+		if options.RecordIndex != nil && int64(len(line)) >= options.RecordThreshold {
+			digest := sha256.Sum256(line)
+			duplicate, err := options.RecordIndex.IsDuplicateRecord(ctx, digest, int64(len(line)))
+			if err != nil {
+				return err
+			}
+			if duplicate {
+				components, err := planRecordComponents(line, options)
+				if err != nil {
+					return err
+				}
+				componentCost, err := plannedStorageCost(components)
+				if err != nil {
+					return err
+				}
+				recordRef, _, err := store.Put(line, false)
+				if err != nil {
+					return err
+				}
+				recordReused := store.HasObject(recordRef) || (options.ExistingReader != nil && options.ExistingReader.HasObject(recordRef))
+				recordCost := int64(0)
+				if !recordReused {
+					recordCost = recordRef.StoredBytes
+				}
+				worthPromoting := recordReused || (componentCost > 0 && recordCost <= componentCost/2)
+				if len(components) > 1 && worthPromoting {
+					if err := flushResidual(); err != nil {
+						return err
+					}
+					return appendPart(PartRecord, "", line)
+				}
+			}
+		}
 		spans, err := jsonraw.FindStringSpans(line, options.FieldThreshold)
 		if err != nil {
 			result.InvalidJSONLines++
@@ -341,6 +414,52 @@ complete:
 	}
 	result.Storage = storage.CompleteAccounting(ctx, storageAssessment, options.StoreDir)
 	return result, nil
+}
+
+func planRecordComponents(line []byte, options FoldOptions) ([]plannedPart, error) {
+	parts := make([]plannedPart, 0, 4)
+	chunker, err := cdc.New(options.CDC, func(chunk cdc.Chunk) error {
+		data := append([]byte(nil), chunk.Data...)
+		parts = append(parts, plannedPart{kind: PartResidual, data: data})
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	writeResidual := func(data []byte) error {
+		if len(data) == 0 {
+			return nil
+		}
+		return chunker.Write(data)
+	}
+	spans, err := jsonraw.FindStringSpans(line, options.FieldThreshold)
+	if err != nil {
+		if err := writeResidual(line); err != nil {
+			return nil, err
+		}
+		if err := chunker.Finish(); err != nil {
+			return nil, err
+		}
+		return parts, nil
+	}
+	cursor := 0
+	for _, span := range spans {
+		if err := writeResidual(line[cursor:span.Start]); err != nil {
+			return nil, err
+		}
+		if err := chunker.Finish(); err != nil {
+			return nil, err
+		}
+		parts = append(parts, plannedPart{kind: PartField, path: span.Path, data: append([]byte(nil), line[span.Start:span.End]...)})
+		cursor = span.End
+	}
+	if err := writeResidual(line[cursor:]); err != nil {
+		return nil, err
+	}
+	if err := chunker.Finish(); err != nil {
+		return nil, err
+	}
+	return parts, nil
 }
 
 func estimateFoldStorageBytes(rawBytes int64) (int64, error) {

@@ -145,6 +145,12 @@ func (d *dedupIndex) BeginFile(path string) error {
 	d.tx = tx
 	d.observe = stmt
 	d.currentFile = path
+	if _, err := tx.Exec(`delete from scan_metadata where key = 'record_lookup_ready'`); err != nil {
+		_ = stmt.Close()
+		_ = tx.Rollback()
+		d.clearTransaction()
+		return fmt.Errorf("invalidate duplicate record lookup: %w", err)
+	}
 	return nil
 }
 
@@ -405,6 +411,10 @@ func (d *dedupIndex) RemoveFilesNotIn(paths map[string]struct{}) error {
 	}
 	tx, err := d.db.Begin()
 	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`delete from scan_metadata where key = 'record_lookup_ready'`); err != nil {
+		_ = tx.Rollback()
 		return err
 	}
 	for _, path := range stale {

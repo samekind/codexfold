@@ -10,10 +10,13 @@ import (
 )
 
 const (
-	ManifestVersion = 1
-	ManifestKind    = "fold-v1"
-	PartResidual    = "residual"
-	PartField       = "field"
+	ManifestVersion   = 1
+	ManifestKind      = "fold-v1"
+	ManifestVersionV2 = 2
+	ManifestKindV2    = "fold-v2"
+	PartResidual      = "residual"
+	PartField         = "field"
+	PartRecord        = "record"
 )
 
 type Manifest struct {
@@ -46,6 +49,7 @@ type ManifestSettings struct {
 	CDCAverageBytes  int64  `json:"cdc_average_bytes"`
 	CDCMaxBytes      int64  `json:"cdc_max_bytes"`
 	Compression      string `json:"compression"`
+	RecordThreshold  int64  `json:"record_threshold,omitempty"`
 }
 
 type Part struct {
@@ -137,10 +141,7 @@ func writeManifestPath(path string, manifest Manifest, overwrite bool) error {
 }
 
 func validateManifest(manifest Manifest) error {
-	if manifest.Version != ManifestVersion {
-		return fmt.Errorf("unsupported fold manifest version %d", manifest.Version)
-	}
-	if manifest.Kind != ManifestKind {
+	if !SupportedManifest(manifest.Version, manifest.Kind) {
 		return fmt.Errorf("unsupported fold manifest kind %q", manifest.Kind)
 	}
 	if manifest.Session.ID == "" || manifest.Source.SHA256 == "" {
@@ -150,7 +151,7 @@ func validateManifest(manifest Manifest) error {
 		return err
 	}
 	for index, part := range manifest.Parts {
-		if part.Kind != PartResidual && part.Kind != PartField {
+		if !SupportedPart(manifest.Version, part.Kind) {
 			return fmt.Errorf("fold manifest part %d has unsupported kind %q", index, part.Kind)
 		}
 		if len(part.Object.SHA256) != 64 || part.Object.RawBytes < 0 {
@@ -158,6 +159,17 @@ func validateManifest(manifest Manifest) error {
 		}
 	}
 	return nil
+}
+
+func SupportedManifest(version int, kind string) bool {
+	return (version == ManifestVersion && kind == ManifestKind) || (version == ManifestVersionV2 && kind == ManifestKindV2)
+}
+
+func SupportedPart(version int, kind string) bool {
+	if kind == PartResidual || kind == PartField {
+		return true
+	}
+	return version == ManifestVersionV2 && kind == PartRecord
 }
 
 func validateSessionID(sessionID string) error {

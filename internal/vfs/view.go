@@ -20,13 +20,13 @@ func NewView(manifest fold.Manifest, reader ObjectReader) (*View, error) {
 	if reader == nil {
 		return nil, errors.New("virtual view object reader is required")
 	}
-	if manifest.Version != fold.ManifestVersion || manifest.Kind != fold.ManifestKind {
+	if !fold.SupportedManifest(manifest.Version, manifest.Kind) {
 		return nil, fmt.Errorf("unsupported fold manifest version=%d kind=%q", manifest.Version, manifest.Kind)
 	}
 	view := &View{manifest: manifest, reader: reader, ends: make([]int64, len(manifest.Parts))}
 	var total int64
 	for index, part := range manifest.Parts {
-		if part.Kind != fold.PartResidual && part.Kind != fold.PartField {
+		if !fold.SupportedPart(manifest.Version, part.Kind) {
 			return nil, fmt.Errorf("manifest part %d has unsupported kind %q", index, part.Kind)
 		}
 		if len(part.Object.SHA256) != 64 || part.Object.RawBytes <= 0 {

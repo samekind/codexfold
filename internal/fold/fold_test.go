@@ -3,7 +3,10 @@ package fold
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,6 +15,146 @@ import (
 	"github.com/samekind/codexfold/internal/cdc"
 	"github.com/samekind/codexfold/internal/storage"
 )
+
+type duplicateRecordFixture map[[sha256.Size]byte]struct{}
+
+func (f duplicateRecordFixture) IsDuplicateRecord(_ context.Context, digest [sha256.Size]byte, _ int64) (bool, error) {
+	_, exists := f[digest]
+	return exists, nil
+}
+
+func TestFoldV2PromotesOnlyConfirmedDuplicateRecords(t *testing.T) {
+	root := t.TempDir()
+	storeDir := filepath.Join(root, "store")
+	value := strings.Repeat("confirmed-duplicate-payload-", 200)
+	repeated := []byte(fmt.Sprintf("{\"type\":\"response_item\",\"payload_a\":%q,\"payload_b\":%q,\"payload_c\":%q,\"payload_d\":%q}\n", value, value, value, value))
+	unique := []byte("{\"type\":\"event_msg\",\"payload\":\"unique record payload\"}\n")
+	source := append(append(append([]byte(nil), repeated...), unique...), repeated...)
+	sourcePath := filepath.Join(root, "source.jsonl")
+	if err := os.WriteFile(sourcePath, source, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	repeatedDigest := sha256.Sum256(repeated)
+	result, err := Fold(context.Background(), Session{ID: "record-v2", RolloutPath: sourcePath, Archived: true}, FoldOptions{
+		StoreDir: storeDir, Apply: true, FieldThreshold: 8, RecordThreshold: 8,
+		RecordIndex: duplicateRecordFixture{repeatedDigest: {}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.RecordParts != 2 || result.ReusedObjects == 0 {
+		t.Fatalf("record-aware fold result = %#v", result)
+	}
+	manifest, err := LoadManifest(storeDir, "record-v2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manifest.Version != ManifestVersionV2 || manifest.Kind != ManifestKindV2 {
+		t.Fatalf("manifest identity = %d/%s", manifest.Version, manifest.Kind)
+	}
+	recordParts := 0
+	for _, part := range manifest.Parts {
+		if part.Kind == PartRecord {
+			recordParts++
+			if part.Object.SHA256 != hex.EncodeToString(repeatedDigest[:]) || part.Object.RawBytes != int64(len(repeated)) {
+				t.Fatalf("record part = %#v", part)
+			}
+		}
+	}
+	if recordParts != 2 {
+		t.Fatalf("record parts = %d, want 2", recordParts)
+	}
+	target := filepath.Join(root, "restored.jsonl")
+	if _, err := Unfold(context.Background(), storeDir, "record-v2", target, false); err != nil {
+		t.Fatal(err)
+	}
+	if restored, err := os.ReadFile(target); err != nil || !bytes.Equal(restored, source) {
+		t.Fatalf("restored V2 bytes differ: err=%v", err)
+	}
+}
+
+func TestManifestV1RejectsRecordPartAndV2AcceptsIt(t *testing.T) {
+	digest := sha256.Sum256([]byte("record"))
+	manifest := Manifest{Version: ManifestVersion, Kind: ManifestKind, Session: ManifestSession{ID: "session"}, Source: ManifestSource{SHA256: hex.EncodeToString(digest[:])}, Parts: []Part{{Kind: PartRecord, Object: ObjectRef{SHA256: hex.EncodeToString(digest[:]), RawBytes: 6}}}}
+	if err := validateManifest(manifest); err == nil {
+		t.Fatal("fold-v1 accepted a record part")
+	}
+	manifest.Version = ManifestVersionV2
+	manifest.Kind = ManifestKindV2
+	if err := validateManifest(manifest); err != nil {
+		t.Fatalf("fold-v2 rejected record part: %v", err)
+	}
+}
+
+func TestFoldV2DoesNotAddRecordObjectWhenExistingComponentsCostLess(t *testing.T) {
+	root := t.TempDir()
+	storeDir := filepath.Join(root, "store")
+	record := []byte("{\"type\":\"response_item\",\"payload\":\"component already stored value\"}\n")
+	first := filepath.Join(root, "first.jsonl")
+	second := filepath.Join(root, "second.jsonl")
+	if err := os.WriteFile(first, record, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(second, record, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	baseOptions := FoldOptions{StoreDir: storeDir, Apply: true, FieldThreshold: 8, RecordThreshold: 8}
+	if _, err := Fold(context.Background(), Session{ID: "first", RolloutPath: first, Archived: true}, baseOptions); err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(record)
+	baseOptions.RecordIndex = duplicateRecordFixture{digest: {}}
+	result, err := Fold(context.Background(), Session{ID: "second", RolloutPath: second, Archived: true}, baseOptions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.RecordParts != 0 || result.NewStoredBytes != 0 {
+		t.Fatalf("record object increased storage over existing components: %#v", result)
+	}
+}
+
+func TestRejectedRecordPromotionPreservesV1Segmentation(t *testing.T) {
+	root := t.TempDir()
+	candidate := []byte("{\"type\":\"candidate\",\"payload\":\"not sufficiently cheaper as one record\"}\n")
+	source := append(append(append([]byte(nil), []byte("{\"before\":true}\n")...), candidate...), []byte("{\"after\":true}\n")...)
+	sourcePath := filepath.Join(root, "source.jsonl")
+	if err := os.WriteFile(sourcePath, source, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	v1Store := filepath.Join(root, "v1")
+	v2Store := filepath.Join(root, "v2")
+	options := FoldOptions{StoreDir: v1Store, Apply: true, FieldThreshold: 8, RecordThreshold: 8}
+	if _, err := Fold(context.Background(), Session{ID: "session", RolloutPath: sourcePath, Archived: true}, options); err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(candidate)
+	options.StoreDir = v2Store
+	options.RecordIndex = duplicateRecordFixture{digest: {}}
+	result, err := Fold(context.Background(), Session{ID: "session", RolloutPath: sourcePath, Archived: true}, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.RecordParts != 0 {
+		t.Fatalf("candidate unexpectedly promoted: %#v", result)
+	}
+	v1, err := LoadManifest(v1Store, "session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	v2, err := LoadManifest(v2Store, "session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(v1.Parts) != len(v2.Parts) {
+		t.Fatalf("part counts differ: v1=%d v2=%d", len(v1.Parts), len(v2.Parts))
+	}
+	for index := range v1.Parts {
+		left, right := v1.Parts[index], v2.Parts[index]
+		if left.Kind != right.Kind || left.JSONPath != right.JSONPath || left.Object.SHA256 != right.Object.SHA256 || left.Object.RawBytes != right.Object.RawBytes {
+			t.Fatalf("part %d differs: v1=%#v v2=%#v", index, left, right)
+		}
+	}
+}
 
 func TestFoldRejectsSourceMutationBeforeManifestCommit(t *testing.T) {
 	root := t.TempDir()
