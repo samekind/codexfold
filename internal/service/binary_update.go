@@ -15,8 +15,10 @@ type BinaryUpdate struct {
 	Candidate       string `json:"candidate"`
 	CurrentSHA256   string `json:"current_sha256"`
 	CandidateSHA256 string `json:"candidate_sha256"`
+	HadTarget       bool   `json:"had_target"`
 	stagedPath      string
 	backupPath      string
+	promoted        bool
 }
 
 func StageBinaryUpdate(candidate string, target string) (*BinaryUpdate, error) {
@@ -28,13 +30,6 @@ func StageBinaryUpdate(candidate string, target string) (*BinaryUpdate, error) {
 	if candidate == target {
 		return nil, errors.New("candidate binary must be separate from the installed target")
 	}
-	targetInfo, err := os.Stat(target)
-	if err != nil {
-		return nil, err
-	}
-	if !targetInfo.Mode().IsRegular() {
-		return nil, errors.New("installed service binary is not a regular file")
-	}
 	candidateInfo, err := os.Stat(candidate)
 	if err != nil {
 		return nil, err
@@ -42,22 +37,40 @@ func StageBinaryUpdate(candidate string, target string) (*BinaryUpdate, error) {
 	if !candidateInfo.Mode().IsRegular() || candidateInfo.Mode().Perm()&0o111 == 0 {
 		return nil, errors.New("candidate service binary must be a regular executable file")
 	}
-	currentSHA256, err := buildid.FileSHA256(target)
-	if err != nil {
+	root := filepath.Dir(target)
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		return nil, err
+	}
+	mode := candidateInfo.Mode().Perm()
+	hadTarget := false
+	currentSHA256 := ""
+	var backupPath string
+	targetInfo, err := os.Stat(target)
+	if err == nil {
+		if !targetInfo.Mode().IsRegular() {
+			return nil, errors.New("installed service binary is not a regular file")
+		}
+		hadTarget = true
+		mode = targetInfo.Mode().Perm()
+		currentSHA256, err = buildid.FileSHA256(target)
+		if err != nil {
+			return nil, err
+		}
+		backupPath, err = copyBinaryTemporary(target, root, ".codexfold-backup-*", mode)
+		if err != nil {
+			return nil, err
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
 	candidateSHA256, err := buildid.FileSHA256(candidate)
 	if err != nil {
+		_ = os.Remove(backupPath)
 		return nil, err
 	}
-	root := filepath.Dir(target)
-	stagedPath, err := copyBinaryTemporary(candidate, root, ".codexfold-candidate-*", targetInfo.Mode().Perm())
+	stagedPath, err := copyBinaryTemporary(candidate, root, ".codexfold-candidate-*", mode)
 	if err != nil {
-		return nil, err
-	}
-	backupPath, err := copyBinaryTemporary(target, root, ".codexfold-backup-*", targetInfo.Mode().Perm())
-	if err != nil {
-		_ = os.Remove(stagedPath)
+		_ = os.Remove(backupPath)
 		return nil, err
 	}
 	if err := syncServiceDirectory(root); err != nil {
@@ -67,7 +80,7 @@ func StageBinaryUpdate(candidate string, target string) (*BinaryUpdate, error) {
 	}
 	return &BinaryUpdate{
 		Target: target, Candidate: candidate, CurrentSHA256: currentSHA256, CandidateSHA256: candidateSHA256,
-		stagedPath: stagedPath, backupPath: backupPath,
+		HadTarget: hadTarget, stagedPath: stagedPath, backupPath: backupPath,
 	}, nil
 }
 
@@ -75,10 +88,18 @@ func (u *BinaryUpdate) Promote() error {
 	if u == nil || u.stagedPath == "" || u.Target == "" {
 		return errors.New("staged binary update is required")
 	}
+	if !u.HadTarget {
+		if _, err := os.Lstat(u.Target); err == nil {
+			return errors.New("service binary target appeared during first install")
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
 	if err := replaceServiceBinary(u.stagedPath, u.Target); err != nil {
 		return err
 	}
 	u.stagedPath = ""
+	u.promoted = true
 	if err := syncServiceDirectory(filepath.Dir(u.Target)); err != nil {
 		return err
 	}
@@ -93,22 +114,35 @@ func (u *BinaryUpdate) Promote() error {
 }
 
 func (u *BinaryUpdate) Rollback() error {
-	if u == nil || u.backupPath == "" || u.Target == "" {
-		return errors.New("binary update backup is unavailable")
+	if u == nil || u.Target == "" {
+		return errors.New("binary update is unavailable")
 	}
-	if err := replaceServiceBinary(u.backupPath, u.Target); err != nil {
+	if !u.promoted {
+		return nil
+	}
+	if u.HadTarget {
+		if u.backupPath == "" {
+			return errors.New("binary update backup is unavailable")
+		}
+		if err := replaceServiceBinary(u.backupPath, u.Target); err != nil {
+			return err
+		}
+		u.backupPath = ""
+	} else if err := os.Remove(u.Target); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	u.backupPath = ""
+	u.promoted = false
 	if err := syncServiceDirectory(filepath.Dir(u.Target)); err != nil {
 		return err
 	}
-	digest, err := buildid.FileSHA256(u.Target)
-	if err != nil {
-		return err
-	}
-	if digest != u.CurrentSHA256 {
-		return fmt.Errorf("rolled back binary digest=%s expected=%s", digest, u.CurrentSHA256)
+	if u.HadTarget {
+		digest, err := buildid.FileSHA256(u.Target)
+		if err != nil {
+			return err
+		}
+		if digest != u.CurrentSHA256 {
+			return fmt.Errorf("rolled back binary digest=%s expected=%s", digest, u.CurrentSHA256)
+		}
 	}
 	return nil
 }

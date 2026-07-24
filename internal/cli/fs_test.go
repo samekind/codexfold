@@ -471,6 +471,44 @@ func TestFSServiceInstallRendersNativeFSKitDaemonAndSupervisor(t *testing.T) {
 	}
 }
 
+func TestFSServiceInstallDryRunAcceptsMissingBinaryTarget(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("native FSKit services are macOS-only")
+	}
+	home, storeDir, _ := fsFixture(t, true)
+	definition := filepath.Join(home, "LaunchAgents", "com.codexfold.fs.plist")
+	installedBinary := filepath.Join(home, "new", "codexfold")
+	candidateBinary := filepath.Join(home, "build", "codexfold")
+	if err := os.MkdirAll(filepath.Dir(candidateBinary), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(candidateBinary, []byte("candidate"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	root := NewRootCommand()
+	var output bytes.Buffer
+	root.SetOut(&output)
+	root.SetErr(&bytes.Buffer{})
+	root.SetArgs([]string{
+		"fs", "service", "install", "--frontend", "native-fskit",
+		"--codex-home", home, "--store", storeDir, "--definition", definition,
+		"--binary", installedBinary, "--binary-source", candidateBinary, "--json",
+	})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("native FSKit first-install dry-run: %v", err)
+	}
+	var result FSServiceInstallResult
+	if err := json.Unmarshal(output.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.BinaryCurrentSHA256 != "" || result.BinaryCandidateSHA256 == "" || !result.BinaryChanged {
+		t.Fatalf("first-install binary transaction = %#v", result)
+	}
+	if _, err := os.Stat(installedBinary); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("dry-run created installed target: %v", err)
+	}
+}
+
 func TestFSServiceInstallRejectsNativeFSKitResourceWithOverlongSocketPath(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("native FSKit services are macOS-only")

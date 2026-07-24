@@ -240,8 +240,11 @@ func newFSServiceInstallCommand() *cobra.Command {
 					return errors.New("candidate binary must be separate from the installed target")
 				}
 				binaryCurrentSHA256, err = buildid.FileSHA256(binary)
-				if err != nil {
+				if err != nil && !errors.Is(err, os.ErrNotExist) {
 					return err
+				}
+				if errors.Is(err, os.ErrNotExist) {
+					binaryCurrentSHA256 = ""
 				}
 				binaryCandidateSHA256, err = buildid.FileSHA256(binarySource)
 				if err != nil {
