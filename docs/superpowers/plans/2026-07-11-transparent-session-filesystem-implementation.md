@@ -12,7 +12,7 @@
 
 ## Alignment Snapshot
 
-Current public status remains `fs-engine-preview`. Tasks 1 through 10 and 12 through 14 are implemented. Task 11 has substantial isolated and bounded real-home macOS evidence, including current-client compatibility, sleep/wake, process-interruption recovery, and one idle retained-source managed CLI session surviving an actual host reboot. Linux FUSE3 now has real unprivileged operation, crash/restart, performance, mount-policy, and `systemd --user` lifecycle evidence. Windows WinFsp and SCM support are implemented and cross-compile, but lack a real Windows host. Actual in-flight power loss, the dedicated retention window, seven incident-free days, Linux client/upgrade/rollback/retention gates, and all real Windows gates remain open.
+Current public status remains `fs-engine-preview`. Tasks 1 through 10 and 12 through 14 are implemented. Task 11 has substantial isolated and bounded real-home macOS evidence, including current-client compatibility, sleep/wake, process-interruption recovery, one idle retained-source managed CLI session surviving an actual host reboot, and a separate durable-journal partial-tail controlled host-interruption recovery. Linux FUSE3 now has real unprivileged operation, crash/restart, performance, mount-policy, and `systemd --user` lifecycle evidence. Windows WinFsp and SCM support are implemented and cross-compile, but lack a real Windows host. The dedicated retention window, seven incident-free days, Linux client/upgrade/rollback/retention gates, and all real Windows gates remain open.
 
 | Task | Status | Current evidence | Remaining work |
 | --- | --- | --- | --- |
@@ -26,11 +26,11 @@ Current public status remains `fs-engine-preview`. Tasks 1 through 10 and 12 thr
 | 8 | Complete | Standalone CLI, guarded lifecycle, bounded planner/apply loop, and isolated automatic-enrollment evidence | Production enablement remains gated by platform readiness |
 | 9 | Complete | Commit `4589ffa`; launchd, real `systemd --user`, Windows SCM compile, and update preflight tests | Windows service runtime and production update promotion remain platform-gated |
 | 10 | Complete | Commit `a1ac76e`; synthetic, crash, race, cross-compile, and 758 MiB evidence | This task proves only the shared engine preview |
-| 11 | Partial | Real macOS CLI/Desktop, FUSE-T, rollback, daemon restart, idle managed-session host reboot, and quarantine evidence | Complete the remaining disruptive and retention gates |
+| 11 | Partial | Real macOS CLI/Desktop, FUSE-T, rollback, daemon restart, idle managed-session host reboot, durable-journal partial-tail host interruption, and quarantine evidence | Complete the retention gate |
 | 12 | Complete | Bounded planner/apply/service tests plus isolated canonical automatic enrollment, native-writer probing, restart, append, quarantine, and failed-cutover evidence | Real-home automatic apply remains promotion-gated |
 | 13 | Complete | Fork graph reports, exact content comparison, guarded official-compatible archive transactions, recovery, static content-change boundaries, and isolated native plus managed FUSE-T round trips | None in this task |
 | 14 | Complete | Physical inventory, hard mutation budgets, lease-aware bounded GC, and truthful projected/actual accounting | Destructive retention remains promotion-gated |
-| 15 | Partial | Current macOS client contracts plus restart gates; real Linux FUSE3 operation, crash, performance, and systemd lifecycle; Windows WinFsp/SCM cross-compile | Actual in-flight power loss, retention windows, Linux client/upgrade/rollback gates, and all real Windows gates remain |
+| 15 | Partial | Current macOS client contracts plus restart and controlled in-flight interruption gates; real Linux FUSE3 operation, crash, performance, and systemd lifecycle; Windows WinFsp/SCM cross-compile | Retention windows, Linux client/upgrade/rollback gates, and all real Windows gates remain |
 
 ## Global Constraints
 
@@ -787,6 +787,7 @@ No private path, session ID, trace content, credential, or control-plane name ma
 
 - [x] Import exact compatibility contracts for the currently installed Codex Desktop and CLI versions and return the isolated canary doctor to a clean client state.
 - [x] Run retained-source managed macOS canaries through sleep/wake and real host restart, including process-interrupted append, compaction, migration, and rollback cases required by the contract.
+- [x] Run a dedicated disposable native-append canary that durably persists one journal and a half-written tail, performs a `reboot -q` host interruption, rejects same-boot verification, and on the next boot proves exact base rollback, valid JSONL, and an empty journal. Verify the independent Pack-only FSKit canary remounts with `fs doctor` healthy.
 - [x] Implement the Linux FUSE3 adapter with explicit `fuse fuse3` build tags and execute real unprivileged read, append, copy-on-write, truncate, canonical rename, native fallback, `SIGKILL` stale-mount recovery, remount, performance, backing-seal, and `systemd --user` install/start/status/stop gates.
 - [x] Implement the Windows WinFsp adapter and native SCM service host, mount probe, configuration, start/stop/status, and restart policy; default and WinFsp binaries and tests cross-compile.
 - [ ] Continue only bounded real-home canary observation and complete seven incident-free days before any `platform-canary` promotion decision; general automatic apply remains disabled.

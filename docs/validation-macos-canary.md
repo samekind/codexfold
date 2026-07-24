@@ -51,8 +51,48 @@ the mounted FSKit evidence is still attributed to behavior-identical build
 This closes the executable non-destructive Pack-only, current-client, fork,
 rollback, restart, process-recovery, and performance gates for the isolated
 macOS candidate. General production promotion still requires the dedicated
-incident-free observation period and a deliberately controlled host power
-interruption while a transaction is in flight.
+incident-free observation period.
+
+## Controlled In-Flight Host Interruption (2026-07-24)
+
+The dedicated transaction-interruption gate ran against a disposable fixture
+on the internal APFS Data volume, never against the real Codex home. The test
+binary is the Darwin-only `TestPowerLossCanary` harness in
+`internal/mountfs/power_loss_canary_darwin_test.go`; it uses the same native
+append journal and startup recovery function as the product path.
+
+1. The harness wrote and `fsync`ed the recovery journal, then stopped at its
+   explicit checkpoint before the product append write. It durably wrote one
+   half of a 2 MiB JSONL tail, leaving a 1,048,576-byte base as a
+   2,097,152-byte partial target; the full transaction would have been
+   3,145,728 bytes. The journal count was exactly one and the arm process was
+   still alive before interruption.
+2. A per-user LaunchAgent installed before the interruption ran `verify` at
+   the next login. Its persisted boot identity changed from `16:15:10` to
+   `20:39:16` local time, so the verifier rejects a same-boot process restart
+   and this result cannot be confused with a service restart or `SIGKILL`.
+3. The machine was restarted with `reboot -q`: a deliberately non-graceful
+   user-space interruption that still lets the kernel flush its filesystem
+   cache. This is controlled host-interruption evidence, not a claim of a
+   physical power-cord removal.
+4. At the next boot, verifier observed the expected 2,097,152-byte partial
+   target and one journal, then called product startup recovery. It restored
+   the target to exactly 1,048,576 bytes with SHA-256
+   `20922c677e0d17f3d9198d9d76ecc20328f3f9ab0bf0adc76f68597d033fe239`,
+   equal to the pre-interruption base SHA-256; JSONL parsed and the journal
+   directory was empty.
+5. Independent post-verifier checks repeated the size, SHA-256, JSONL, and
+   empty-journal assertions. The existing Pack-only FSKit canary also
+   restarted automatically: mount present, all 11 `fs doctor` components
+   healthy with zero issues, and the 256 MiB fixture still had SHA-256
+   `bdf04ec3fa10af7b803564739818047eb558829cb23d136dc010bd4aaa064d52`.
+
+The durable local `PASS.json` records the pre-recovery partial SHA, both boot
+identities, verifier PID, final size/SHA, and zero journals. The harness first
+passed an uncounted arm/kill/verify preflight and a negative same-boot check;
+the latter refused recovery and preserved both the partial target and journal.
+This closes the in-flight macOS journal-recovery gate only. It does not shorten
+the incident-free retention requirement or authorize real-home migration.
 
 ## Native FSKit Development Checkpoint
 
@@ -68,13 +108,13 @@ Sanitized operation traces from real isolated Codex CLI `0.144.3`, bundled CLI `
 
 The current candidate passed real managed CLI and Desktop resume, durable append, a real repository fix with `go test ./...`, the official CLI fork flow, the Desktop `Continue in new task from here` flow, parent/child isolation, official archive/unarchive, managed service restart, host reboot, full-history recovery, and post-restart continuation. Build 102 then resumed the same managed parent through the current bundled CLI, recovered the prior fix rationale, inspected the real source and tests, and ran `go test ./...` successfully. The final managed parent contained 919,038 bytes and 636 valid JSONL records. Its original 393,640-byte folded base and every previously recorded full-file prefix remained byte-identical while all later writes stayed in the append delta; no writable backing was created. The build 102 Desktop app-server used the isolated Codex home and Electron data directory, and twice read the complete 919,038-byte managed parent without changing its SHA-256. The independently writable native Desktop child contained 882,688 bytes and 607 valid records, matched its native backing exactly, and had no managed-session state. The parent's database update preceded the child creation, the child turn did not update the parent, and branch-specific markers never crossed back into the parent.
 
-One intentionally interrupted slow-provider CLI turn emitted a client-local rollout-writer `EIO` before Codex reopened the file. The daemon trace contains no failed write for that event; all retry appends and the final `fsync` succeeded, the pre-interruption full-file SHA-256 remained an exact prefix, and all resulting records parsed. A subsequent normal real CLI turn completed without the warning. This is retained as interruption evidence, not counted as a clean client pass. Production activation, production service loading, and real-home migration remain disabled; actual in-flight power loss and the incident-free retention window remain open macOS promotion gates.
+One intentionally interrupted slow-provider CLI turn emitted a client-local rollout-writer `EIO` before Codex reopened the file. The daemon trace contains no failed write for that event; all retry appends and the final `fsync` succeeded, the pre-interruption full-file SHA-256 remained an exact prefix, and all resulting records parsed. A subsequent normal real CLI turn completed without the warning. This is retained as interruption evidence, not counted as a clean client pass. Production activation, production service loading, and real-home migration remain disabled while the incident-free retention window remains open; the separate controlled in-flight host-interruption gate is recorded above.
 
 The FUSE-T evidence below is retained as historical compatibility and regression evidence. It is not the terminal architecture and must not be used to claim Apple-native FSKit readiness.
 
 ## Historical FUSE-T Status
 
-The FUSE-T macOS adapter and isolated real Codex CLI and Desktop canaries have passed for read, append, resume, fork, child-session enrollment, canonical archive/unarchive moves, launchd restart, rollback, namespace deactivation, and unknown-version quarantine. A retained-source CLI canary survived an actual host reboot while managed, then resumed through the recovered mount and rolled back to an exact native JSONL. The currently installed CLI and Desktop versions also passed exact compatibility and isolated retained-source canaries. Process-level interruption recovery now covers append, compaction, migration, and rollback, and a managed session passed an actual Deep Idle sleep/wake cycle followed by a real model turn. The user Codex home now uses the canonical namespace with ordinary sessions remaining native passthrough and one explicitly selected retained-source canary managed for observation. The project remains at `fs-engine-preview` because that canary has not completed retention, in-flight transaction evidence does not claim an actual power-loss test, and the seven-day incident-free gate has not completed.
+The FUSE-T macOS adapter and isolated real Codex CLI and Desktop canaries have passed for read, append, resume, fork, child-session enrollment, canonical archive/unarchive moves, launchd restart, rollback, namespace deactivation, and unknown-version quarantine. A retained-source CLI canary survived an actual host reboot while managed, then resumed through the recovered mount and rolled back to an exact native JSONL. The currently installed CLI and Desktop versions also passed exact compatibility and isolated retained-source canaries. Process-level interruption recovery now covers append, compaction, migration, and rollback, and a managed session passed an actual Deep Idle sleep/wake cycle followed by a real model turn. The separate native-append in-flight host-interruption canary now has its own exact journal evidence above. The user Codex home now uses the canonical namespace with ordinary sessions remaining native passthrough and one explicitly selected retained-source canary managed for observation. The project remains at `fs-engine-preview` because that canary has not completed retention and the seven-day incident-free gate has not completed.
 
 Backend selection evidence on 2026-07-17:
 
@@ -270,7 +310,6 @@ A direct `SIGTERM` stopped the foreground service and removed the mount cleanly.
 The following gates are still open:
 
 - Completion of the dedicated retained-source user-home canary retention window.
-- An actual power-loss or host-restart interruption while a transaction is in flight; simultaneous process termination and a separate idle managed-session host reboot have passed, but they are recorded as distinct evidence.
 - Seven incident-free days after reaching `platform-canary`.
 
 Until every applicable gate passes, the project must keep the capability at `fs-engine-preview`, retain original JSONL files, and avoid changing real Codex routes.

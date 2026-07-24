@@ -6,6 +6,21 @@ pre-1.0, so a minor version may contain compatibility changes.
 
 ## [Unreleased]
 
+### Added
+
+- A Darwin-only controlled host-interruption canary for the native append
+  journal. It arms only with explicit environment variables, persists a
+  journal and partial JSONL tail on an isolated internal-volume fixture, and
+  requires a changed boot identity before product startup recovery can pass.
+
+### Validation
+
+- A real `reboot -q` interruption ran at the durable-journal / partial-tail
+  checkpoint. On the next boot, automatic recovery restored the exact base
+  SHA-256, rejected partial data, cleared the journal, and the independent
+  Pack-only FSKit canary returned to 11 healthy doctor components with its
+  256 MiB fixture unchanged.
+
 ## [0.3.0-beta.2] - 2026-07-24
 
 ### Added
