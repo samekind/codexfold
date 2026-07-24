@@ -3,6 +3,7 @@ package pack
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -11,13 +12,13 @@ import (
 	"math"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 
 	"github.com/klauspost/compress/zstd"
 	"github.com/samekind/codexfold/internal/fold"
 	"github.com/samekind/codexfold/internal/storage"
+	_ "modernc.org/sqlite"
 )
 
 type BuildOptions struct {
@@ -29,8 +30,8 @@ type BuildOptions struct {
 
 type BuildResult struct {
 	Generation  string                      `json:"generation"`
-	ObjectCount int                         `json:"object_count"`
-	BlockCount  int                         `json:"block_count"`
+	ObjectCount int64                       `json:"object_count"`
+	BlockCount  int64                       `json:"block_count"`
 	PackCount   int                         `json:"pack_count"`
 	RawBytes    int64                       `json:"raw_bytes"`
 	StoredBytes int64                       `json:"stored_bytes"`
@@ -64,10 +65,16 @@ func Build(ctx context.Context, storeDir string, options BuildOptions) (BuildRes
 		return BuildResult{}, err
 	}
 	defer lock.Close()
-	refs, err := referencedObjects(storeDir)
+	referenceDirectory, err := os.MkdirTemp(storeDir, ".pack-references-")
 	if err != nil {
 		return BuildResult{}, err
 	}
+	defer os.RemoveAll(referenceDirectory)
+	references, objectCount, rawBytes, err := buildReferenceIndex(ctx, storeDir, filepath.Join(referenceDirectory, "references.sqlite"))
+	if err != nil {
+		return BuildResult{}, err
+	}
+	defer references.Close()
 	budget := options.Budget
 	if budget == nil {
 		guard, err := storage.DefaultGuard(storeDir)
@@ -76,7 +83,7 @@ func Build(ctx context.Context, storeDir string, options BuildOptions) (BuildRes
 		}
 		budget = guard
 	}
-	estimatedBytes, err := estimatedGenerationBytes(refs)
+	estimatedBytes, err := estimatedGenerationBytes(rawBytes)
 	if err != nil {
 		return BuildResult{}, err
 	}
@@ -99,27 +106,63 @@ func Build(ctx context.Context, storeDir string, options BuildOptions) (BuildRes
 	}
 	defer func() { _ = os.RemoveAll(temporaryDir) }()
 	generation := "gen-" + strings.TrimPrefix(filepath.Base(temporaryDir), ".generation-")
-	index := Index{Version: IndexVersion, Kind: IndexKind, Generation: generation, CreatedAt: time.Now().UTC().Format(time.RFC3339Nano), BlockBytes: options.BlockBytes, Objects: make([]Object, 0, len(refs))}
-	result := BuildResult{Generation: generation, ObjectCount: len(refs)}
+	result := BuildResult{Generation: generation, ObjectCount: objectCount}
 	writer := &packWriter{directory: temporaryDir, limit: options.PackBytes}
+	objectsFile, err := os.OpenFile(filepath.Join(temporaryDir, indexV3ObjectsFile), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return BuildResult{}, err
+	}
+	blocksFile, err := os.OpenFile(filepath.Join(temporaryDir, indexV3BlocksFile), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		_ = objectsFile.Close()
+		return BuildResult{}, err
+	}
+	defer objectsFile.Close()
+	defer blocksFile.Close()
 	encoder, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedDefault))
 	if err != nil {
 		return BuildResult{}, fmt.Errorf("create pack encoder: %w", err)
 	}
 	defer encoder.Close()
 	store := fold.NewObjectStore(storeDir)
-	buffer := make([]byte, int(options.BlockBytes))
-	for _, ref := range refs {
-		if err := ctx.Err(); err != nil {
-			return BuildResult{}, err
-		}
-		stream, err := store.OpenStream(ref)
+	var packedSource *Resolver
+	if _, err := CurrentGeneration(storeDir); err == nil {
+		packedSource, err = Open(storeDir, OpenOptions{CacheBytes: -1})
 		if err != nil {
 			return BuildResult{}, err
 		}
-		object := Object{SHA256: ref.SHA256, RawBytes: ref.RawBytes}
+		defer packedSource.Close()
+	}
+	buffer := make([]byte, int(options.BlockBytes))
+	rows, err := references.QueryContext(ctx, `select digest, raw_bytes from pack_references order by digest`)
+	if err != nil {
+		_ = objectsFile.Close()
+		_ = blocksFile.Close()
+		return BuildResult{}, err
+	}
+	packIndexes := make(map[string]uint32)
+	packNames := make([]string, 0)
+	for rows.Next() {
+		if err := ctx.Err(); err != nil {
+			_ = rows.Close()
+			return BuildResult{}, err
+		}
+		var ref fold.ObjectRef
+		if err := rows.Scan(&ref.SHA256, &ref.RawBytes); err != nil {
+			_ = rows.Close()
+			return BuildResult{}, err
+		}
+		stream, err := store.OpenStream(ref)
+		if err != nil && errors.Is(err, os.ErrNotExist) && packedSource != nil {
+			stream, err = packedSource.OpenObject(ctx, ref)
+		}
+		if err != nil {
+			return BuildResult{}, err
+		}
 		objectHash := sha256.New()
 		var rawOffset int64
+		firstBlock := result.BlockCount
+		var objectBlocks uint32
 		for {
 			n, readErr := io.ReadFull(stream, buffer)
 			if n > 0 {
@@ -138,9 +181,27 @@ func Build(ctx context.Context, storeDir string, options BuildOptions) (BuildRes
 					return BuildResult{}, writeErr
 				}
 				blockHash := sha256.Sum256(raw)
-				object.Blocks = append(object.Blocks, Block{Pack: packName, PackOffset: packOffset, StoredBytes: int64(len(stored)), RawOffset: rawOffset, RawBytes: int64(n), SHA256: hex.EncodeToString(blockHash[:]), Encoding: encoding})
+				packIndex, exists := packIndexes[packName]
+				if !exists {
+					packIndex = uint32(len(packNames))
+					packIndexes[packName] = packIndex
+					packNames = append(packNames, packName)
+				}
+				encodingByte := byte(0)
+				if encoding == EncodingRaw {
+					encodingByte = 1
+				}
+				if _, err := blocksFile.Write(encodeBlockV3(blockV3Record{PackIndex: packIndex, PackOffset: packOffset, StoredBytes: int64(len(stored)), RawOffset: rawOffset, RawBytes: int64(n), Digest: blockHash, Encoding: encodingByte})); err != nil {
+					_ = stream.Close()
+					return BuildResult{}, err
+				}
 				rawOffset += int64(n)
 				result.BlockCount++
+				if objectBlocks == ^uint32(0) {
+					_ = stream.Close()
+					return BuildResult{}, fmt.Errorf("object %s exceeds pack v3 block count", ref.SHA256)
+				}
+				objectBlocks++
 				result.RawBytes += int64(n)
 				result.StoredBytes += int64(len(stored))
 			}
@@ -158,16 +219,33 @@ func Build(ctx context.Context, storeDir string, options BuildOptions) (BuildRes
 		if rawOffset != ref.RawBytes || hex.EncodeToString(objectHash.Sum(nil)) != ref.SHA256 {
 			return BuildResult{}, fmt.Errorf("loose object %s failed stream verification", ref.SHA256)
 		}
-		index.Objects = append(index.Objects, object)
+		digest, err := decodeDigest(ref.SHA256)
+		if err != nil {
+			return BuildResult{}, err
+		}
+		if _, err := objectsFile.Write(encodeObjectV3(objectV3Record{Digest: digest, RawBytes: ref.RawBytes, FirstBlock: firstBlock, BlockCount: objectBlocks})); err != nil {
+			return BuildResult{}, err
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return BuildResult{}, err
+	}
+	if err := rows.Close(); err != nil {
+		return BuildResult{}, err
 	}
 	if err := writer.close(); err != nil {
 		return BuildResult{}, err
 	}
-	result.PackCount = writer.sequence
-	if err := writeIndex(temporaryDir, index); err != nil {
+	if err := syncAndCloseIndexFiles(objectsFile, blocksFile); err != nil {
 		return BuildResult{}, err
 	}
-	if err := verifyGeneration(ctx, temporaryDir, index); err != nil {
+	result.PackCount = writer.sequence
+	meta := indexV3Meta{Version: indexV3Version, Kind: indexV3Kind, Generation: generation, CreatedAt: time.Now().UTC().Format(time.RFC3339Nano), BlockBytes: options.BlockBytes, ObjectCount: result.ObjectCount, BlockCount: result.BlockCount, Packs: packNames}
+	if err := writeIndexV3Meta(temporaryDir, meta); err != nil {
+		return BuildResult{}, err
+	}
+	if err := verifyGeneration(ctx, temporaryDir); err != nil {
 		return BuildResult{}, fmt.Errorf("verify candidate pack generation: %w", err)
 	}
 	finalDir := filepath.Join(packsDir, generation)
@@ -196,14 +274,10 @@ func preferRawBlock(raw []byte, compressed []byte) bool {
 	return len(raw) <= 16<<10 && len(compressed)*2 >= len(raw)
 }
 
-func estimatedGenerationBytes(refs []fold.ObjectRef) (int64, error) {
+func estimatedGenerationBytes(rawBytes int64) (int64, error) {
 	const fixedOverhead = int64(1 << 20)
-	var rawBytes int64
-	for _, ref := range refs {
-		if ref.RawBytes < 0 || rawBytes > math.MaxInt64-ref.RawBytes {
-			return 0, errors.New("pack generation byte estimate overflow")
-		}
-		rawBytes += ref.RawBytes
+	if rawBytes < 0 {
+		return 0, errors.New("pack generation byte estimate overflow")
 	}
 	compressionOverhead := rawBytes/16 + fixedOverhead
 	if rawBytes > math.MaxInt64-compressionOverhead {
@@ -212,9 +286,30 @@ func estimatedGenerationBytes(refs []fold.ObjectRef) (int64, error) {
 	return rawBytes + compressionOverhead, nil
 }
 
-func referencedObjects(storeDir string) ([]fold.ObjectRef, error) {
-	refs := make(map[string]fold.ObjectRef)
-	err := filepath.WalkDir(filepath.Join(storeDir, "manifests"), func(path string, entry os.DirEntry, walkErr error) error {
+func buildReferenceIndex(ctx context.Context, storeDir string, path string) (*sql.DB, int64, int64, error) {
+	database, err := sql.Open("sqlite", path)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	keep := false
+	defer func() {
+		if !keep {
+			_ = database.Close()
+		}
+	}()
+	if _, err := database.ExecContext(ctx, `pragma journal_mode=off; pragma synchronous=off; pragma temp_store=file; pragma cache_size=-16384; create table pack_references (digest text primary key, raw_bytes integer not null) without rowid`); err != nil {
+		return nil, 0, 0, err
+	}
+	transaction, err := database.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	statement, err := transaction.PrepareContext(ctx, `insert into pack_references(digest, raw_bytes) values (?, ?) on conflict(digest) do update set raw_bytes = case when raw_bytes = excluded.raw_bytes then raw_bytes else -1 end`)
+	if err != nil {
+		_ = transaction.Rollback()
+		return nil, 0, 0, err
+	}
+	err = filepath.WalkDir(filepath.Join(storeDir, "manifests"), func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
@@ -226,26 +321,73 @@ func referencedObjects(storeDir string) ([]fold.ObjectRef, error) {
 			return err
 		}
 		for _, part := range manifest.Parts {
-			if existing, ok := refs[part.Object.SHA256]; ok && existing.RawBytes != part.Object.RawBytes {
-				return fmt.Errorf("object %s has conflicting raw lengths", part.Object.SHA256)
+			if _, err := statement.ExecContext(ctx, part.Object.SHA256, part.Object.RawBytes); err != nil {
+				return err
 			}
-			refs[part.Object.SHA256] = part.Object
 		}
 		return nil
 	})
+	closeErr := statement.Close()
 	if err != nil {
-		return nil, fmt.Errorf("read manifests for pack build: %w", err)
+		_ = transaction.Rollback()
+		return nil, 0, 0, fmt.Errorf("read manifests for pack build: %w", err)
 	}
-	digests := make([]string, 0, len(refs))
-	for digest := range refs {
-		digests = append(digests, digest)
+	if closeErr != nil {
+		_ = transaction.Rollback()
+		return nil, 0, 0, closeErr
 	}
-	sort.Strings(digests)
-	result := make([]fold.ObjectRef, 0, len(digests))
-	for _, digest := range digests {
-		result = append(result, refs[digest])
+	if err := transaction.Commit(); err != nil {
+		return nil, 0, 0, err
 	}
-	return result, nil
+	var conflicts int64
+	if err := database.QueryRowContext(ctx, `select count(*) from pack_references where raw_bytes < 0`).Scan(&conflicts); err != nil {
+		return nil, 0, 0, err
+	}
+	if conflicts != 0 {
+		return nil, 0, 0, fmt.Errorf("%d object digest(s) have conflicting raw lengths", conflicts)
+	}
+	var count, bytes int64
+	if err := database.QueryRowContext(ctx, `select count(*), coalesce(sum(raw_bytes), 0) from pack_references`).Scan(&count, &bytes); err != nil {
+		return nil, 0, 0, err
+	}
+	keep = true
+	return database, count, bytes, nil
+}
+
+func syncAndCloseIndexFiles(files ...*os.File) error {
+	for _, file := range files {
+		if err := file.Sync(); err != nil {
+			return err
+		}
+		if err := file.Close(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func writeIndexV3Meta(directory string, meta indexV3Meta) error {
+	data, err := json.Marshal(meta)
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	file, err := os.OpenFile(filepath.Join(directory, indexV3MetaFilename), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := file.Write(data); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	return syncDirectory(directory)
 }
 
 func (w *packWriter) write(data []byte) (string, int64, error) {

@@ -1316,6 +1316,7 @@ func newFSCompactCommand() *cobra.Command {
 					manifestPath := filepath.Join(store, "manifests", "generations", state.SessionID, fmt.Sprintf("%020d.json", generation))
 					options := fold.FoldOptions{
 						StoreDir: store, ManifestPathOverride: manifestPath, Apply: true, Overwrite: true,
+						ExistingReader: resolver,
 						FieldThreshold: currentManifest.Settings.FieldThreshold, MaxJSONLineBytes: currentManifest.Settings.MaxJSONLineBytes,
 						CDC: cdc.Options{MinBytes: currentManifest.Settings.CDCMinBytes, AverageBytes: currentManifest.Settings.CDCAverageBytes, MaxBytes: currentManifest.Settings.CDCMaxBytes},
 					}

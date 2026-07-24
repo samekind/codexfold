@@ -2,11 +2,8 @@ package fold
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -49,9 +46,12 @@ func Doctor(ctx context.Context, storeDir string) (DoctorResult, error) {
 func DoctorWithOptions(ctx context.Context, storeDir string, options DoctorOptions) (DoctorResult, error) {
 	result := DoctorResult{StoreDir: storeDir, Issues: make([]DoctorIssue, 0)}
 	reader := openObjectReader(storeDir, options.Reader)
-	store := NewObjectStore(storeDir)
-	unique := make(map[string]ObjectRef)
-	err := walkManifestPaths(storeDir, func(path string) error {
+	unique, err := newDiskDigestSet()
+	if err != nil {
+		return DoctorResult{}, err
+	}
+	defer unique.Close()
+	err = walkManifestPaths(storeDir, func(path string) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -63,7 +63,9 @@ func DoctorWithOptions(ctx context.Context, storeDir string, options DoctorOptio
 		}
 		for _, part := range manifest.Parts {
 			result.ObjectReferenceCount++
-			unique[part.Object.SHA256] = part.Object
+			if err := unique.Add(part.Object.SHA256); err != nil {
+				return err
+			}
 		}
 		if err := verifyStoredManifest(ctx, reader, manifest); err != nil {
 			result.Issues = append(result.Issues, DoctorIssue{
@@ -77,27 +79,11 @@ func DoctorWithOptions(ctx context.Context, storeDir string, options DoctorOptio
 	if err != nil {
 		return DoctorResult{}, err
 	}
-	result.UniqueObjectCount = len(unique)
-	for digest, ref := range unique {
-		if err := ctx.Err(); err != nil {
-			return DoctorResult{}, err
-		}
-		stream, err := reader.OpenObject(ctx, ref)
-		if err == nil {
-			hasher := sha256.New()
-			var bytesRead int64
-			bytesRead, err = io.Copy(hasher, stream)
-			err = errors.Join(err, stream.Close())
-			if err == nil && (bytesRead != ref.RawBytes || hex.EncodeToString(hasher.Sum(nil)) != ref.SHA256) {
-				err = fmt.Errorf("object reconstruction mismatch")
-			}
-		}
-		if err != nil {
-			result.Issues = append(result.Issues, DoctorIssue{
-				Scope: "object", Path: store.ObjectPath(digest), Error: err.Error(),
-			})
-		}
+	uniqueCount, err := unique.Count(ctx)
+	if err != nil {
+		return DoctorResult{}, err
 	}
+	result.UniqueObjectCount = uniqueCount
 	result.Storage, err = storage.Scan(ctx, storage.Options{StoreDir: storeDir, AllowMetadataIssues: true})
 	if err != nil {
 		result.Issues = append(result.Issues, DoctorIssue{Scope: "storage", Path: storeDir, Error: err.Error()})

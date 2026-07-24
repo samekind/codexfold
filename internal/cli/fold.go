@@ -33,6 +33,11 @@ func newFoldCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			resolver, packErr := pack.Open(options.StoreDir, pack.OpenOptions{CacheBytes: -1})
+			if packErr == nil {
+				defer resolver.Close()
+				options.ExistingReader = resolver
+			}
 			result, err := fold.Fold(command.Context(), toFoldSession(session), options)
 			if err != nil {
 				return err

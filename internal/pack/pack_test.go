@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -83,6 +84,75 @@ func TestBuildAndResolverReadExactRandomRanges(t *testing.T) {
 	}
 }
 
+func TestBuildWritesBoundedV3IndexAndResolverKeepsNoObjectMap(t *testing.T) {
+	root := t.TempDir()
+	values := make([][]byte, 0, 256)
+	for index := 0; index < 256; index++ {
+		values = append(values, []byte(fmt.Sprintf("bounded-v3-object-%06d", index)))
+	}
+	refs := putObjects(t, root, values...)
+	writeManifest(t, root, "session", refs)
+	result, err := Build(context.Background(), root, BuildOptions{BlockBytes: 4 << 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory := filepath.Join(root, "packs", result.Generation)
+	if _, err := os.Stat(filepath.Join(directory, "index.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("v3 build emitted legacy JSON index: %v", err)
+	}
+	metaData, err := os.ReadFile(filepath.Join(directory, indexV3MetaFilename))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var meta indexV3Meta
+	if err := json.Unmarshal(metaData, &meta); err != nil {
+		t.Fatal(err)
+	}
+	objectsInfo, err := os.Stat(filepath.Join(directory, indexV3ObjectsFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocksInfo, err := os.Stat(filepath.Join(directory, indexV3BlocksFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.ObjectCount != int64(len(refs)) || objectsInfo.Size() != meta.ObjectCount*objectV3RecordBytes || blocksInfo.Size() != meta.BlockCount*blockV3RecordBytes {
+		t.Fatalf("v3 fixed index sizes: meta=%#v objects=%d blocks=%d", meta, objectsInfo.Size(), blocksInfo.Size())
+	}
+	resolver, err := Open(root, OpenOptions{CacheBytes: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resolver.Close()
+	if resolver.v3 == nil || len(resolver.objects) != 0 || resolver.ObjectCount() != int64(len(refs)) {
+		t.Fatalf("v3 resolver retained legacy map: v3=%t map=%d count=%d", resolver.v3 != nil, len(resolver.objects), resolver.ObjectCount())
+	}
+}
+
+func TestResolverRejectsUnsortedV3ObjectIndex(t *testing.T) {
+	root := t.TempDir()
+	refs := putObjects(t, root, []byte("unsorted-a"), []byte("unsorted-b"))
+	writeManifest(t, root, "session", refs)
+	result, err := Build(context.Background(), root, BuildOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, "packs", result.Generation, indexV3ObjectsFile)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := append([]byte(nil), data[:objectV3RecordBytes]...)
+	copy(data[:objectV3RecordBytes], data[objectV3RecordBytes:2*objectV3RecordBytes])
+	copy(data[objectV3RecordBytes:2*objectV3RecordBytes], first)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(root, OpenOptions{}); err == nil || !strings.Contains(err.Error(), "strictly sorted") {
+		t.Fatalf("unsorted v3 index error = %v", err)
+	}
+}
+
 func TestPackOnlyUnfoldAndFoldDoctor(t *testing.T) {
 	root := t.TempDir()
 	first := []byte("first packed object\n")
@@ -118,6 +188,50 @@ func TestPackOnlyUnfoldAndFoldDoctor(t *testing.T) {
 	}
 }
 
+func TestFoldReusesPackedObjectWithoutRecreatingLooseCopy(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "first.jsonl")
+	data := bytes.Repeat([]byte("{\"packed_reuse\":\"same-large-value\"}\n"), 200)
+	if err := os.WriteFile(source, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fold.Fold(context.Background(), fold.Session{ID: "first", RolloutPath: source, Archived: true}, fold.FoldOptions{StoreDir: root, Apply: true, FieldThreshold: 8}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Build(context.Background(), root, BuildOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	resolver, err := Open(root, OpenOptions{CacheBytes: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resolver.Close()
+	if _, err := RetireLoose(context.Background(), root, RetireLooseOptions{Apply: true}); err != nil {
+		t.Fatal(err)
+	}
+	second := filepath.Join(root, "second.jsonl")
+	if err := os.WriteFile(second, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result, err := fold.Fold(context.Background(), fold.Session{ID: "second", RolloutPath: second, Archived: true}, fold.FoldOptions{StoreDir: root, Apply: true, FieldThreshold: 8, ExistingReader: resolver})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.UniqueObjects != 0 || result.ReusedObjects == 0 || result.NewStoredBytes != 0 {
+		t.Fatalf("packed fold reuse = %#v", result)
+	}
+	looseFiles := 0
+	_ = filepath.WalkDir(filepath.Join(root, "objects"), func(_ string, entry os.DirEntry, err error) error {
+		if err == nil && !entry.IsDir() && filepath.Ext(entry.Name()) == ".zst" {
+			looseFiles++
+		}
+		return err
+	})
+	if looseFiles != 0 {
+		t.Fatalf("fold recreated %d loose object(s)", looseFiles)
+	}
+}
+
 func TestRetireLooseRequiresPackOnlyProofAndReportsActualReclamation(t *testing.T) {
 	root := t.TempDir()
 	refs := putObjects(t, root, bytes.Repeat([]byte("retire-loose-object"), 1000))
@@ -150,6 +264,12 @@ func TestRetireLooseRequiresPackOnlyProofAndReportsActualReclamation(t *testing.
 	target := filepath.Join(t.TempDir(), "restored.jsonl")
 	if _, err := fold.UnfoldWithOptions(context.Background(), root, "session", fold.UnfoldOptions{TargetPath: target, Reader: resolver}); err != nil {
 		t.Fatalf("unfold after loose retirement: %v", err)
+	}
+	if _, err := Build(context.Background(), root, BuildOptions{}); err != nil {
+		t.Fatalf("pack-only rebuild after loose retirement: %v", err)
+	}
+	if _, err := os.Stat(fold.NewObjectStore(root).ObjectPath(refs[0].SHA256)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("pack-only rebuild recreated loose object: %v", err)
 	}
 }
 
@@ -298,6 +418,11 @@ func TestResolverOpensLegacyV1ZstdIndex(t *testing.T) {
 	}
 	if err := os.WriteFile(filepath.Join(root, "packs", result.Generation, "index.json"), encoded, 0o600); err != nil {
 		t.Fatal(err)
+	}
+	for _, name := range []string{indexV3MetaFilename, indexV3ObjectsFile, indexV3BlocksFile} {
+		if err := os.Remove(filepath.Join(root, "packs", result.Generation, name)); err != nil {
+			t.Fatal(err)
+		}
 	}
 	resolver, err := Open(root, OpenOptions{})
 	if err != nil {
@@ -682,7 +807,20 @@ func loadCurrentIndex(t *testing.T, root string) Index {
 	if err != nil {
 		t.Fatalf("read CURRENT: %v", err)
 	}
-	data, err := os.ReadFile(filepath.Join(root, "packs", string(bytes.TrimSpace(current)), "index.json"))
+	directory := filepath.Join(root, "packs", string(bytes.TrimSpace(current)))
+	if v3, err := openIndexV3(directory); err == nil {
+		defer v3.close()
+		index := Index{Version: v3.meta.Version, Kind: v3.meta.Kind, Generation: v3.meta.Generation, CreatedAt: v3.meta.CreatedAt, BlockBytes: v3.meta.BlockBytes, Objects: make([]Object, 0, v3.meta.ObjectCount)}
+		for position := int64(0); position < v3.meta.ObjectCount; position++ {
+			object, err := v3.objectAt(position)
+			if err != nil {
+				t.Fatalf("read v3 object %d: %v", position, err)
+			}
+			index.Objects = append(index.Objects, object)
+		}
+		return index
+	}
+	data, err := os.ReadFile(filepath.Join(directory, "index.json"))
 	if err != nil {
 		t.Fatalf("read index: %v", err)
 	}

@@ -20,8 +20,8 @@ type DoctorIssue struct {
 
 type DoctorResult struct {
 	Generation            string        `json:"generation,omitempty"`
-	ObjectCount           int           `json:"object_count"`
-	VerifiedCount         int           `json:"verified_count"`
+	ObjectCount           int64         `json:"object_count"`
+	VerifiedCount         int64         `json:"verified_count"`
 	ManifestCount         int           `json:"manifest_count"`
 	VerifiedManifestCount int           `json:"verified_manifest_count"`
 	IssueCount            int           `json:"issue_count"`
@@ -34,8 +34,13 @@ func Doctor(ctx context.Context, storeDir string) (DoctorResult, error) {
 		return DoctorResult{IssueCount: 1, Issues: []DoctorIssue{{Message: err.Error()}}}, nil
 	}
 	defer resolver.Close()
-	result := DoctorResult{Generation: resolver.index.Generation, ObjectCount: len(resolver.index.Objects)}
-	for _, object := range resolver.index.Objects {
+	result := DoctorResult{Generation: resolver.Generation(), ObjectCount: resolver.ObjectCount()}
+	for position := int64(0); position < resolver.ObjectCount(); position++ {
+		object, objectErr := resolver.objectAt(position)
+		if objectErr != nil {
+			result.Issues = append(result.Issues, DoctorIssue{Message: objectErr.Error()})
+			continue
+		}
 		hasher := sha256.New()
 		buffer := make([]byte, 128<<10)
 		var offset int64
@@ -130,13 +135,17 @@ func verifyPackedManifests(ctx context.Context, storeDir string, resolver *Resol
 	return err
 }
 
-func verifyGeneration(ctx context.Context, directory string, index Index) error {
+func verifyGeneration(ctx context.Context, directory string) error {
 	resolver, err := openGeneration(directory, 0, false)
 	if err != nil {
 		return err
 	}
 	defer resolver.Close()
-	for _, object := range index.Objects {
+	for position := int64(0); position < resolver.ObjectCount(); position++ {
+		object, err := resolver.objectAt(position)
+		if err != nil {
+			return err
+		}
 		hasher := sha256.New()
 		buffer := make([]byte, 128<<10)
 		var offset int64

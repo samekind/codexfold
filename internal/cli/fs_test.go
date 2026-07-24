@@ -2684,21 +2684,11 @@ func TestStartupStorageGCRunsOnlyAfterHealthyStoreVerification(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	index, err := os.ReadFile(filepath.Join(storeDir, "packs", strings.TrimSpace(string(current)), "index.json"))
-	if err != nil {
-		t.Fatal(err)
+	packs, err := filepath.Glob(filepath.Join(storeDir, "packs", strings.TrimSpace(string(current)), "pack-*.pack"))
+	if err != nil || len(packs) == 0 {
+		t.Fatalf("find current pack files: %#v err=%v", packs, err)
 	}
-	var decoded struct {
-		Objects []struct {
-			Blocks []struct {
-				Pack string `json:"pack"`
-			} `json:"blocks"`
-		} `json:"objects"`
-	}
-	if err := json.Unmarshal(index, &decoded); err != nil || len(decoded.Objects) == 0 || len(decoded.Objects[0].Blocks) == 0 {
-		t.Fatalf("decode current pack index: %#v err=%v", decoded, err)
-	}
-	packPath := filepath.Join(storeDir, "packs", strings.TrimSpace(string(current)), decoded.Objects[0].Blocks[0].Pack)
+	packPath := packs[0]
 	if err := os.WriteFile(packPath, []byte("corrupt"), 0o600); err != nil {
 		t.Fatal(err)
 	}

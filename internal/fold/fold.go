@@ -31,6 +31,7 @@ type FoldOptions struct {
 	MaxJSONLineBytes     int64
 	CDC                  cdc.Options
 	Budget               storage.Checker
+	ExistingReader       ObjectReader
 	beforeCommit         func() error
 }
 
@@ -170,6 +171,10 @@ func Fold(ctx context.Context, session Session, options FoldOptions) (FoldResult
 		ManifestPath: manifestPath, DryRun: !options.Apply,
 	}
 	store := NewObjectStore(options.StoreDir)
+	objectReader := ObjectReader(store)
+	if options.ExistingReader != nil {
+		objectReader = fallbackObjectReader{primary: store, fallback: options.ExistingReader}
+	}
 	sourceHash := sha256.New()
 	reconstructionHash := sha256.New()
 	var reconstructionBytes int64
@@ -178,7 +183,13 @@ func Fold(ctx context.Context, session Session, options FoldOptions) (FoldResult
 		if len(data) == 0 {
 			return nil
 		}
-		ref, reused, err := store.Put(data, options.Apply)
+		digest := sha256.Sum256(data)
+		ref := ObjectRef{SHA256: hex.EncodeToString(digest[:]), RawBytes: int64(len(data))}
+		reused := options.ExistingReader != nil && options.ExistingReader.HasObject(ref)
+		var err error
+		if !reused {
+			ref, reused, err = store.Put(data, options.Apply)
+		}
 		if err != nil {
 			return err
 		}
@@ -313,7 +324,7 @@ complete:
 	if !options.Apply {
 		return result, nil
 	}
-	if err := verifyStoredManifest(ctx, store, manifest); err != nil {
+	if err := verifyStoredManifest(ctx, objectReader, manifest); err != nil {
 		return FoldResult{}, err
 	}
 	if err := store.SyncPending(ctx); err != nil {

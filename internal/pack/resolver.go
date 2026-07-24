@@ -1,6 +1,7 @@
 package pack
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -29,6 +30,9 @@ type Resolver struct {
 	directory            string
 	index                Index
 	objects              map[string]Object
+	v3                   *indexV3
+	generation           string
+	objectCount          int64
 	packs                map[string]*os.File
 	cache                *blockCache
 	decoders             chan *zstd.Decoder
@@ -51,6 +55,9 @@ type resolverResources struct {
 	directory            string
 	index                Index
 	objects              map[string]Object
+	v3                   *indexV3
+	generation           string
+	objectCount          int64
 	packs                map[string]*os.File
 	cache                *blockCache
 	decoders             chan *zstd.Decoder
@@ -126,21 +133,31 @@ func loadResolverResources(key resolverResourceKey) (*resolverResources, error) 
 			_ = lease.Close()
 		}
 	}()
-	data, err := os.ReadFile(filepath.Join(directory, "index.json"))
-	if err != nil {
-		return nil, fmt.Errorf("read pack index: %w", err)
-	}
 	var index Index
-	if err := json.Unmarshal(data, &index); err != nil {
-		return nil, fmt.Errorf("decode pack index: %w", err)
-	}
-	normalizeLegacyIndex(&index)
-	directoryName := filepath.Base(directory)
-	if directoryName != index.Generation && !strings.HasPrefix(directoryName, ".generation-") {
-		return nil, fmt.Errorf("pack index generation %q does not match directory %q", index.Generation, filepath.Base(directory))
-	}
-	if err := validateIndex(index); err != nil {
-		return nil, err
+	var v3 *indexV3
+	if _, statErr := os.Stat(filepath.Join(directory, indexV3MetaFilename)); statErr == nil {
+		v3, err = openIndexV3(directory)
+		if err != nil {
+			return nil, err
+		}
+	} else if !errors.Is(statErr, os.ErrNotExist) {
+		return nil, statErr
+	} else {
+		data, readErr := os.ReadFile(filepath.Join(directory, "index.json"))
+		if readErr != nil {
+			return nil, fmt.Errorf("read pack index: %w", readErr)
+		}
+		if err := json.Unmarshal(data, &index); err != nil {
+			return nil, fmt.Errorf("decode pack index: %w", err)
+		}
+		normalizeLegacyIndex(&index)
+		directoryName := filepath.Base(directory)
+		if directoryName != index.Generation && !strings.HasPrefix(directoryName, ".generation-") {
+			return nil, fmt.Errorf("pack index generation %q does not match directory %q", index.Generation, filepath.Base(directory))
+		}
+		if err := validateIndex(index); err != nil {
+			return nil, err
+		}
 	}
 	decoderPoolSize := runtime.GOMAXPROCS(0)
 	if decoderPoolSize < 1 {
@@ -150,37 +167,49 @@ func loadResolverResources(key resolverResourceKey) (*resolverResources, error) 
 		decoderPoolSize = 32
 	}
 	shared = &resolverResources{
-		key:       key,
-		directory: directory, index: index, objects: make(map[string]Object, len(index.Objects)),
-		packs: make(map[string]*os.File), cache: newBlockCache(key.cacheBytes),
+		key: key, directory: directory, index: index, v3: v3,
+		objects: make(map[string]Object, len(index.Objects)),
+		packs:   make(map[string]*os.File), cache: newBlockCache(key.cacheBytes),
 		decoders: make(chan *zstd.Decoder, decoderPoolSize), lease: lease,
+	}
+	packNames := make([]string, 0)
+	if v3 != nil {
+		shared.generation = v3.meta.Generation
+		shared.objectCount = v3.meta.ObjectCount
+		packNames = append(packNames, v3.meta.Packs...)
+	} else {
+		shared.generation = index.Generation
+		shared.objectCount = int64(len(index.Objects))
 	}
 	for _, object := range index.Objects {
 		shared.objects[object.SHA256] = object
 		for _, block := range object.Blocks {
-			if _, ok := shared.packs[block.Pack]; ok {
-				continue
-			}
-			file, err := os.Open(filepath.Join(directory, block.Pack))
-			if err != nil {
-				return nil, fmt.Errorf("open pack %s: %w", block.Pack, err)
-			}
-			if key.bypassOSCache {
-				applied, err := configureNoCache(file)
-				if err != nil {
-					_ = file.Close()
-					return nil, fmt.Errorf("disable OS cache for pack %s: %w", block.Pack, err)
-				}
-				shared.bypassOSCacheApplied = shared.bypassOSCacheApplied || applied
-			}
-			shared.packs[block.Pack] = file
+			packNames = append(packNames, block.Pack)
 		}
+	}
+	for _, packName := range packNames {
+		if _, ok := shared.packs[packName]; ok {
+			continue
+		}
+		file, err := os.Open(filepath.Join(directory, packName))
+		if err != nil {
+			return nil, fmt.Errorf("open pack %s: %w", packName, err)
+		}
+		if key.bypassOSCache {
+			applied, err := configureNoCache(file)
+			if err != nil {
+				_ = file.Close()
+				return nil, fmt.Errorf("disable OS cache for pack %s: %w", packName, err)
+			}
+			shared.bypassOSCacheApplied = shared.bypassOSCacheApplied || applied
+		}
+		shared.packs[packName] = file
 	}
 	packSizes, err := resolverPackSizes(shared.packs)
 	if err != nil {
 		return nil, err
 	}
-	if err := validatePackedBlockBounds(index, packSizes); err != nil {
+	if err := validateResolverBounds(shared, packSizes); err != nil {
 		return nil, err
 	}
 	keepResources = true
@@ -189,11 +218,37 @@ func loadResolverResources(key resolverResourceKey) (*resolverResources, error) 
 
 func resolverFromResources(shared *resolverResources) *Resolver {
 	return &Resolver{
-		directory: shared.directory, index: shared.index, objects: shared.objects,
+		directory: shared.directory, index: shared.index, objects: shared.objects, v3: shared.v3,
+		generation: shared.generation, objectCount: shared.objectCount,
 		packs: shared.packs, cache: shared.cache, decoders: shared.decoders,
 		decoderFactory: newPackDecoder, lease: shared.lease,
 		bypassOSCacheApplied: shared.bypassOSCacheApplied, shared: shared,
 	}
+}
+
+func validateResolverBounds(shared *resolverResources, packSizes map[string]int64) error {
+	if shared.v3 == nil {
+		return validatePackedBlockBounds(shared.index, packSizes)
+	}
+	var previous [32]byte
+	for position := int64(0); position < shared.v3.meta.ObjectCount; position++ {
+		record, err := shared.v3.readObjectRecord(position)
+		if err != nil {
+			return err
+		}
+		if position > 0 && bytes.Compare(previous[:], record.Digest[:]) >= 0 {
+			return errors.New("pack v3 object index is not strictly sorted")
+		}
+		previous = record.Digest
+		object, err := shared.v3.objectAt(position)
+		if err != nil {
+			return err
+		}
+		if err := validateObjectBlockBounds(object, packSizes); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func resolverPackSizes(packs map[string]*os.File) (map[string]int64, error) {
@@ -210,14 +265,21 @@ func resolverPackSizes(packs map[string]*os.File) (map[string]int64, error) {
 
 func validatePackedBlockBounds(index Index, packSizes map[string]int64) error {
 	for _, object := range index.Objects {
-		for blockIndex, block := range object.Blocks {
-			packSize, exists := packSizes[block.Pack]
-			if !exists {
-				return fmt.Errorf("packed block %s:%d references unopened pack %s", object.SHA256, blockIndex, block.Pack)
-			}
-			if block.PackOffset > packSize || block.StoredBytes > packSize-block.PackOffset {
-				return fmt.Errorf("packed block %s:%d exceeds %s size", object.SHA256, blockIndex, block.Pack)
-			}
+		if err := validateObjectBlockBounds(object, packSizes); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateObjectBlockBounds(object Object, packSizes map[string]int64) error {
+	for blockIndex, block := range object.Blocks {
+		packSize, exists := packSizes[block.Pack]
+		if !exists {
+			return fmt.Errorf("packed block %s:%d references unopened pack %s", object.SHA256, blockIndex, block.Pack)
+		}
+		if block.PackOffset > packSize || block.StoredBytes > packSize-block.PackOffset {
+			return fmt.Errorf("packed block %s:%d exceeds %s size", object.SHA256, blockIndex, block.Pack)
 		}
 	}
 	return nil
@@ -225,11 +287,36 @@ func validatePackedBlockBounds(index Index, packSizes map[string]int64) error {
 
 func (r *Resolver) OSCacheBypassApplied() bool { return r.bypassOSCacheApplied }
 
-func (r *Resolver) Generation() string { return r.index.Generation }
+func (r *Resolver) Generation() string { return r.generation }
+
+func (r *Resolver) ObjectCount() int64 { return r.objectCount }
+
+func (r *Resolver) objectAt(position int64) (Object, error) {
+	if position < 0 || position >= r.objectCount {
+		return Object{}, io.EOF
+	}
+	if r.v3 != nil {
+		return r.v3.objectAt(position)
+	}
+	return r.index.Objects[position], nil
+}
 
 func (r *Resolver) HasDigest(digest string) bool {
-	_, ok := r.objects[digest]
-	return ok
+	_, ok, err := r.lookupObject(digest)
+	return err == nil && ok
+}
+
+func (r *Resolver) HasObject(ref fold.ObjectRef) bool {
+	object, ok, err := r.lookupObject(ref.SHA256)
+	return err == nil && ok && object.RawBytes == ref.RawBytes
+}
+
+func (r *Resolver) lookupObject(digest string) (Object, bool, error) {
+	if r.v3 != nil {
+		return r.v3.lookup(digest)
+	}
+	object, ok := r.objects[digest]
+	return object, ok, nil
 }
 
 func (r *Resolver) ReadAt(ctx context.Context, ref fold.ObjectRef, destination []byte, offset int64) (int, error) {
@@ -239,7 +326,10 @@ func (r *Resolver) ReadAt(ctx context.Context, ref fold.ObjectRef, destination [
 	if len(destination) == 0 {
 		return 0, nil
 	}
-	object, ok := r.objects[ref.SHA256]
+	object, ok, lookupErr := r.lookupObject(ref.SHA256)
+	if lookupErr != nil {
+		return 0, lookupErr
+	}
 	if !ok {
 		return 0, fmt.Errorf("object %s is not packed", ref.SHA256)
 	}
@@ -285,7 +375,10 @@ type objectStream struct {
 }
 
 func (r *Resolver) OpenObject(ctx context.Context, ref fold.ObjectRef) (io.ReadCloser, error) {
-	object, ok := r.objects[ref.SHA256]
+	object, ok, lookupErr := r.lookupObject(ref.SHA256)
+	if lookupErr != nil {
+		return nil, lookupErr
+	}
 	if !ok {
 		return nil, fmt.Errorf("object %s is not packed", ref.SHA256)
 	}
@@ -407,6 +500,9 @@ func closeResolverResources(shared *resolverResources) error {
 		if err := shared.packs[name].Close(); err != nil && closeErr == nil {
 			closeErr = err
 		}
+	}
+	if shared.v3 != nil {
+		closeErr = errors.Join(closeErr, shared.v3.close())
 	}
 	for {
 		select {

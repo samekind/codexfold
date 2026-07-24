@@ -16,6 +16,11 @@ func (s *ObjectStore) OpenObject(_ context.Context, ref ObjectRef) (io.ReadClose
 	return s.OpenStream(ref)
 }
 
+func (s *ObjectStore) HasObject(ref ObjectRef) bool {
+	info, err := os.Stat(s.ObjectPath(ref.SHA256))
+	return err == nil && info.Mode().IsRegular()
+}
+
 type objectStream struct {
 	ref     ObjectRef
 	file    *os.File
