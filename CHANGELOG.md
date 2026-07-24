@@ -6,6 +6,41 @@ pre-1.0, so a minor version may contain compatibility changes.
 
 ## [Unreleased]
 
+## [0.3.0-beta.2] - 2026-07-24
+
+### Added
+
+- Bounded-memory Pack V3 storage with indexed packfiles, exact object and
+  manifest verification, and pack-only session reconstruction.
+- Dry-run-first retirement of loose objects and retained native snapshots,
+  including durable proofs, interrupted-retirement recovery, and exact native
+  rollback after the original snapshot is gone.
+- A native FSKit Unix-socket path preflight that rejects service definitions
+  macOS cannot bind.
+
+### Changed
+
+- Filesystem and enrollment health checks now verify manifests through the
+  authoritative current pack after loose objects are retired. A present but
+  unreadable `packs/CURRENT` fails closed instead of being masked by loose
+  objects.
+- The isolated current-client Canary now covers Pack-only CLI and Desktop
+  resume, a real repository test run, official Desktop fork, parent/child
+  isolation, service restart, process recovery, and canonical native rollback.
+
+### Validation Boundary
+
+- Current PATH CLI `0.144.3` and Desktop `26.721.31836+5828` completed real
+  model turns against an isolated Pack-only parent. The parent and native child
+  then continued independently with valid JSONL and passing `go test ./...`.
+- The 256 MiB managed FSKit sample passed after loose retirement with cold and
+  warm mounted/native ratios of `3.009` and `1.024`; aggregate service RSS was
+  `169,088 KiB`, below the `256 MiB` gate.
+- Go daemon, supervisor, Host wrapper, and FSKit extension termination each
+  recovered automatically with unchanged complete SHA-256 values.
+- Full production promotion still requires the incident-free observation
+  period and a deliberately controlled in-flight host power-interruption test.
+
 ## [0.3.0-beta.1] - 2026-07-23
 
 ### Added
@@ -55,7 +90,8 @@ pre-1.0, so a minor version may contain compatibility changes.
 
 - Initial local-first scan, fold, exact restore, and object-store release.
 
-[Unreleased]: https://github.com/samekind/codexfold/compare/v0.3.0-beta.1...HEAD
+[Unreleased]: https://github.com/samekind/codexfold/compare/v0.3.0-beta.2...HEAD
+[0.3.0-beta.2]: https://github.com/samekind/codexfold/compare/v0.3.0-beta.1...v0.3.0-beta.2
 [0.3.0-beta.1]: https://github.com/samekind/codexfold/compare/v0.2.1...v0.3.0-beta.1
 [0.2.1]: https://github.com/samekind/codexfold/releases/tag/v0.2.1
 [0.2.0]: https://github.com/samekind/codexfold/releases/tag/v0.2.0

@@ -12,7 +12,7 @@ It finds exact duplicate raw JSON string tokens, complete JSONL records, and con
 
 ## Current Status
 
-`v0.3.0-beta.1` is the first versioned `fs-engine-preview`. It preserves the released storage-engine commands from `v0.2.1` and adds the transparent filesystem implementation, guarded service lifecycle, and platform validation described below.
+`v0.3.0-beta.2` is the current `fs-engine-preview`. It adds bounded Pack V3 storage, verified loose-object and native-snapshot retirement, Pack-only recovery, and current-client validation to the transparent filesystem introduced in `v0.3.0-beta.1`.
 
 The requirements and release gates for normal JSONL paths backed transparently by shared storage are defined in [the transparent filesystem product contract](docs/superpowers/specs/2026-07-11-transparent-session-filesystem-design.md). No release may claim `随点随开`, transparent session access, or production-ready virtual sessions before the platform-specific gates in that contract pass.
 
@@ -29,7 +29,7 @@ The transparent filesystem preview has these explicit boundaries:
 - The earlier synchronous FUSE-T NFS route remains historical validation evidence and a development fallback only. FUSE-T's third-party FSKit backend remains rejected after deterministic byte-loss and cache-invalidation failures; it is not the Apple-native FSKit implementation in this repository.
 - Linux FUSE3 has real unprivileged read, append, copy-on-write, truncate, archive rename, crash recovery, remount, performance, and `systemd --user` lifecycle evidence.
 - Windows has a WinFsp adapter and native Windows Service host that cross-compile, but no real Windows/WinFsp host has validated them yet.
-- The production service and production Codex home remain disabled. Retention, actual in-flight power loss, the incident-free observation gate, and the remaining platform-specific client gates still block promotion.
+- The production service and production Codex home remain disabled by default. The isolated macOS candidate has completed Pack-only current-client, restart, rollback, process-recovery, and performance gates. A controlled in-flight host power interruption and the incident-free observation period still block general production promotion.
 
 See [the Linux FUSE3 validation](docs/validation-linux-fuse3.md) and [the macOS canary validation](docs/validation-macos-canary.md) for the evidence boundary. The default build remains storage-only; platform mounts require explicit build tags and installed host prerequisites.
 
@@ -38,11 +38,11 @@ See [the Linux FUSE3 validation](docs/validation-linux-fuse3.md) and [the macOS 
 Install the versioned preview with Go:
 
 ```bash
-go install github.com/samekind/codexfold/cmd/codexfold@v0.3.0-beta.1
+go install github.com/samekind/codexfold/cmd/codexfold@v0.3.0-beta.2
 codexfold --version
 ```
 
-The [GitHub Release](https://github.com/samekind/codexfold/releases/tag/v0.3.0-beta.1) provides checksum-covered default CLI archives for macOS, Linux, and Windows on `amd64` and `arm64`. These archives expose the local storage and recovery command surface; they do not contain a generally signed macOS FSKit App.
+The [GitHub Release](https://github.com/samekind/codexfold/releases/tag/v0.3.0-beta.2) provides checksum-covered default CLI archives for macOS, Linux, and Windows on `amd64` and `arm64`. These archives expose the local storage and recovery command surface; they do not contain a generally signed macOS FSKit App.
 
 The FSKit App under `platform/darwin/fskit` currently requires Xcode 27, XcodeGen, an eligible Apple development team, and source signing. The validated App uses a maintainer Apple Development identity and is neither Developer ID distributed nor notarized for general installation. Follow the [maintainer guide](docs/maintainer-guide.md) and use only an isolated Codex home until the product contract permits production promotion.
 
@@ -167,4 +167,4 @@ codexfold gc --apply
 git diff --check
 ```
 
-See the [changelog](CHANGELOG.md), [v0.3.0-beta.1 release notes](docs/releases/v0.3.0-beta.1.md), [architecture](docs/design.md), [Fold V1 format](docs/fold-v1.md), [v0.2 validation](docs/validation-v0.2.md), [transparent filesystem product contract](docs/superpowers/specs/2026-07-11-transparent-session-filesystem-design.md), and [maintainer guide](docs/maintainer-guide.md).
+See the [changelog](CHANGELOG.md), [v0.3.0-beta.2 release notes](docs/releases/v0.3.0-beta.2.md), [architecture](docs/design.md), [Fold V1 format](docs/fold-v1.md), [v0.2 validation](docs/validation-v0.2.md), [transparent filesystem product contract](docs/superpowers/specs/2026-07-11-transparent-session-filesystem-design.md), and [maintainer guide](docs/maintainer-guide.md).

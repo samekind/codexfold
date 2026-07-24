@@ -1,5 +1,59 @@
 # macOS Adapter And Canary Validation
 
+## Pack-Only Current-Client Canary (2026-07-24)
+
+The signed build 102 Apple-native FSKit App/extension and helper candidate
+`a28ea3e8bbd213babe5467cf68daed685e884516bb6dd17b4a9116e879f8c139`
+completed the isolated Pack V3 retirement sequence without changing the real
+Codex home or the real Desktop process. Source metadata remains `0.3.0 (103)`;
+the mounted FSKit evidence is still attributed to behavior-identical build
+102 rather than relabeled as build 103.
+
+- Pack doctor verified 63 of 63 objects and 4 of 4 manifests before deletion.
+  `pack retire-loose --apply` removed all 63 loose objects and reclaimed
+  339,968 physical bytes. After service restart, three managed files retained
+  their exact lengths and SHA-256 values, including the 256 MiB fixture.
+- A temporary 4,096-byte mismatch was traced to the adjacent macOS AppleDouble
+  file `._rollout-...jsonl`, whose SHA-256 exactly matched the alleged bad
+  result. The canonical rollout itself remained byte-exact. Product discovery
+  already excludes `._*`; all final checks used exact basenames.
+- Filesystem doctor initially exposed a genuine post-retirement gap: its
+  manifest component still required loose objects. The shared health path now
+  uses the authoritative current Pack resolver, and rejects a broken present
+  `packs/CURRENT` instead of silently falling back. Final doctor reported all
+  11 components healthy and zero issues with zero loose objects.
+- PATH `codex-cli 0.144.3` resumed the Pack-only parent, recovered the previous
+  API-design rationale and concrete tests, inspected the real repository, and
+  completed `go test ./...`. Desktop `26.721.31836+5828` displayed the complete
+  history and completed another repository/test review.
+- Desktop's official `Continue in new chat from here` action created native
+  child `019f93ea-ff0f-7753-a3b5-3e0a040c0caa`. The child inherited the full
+  parent history, completed `go test ./...`, and matched its native backing
+  byte-for-byte. Child-only and later parent-only markers remained isolated.
+- Canonical rollback materialized the Pack-only parent as a 1,196,755-byte
+  native rollout with SHA-256
+  `c61b3cbc0f65e860fadae315f747485bae427a31b1cf0d4b5fdebd0375f7b4b2`.
+  The managed state was retired, service restart preserved mounted/native byte
+  identity, and a real CLI native resume completed another model turn and
+  `go test ./...`.
+- Transactional helper update made the configured, installed, and running
+  helper SHA identical. Forced termination of the Go daemon child, supervisor
+  child, Host wrapper, and active FSKit extension each recovered automatically.
+  The 256 MiB managed fixture retained SHA-256
+  `bdf04ec3fa10af7b803564739818047eb558829cb23d136dc010bd4aaa064d52`
+  after every recovery.
+- The final independently restarted managed performance round measured cold
+  native and virtual reads at 5,028.78 and 15,129.88 MiB/s, ratio `3.009`; warm
+  reads measured 15,017.23 and 15,378.95 MiB/s, ratio `1.024`. `F_NOCACHE`
+  applied to both cold paths. Aggregate service RSS was 169,088 KiB, below the
+  256 MiB gate. Results are observations, not general throughput guarantees.
+
+This closes the executable non-destructive Pack-only, current-client, fork,
+rollback, restart, process-recovery, and performance gates for the isolated
+macOS candidate. General production promotion still requires the dedicated
+incident-free observation period and a deliberately controlled host power
+interruption while a transaction is in flight.
+
 ## Native FSKit Development Checkpoint
 
 As of 2026-07-23, the terminal macOS validation candidate is the signed build 102 Apple-native Swift FSKit App/extension running the current Go helper through versioned binary UDS IPC. The transactionally installed isolated candidate passes mounted metadata and xattr behavior, append, `fsync`, `F_FULLFSYNC`, overlapping open lifetimes, random write, truncate, namespace and archive moves, mmap, open-unlink, external file and directory refresh, read-ahead coherency, eight-way virtual concurrent reads, exact-byte comparison, and managed service restart. Build-identity checks, environment sanitization, transactional app/definition/helper installation, and rollback also pass.
