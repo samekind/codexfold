@@ -1,11 +1,13 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/samekind/codexfold/internal/sessionns"
 )
@@ -19,6 +21,8 @@ type canonicalNamespaceReadiness struct {
 // restart can briefly expose a healthy mount before native passthrough entries
 // have repopulated, so readiness is intentionally distinct from mount health.
 var enrollmentCanonicalNamespaceReadinessProbe = probeEnrollmentCanonicalNamespaceReadiness
+
+var waitForCanonicalNamespaceActivation = waitForCanonicalNativePassthrough
 
 func probeEnrollmentCanonicalNamespaceReadiness(home string, mount string, nativeRoot string) canonicalNamespaceReadiness {
 	status, err := sessionns.Inspect(sessionns.Options{Home: home, Mount: mount, NativeRoot: nativeRoot, MountProbe: mountHealthProbe})
@@ -36,6 +40,32 @@ func probeEnrollmentCanonicalNamespaceReadiness(home string, mount string, nativ
 // visibility and kind only, not content, so active appends cannot turn a
 // readiness check into a false mismatch.
 func probeCanonicalNativePassthrough(mount string, nativeRoot string) error {
+	return probeCanonicalNativePassthroughMetadata(mount, nativeRoot, false)
+}
+
+func waitForCanonicalNativePassthrough(ctx context.Context, mount string, nativeRoot string, timeout time.Duration) error {
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for {
+		lastErr = probeCanonicalNativePassthroughMetadata(mount, nativeRoot, true)
+		if lastErr == nil {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("native paths did not become fully visible: %w", lastErr)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(25 * time.Millisecond):
+		}
+	}
+}
+
+func probeCanonicalNativePassthroughMetadata(mount string, nativeRoot string, requireSize bool) error {
 	mount = filepath.Clean(mount)
 	nativeRoot = filepath.Clean(nativeRoot)
 	for _, namespace := range []string{"sessions", "archived_sessions"} {
@@ -72,6 +102,9 @@ func probeCanonicalNativePassthrough(mount string, nativeRoot string) error {
 			}
 			if mounted.IsDir() != info.IsDir() || (!info.IsDir() && !mounted.Mode().IsRegular()) {
 				return fmt.Errorf("native path %s and mounted path %s have different kinds", nativePath, mountedPath)
+			}
+			if requireSize && info.Mode().IsRegular() && mounted.Size() != info.Size() {
+				return fmt.Errorf("native path %s size %d differs from mounted path %s size %d", nativePath, info.Size(), mountedPath, mounted.Size())
 			}
 			return nil
 		})

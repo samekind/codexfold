@@ -217,6 +217,9 @@ func TestFSNamespaceActivateAndDeactivateCommandsPreserveNativeFiles(t *testing.
 	previousProbe := mountHealthProbe
 	t.Cleanup(func() { mountHealthProbe = previousProbe })
 	mountHealthProbe = func(string) error { return nil }
+	previousReadiness := waitForCanonicalNamespaceActivation
+	waitForCanonicalNamespaceActivation = func(context.Context, string, string, time.Duration) error { return nil }
+	t.Cleanup(func() { waitForCanonicalNamespaceActivation = previousReadiness })
 	executeFS(t, []string{
 		"fs", "namespace", "activate", "--apply",
 		"--codex-home", home, "--mount", mount, "--native-root", nativeRoot,
