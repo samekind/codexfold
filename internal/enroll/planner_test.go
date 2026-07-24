@@ -261,6 +261,84 @@ func TestApplyRevalidatesFingerprintAndSkipsAlreadyManagedSessions(t *testing.T)
 	}
 }
 
+func TestRevalidateReturnsOnlyStableUnmanagedDecisions(t *testing.T) {
+	root := t.TempDir()
+	paths := map[string]string{
+		"stable":  filepath.Join(root, "stable.jsonl"),
+		"changed": filepath.Join(root, "changed.jsonl"),
+		"managed": filepath.Join(root, "managed.jsonl"),
+	}
+	for id, path := range paths {
+		if err := os.WriteFile(path, []byte(id+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	selected := make([]Decision, 0, len(paths))
+	for _, id := range []string{"stable", "changed", "managed"} {
+		info, err := os.Stat(paths[id])
+		if err != nil {
+			t.Fatal(err)
+		}
+		selected = append(selected, Decision{
+			SessionID: id, RolloutPath: paths[id], Selected: true,
+			Fingerprint: Fingerprint{Size: info.Size(), ModTimeUnixNano: info.ModTime().UnixNano()},
+		})
+	}
+	if err := os.WriteFile(paths["changed"], []byte("changed after planning\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	decisions, result, err := Revalidate(context.Background(), Plan{Selected: selected}, RevalidateOptions{
+		IsManaged: func(_ context.Context, sessionID string) (bool, error) {
+			return sessionID == "managed", nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(decisions) != 1 || decisions[0].SessionID != "stable" {
+		t.Fatalf("revalidated decisions = %#v", decisions)
+	}
+	if result.Selected != 3 || result.Applied != 0 || result.SkippedChanged != 1 || result.SkippedManaged != 1 {
+		t.Fatalf("revalidation result = %#v", result)
+	}
+}
+
+func TestRevalidateHonorsBatchLimitBeforeFiltering(t *testing.T) {
+	root := t.TempDir()
+	selected := make([]Decision, 0, 3)
+	for _, id := range []string{"managed", "stable", "outside-limit"} {
+		path := filepath.Join(root, id+".jsonl")
+		if err := os.WriteFile(path, []byte(id+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		selected = append(selected, Decision{
+			SessionID: id, RolloutPath: path, Selected: true,
+			Fingerprint: Fingerprint{Size: info.Size(), ModTimeUnixNano: info.ModTime().UnixNano()},
+		})
+	}
+
+	decisions, result, err := Revalidate(context.Background(), Plan{Selected: selected}, RevalidateOptions{
+		Limit: 2,
+		IsManaged: func(_ context.Context, sessionID string) (bool, error) {
+			return sessionID == "managed", nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(decisions) != 1 || decisions[0].SessionID != "stable" {
+		t.Fatalf("limited decisions = %#v", decisions)
+	}
+	if result.Selected != 2 || result.SkippedManaged != 1 || result.SkippedChanged != 0 {
+		t.Fatalf("limited revalidation result = %#v", result)
+	}
+}
+
 type allowingBudget struct{}
 
 func (allowingBudget) Check(_ context.Context, projection storage.Projection) (storage.Assessment, error) {

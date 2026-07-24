@@ -84,6 +84,8 @@ var runEnrollmentStorageGC = func(ctx context.Context, store string) (storage.St
 	return storage.Collect(ctx, storage.GCOptions{StoreDir: store, Apply: true})
 }
 
+var enrollmentStorageHealthProbe = requireEnrollmentStorageHealth
+
 func newFSEnrollCommand() *cobra.Command {
 	command := &cobra.Command{Use: "enroll", Short: "Plan and apply bounded automatic session enrollment"}
 	command.AddCommand(newFSEnrollPlanCommand())
@@ -168,57 +170,87 @@ func runEnrollmentCycle(ctx context.Context, flags enrollmentFlags) (FSEnrollmen
 		nativeRoot = filepath.Join(home, "fold-native")
 	}
 	nativeRoot = filepath.Clean(nativeRoot)
-	applied, err := enroll.Apply(ctx, plan, enroll.ApplyOptions{
+	states, err := vfs.DiscoverSessionStates(store)
+	if err != nil {
+		return FSEnrollmentApplyResult{Plan: plan}, err
+	}
+	managed := make(map[string]struct{}, len(states))
+	for _, state := range states {
+		managed[state.SessionID] = struct{}{}
+	}
+	selected, applied, err := enroll.Revalidate(ctx, plan, enroll.RevalidateOptions{
 		Limit: flags.batchSize,
 		IsManaged: func(_ context.Context, sessionID string) (bool, error) {
-			states, err := vfs.DiscoverSessionStates(store)
-			if err != nil {
-				return false, err
-			}
-			for _, state := range states {
-				if state.SessionID == sessionID {
-					return true, nil
-				}
-			}
-			return false, nil
-		},
-		Apply: func(ctx context.Context, decision enroll.Decision) error {
-			sessions, err := codex.LoadSessions(home)
-			if err != nil {
-				return err
-			}
-			current, err := findSession(sessions, decision.SessionID)
-			if err != nil {
-				return err
-			}
-			if filepath.Clean(current.RolloutPath) != filepath.Clean(decision.RolloutPath) {
-				return errors.New("session route changed after enrollment planning")
-			}
-			writers, err := enrollmentWriterProbe(ctx, []codex.Session{current})
-			if err != nil {
-				return fmt.Errorf("recheck native session writer: %w", err)
-			}
-			if writers[current.ID] {
-				return errors.New("session acquired an active native writer after enrollment planning")
-			}
-			if _, err := mountfs.ValidateNativeRollout(ctx, decision.RolloutPath); err != nil {
-				return fmt.Errorf("native rollout is not eligible for transparent routing: %w", err)
-			}
-			return applyEnrollmentCommands(ctx, home, store, mount, nativeRoot, decision.SessionID, flags.canary)
+			_, ok := managed[sessionID]
+			return ok, nil
 		},
 	})
 	result := FSEnrollmentApplyResult{Plan: plan, Apply: applied}
 	if err != nil {
-		// A failed fold/pack/migrate transaction must not trigger retirement or
-		// GC in the same cycle. Leave every recovery artifact for doctor/recover.
 		return result, err
+	}
+	for _, decision := range selected {
+		if err := revalidateEnrollmentDecision(ctx, home, decision, true); err != nil {
+			return result, fmt.Errorf("prepare enrollment for %s: %w", decision.SessionID, err)
+		}
+		if err := runEnrollmentCommand(ctx, []string{"fold", decision.SessionID, "--codex-home", home, "--store", store, "--apply", "--overwrite"}); err != nil {
+			return result, fmt.Errorf("fold enrollment for %s: %w", decision.SessionID, err)
+		}
+	}
+	if len(selected) != 0 {
+		if err := runEnrollmentCommand(ctx, []string{"pack", "build", "--codex-home", home, "--store", store}); err != nil {
+			return result, fmt.Errorf("build enrollment pack for %d sessions: %w", len(selected), err)
+		}
+	}
+	for _, decision := range selected {
+		if err := revalidateEnrollmentDecision(ctx, home, decision, false); err != nil {
+			return result, fmt.Errorf("commit enrollment for %s: %w", decision.SessionID, err)
+		}
+		arguments := []string{
+			"fs", "migrate", decision.SessionID, "--codex-home", home, "--store", store,
+			"--mount", mount, "--canonical-namespace", "--native-root", nativeRoot, "--apply",
+		}
+		if flags.canary {
+			arguments = append(arguments, "--compatibility-canary", "--cli", "none", "--desktop-app", "none")
+		}
+		if err := runEnrollmentCommand(ctx, arguments); err != nil {
+			return result, fmt.Errorf("migrate enrollment for %s: %w", decision.SessionID, err)
+		}
+		result.Apply.Applied++
 	}
 	if ctx.Err() != nil {
 		return result, ctx.Err()
 	}
-	maintenance, maintenanceErr := runEnrollmentMaintenance(ctx, home, store, applied.Applied)
+	maintenance, maintenanceErr := runEnrollmentMaintenance(ctx, home, store, result.Apply.Applied)
 	result.Maintenance = maintenance
-	return result, errors.Join(err, maintenanceErr)
+	return result, maintenanceErr
+}
+
+func revalidateEnrollmentDecision(ctx context.Context, home string, decision enroll.Decision, validateRollout bool) error {
+	sessions, err := codex.LoadSessions(home)
+	if err != nil {
+		return err
+	}
+	current, err := findSession(sessions, decision.SessionID)
+	if err != nil {
+		return err
+	}
+	if filepath.Clean(current.RolloutPath) != filepath.Clean(decision.RolloutPath) {
+		return errors.New("session route changed after enrollment planning")
+	}
+	writers, err := enrollmentWriterProbe(ctx, []codex.Session{current})
+	if err != nil {
+		return fmt.Errorf("recheck native session writer: %w", err)
+	}
+	if writers[current.ID] {
+		return errors.New("session acquired an active native writer after enrollment planning")
+	}
+	if validateRollout {
+		if _, err := mountfs.ValidateNativeRollout(ctx, decision.RolloutPath); err != nil {
+			return fmt.Errorf("native rollout is not eligible for transparent routing: %w", err)
+		}
+	}
+	return nil
 }
 
 func runPeriodicEnrollment(ctx context.Context, flags enrollmentFlags, interval time.Duration, report enrollmentCycleReporter) {
@@ -296,7 +328,6 @@ func buildEnrollmentPlan(ctx context.Context, flags enrollmentFlags) (enroll.Pla
 	if err != nil {
 		return enroll.Plan{}, "", err
 	}
-	doctorHealthy := requireEnrollmentStorageHealth(ctx, store) == nil
 	mountHealthy := mountHealthProbe(mount) == nil
 	readiness := canonicalNamespaceReadiness{}
 	if flags.canonicalNamespace && mountHealthy {
@@ -306,11 +337,12 @@ func buildEnrollmentPlan(ctx context.Context, flags enrollmentFlags) (enroll.Pla
 	if err != nil {
 		return enroll.Plan{}, "", err
 	}
-	plan, err := enroll.Build(ctx, enroll.Input{
-		Sessions: sessions, Managed: managed, Previous: observations, Now: time.Now(),
+	now := time.Now()
+	input := enroll.Input{
+		Sessions: sessions, Managed: managed, Previous: observations, Now: now,
 		Policy: enroll.Policy{StableFor: flags.stableFor, BatchSize: flags.batchSize, ArchivedOnly: false},
 		Gates: enroll.Gates{
-			DoctorHealthy: doctorHealthy, MountHealthy: mountHealthy,
+			DoctorHealthy: true, MountHealthy: mountHealthy,
 			CanonicalNamespace: flags.canonicalNamespace, NamespaceActive: readiness.Active, NamespaceReady: readiness.Ready,
 			EnrollmentAllowed: flags.canary || automaticEnrollmentAllowed(verifiedCapability()),
 		},
@@ -318,7 +350,18 @@ func buildEnrollmentPlan(ctx context.Context, flags enrollmentFlags) (enroll.Pla
 			return writers[session.ID], nil
 		},
 		Budget: guard,
-	})
+	}
+	plan, err := enroll.Build(ctx, input)
+	if err != nil || len(plan.Selected) == 0 {
+		return plan, store, err
+	}
+	// Full fold and pack verification reconstructs every managed session. Keep
+	// it off the no-op polling path, but require it before any batch mutation.
+	if enrollmentStorageHealthProbe(ctx, store) == nil {
+		return plan, store, nil
+	}
+	input.Gates.DoctorHealthy = false
+	plan, err = enroll.Build(ctx, input)
 	return plan, store, err
 }
 
@@ -355,23 +398,6 @@ func automaticEnrollmentAllowed(capability fsctl.Capability) bool {
 
 func enrollmentObservationPath(store string) string {
 	return filepath.Join(filepath.Clean(store), "enrollment", "observations.json")
-}
-
-func applyEnrollmentCommands(ctx context.Context, home string, store string, mount string, nativeRoot string, sessionID string, canary bool) error {
-	commands := [][]string{
-		{"fold", sessionID, "--codex-home", home, "--store", store, "--apply", "--overwrite"},
-		{"pack", "build", "--codex-home", home, "--store", store},
-		{"fs", "migrate", sessionID, "--codex-home", home, "--store", store, "--mount", mount, "--canonical-namespace", "--native-root", nativeRoot, "--apply"},
-	}
-	if canary {
-		commands[2] = append(commands[2], "--compatibility-canary", "--cli", "none", "--desktop-app", "none")
-	}
-	for _, command := range commands {
-		if err := runEnrollmentCommand(ctx, command); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 func runEnrollmentMaintenance(ctx context.Context, home string, store string, newlyApplied int) (FSEnrollmentMaintenanceResult, error) {

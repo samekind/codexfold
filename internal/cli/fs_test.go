@@ -781,6 +781,57 @@ func TestFSEnrollmentPlanRequiresTwoStableObservationsAndCanaryGate(t *testing.T
 	}
 }
 
+func TestEnrollmentPlanRunsFullStorageHealthOnlyForCandidateBatch(t *testing.T) {
+	home, storeDir, _ := fsFixture(t, true)
+	allowEnrollmentWriterProbe(t)
+	allowEnrollmentNamespaceReadiness(t)
+	oldMountProbe := mountHealthProbe
+	mountHealthProbe = func(string) error { return nil }
+	t.Cleanup(func() { mountHealthProbe = oldMountProbe })
+	oldHealthProbe := enrollmentStorageHealthProbe
+	healthCalls := 0
+	enrollmentStorageHealthProbe = func(context.Context, string) error {
+		healthCalls++
+		return errors.New("corrupt store")
+	}
+	t.Cleanup(func() { enrollmentStorageHealthProbe = oldHealthProbe })
+	flags := enrollmentFlags{
+		codexHome: home, storeDir: storeDir, mountPoint: filepath.Join(home, "mount"),
+		nativeRoot: filepath.Join(home, "fold-native"), canonicalNamespace: true,
+		stableFor: time.Nanosecond, batchSize: 1,
+	}
+
+	first, _, err := buildEnrollmentPlan(context.Background(), flags)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if healthCalls != 0 || len(first.Selected) != 0 {
+		t.Fatalf("candidate-free plan ran full health: calls=%d plan=%#v", healthCalls, first)
+	}
+	if err := enroll.SaveObservations(enrollmentObservationPath(storeDir), first.Observations); err != nil {
+		t.Fatal(err)
+	}
+	second, _, err := buildEnrollmentPlan(context.Background(), flags)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if healthCalls != 1 || len(second.Selected) != 0 {
+		t.Fatalf("candidate plan health calls=%d plan=%#v", healthCalls, second)
+	}
+	foundDoctorReason := false
+	for _, decision := range second.Decisions {
+		if decision.SessionID != "session" {
+			continue
+		}
+		for _, reason := range decision.Reasons {
+			foundDoctorReason = foundDoctorReason || reason == enroll.ReasonDoctorUnhealthy
+		}
+	}
+	if !foundDoctorReason {
+		t.Fatalf("unhealthy candidate plan did not report doctor gate: %#v", second)
+	}
+}
+
 func TestFSEnrollmentApplyRunsFoldPackMigrateAndStopsBeforeRouteOnFailure(t *testing.T) {
 	home, storeDir, nativePath := fsFixture(t, true)
 	allowEnrollmentWriterProbe(t)
@@ -827,6 +878,146 @@ func TestFSEnrollmentApplyRunsFoldPackMigrateAndStopsBeforeRouteOnFailure(t *tes
 	}
 	if data, err := os.ReadFile(nativePath); err != nil || len(data) == 0 {
 		t.Fatalf("failed enrollment changed source: bytes=%d err=%v", len(data), err)
+	}
+}
+
+func TestFSEnrollmentApplyBatchesFoldAndPackBeforeMigration(t *testing.T) {
+	home, storeDir, firstPath := fsFixture(t, true)
+	secondPath := addEnrollmentFixtureSession(t, home, "second", 0)
+	allowEnrollmentWriterProbe(t)
+	allowEnrollmentNamespaceReadiness(t)
+	oldProbe := mountHealthProbe
+	mountHealthProbe = func(string) error { return nil }
+	t.Cleanup(func() { mountHealthProbe = oldProbe })
+	saveEnrollmentObservations(t, storeDir, map[string]string{"session": firstPath, "second": secondPath})
+
+	oldRunner := runEnrollmentCommand
+	var calls [][]string
+	runEnrollmentCommand = func(_ context.Context, args []string) error {
+		calls = append(calls, append([]string(nil), args...))
+		return nil
+	}
+	t.Cleanup(func() { runEnrollmentCommand = oldRunner })
+	oldGC := runEnrollmentStorageGC
+	runEnrollmentStorageGC = func(context.Context, string) (storage.StorageGCResult, error) {
+		return storage.StorageGCResult{}, nil
+	}
+	t.Cleanup(func() { runEnrollmentStorageGC = oldGC })
+
+	result, err := runEnrollmentCycle(context.Background(), enrollmentFlags{
+		codexHome: home, storeDir: storeDir, mountPoint: filepath.Join(home, "mount"),
+		nativeRoot: filepath.Join(home, "fold-native"), canonicalNamespace: true,
+		stableFor: time.Nanosecond, batchSize: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Apply.Selected != 2 || result.Apply.Applied != 2 {
+		t.Fatalf("batch enrollment result = %#v", result.Apply)
+	}
+	if len(calls) < 5 {
+		t.Fatalf("batch enrollment commands = %#v", calls)
+	}
+	if calls[0][0] != "fold" || calls[1][0] != "fold" || calls[2][0] != "pack" || calls[2][1] != "build" || calls[3][0] != "fs" || calls[3][1] != "migrate" || calls[4][0] != "fs" || calls[4][1] != "migrate" {
+		t.Fatalf("batch enrollment command order = %#v", calls)
+	}
+	packBuilds := 0
+	for _, call := range calls {
+		if len(call) >= 2 && call[0] == "pack" && call[1] == "build" {
+			packBuilds++
+		}
+	}
+	if packBuilds != 1 {
+		t.Fatalf("batch enrollment pack builds = %d, calls=%#v", packBuilds, calls)
+	}
+}
+
+func TestFSEnrollmentApplyPreservesPartialMigrationProgress(t *testing.T) {
+	home, storeDir, firstPath := fsFixture(t, true)
+	secondPath := addEnrollmentFixtureSession(t, home, "second", 0)
+	firstBefore, err := os.ReadFile(firstPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondBefore, err := os.ReadFile(secondPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	allowEnrollmentWriterProbe(t)
+	allowEnrollmentNamespaceReadiness(t)
+	oldProbe := mountHealthProbe
+	mountHealthProbe = func(string) error { return nil }
+	t.Cleanup(func() { mountHealthProbe = oldProbe })
+	saveEnrollmentObservations(t, storeDir, map[string]string{"session": firstPath, "second": secondPath})
+
+	oldRunner := runEnrollmentCommand
+	migratedID := ""
+	runEnrollmentCommand = func(_ context.Context, args []string) error {
+		if len(args) < 3 || args[0] != "fs" || args[1] != "migrate" {
+			return nil
+		}
+		if migratedID == "" {
+			migratedID = args[2]
+			db, err := sql.Open("sqlite", filepath.Join(home, "state_5.sqlite"))
+			if err != nil {
+				return err
+			}
+			_, updateErr := db.Exec(`update threads set rollout_path = ? where id = ?`, filepath.Join(home, "mount", "managed", migratedID+".jsonl"), migratedID)
+			closeErr := db.Close()
+			return errors.Join(updateErr, closeErr)
+		}
+		return errors.New("second migration failed")
+	}
+	t.Cleanup(func() { runEnrollmentCommand = oldRunner })
+	oldDiscover := discoverEnrollmentSessionStates
+	discoverEnrollmentSessionStates = func(string) ([]vfs.SessionState, error) {
+		t.Fatal("maintenance discovery ran after partial migration failure")
+		return nil, nil
+	}
+	t.Cleanup(func() { discoverEnrollmentSessionStates = oldDiscover })
+	oldGC := runEnrollmentStorageGC
+	runEnrollmentStorageGC = func(context.Context, string) (storage.StorageGCResult, error) {
+		t.Fatal("maintenance GC ran after partial migration failure")
+		return storage.StorageGCResult{}, nil
+	}
+	t.Cleanup(func() { runEnrollmentStorageGC = oldGC })
+
+	result, err := runEnrollmentCycle(context.Background(), enrollmentFlags{
+		codexHome: home, storeDir: storeDir, mountPoint: filepath.Join(home, "mount"),
+		nativeRoot: filepath.Join(home, "fold-native"), canonicalNamespace: true,
+		stableFor: time.Nanosecond, batchSize: 2,
+	})
+	if err == nil || !strings.Contains(err.Error(), "second migration failed") {
+		t.Fatalf("partial migration error = %v", err)
+	}
+	if result.Apply.Applied != 1 {
+		t.Fatalf("partial migration applied = %d", result.Apply.Applied)
+	}
+	sessions, loadErr := codex.LoadSessions(home)
+	if loadErr != nil {
+		t.Fatal(loadErr)
+	}
+	routes := make(map[string]string, len(sessions))
+	for _, session := range sessions {
+		routes[session.ID] = filepath.Clean(session.RolloutPath)
+	}
+	if routes[migratedID] == filepath.Clean(firstPath) || routes[migratedID] == filepath.Clean(secondPath) {
+		t.Fatalf("successful migration remained native: id=%s routes=%#v", migratedID, routes)
+	}
+	remainingID := "session"
+	remainingPath := firstPath
+	if migratedID == "session" {
+		remainingID = "second"
+		remainingPath = secondPath
+	}
+	if routes[remainingID] != filepath.Clean(remainingPath) {
+		t.Fatalf("failed migration changed native route: id=%s routes=%#v", remainingID, routes)
+	}
+	for path, want := range map[string][]byte{firstPath: firstBefore, secondPath: secondBefore} {
+		got, readErr := os.ReadFile(path)
+		if readErr != nil || !bytes.Equal(got, want) {
+			t.Fatalf("partial migration changed native source %s: bytes=%d err=%v", path, len(got), readErr)
+		}
 	}
 }
 
@@ -3323,6 +3514,42 @@ func fsFixture(t *testing.T, archived bool) (string, string, string) {
 		t.Fatalf("pack fixture: %v", err)
 	}
 	return home, storeDir, nativePath
+}
+
+func addEnrollmentFixtureSession(t *testing.T, home string, sessionID string, updatedAt int64) string {
+	t.Helper()
+	rolloutPath := filepath.Join(home, sessionID+".jsonl")
+	if err := os.WriteFile(rolloutPath, []byte("{\"type\":\"session_meta\"}\n{\"value\":\""+sessionID+"-repeated-field-value\"}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", filepath.Join(home, "state_5.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, insertErr := db.Exec(`insert into threads values (?, ?, '/workspace', ?, 'provider', 'model', ?, 1, '')`, sessionID, sessionID, rolloutPath, updatedAt)
+	closeErr := db.Close()
+	if err := errors.Join(insertErr, closeErr); err != nil {
+		t.Fatal(err)
+	}
+	return rolloutPath
+}
+
+func saveEnrollmentObservations(t *testing.T, storeDir string, sessions map[string]string) {
+	t.Helper()
+	observations := make(enroll.Observations, len(sessions))
+	for sessionID, rolloutPath := range sessions {
+		info, err := os.Stat(rolloutPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		observations[sessionID] = enroll.Observation{
+			Path: rolloutPath, Size: info.Size(), ModTimeUnixNano: info.ModTime().UnixNano(),
+			StableSinceUnixNano: time.Now().Add(-time.Hour).UnixNano(),
+		}
+	}
+	if err := enroll.SaveObservations(enrollmentObservationPath(storeDir), observations); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func approvedCLIContract(t *testing.T, storeDir string, version string) string {
