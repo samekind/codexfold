@@ -44,6 +44,14 @@ Verification completed with:
 
 One rejected active fold left 38,604 unreferenced loose objects. GC identified and removed all of them, reclaiming 249,114,624 physical bytes while preserving every referenced object.
 
+## Real Codex CLI Resume
+
+After the storage validation changes, the official `codex-cli 0.144.3` resumed an existing packed managed session through the isolated Apple-native FSKit mount. The resumed agent inspected the fixture module and completed `go test ./...` with exit code zero.
+
+The visible rollout grew from 919,038 to 928,034 bytes. The 8,996-byte turn was appended to the durable delta; the 393,640-byte folded base and its SHA-256 remained unchanged, and no full writable backing was created. A post-run pack doctor verified all 63 packed objects and all four complete manifests with zero issues. The final physical JSONL record parsed successfully.
+
+This was a real model request and real tool execution using the unmodified official CLI. It used an isolated Codex home and did not modify production Codex routes or rollouts.
+
 ## Open Gates
 
 - Fold V1 does not represent a complete repeated JSONL record as one atomic object. Exact record duplication is measured, and its bytes can be reused through field and CDC objects, but an atomic record layer requires a compatible hierarchical or precomputed Fold V2 representation rather than weakening field/chunk reuse.
