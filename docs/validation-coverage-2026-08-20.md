@@ -1,0 +1,106 @@
+# Current-Candidate Coverage Matrix (2026-08-20)
+
+Scenario coverage is derived from enumerable sources, never from a tester's
+recollection. Completeness is therefore auditable: every row below traces to a
+locked requirement, and every row must name either its evidence or the fact that
+it has none.
+
+Sources, all enumerable:
+
+1. The 22 contract requirements `TF-001`–`TF-022`.
+2. The 16 founding storage scenarios in [product-inheritance.md](product-inheritance.md) §2.
+3. The 11 grill locks in [product-inheritance.md](product-inheritance.md) §5.
+4. The real Codex operation traces, which define which file operations must work
+   at all. An operation Codex performs that is absent from a trace is an unknown,
+   not a pass.
+
+Status values are exact:
+
+- `verified-current` — observed on the current candidate build during this
+  validation, with the evidence named.
+- `historical` — observed only on the signed build 102 candidate. That evidence
+  does not transfer.
+- `code-only` — unit or synthetic coverage exists; no real-candidate observation.
+- `none` — no observation of any kind on the current candidate.
+- `blocked-on-operator` — cannot be observed without a human product action.
+
+## Contract requirements
+
+| Req | Requirement | Status | Evidence on the current candidate |
+| --- | --- | --- | --- |
+| `TF-001` | No manual materialization to open or resume | `verified-current` | Real `codex exec` wrote and read sessions as ordinary paths; no materialize step in any flow |
+| `TF-002` | Unmodified Desktop and CLI both work | CLI `verified-current`, Desktop `historical` | Two real CLI sessions created and read through the mount; no Desktop task has traversed this candidate |
+| `TF-003` | Every byte and every operation Codex uses behaves natively | bytes `verified-current`, operation set `none` | Byte identity held across every phase; the operation set used by the current Desktop/CLI builds has not been re-derived from a trace for this candidate |
+| `TF-004` | Identical content stored once; forks independently writable | dedup `verified-current`, fork independence `historical` | Physical/logical ratio 1.14x on 11 real sessions; no fork created on this candidate |
+| `TF-005` | Append goes to a durable delta without full materialization | `verified-current` | Real `codex exec` appended through the mount; managed rollouts grew without a writable base |
+| `TF-006` | Truncate and random write transition to copy-on-write | `code-only` | Unit coverage in `internal/mountfs`; not exercised through the live mount |
+| `TF-007` | Packed reads avoid per-part loose opens | `verified-current` (indirect) | The store is pack-only; 11390 consecutive reads served with no loose objects present |
+| `TF-008` | Performance and memory gates | `none` | No measurement taken during this validation |
+| `TF-009` | Daemon termination, host restart, interrupted commit/migration/compaction recover without byte loss | daemon restart `verified-current`, host restart `historical`, interrupted phases `code-only` | Six service restarts and four binary replacements left all nine baseline rollouts byte-identical |
+| `TF-010` | Routing unchanged until shadow verification; native snapshot reclaimable after exact proof | `verified-current` | Enrollment cycle reported `native_retired=1` after its proof, with byte identity preserved |
+| `TF-011` | No per-session setup; automatic discovery and bulk enrollment | `verified-current` | Two real sessions were enrolled by the service with no manual `enroll apply` |
+| `TF-012` | Platform-neutral core, independent adapter readiness | macOS `verified-current`, Linux/Windows `none` | linux/amd64 and windows/amd64 build; no runtime observation on either |
+| `TF-013` | Capability claims use canonical terms only | `code-only` | Enforced and unit-tested in `internal/fsctl` |
+| `TF-014` | Native reclamation requires durable exact reconstruction proof | `verified-current` (partial) | `native_retired=1` implies the proof path ran; the receipt itself was not inspected |
+| `TF-015` | Client version is diagnostic, never write permission | `code-only` | Unit coverage; no version-change event during this validation |
+| `TF-016` | Elevated prerequisites only after explicit authorization | `blocked-on-operator` | The FSKit extension install path was not exercised |
+| `TF-017` | A canonical mount never degrades into a writable directory | `none` | Not exercised |
+| `TF-018` | Fork-family classification is conservative and dry-run-first | `none` | No fork-family operation run on this candidate |
+| `TF-019` | Archive and deletion are distinct; rename never authorizes deletion | `none` | No archive or delete run on this candidate |
+| `TF-020` | Byte-preserving storage never changes rollout bytes | `verified-current` | Nine baseline rollouts byte-identical across every phase, including a reclaim that removed four generations |
+| `TF-021` | Hard preflight and reserve budgets govern all retained artifacts | `verified-current` | The free-space reserve blocked enrollment and blocked fold twice during this validation, exactly as designed |
+| `TF-022` | Standalone product, no private control-plane dependency | `code-only` | Reviewed at source level only |
+
+## Grill locks
+
+| Lock | Behaviour | Status | Evidence |
+| --- | --- | --- | --- |
+| §5.1 | One bad session must not kill the service | `code-only` | Unit test proves a stalled session load does not block a healthy one; not observed live |
+| §5.2 | Path always present; read/write pauses at most ten seconds | **`verified-current: FAILING`** | Reproduced 4 of 5 restarts with reads in flight: 12-21 `ENOENT` and an occasional `EPROTO` reach the reader during the roughly 0.7 s window where `daemon.state` is `stopped`. Byte integrity held (0 mismatches) and the longest read gap was 0.58 s, so the ten-second pause budget passes; the lock's other half, never letting Codex see file-not-found, does not. Managed routes stayed published (`managed=healthy`, 11 sessions) throughout, so this is not a route-publication gap |
+| §5.3 | Under ten seconds silent, at ten seconds a popup, recovery announced | `code-only` | No real failure has produced a window |
+| §5.4 | Resident after login; UI exit does not stop service | `code-only` | Not exercised |
+| §5.5 | Never update while Codex runs | `code-only` | Not exercised |
+| §5.6 | Background compaction is preemptible and skips sessions in use | `verified-current` (partial) | An enrollment cycle ran while 11390 reads were in flight and neither disturbed the other |
+| §5.7 | Release native source only after independent full proof | `verified-current` | `native_retired=1` after proof |
+| §5.8 | Auto-repair only within the stated bounds | `verified-current` (partial) | A real transient at enrollment was retained, deferred, and recovered in one second without operator action |
+| §5.9 | Archive never deletes; explicit delete is permanent | `none` | Not exercised |
+| §5.10 | Acceptance uses real work in an isolated instance with external observation | `blocked-on-operator` | Requires a Cockpit **Start** and real operator work |
+| §5.11 | Production stays disabled until separately authorized | `verified-current` | Production PIDs unchanged; `~/.codex/sessions` never routed |
+
+## Open defect: §5.2
+
+During a backend restart a reader receives `ENOENT`. The Swift frontend does
+implement the keep-alive contract for transport failures - it blocks, retries for
+ten seconds, and publishes a recovering status while holding the mount present -
+so this is not a missing feature but a misclassification: connecting to a socket
+that does not exist yet fails with "no such file or directory", and that errno
+reaches the client as though the session file were gone. `descriptor.bin` is
+published by atomic rename and never removed, so the descriptor is not the
+source, and the route table stays populated, so the route table is not either.
+
+This is the exact symptom the 2026-07-25 accident presented as sessions
+disappearing, and it reproduces in about twenty-five seconds:
+
+```text
+t=0.00  open=ok       daemon=healthy  managedSessions=11
+t=1.56  open=ENOENT   daemon=stopped  managedSessions=11
+t=2.24  open=ok       daemon=healthy  managedSessions=11   (new pid)
+```
+
+The fix belongs in the frontend's error classification: a transport failure,
+including a socket path that does not exist yet, must enter the existing recovery
+wait rather than become a filesystem errno. It requires an Xcode rebuild and
+re-sign of the candidate extension, so it is recorded here rather than attempted
+at the end of this validation.
+
+## What this matrix says
+
+Byte safety is the strongest column: every phase that could have lost data was
+checked by exact SHA-256, and none did. The weakest column is lived reliability:
+`TF-002` Desktop, `§5.2` in-flight pause, and `§5.3` the ten-second incident have
+no real-candidate observation at all, and those are precisely the behaviours the
+2026-07-25 accident produced.
+
+Coverage grows only by moving a row, and a row moves only when its evidence is
+named. A test run that does not move a row has not improved coverage, however
+many assertions it contains.
