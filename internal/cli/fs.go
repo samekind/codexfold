@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -23,6 +24,7 @@ import (
 	"github.com/samekind/codexfold/internal/fold"
 	"github.com/samekind/codexfold/internal/fsctl"
 	"github.com/samekind/codexfold/internal/fskitproto"
+	"github.com/samekind/codexfold/internal/fskitstatus"
 	"github.com/samekind/codexfold/internal/mountfs"
 	"github.com/samekind/codexfold/internal/pack"
 	"github.com/samekind/codexfold/internal/scan"
@@ -92,9 +94,10 @@ type FSCompactResult struct {
 }
 
 type FSRecoverResult struct {
-	SessionIDs []string `json:"session_ids"`
-	Recovered  int      `json:"recovered"`
-	DryRun     bool     `json:"dry_run"`
+	SessionIDs         []string `json:"session_ids"`
+	Recovered          int      `json:"recovered"`
+	PendingRetirements int      `json:"pending_retirements"`
+	DryRun             bool     `json:"dry_run"`
 }
 
 type FSNativeValidationResult struct {
@@ -160,6 +163,9 @@ func newFSRetireNativeCommand() *cobra.Command {
 				if err != nil {
 					return fmt.Errorf("native snapshot is empty without a valid retirement proof: %w", err)
 				}
+				if err := validateRetiredNativeProofForState(store, state, proof); err != nil {
+					return err
+				}
 				result.AlreadyRetired = true
 				result.SnapshotBytes = proof.Snapshot.Bytes
 				result.ProofPath = proofPath
@@ -167,6 +173,27 @@ func newFSRetireNativeCommand() *cobra.Command {
 				result.VisibleBytes = proof.Visible.Bytes
 				result.VisibleSHA256 = proof.Visible.SHA256
 				if apply {
+					managed, resolver, err := openPackOnlyVerifiedManagedSession(command.Context(), store, state)
+					if err != nil {
+						return err
+					}
+					verifiedState := managed.State()
+					if closeErr := resolver.Close(); closeErr != nil {
+						return closeErr
+					}
+					if verifiedState != state {
+						return errors.New("managed session changed during already-retired pack-only recovery proof")
+					}
+					currentState, err := managedState(store, state.SessionID)
+					if err != nil {
+						return err
+					}
+					if currentState != state {
+						return errors.New("managed session changed before interrupted native retirement replay")
+					}
+					if err := validateRetiredNativeProofForState(store, currentState, proof); err != nil {
+						return err
+					}
 					result.StorageBefore, err = storage.Scan(command.Context(), storage.Options{StoreDir: store, AllowMetadataIssues: true})
 					if err != nil {
 						return err
@@ -192,25 +219,11 @@ func newFSRetireNativeCommand() *cobra.Command {
 			if filepath.Clean(state.NativeSnapshot.Path) != filepath.Clean(expectedSnapshot) {
 				return errors.New("only the managed canonical snapshot can be retired")
 			}
-			packReport, err := pack.Doctor(command.Context(), store)
-			if err != nil {
-				return err
-			}
-			if packReport.IssueCount != 0 || packReport.VerifiedManifestCount != packReport.ManifestCount {
-				return fmt.Errorf("pack-only recovery proof failed: %d issue(s)", packReport.IssueCount)
-			}
-			managed, resolver, err := openManagedSession(command.Context(), store, state)
+			managed, resolver, err := openPackOnlyVerifiedManagedSession(command.Context(), store, state)
 			if err != nil {
 				return err
 			}
 			defer resolver.Close()
-			foldReport, err := fold.DoctorWithOptions(command.Context(), store, fold.DoctorOptions{Reader: resolver})
-			if err != nil {
-				return err
-			}
-			if foldReport.IssueCount != 0 || foldReport.VerifiedManifestCount != foldReport.ManifestCount {
-				return fmt.Errorf("fold pack-only recovery proof failed: %d issue(s)", foldReport.IssueCount)
-			}
 			writer, err := managed.OpenWriter()
 			if errors.Is(err, vfs.ErrWriterBusy) {
 				return errors.New("cannot retire native snapshot while the session has an active writer")
@@ -452,7 +465,7 @@ func newFSBenchmarkCommand() *cobra.Command {
 				return err
 			}
 			store := resolveFoldStore(home, storeDir)
-			states, err := vfs.DiscoverSessionStates(store)
+			states, _, err := vfs.DiscoverSessionStatesDetailedReadOnly(store)
 			if err != nil {
 				return err
 			}
@@ -550,6 +563,10 @@ func newFSServeCommand() *cobra.Command {
 		Short: "Mount managed sessions and hot-load newly enrolled state",
 		Args:  cobra.NoArgs,
 		RunE: func(command *cobra.Command, _ []string) error {
+			// The resident service log is a launchd stderr file with no time
+			// information of its own. Stamp it at the writer so every existing
+			// report line becomes correlatable without touching each call site.
+			command.SetErr(newTimestampedWriter(command.ErrOrStderr()))
 			home, err := codex.ResolveHome(codexHome)
 			if err != nil {
 				return err
@@ -592,10 +609,26 @@ func newFSServeCommand() *cobra.Command {
 			}
 			store := resolveFoldStore(home, storeDir)
 			mount := defaultMountPoint(home, mountPoint)
-			states, err := vfs.DiscoverSessionStates(store)
-			if err != nil {
+			if apply {
+				if err := ensureFSServeStore(store); err != nil {
+					return err
+				}
+			}
+			states, _, err := vfs.DiscoverSessionStatesDetailedReadOnly(store)
+			if err != nil && !(errors.Is(err, os.ErrNotExist) && !apply) {
 				return err
 			}
+			if errors.Is(err, os.ErrNotExist) {
+				states = nil
+			}
+			deletions, err := vfs.DiscoverSessionDeletions(store)
+			if err != nil && !(errors.Is(err, os.ErrNotExist) && !apply) {
+				return err
+			}
+			if errors.Is(err, os.ErrNotExist) {
+				deletions = nil
+			}
+			states, _ = filterDeletedSessionMetadata(states, nil, deletedSessionIDs(deletions))
 			if nativeFSKitResource == "" {
 				nativeFSKitResource = filepath.Join(store, "fs", "native-fskit")
 			}
@@ -624,15 +657,15 @@ func newFSServeCommand() *cobra.Command {
 			}
 			defer processLock.Close()
 			if canonicalNamespace {
-				for _, state := range states {
-					if _, err := recoverInterruptedCanonicalMigration(home, store, nativeRoot, state); err != nil {
-						return err
-					}
-				}
-				states, err = vfs.DiscoverSessionStates(store)
+				states, _, err = vfs.DiscoverSessionStatesDetailedReadOnly(store)
 				if err != nil {
 					return err
 				}
+				deletions, err = vfs.DiscoverSessionDeletions(store)
+				if err != nil {
+					return err
+				}
+				states, _ = filterDeletedSessionMetadata(states, nil, deletedSessionIDs(deletions))
 				result.ManagedSessions = len(states)
 			}
 			var operationRecorder func(string)
@@ -655,6 +688,15 @@ func newFSServeCommand() *cobra.Command {
 			if canonicalNamespace {
 				filesystem = mountfs.NewCanonical()
 				filesystem.SetNativeRoot(nativeRoot)
+				filesystem.SetSessionDeletionPublisher(func(state vfs.SessionState, route string) error {
+					_, err := vfs.PublishSessionDeletion(store, state, route)
+					return err
+				})
+				for _, deletion := range deletions {
+					if err := filesystem.HideDeletedSessionAt(deletion.SessionID, deletion.Route); err != nil {
+						return err
+					}
+				}
 				if frontend == "native-fskit" {
 					filesystem.SetNativeNamespaceRefreshMount(mount)
 				}
@@ -665,6 +707,12 @@ func newFSServeCommand() *cobra.Command {
 					return fmt.Errorf("validate native writer rollouts: %w", err)
 				}
 			}
+			// Session-load incidents are the only place a client I/O error can be
+			// correlated with the store transition that caused it, so they are
+			// recorded for both namespace shapes.
+			filesystem.SetSessionLoadRecorder(func(line string) {
+				_, _ = fmt.Fprintln(command.ErrOrStderr(), line)
+			})
 			ctx, cancel := context.WithCancel(command.Context())
 			defer cancel()
 			var nativeWatcherDone chan error
@@ -705,7 +753,29 @@ func newFSServeCommand() *cobra.Command {
 			known := make(map[string]uint64)
 			knownRoutes := make(map[string]string)
 			knownPacks := make(map[string]string)
+			lastStateIssueSignature := ""
+			lastReloadError := ""
+			lastMissingKnownSignature := ""
+			var managedReportMu sync.Mutex
+			reportManagedReloadSafe := func(err error) {
+				managedReportMu.Lock()
+				defer managedReportMu.Unlock()
+				reportManagedReload(command.ErrOrStderr(), err, &lastReloadError)
+			}
+			managedStatusPath := ""
+			if frontend == "native-fskit" {
+				managedStatusPath = service.FSKitStatusPath(nativeFSKitResource, "managed")
+			}
+			managedStatus := newManagedStatusReporterForStore(managedStatusPath, store, mount, nativeFSKitResource, func(err error) {
+				_, _ = fmt.Fprintf(command.ErrOrStderr(), "write managed session status: %v\n", err)
+			})
+			defer func() { _ = managedStatus.Close(500 * time.Millisecond) }()
 			var loadMu sync.Mutex
+			var managedObservationSequence uint64
+			nextManagedObservationSequence := func() uint64 {
+				managedObservationSequence++
+				return managedObservationSequence
+			}
 			openState := func(state vfs.SessionState) (*vfs.Session, *pack.Resolver, error) {
 				managed, resolver, err := openManagedSession(ctx, store, state)
 				if err != nil {
@@ -713,64 +783,295 @@ func newFSServeCommand() *cobra.Command {
 				}
 				return managed, resolver, nil
 			}
+			recordManagedLoaderFailure := func(sessionID string, started time.Time, err error) {
+				delete(known, sessionID)
+				delete(knownRoutes, sessionID)
+				delete(knownPacks, sessionID)
+				observation := managedReloadObservation{
+					Sequence:        nextManagedObservationSequence(),
+					Fatal:           fmt.Errorf("open managed session %s: %w", sessionID, err),
+					ManagedSessions: len(known), FailureStartedAt: started,
+				}
+				managedStatus.Observe(observation)
+				reportManagedReloadSafe(observation.Err())
+			}
 			filesystem.SetOwnedSessionLoader(func(sessionID string) (*vfs.Session, io.Closer, error) {
+				started := time.Now()
 				loadMu.Lock()
 				defer loadMu.Unlock()
-				states, err := vfs.DiscoverSessionStates(store)
+				if _, err := vfs.LoadSessionDeletion(store, sessionID); err == nil {
+					return nil, nil, os.ErrNotExist
+				} else if !errors.Is(err, os.ErrNotExist) {
+					recordManagedLoaderFailure(sessionID, started, err)
+					return nil, nil, err
+				}
+				states, issues, err := vfs.DiscoverSessionStatesDetailedReadOnly(store)
 				if err != nil {
+					recordManagedLoaderFailure(sessionID, started, err)
 					return nil, nil, err
 				}
 				for _, state := range states {
 					if state.SessionID == sessionID {
-						managed, resolver, err := openState(state)
+						managed, resolver, err := openManagedSessionDeferred(ctx, store, state)
 						if err == nil {
 							known[state.SessionID] = state.Generation
 							knownPacks[state.SessionID] = resolver.Generation()
+						} else {
+							recordManagedLoaderFailure(sessionID, started, err)
 						}
 						return managed, resolver, err
 					}
 				}
+				for _, issue := range issues {
+					if issue.SessionID == sessionID {
+						err := fmt.Errorf("managed session %s is retained while its state is unavailable: %w", sessionID, issue.Err)
+						recordManagedLoaderFailure(sessionID, started, err)
+						return nil, nil, err
+					}
+				}
+				if _, previouslyManaged := known[sessionID]; previouslyManaged {
+					recordManagedLoaderFailure(sessionID, started, os.ErrNotExist)
+				}
 				return nil, nil, os.ErrNotExist
 			})
-			load := func() error {
-				loadMu.Lock()
-				defer loadMu.Unlock()
-				states, err := vfs.DiscoverSessionStates(store)
+			reloadLocked := func() managedReloadObservation {
+				observation := managedReloadObservation{
+					Sequence: nextManagedObservationSequence(), FailureStartedAt: time.Now(),
+				}
+				observation.ManagedSessions = len(known)
+
+				initialStates, initialIssues, err := vfs.DiscoverSessionStatesDetailedReadOnly(store)
 				if err != nil {
-					return err
+					observation.Fatal = err
+					return observation
+				}
+				deletions, err := vfs.DiscoverSessionDeletions(store)
+				if err != nil {
+					observation.Fatal = err
+					return observation
+				}
+				initialStates, initialIssues = filterDeletedSessionMetadata(initialStates, initialIssues, deletedSessionIDs(deletions))
+				expectedManaged := retainedManagedSessionGenerations(known, initialStates, initialIssues)
+				registryRemovals := make(map[string]struct{})
+				registryMissing := false
+				if canonicalNamespace {
+					registry, registryErr := LoadManagedSessionRegistry(store)
+					switch {
+					case registryErr == nil:
+						mergeManagedSessionRegistryGenerations(expectedManaged, registry)
+					case errors.Is(registryErr, os.ErrNotExist):
+						registryMissing = true
+					default:
+						observation.Fatal = fmt.Errorf("load durable managed session registry: %w", registryErr)
+						return observation
+					}
+				}
+				observation.StateIssues = initialIssues
+				observation.ManagedSessions = len(expectedManaged)
+				var codexSessions []codex.Session
+				codexSnapshotLoaded := false
+				if len(deletions) != 0 || canonicalNamespace {
+					codexSessions, err = codex.LoadSessions(home)
+					if err != nil {
+						observation.Fatal = err
+						return observation
+					}
+					codexSnapshotLoaded = true
+				}
+				if canonicalNamespace && registryMissing {
+					bootstrapEntries, bootstrapErr := managedSessionRegistryBootstrapEntries(store, expectedManaged)
+					if bootstrapErr != nil {
+						observation.Fatal = bootstrapErr
+						return observation
+					}
+					registry, bootstrapErr := WriteManagedSessionRegistry(
+						store,
+						bootstrapEntries,
+						ManagedSessionRegistryWriteOptions{Bootstrap: true},
+					)
+					if bootstrapErr != nil {
+						observation.Fatal = fmt.Errorf("bootstrap durable managed session registry: %w", bootstrapErr)
+						return observation
+					}
+					mergeManagedSessionRegistryGenerations(expectedManaged, registry)
+					registryMissing = false
+				}
+				deleted, err := reconcileManagedSessionDeletionSet(store, filesystem, canonicalNamespace, deletions, known, knownRoutes, knownPacks)
+				if err != nil {
+					observation.Fatal = err
+					return observation
+				}
+				for sessionID := range deleted {
+					delete(expectedManaged, sessionID)
+					registryRemovals[sessionID] = struct{}{}
+				}
+				states, issues, err := vfs.DiscoverSessionStatesDetailedReadOnly(store)
+				if err != nil {
+					observation.Fatal = err
+					return observation
+				}
+				states, issues = filterDeletedSessionMetadata(states, issues, deleted)
+				if canonicalNamespace {
+					retirementResult, retirementErr := recoverCanonicalRetirementsWithOwnerHandoff(
+						ctx, home, store, mount, nativeRoot,
+						func(sessionID string, expectedRoute string, commit func() error) error {
+							return detachCompletedManagedSession(filesystem, sessionID, expectedRoute, known, knownRoutes, knownPacks, commit)
+						},
+					)
+					if retirementErr != nil {
+						observation.Fatal = errors.Join(observation.Fatal, retirementErr)
+					}
+					if retirementResult.Deferred != 0 {
+						observation.Fatal = errors.Join(observation.Fatal, fmt.Errorf(
+							"%d canonical retirement recovery operation(s) are waiting for active leases or locks",
+							retirementResult.Deferred,
+						))
+					}
+					for _, sessionID := range retirementResult.CompletedSessionIDs {
+						delete(expectedManaged, sessionID)
+						registryRemovals[sessionID] = struct{}{}
+					}
+					if retirementErr != nil || retirementResult.Completed != 0 || retirementResult.Restored != 0 {
+						states, issues, err = vfs.DiscoverSessionStatesDetailedReadOnly(store)
+						if err != nil {
+							observation.Fatal = errors.Join(observation.Fatal, err)
+							return observation
+						}
+						states, issues = filterDeletedSessionMetadata(states, issues, deleted)
+					}
+				}
+				if canonicalNamespace && !codexSnapshotLoaded && (len(states) != 0 || len(issues) != 0) {
+					codexSessions, err = codex.LoadSessions(home)
+					if err != nil {
+						observation.Fatal = err
+						return observation
+					}
+					codexSnapshotLoaded = true
+				}
+				if canonicalNamespace && len(issues) != 0 {
+					if !codexSnapshotLoaded {
+						observation.Fatal = errors.Join(observation.Fatal, errors.New("managed state recovery requires a complete Codex metadata snapshot"))
+						return observation
+					}
+					recoveredState, recoveryErr := recoverManagedSessionStateIssues(store, codexSessions, issues, deleted)
+					if recoveryErr != nil {
+						observation.Fatal = errors.Join(observation.Fatal, recoveryErr)
+					}
+					if recoveredState {
+						states, issues, err = vfs.DiscoverSessionStatesDetailedReadOnly(store)
+						if err != nil {
+							observation.Fatal = errors.Join(observation.Fatal, err)
+							return observation
+						}
+						states, issues = filterDeletedSessionMetadata(states, issues, deleted)
+					}
+				}
+				if canonicalNamespace && len(states) != 0 {
+					if !codexSnapshotLoaded {
+						observation.Fatal = errors.New("interrupted canonical migration recovery requires a complete Codex metadata snapshot")
+						return observation
+					}
+					retiredSessions, recoveryErr := recoverInterruptedCanonicalMigrationsWithOwnerHandoff(
+						home, store, nativeRoot, states, codexSessions,
+						func(sessionID string, expectedRoute string, commit func() error) error {
+							return detachCompletedManagedSession(filesystem, sessionID, expectedRoute, known, knownRoutes, knownPacks, commit)
+						},
+					)
+					if recoveryErr != nil {
+						observation.Fatal = errors.Join(observation.Fatal, recoveryErr)
+					}
+					for _, sessionID := range retiredSessions {
+						delete(expectedManaged, sessionID)
+						registryRemovals[sessionID] = struct{}{}
+					}
+					if len(retiredSessions) != 0 {
+						states, issues, err = vfs.DiscoverSessionStatesDetailedReadOnly(store)
+						if err != nil {
+							observation.Fatal = errors.Join(observation.Fatal, err)
+							return observation
+						}
+						states, issues = filterDeletedSessionMetadata(states, issues, deleted)
+					}
+				}
+				missingManifests, err := missingManagedManifestIDs(store, states)
+				if err != nil {
+					observation.Fatal = err
+					return observation
+				}
+				if len(missingManifests) != 0 {
+					if !codexSnapshotLoaded {
+						codexSessions, err = codex.LoadSessions(home)
+						if err != nil {
+							observation.Fatal = errors.Join(observation.Fatal, fmt.Errorf("automatic managed manifest recovery requires a complete Codex metadata snapshot: %w", err))
+							return observation
+						}
+						codexSnapshotLoaded = true
+					}
+					if _, err := pack.RepairCurrentManifests(store); err != nil {
+						observation.Fatal = fmt.Errorf("repair missing managed manifests: %w", err)
+						return observation
+					}
+					states, issues, err = vfs.DiscoverSessionStatesDetailedReadOnly(store)
+					if err != nil {
+						observation.Fatal = err
+						return observation
+					}
+					states, issues = filterDeletedSessionMetadata(states, issues, deleted)
+					stillMissing, checkErr := missingManagedManifestIDs(store, states)
+					if checkErr != nil {
+						observation.Fatal = checkErr
+						return observation
+					}
+					if len(stillMissing) != 0 {
+						observation.Fatal = fmt.Errorf("managed manifests remain unavailable after recovery: %s", strings.Join(stillMissing, ","))
+						return observation
+					}
+				}
+				observation.StateIssues = issues
+				reportManagedStateIssues(command.ErrOrStderr(), issues, &lastStateIssueSignature)
+				if canonicalNamespace {
+					// Recovery and repair can outlive a SQLite route change. Refresh at
+					// the final publication boundary so stale metadata never authorizes a
+					// Move, Upsert, retirement acknowledgement, or owner switch.
+					codexSessions, err = codex.LoadSessions(home)
+					if err != nil {
+						observation.Fatal = errors.Join(observation.Fatal, fmt.Errorf("refresh Codex metadata before managed route publication: %w", err))
+						return observation
+					}
+					codexSnapshotLoaded = true
 				}
 				currentPack, err := currentPackForStates(store, states)
 				if err != nil {
-					return err
+					observation.Fatal = err
+					return observation
 				}
 				routes := make(map[string]string)
 				if canonicalNamespace {
-					routes, err = discoverCanonicalRoutes(home, mount, store, states, codex.LoadSessions)
+					routes, err = canonicalSessionRoutes(home, mount, store, states, codexSessions)
 					if err != nil {
-						return err
+						observation.Fatal = err
+						return observation
 					}
 				}
-				seen := make(map[string]struct{}, len(states))
+				missingRoutes := make([]string, 0)
 				for _, state := range states {
-					seen[state.SessionID] = struct{}{}
 					if canonicalNamespace {
 						route, exists := routes[state.SessionID]
-						handled, err := syncCanonicalRetirement(store, home, nativeRoot, filesystem, state, route, exists, known, knownRoutes, knownPacks, currentPack, openState)
+						if !exists {
+							missingRoutes = append(missingRoutes, state.SessionID)
+						}
+						handled, err := syncCanonicalRetirement(ctx, store, home, nativeRoot, filesystem, state, route, exists, known, knownRoutes, knownPacks, currentPack, openState)
 						if err != nil {
-							return err
+							observation.Fatal = err
+							return observation
 						}
 						if handled {
 							continue
 						}
 						if !exists {
-							if _, mounted := known[state.SessionID]; mounted {
-								if err := filesystem.RemoveSession(state.SessionID); err != nil && !errors.Is(err, os.ErrNotExist) {
-									return err
-								}
-								delete(known, state.SessionID)
-								delete(knownRoutes, state.SessionID)
-								delete(knownPacks, state.SessionID)
-							}
+							// Codex metadata or a route can disappear transiently. Keep the
+							// last-known-good owner until an explicit retirement/tombstone
+							// authorizes removal.
 							continue
 						}
 						generation, generationKnown := known[state.SessionID]
@@ -779,26 +1080,19 @@ func newFSServeCommand() *cobra.Command {
 								continue
 							}
 							if err := filesystem.MoveSessionAt(state.SessionID, route); err != nil {
-								return err
+								observation.Fatal = err
+								return observation
+							}
+							if err := writeMountAcknowledgement(store, state.SessionID, state.Generation, route); err != nil {
+								observation.Fatal = err
+								return observation
 							}
 							knownRoutes[state.SessionID] = route
-							if err := writeMountAcknowledgement(store, state.SessionID, state.Generation, route); err != nil {
-								return err
-							}
 							continue
 						}
-						managed, resolver, err := openState(state)
-						if err != nil {
-							return err
-						}
-						if err := filesystem.UpsertSessionAtOwned(state.SessionID, route, managed, resolver); err != nil {
-							return err
-						}
-						known[state.SessionID] = state.Generation
-						knownRoutes[state.SessionID] = route
-						knownPacks[state.SessionID] = resolver.Generation()
-						if err := writeMountAcknowledgement(store, state.SessionID, state.Generation, route); err != nil {
-							return err
+						if err := upsertCanonicalManagedState(store, filesystem, state, route, known, knownRoutes, knownPacks, openState); err != nil {
+							observation.Fatal = err
+							return observation
 						}
 						continue
 					}
@@ -807,55 +1101,75 @@ func newFSServeCommand() *cobra.Command {
 					}
 					managed, resolver, err := openState(state)
 					if err != nil {
-						return err
+						observation.Fatal = err
+						return observation
 					}
 					if err := filesystem.UpsertSessionOwned(state.SessionID, managed, resolver); err != nil {
-						return err
+						observation.Fatal = err
+						return observation
 					}
-					known[state.SessionID] = state.Generation
+					known[state.SessionID] = managed.State().Generation
 					knownPacks[state.SessionID] = resolver.Generation()
 				}
-				for sessionID := range known {
-					if _, exists := seen[sessionID]; exists {
-						continue
+				if canonicalNamespace {
+					finalSnapshot, registryErr := publishManagedSessionRegistryAtFinalFence(store, known, registryRemovals)
+					if registryErr != nil {
+						observation.Fatal = fmt.Errorf("publish durable managed session registry: %w", registryErr)
+						return observation
 					}
-					if err := filesystem.RemoveSession(sessionID); err != nil && !errors.Is(err, os.ErrNotExist) {
-						return err
-					}
-					delete(known, sessionID)
-					delete(knownRoutes, sessionID)
-					delete(knownPacks, sessionID)
+					expectedManaged = finalSnapshot.Retained
+					states, issues = finalSnapshot.States, finalSnapshot.Issues
+					observation.StateIssues = issues
+					reportManagedStateIssues(command.ErrOrStderr(), issues, &lastStateIssueSignature)
+				} else {
+					expectedManaged = retainedManagedSessionGenerations(known, states, issues)
 				}
-				return nil
+				seen := managedSessionIDsRetained(states, issues)
+				observation.MissingState = missingManagedSessionIDs(expectedManaged, seen)
+				observation.MissingRoute = missingRoutes
+				observation.ManagedSessions = retainedManagedSessionCount(expectedManaged, seen)
+				reportMissingKnownSessions(command.ErrOrStderr(), expectedManaged, seen, &lastMissingKnownSignature)
+				return observation
 			}
-			if err := load(); err != nil {
-				return err
+			load := func() error {
+				loadMu.Lock()
+				defer loadMu.Unlock()
+				observation := reloadLocked()
+				managedStatus.Observe(observation)
+				return observation.Err()
 			}
+			reportManagedReloadSafe(load())
 			storageMaintenanceDone := startStorageMaintenance(ctx, command.ErrOrStderr(), store, startupStorageGC)
+			var storageStatusDone <-chan struct{}
+			var activityCounter *mountfs.IOActivityCounter
+			if frontend == "native-fskit" {
+				storageStatusDone = startStorageStatusReporter(
+					ctx,
+					command.ErrOrStderr(),
+					store,
+					service.FSKitStatusPath(nativeFSKitResource, "storage"),
+					time.Minute,
+					storageMaintenanceDone,
+					storage.Scan,
+					fskitstatus.Write,
+				)
+				activityCounter = &mountfs.IOActivityCounter{}
+			}
 			runtimeMemoryMaintenanceDone := startRuntimeMemoryMaintenance(ctx, filesystem)
 			watcherDone := make(chan struct{})
-			watcherErrors := make(chan error, 1)
 			go func() {
 				defer close(watcherDone)
-				ticker := time.NewTicker(time.Second)
-				defer ticker.Stop()
-				for {
-					select {
-					case <-ctx.Done():
-						return
-					case <-ticker.C:
-						if err := load(); err != nil {
-							watcherErrors <- err
-							cancel()
-							return
-						}
-					}
-				}
+				runManagedReloadLoop(ctx, time.Second, 30*time.Second, load, func(err error) {
+					reportManagedReloadSafe(err)
+				})
 			}()
 			var mountErr error
 			if frontend == "native-fskit" {
 				mountErr = mountfs.ServeNativeFSKit(ctx, filesystem, mountfs.NativeFSKitServerOptions{
-					SocketPath: nativeFSKitSocket, ResourcePath: nativeFSKitResource, Recorder: operationRecorder,
+					SocketPath: nativeFSKitSocket, ResourcePath: nativeFSKitResource,
+					StatusPath: service.FSKitStatusPath(nativeFSKitResource, "daemon"), MountPoint: mount,
+					Recorder:                   operationRecorder,
+					Activity:                   activityCounter,
 					PrewarmSharedMemoryWindows: 4,
 				})
 			} else {
@@ -864,6 +1178,9 @@ func newFSServeCommand() *cobra.Command {
 			cancel()
 			<-watcherDone
 			<-storageMaintenanceDone
+			if storageStatusDone != nil {
+				<-storageStatusDone
+			}
 			<-runtimeMemoryMaintenanceDone
 			if enrollmentDone != nil {
 				<-enrollmentDone
@@ -876,12 +1193,7 @@ func newFSServeCommand() *cobra.Command {
 				}
 			}
 			sessionCloseErr := filesystem.CloseSessions()
-			select {
-			case watcherErr := <-watcherErrors:
-				return errors.Join(watcherErr, sessionCloseErr)
-			default:
-				return errors.Join(mountErr, nativeWatcherErr, sessionCloseErr)
-			}
+			return errors.Join(mountErr, nativeWatcherErr, sessionCloseErr)
 		},
 	}
 	command.Flags().StringVar(&codexHome, "codex-home", "", "Codex home directory; defaults to CODEX_HOME or ~/.codex")
@@ -901,6 +1213,280 @@ func newFSServeCommand() *cobra.Command {
 	command.Flags().BoolVar(&enrollmentCanary, "enrollment-canary", false, "Enable additional isolated-home constraints for periodic validation")
 	command.Flags().BoolVar(&jsonOutput, "json", false, "Emit JSON output for dry-run")
 	return command
+}
+
+func ensureFSServeStore(store string) error {
+	if !filepath.IsAbs(store) {
+		return errors.New("filesystem service store must be absolute")
+	}
+	if err := os.MkdirAll(store, 0o700); err != nil {
+		return fmt.Errorf("create filesystem service store: %w", err)
+	}
+	info, err := os.Lstat(store)
+	if err != nil {
+		return fmt.Errorf("inspect filesystem service store: %w", err)
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("filesystem service store must be a real directory")
+	}
+	return nil
+}
+
+func managedSessionIDsRetained(states []vfs.SessionState, issues []vfs.SessionStateIssue) map[string]struct{} {
+	retained := make(map[string]struct{}, len(states)+len(issues))
+	for _, state := range states {
+		retained[state.SessionID] = struct{}{}
+	}
+	for _, issue := range issues {
+		if issue.SessionID != "" {
+			retained[issue.SessionID] = struct{}{}
+		}
+	}
+	return retained
+}
+
+func retainedManagedSessionGenerations(known map[string]uint64, states []vfs.SessionState, issues []vfs.SessionStateIssue) map[string]uint64 {
+	retained := make(map[string]uint64, len(known)+len(states)+len(issues))
+	for sessionID, generation := range known {
+		retained[sessionID] = generation
+	}
+	for _, state := range states {
+		if state.Generation > retained[state.SessionID] {
+			retained[state.SessionID] = state.Generation
+		}
+	}
+	for _, issue := range issues {
+		if issue.SessionID != "" {
+			if _, exists := retained[issue.SessionID]; !exists {
+				retained[issue.SessionID] = 0
+			}
+		}
+	}
+	return retained
+}
+
+func mergeManagedSessionRegistryGenerations(retained map[string]uint64, registry ManagedSessionRegistry) {
+	for _, entry := range registry.Entries {
+		if entry.Generation > retained[entry.ID] {
+			retained[entry.ID] = entry.Generation
+		}
+	}
+}
+
+func managedSessionRegistryEntriesFromGenerations(retained map[string]uint64) []ManagedSessionRegistryEntry {
+	entries := make([]ManagedSessionRegistryEntry, 0, len(retained))
+	for sessionID, generation := range retained {
+		if generation == 0 {
+			continue
+		}
+		entries = append(entries, ManagedSessionRegistryEntry{ID: sessionID, Generation: generation})
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].ID < entries[j].ID })
+	return entries
+}
+
+func deletedSessionIDs(deletions []vfs.SessionDeletion) map[string]struct{} {
+	deleted := make(map[string]struct{}, len(deletions))
+	for _, deletion := range deletions {
+		deleted[deletion.SessionID] = struct{}{}
+	}
+	return deleted
+}
+
+func filterDeletedSessionMetadata(states []vfs.SessionState, issues []vfs.SessionStateIssue, deleted map[string]struct{}) ([]vfs.SessionState, []vfs.SessionStateIssue) {
+	if len(deleted) == 0 {
+		return states, issues
+	}
+	activeStates := make([]vfs.SessionState, 0, len(states))
+	for _, state := range states {
+		if _, exists := deleted[state.SessionID]; !exists {
+			activeStates = append(activeStates, state)
+		}
+	}
+	activeIssues := make([]vfs.SessionStateIssue, 0, len(issues))
+	for _, issue := range issues {
+		if _, exists := deleted[issue.SessionID]; !exists {
+			activeIssues = append(activeIssues, issue)
+		}
+	}
+	return activeStates, activeIssues
+}
+
+func reconcileManagedSessionDeletions(
+	store string,
+	filesystem *mountfs.Filesystem,
+	canonicalNamespace bool,
+	known map[string]uint64,
+	knownRoutes map[string]string,
+	knownPacks map[string]string,
+) (map[string]struct{}, error) {
+	deletions, err := vfs.DiscoverSessionDeletions(store)
+	if err != nil {
+		return nil, err
+	}
+	return reconcileManagedSessionDeletionSet(store, filesystem, canonicalNamespace, deletions, known, knownRoutes, knownPacks)
+}
+
+func reconcileManagedSessionDeletionSet(
+	store string,
+	filesystem *mountfs.Filesystem,
+	canonicalNamespace bool,
+	deletions []vfs.SessionDeletion,
+	known map[string]uint64,
+	knownRoutes map[string]string,
+	knownPacks map[string]string,
+) (map[string]struct{}, error) {
+	deleted := deletedSessionIDs(deletions)
+	var replayErrors []error
+	for _, deletion := range deletions {
+		if err := filesystem.RemoveSession(deletion.SessionID); err != nil && !errors.Is(err, os.ErrNotExist) {
+			replayErrors = append(replayErrors, fmt.Errorf("detach deleted managed session %s: %w", deletion.SessionID, err))
+		}
+		delete(known, deletion.SessionID)
+		delete(knownRoutes, deletion.SessionID)
+		delete(knownPacks, deletion.SessionID)
+		if canonicalNamespace {
+			if err := filesystem.HideDeletedSessionAt(deletion.SessionID, deletion.Route); err != nil {
+				replayErrors = append(replayErrors, err)
+				continue
+			}
+		}
+		if _, err := vfs.AdvanceSessionDeletion(store, deletion); err != nil && !errors.Is(err, vfs.ErrSessionDeletionBusy) {
+			replayErrors = append(replayErrors, fmt.Errorf("replay managed session deletion %s: %w", deletion.SessionID, err))
+		}
+	}
+	return deleted, errors.Join(replayErrors...)
+}
+
+func reportManagedStateIssues(writer io.Writer, issues []vfs.SessionStateIssue, previous *string) {
+	var builder strings.Builder
+	for _, issue := range issues {
+		fmt.Fprintf(&builder, "%s\x00%s\x00%s\x00%s\n", issue.SessionID, issue.Kind, issue.Path, issue.Err)
+	}
+	signature := builder.String()
+	if signature == *previous {
+		return
+	}
+	if signature == "" {
+		if *previous != "" {
+			_, _ = fmt.Fprintln(writer, "managed session state issues cleared")
+		}
+		*previous = signature
+		return
+	}
+	for _, issue := range issues {
+		_, _ = fmt.Fprintf(writer, "managed session retained session=%s issue=%s path=%s error=%v\n", issue.SessionID, issue.Kind, issue.Path, issue.Err)
+	}
+	*previous = signature
+}
+
+func reportMissingKnownSessions(writer io.Writer, known map[string]uint64, seen map[string]struct{}, previous *string) {
+	missing := make([]string, 0)
+	for sessionID := range known {
+		if _, exists := seen[sessionID]; !exists {
+			missing = append(missing, sessionID)
+		}
+	}
+	sort.Strings(missing)
+	signature := strings.Join(missing, ",")
+	if signature == *previous {
+		return
+	}
+	if signature == "" {
+		if *previous != "" {
+			_, _ = fmt.Fprintln(writer, "managed session metadata presence recovered")
+		}
+	} else {
+		_, _ = fmt.Fprintf(writer, "managed sessions retained without current metadata sessions=%s\n", signature)
+	}
+	*previous = signature
+}
+
+func reportManagedReload(writer io.Writer, err error, previous *string) {
+	current := ""
+	if err != nil {
+		current = err.Error()
+	}
+	if current == *previous {
+		return
+	}
+	if current == "" {
+		if *previous != "" {
+			_, _ = fmt.Fprintln(writer, "managed session reload recovered")
+		}
+	} else {
+		_, _ = fmt.Fprintf(writer, "managed session reload deferred; last-known-good sessions remain mounted: %v\n", err)
+	}
+	*previous = current
+}
+
+type managedReloadDelayState struct {
+	minimumDelay     time.Duration
+	maximumDelay     time.Duration
+	recoveryDeadline time.Duration
+	failureStartedAt time.Time
+	backoffDelay     time.Duration
+}
+
+func newManagedReloadDelayState(minimumDelay time.Duration, maximumDelay time.Duration, recoveryDeadline time.Duration) managedReloadDelayState {
+	if minimumDelay <= 0 {
+		minimumDelay = time.Second
+	}
+	if maximumDelay < minimumDelay {
+		maximumDelay = minimumDelay
+	}
+	if recoveryDeadline < 0 {
+		recoveryDeadline = 0
+	}
+	return managedReloadDelayState{
+		minimumDelay: minimumDelay, maximumDelay: maximumDelay,
+		recoveryDeadline: recoveryDeadline, backoffDelay: minimumDelay,
+	}
+}
+
+func (state *managedReloadDelayState) next(err error, observedAt time.Time) time.Duration {
+	if err == nil {
+		state.failureStartedAt = time.Time{}
+		state.backoffDelay = state.minimumDelay
+		return state.minimumDelay
+	}
+	if state.failureStartedAt.IsZero() {
+		state.failureStartedAt = observedAt
+		state.backoffDelay = state.minimumDelay
+		return state.minimumDelay
+	}
+	if observedAt.Sub(state.failureStartedAt) < state.recoveryDeadline {
+		state.backoffDelay = state.minimumDelay
+		return state.minimumDelay
+	}
+	if state.backoffDelay > state.maximumDelay/2 {
+		state.backoffDelay = state.maximumDelay
+	} else {
+		state.backoffDelay *= 2
+		if state.backoffDelay > state.maximumDelay {
+			state.backoffDelay = state.maximumDelay
+		}
+	}
+	return state.backoffDelay
+}
+
+func runManagedReloadLoop(ctx context.Context, minimumDelay time.Duration, maximumDelay time.Duration, load func() error, report func(error)) {
+	delayState := newManagedReloadDelayState(minimumDelay, maximumDelay, managedRecoveryDeadline)
+	delay := delayState.minimumDelay
+	for {
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return
+		case <-timer.C:
+		}
+		err := load()
+		report(err)
+		delay = delayState.next(err, time.Now())
+	}
 }
 
 func defaultNativeFSKitSocket(home string, resourcePath string) string {
@@ -923,6 +1509,7 @@ func validateNativeFSKitSocketPath(path string) error {
 }
 
 func syncCanonicalRetirement(
+	ctx context.Context,
 	store string,
 	home string,
 	nativeRoot string,
@@ -936,6 +1523,28 @@ func syncCanonicalRetirement(
 	currentPack string,
 	openState func(vfs.SessionState) (*vfs.Session, *pack.Resolver, error),
 ) (bool, error) {
+	return syncCanonicalRetirementWithFinalFenceHook(
+		ctx, store, home, nativeRoot, filesystem, state, route, routeExists,
+		known, knownRoutes, knownPacks, currentPack, openState, nil,
+	)
+}
+
+func syncCanonicalRetirementWithFinalFenceHook(
+	ctx context.Context,
+	store string,
+	home string,
+	nativeRoot string,
+	filesystem *mountfs.Filesystem,
+	state vfs.SessionState,
+	route string,
+	routeExists bool,
+	known map[string]uint64,
+	knownRoutes map[string]string,
+	knownPacks map[string]string,
+	currentPack string,
+	openState func(vfs.SessionState) (*vfs.Session, *pack.Resolver, error),
+	beforeFinalFence func() error,
+) (bool, error) {
 	retirement, retiring, err := readRetirementRequest(store, state.SessionID)
 	if err != nil {
 		return false, err
@@ -943,10 +1552,38 @@ func syncCanonicalRetirement(
 	if !retiring {
 		return false, removeIfExists(filepath.Join(store, "fs", "sessions", state.SessionID, retirementAcknowledgementFilename))
 	}
+	deletionLock, err := storage.AcquireOperationLock(store, "session-deletions")
+	if errors.Is(err, storage.ErrOperationLockHeld) {
+		return true, fmt.Errorf("%w: retirement cutover is waiting for explicit deletion reconciliation", storage.ErrOperationLockHeld)
+	}
+	if err != nil {
+		return true, err
+	}
+	defer deletionLock.Close()
+	currentRetirement, stillRetiring, err := readRetirementRequest(store, state.SessionID)
+	if err != nil {
+		return true, err
+	}
+	if !stillRetiring || currentRetirement != retirement {
+		return true, errors.New("retirement request changed before cutover serialization")
+	}
+	if _, err := vfs.LoadSessionDeletion(store, state.SessionID); err == nil {
+		// Explicit deletion is the higher authority. Leave the retirement request
+		// untouched so deletion replay can quarantine the exact managed evidence.
+		return true, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return true, err
+	}
+	activeDirectory := filepath.Join(filepath.Clean(store), "fs", "sessions", state.SessionID)
+	acknowledgement, err := validateRetirementAcknowledgement(activeDirectory, retirement)
+	if err != nil {
+		return true, err
+	}
+	if acknowledgement.Acknowledged || acknowledgement.Rejected {
+		return true, nil
+	}
 	reject := func(message string) (bool, error) {
-		rejected := retirement
-		rejected.Error = message
-		return true, writeRetirementAcknowledgement(store, state.SessionID, rejected)
+		return true, ensureRetirementRejectionAt(activeDirectory, retirement, message)
 	}
 	if !routeExists || retirement.Route != route {
 		return reject("retirement request does not match the current session route")
@@ -968,21 +1605,85 @@ func syncCanonicalRetirement(
 	if retirement.Generation != generation {
 		return reject("retirement request generation does not match the current session state")
 	}
+	guard, acquired, err := vfs.TryAcquireWriterLeaseGuard(store, state.SessionID)
+	if err != nil {
+		return true, err
+	}
+	if !acquired {
+		return true, errors.New("retirement cutover is waiting for the managed writer lease")
+	}
+	defer guard.Close()
+	recovered, err := vfs.RecoverSessionJournalWithWriterLease(ctx, filepath.Join(activeDirectory, "state.json"))
+	if err != nil {
+		return true, fmt.Errorf("recover managed journal before retirement cutover: %w", err)
+	}
+	if recovered.SessionID != state.SessionID || recovered.Generation != retirement.Generation {
+		return reject("managed session advanced after retirement request publication")
+	}
+	binding, err := loadCurrentRetirementStateBinding(activeDirectory, state.SessionID, retirement.Generation)
+	if err != nil || binding.StateSHA256 != retirement.StateSHA256 || binding.CheckpointSequence != retirement.CheckpointSequence || binding.CheckpointSHA256 != retirement.CheckpointSHA256 {
+		return reject("managed session advanced after retirement request publication")
+	}
 	nativeTargetPath, err := canonicalNativeRoute(home, nativeRoot, filepath.Join(home, filepath.FromSlash(strings.TrimPrefix(route, "/"))))
 	if err != nil {
 		return true, err
 	}
-	nativeTarget, targetErr := hashPath(nativeTargetPath)
+	nativeTarget, targetErr := hashStableCanonicalNativeFile(nativeRoot, nativeTargetPath)
 	if targetErr != nil || nativeTarget.Bytes != retirement.Bytes || nativeTarget.SHA256 != retirement.SHA256 {
 		return reject("native rollback target is unavailable or changed")
 	}
-	if err := filesystem.PreferNativeSession(state.SessionID); err != nil {
+	if err := filesystem.RemoveSessionAtWithCommit(state.SessionID, route, func() error {
+		if _, err := vfs.LoadSessionDeletion(store, state.SessionID); err == nil {
+			return errors.New("explicit deletion tombstone supersedes retirement cutover")
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		binding, err := loadCurrentRetirementStateBinding(filepath.Join(filepath.Clean(store), "fs", "sessions", state.SessionID), state.SessionID, retirement.Generation)
+		if err != nil {
+			return publishRetirementCutoverRejectionAt(activeDirectory, retirement, "managed checkpoint changed before retirement cutover")
+		}
+		if binding.StateSHA256 != retirement.StateSHA256 || binding.CheckpointSequence != retirement.CheckpointSequence || binding.CheckpointSHA256 != retirement.CheckpointSHA256 {
+			return publishRetirementCutoverRejectionAt(activeDirectory, retirement, "managed session advanced after retirement request publication")
+		}
+		if beforeFinalFence != nil {
+			if err := beforeFinalFence(); err != nil {
+				return err
+			}
+		}
+		if !canonicalNativeFileStillMatches(nativeRoot, nativeTargetPath, nativeTarget) {
+			return publishRetirementCutoverRejectionAt(activeDirectory, retirement, "native rollback target changed at the retirement cutover boundary")
+		}
+		return writeRetirementAcknowledgement(store, state.SessionID, retirement)
+	}); err != nil {
+		if errors.Is(err, errRetirementCutoverRejected) {
+			return true, nil
+		}
+		if errors.Is(err, mountfs.ErrManagedSessionRouteChanged) {
+			return reject("managed session route changed before owner retirement")
+		}
+		if errors.Is(err, mountfs.ErrManagedSessionDeletionInProgress) {
+			return true, nil
+		}
 		return true, err
 	}
-	if err := writeRetirementAcknowledgement(store, state.SessionID, retirement); err != nil {
-		return true, err
-	}
+	delete(known, state.SessionID)
+	delete(knownRoutes, state.SessionID)
+	delete(knownPacks, state.SessionID)
 	return true, nil
+}
+
+func createCanonicalRetirementRequestWithDeletionFence(store string, sessionID string, generation uint64, route string, target vfs.NativeFile) (request retirementControl, resultErr error) {
+	deletionLock, err := storage.AcquireOperationLock(store, "session-deletions")
+	if err != nil {
+		return retirementControl{}, fmt.Errorf("serialize retirement request with explicit deletion: %w", err)
+	}
+	defer func() { resultErr = errors.Join(resultErr, deletionLock.Close()) }()
+	if _, err := vfs.LoadSessionDeletion(store, sessionID); err == nil {
+		return retirementControl{}, errors.New("explicit session deletion supersedes canonical retirement")
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return retirementControl{}, err
+	}
+	return createRetirementRequest(store, sessionID, generation, route, target)
 }
 
 func newFSMigrateCommand() *cobra.Command {
@@ -1109,7 +1810,7 @@ func newFSMigrateCommand() *cobra.Command {
 						}
 						return cause
 					}
-					return rollbackCanonicalMigration(store, session.ID, canonicalSource, native.Path, cause)
+					return rollbackCanonicalMigration(canonicalSource, native.Path, cause)
 				}
 				managed, migrationLease, err := vfs.OpenSessionWithWriter(command.Context(), vfs.SessionOptions{Root: store, ManifestPath: fold.ManifestPath(store, session.ID), Manifest: manifest, Reader: resolver, NativeSnapshot: native})
 				if err != nil {
@@ -1187,19 +1888,11 @@ func newFSMigrateCommand() *cobra.Command {
 	return command
 }
 
-func rollbackCanonicalMigration(store string, sessionID string, sourcePath string, retainedPath string, cause error) error {
-	// Keep the managed route live until an exact native source is available.
-	// If restoration fails, retiring state here would remove both recovery paths.
-	if err := restoreCanonicalSnapshotSource(sourcePath, retainedPath); err != nil {
-		return errors.Join(cause, err)
-	}
-	stateDirectory := filepath.Join(filepath.Clean(store), "fs", "sessions", sessionID)
-	if _, err := os.Stat(stateDirectory); errors.Is(err, os.ErrNotExist) {
-		return cause
-	} else if err != nil {
-		return errors.Join(cause, err)
-	}
-	if _, err := retireManagedState(store, sessionID); err != nil {
+func rollbackCanonicalMigration(sourcePath string, retainedPath string, cause error) error {
+	// A standalone migration command cannot detach the daemon's live owner.
+	// Preserve both native and managed evidence; an eventual switch back to
+	// native must use the daemon retirement handoff.
+	if err := preserveCanonicalSnapshotSource(sourcePath, retainedPath); err != nil {
 		return errors.Join(cause, err)
 	}
 	return cause
@@ -1284,13 +1977,6 @@ func newFSRollbackCommand() *cobra.Command {
 						return fmt.Errorf("canonical filesystem mount is not healthy: %w", err)
 					}
 				}
-				nativeSnapshotAlreadyRetired := false
-				if canonicalNamespace && state.NativeSnapshot.Path != "" {
-					nativeSnapshotAlreadyRetired, err = vfs.NativeSnapshotAlreadyRetired(store, state)
-					if err != nil {
-						return fmt.Errorf("verify canonical native snapshot retirement: %w", err)
-					}
-				}
 				managed, resolver, err := openManagedSession(command.Context(), store, state)
 				if err != nil {
 					return err
@@ -1303,7 +1989,12 @@ func newFSRollbackCommand() *cobra.Command {
 				if err != nil {
 					return err
 				}
-				defer rollbackLease.Close()
+				rollbackLeaseOpen := true
+				defer func() {
+					if rollbackLeaseOpen {
+						_ = rollbackLease.Close()
+					}
+				}()
 				visible, err := managed.VisibleInfo()
 				if err != nil {
 					return err
@@ -1326,24 +2017,45 @@ func newFSRollbackCommand() *cobra.Command {
 					return err
 				}
 				if canonicalNamespace {
-					mountedTarget, err := canonicalMountRoute(home, mount, current.RolloutPath)
-					if err != nil {
-						return err
-					}
 					canonicalRoute, err := canonicalNamespaceRoute(home, mount, current.RolloutPath)
 					if err != nil {
 						return err
 					}
-					retirement, err := createRetirementRequest(store, state.SessionID, managed.State().Generation, canonicalRoute, target)
+					retirement, err := createCanonicalRetirementRequestWithDeletionFence(store, state.SessionID, managed.State().Generation, canonicalRoute, target)
 					if err != nil {
 						return err
 					}
+					// The durable request binds the exact checkpoint. Release the
+					// initiator lease before waiting so the daemon can acquire the same
+					// writer guard and atomically detach+ack. Any intervening managed
+					// write advances the checkpoint and makes the daemon reject cutover.
+					if err := rollbackLease.Close(); err != nil {
+						return fmt.Errorf("release rollback writer lease after durable request publication: %w", err)
+					}
+					rollbackLeaseOpen = false
 					recoveryWait := mountWait
 					if recoveryWait < 15*time.Second {
 						recoveryWait = 15 * time.Second
 					}
 					restoreManagedRoute := func(cause error, retiredState string, retiredSnapshot string) error {
 						var restoreErrors []error
+						deletionLock, lockErr := storage.AcquireOperationLock(store, "session-deletions")
+						if lockErr != nil {
+							return errors.Join(cause, fmt.Errorf("serialize retirement compensation with explicit deletion: %w", lockErr))
+						}
+						lockOpen := true
+						closeDeletionLock := func() {
+							if lockOpen {
+								restoreErrors = append(restoreErrors, deletionLock.Close())
+								lockOpen = false
+							}
+						}
+						defer closeDeletionLock()
+						if _, deletionErr := vfs.LoadSessionDeletion(store, state.SessionID); deletionErr == nil {
+							return errors.Join(cause, errors.New("explicit session deletion superseded retirement compensation"))
+						} else if !errors.Is(deletionErr, os.ErrNotExist) {
+							return errors.Join(cause, deletionErr)
+						}
 						if retiredSnapshot != "" {
 							if err := restoreCanonicalNativeSnapshot(state.NativeSnapshot.Path, retiredSnapshot); err != nil {
 								restoreErrors = append(restoreErrors, err)
@@ -1352,17 +2064,27 @@ func newFSRollbackCommand() *cobra.Command {
 						var restored vfs.SessionState
 						if retiredState == "" {
 							directory := filepath.Join(store, "fs", "sessions", state.SessionID)
-							if err := clearRetirementControl(directory); err != nil {
-								restoreErrors = append(restoreErrors, err)
-							} else {
+							_, pending, requestErr := readRetirementRequest(store, state.SessionID)
+							if requestErr != nil {
+								restoreErrors = append(restoreErrors, requestErr)
+							} else if pending {
 								restored, err = vfs.RepublishSessionState(filepath.Join(directory, "state.json"))
 								if err != nil {
 									restoreErrors = append(restoreErrors, err)
+								} else if err := upsertManagedSessionRegistryEntryIfPresent(store, restored.SessionID, restored.Generation); err != nil {
+									restoreErrors = append(restoreErrors, err)
+								} else if err := clearRetirementControl(directory); err != nil {
+									restoreErrors = append(restoreErrors, err)
+								}
+							} else {
+								restored, err = managedState(store, state.SessionID)
+								if err != nil {
+									restoreErrors = append(restoreErrors, err)
+								} else if restored.Generation <= retirement.Generation {
+									restoreErrors = append(restoreErrors, errors.New("retirement request disappeared without committed or compensated state"))
 								}
 							}
-						} else if err := clearRetirementControl(retiredState); err != nil {
-							restoreErrors = append(restoreErrors, err)
-						} else if err := restoreManagedState(store, state.SessionID, retiredState); err != nil {
+						} else if err := restoreManagedStateWithWriterLease(store, state.SessionID, retiredState); err != nil {
 							restoreErrors = append(restoreErrors, err)
 						} else {
 							restored, err = managedState(store, state.SessionID)
@@ -1370,42 +2092,72 @@ func newFSRollbackCommand() *cobra.Command {
 								restoreErrors = append(restoreErrors, err)
 							}
 						}
-						if restored.Generation != 0 {
-							if err := waitForMountAcknowledgement(command.Context(), store, state.SessionID, restored.Generation, canonicalRoute, recoveryWait); err != nil {
+						var restoredVisible vfs.NativeFile
+						if restored.Generation != 0 && len(restoreErrors) == 0 {
+							restoredManaged, restoredResolver, openErr := openManagedSession(command.Context(), store, restored)
+							if openErr != nil {
+								restoreErrors = append(restoreErrors, openErr)
+							} else {
+								restored = restoredManaged.State()
+								restoredVisible, openErr = hashManagedSessionVisible(command.Context(), restoredManaged)
+								restoreErrors = append(restoreErrors, errors.Join(openErr, restoredResolver.Close()))
+								if err := upsertManagedSessionRegistryEntryIfPresent(store, restored.SessionID, restored.Generation); err != nil {
+									restoreErrors = append(restoreErrors, err)
+								}
+							}
+						}
+						closeDeletionLock()
+						if restored.Generation != 0 && len(restoreErrors) == 0 {
+							freshSessions, freshErr := codex.LoadSessions(home)
+							if freshErr != nil {
+								restoreErrors = append(restoreErrors, freshErr)
+								return errors.Join(append([]error{cause}, restoreErrors...)...)
+							}
+							freshSession, freshErr := findSession(freshSessions, state.SessionID)
+							if freshErr != nil {
+								restoreErrors = append(restoreErrors, freshErr)
+								return errors.Join(append([]error{cause}, restoreErrors...)...)
+							}
+							freshRoute, freshErr := canonicalNamespaceRoute(home, mount, freshSession.RolloutPath)
+							if freshErr != nil {
+								restoreErrors = append(restoreErrors, freshErr)
+								return errors.Join(append([]error{cause}, restoreErrors...)...)
+							}
+							freshMountedTarget, freshErr := canonicalMountRoute(home, mount, freshSession.RolloutPath)
+							if freshErr != nil {
+								restoreErrors = append(restoreErrors, freshErr)
+								return errors.Join(append([]error{cause}, restoreErrors...)...)
+							}
+							if err := waitForMountAcknowledgement(command.Context(), store, state.SessionID, restored.Generation, freshRoute, recoveryWait); err != nil {
 								restoreErrors = append(restoreErrors, fmt.Errorf("wait for restored managed route: %w", err))
-							} else if _, err := waitForTargetMatch(command.Context(), mountedTarget, target, recoveryWait); err != nil {
+							} else if _, err := waitForTargetPrefix(command.Context(), freshMountedTarget, restoredVisible, recoveryWait); err != nil {
 								restoreErrors = append(restoreErrors, fmt.Errorf("verify restored managed route: %w", err))
 							}
 						}
 						return errors.Join(append([]error{cause}, restoreErrors...)...)
 					}
 					if err := waitForRetirementAcknowledgement(command.Context(), store, state.SessionID, retirement, mountWait); err != nil {
-						return restoreManagedRoute(err, "", "")
-					}
-					_, err = waitForTargetMatch(command.Context(), mountedTarget, target, mountWait)
-					if err != nil {
-						return restoreManagedRoute(fmt.Errorf("verify canonical native rollback: %w", err), "", "")
-					}
-					nativeTarget, err := hashPath(target.Path)
-					if err != nil || nativeTarget.Bytes != target.Bytes || nativeTarget.SHA256 != target.SHA256 {
-						if err == nil {
-							err = errors.New("canonical native rollback target changed before retirement")
+						if errors.Is(err, errRetirementRejected) {
+							return restoreManagedRoute(err, "", "")
 						}
-						return restoreManagedRoute(fmt.Errorf("verify canonical native rollback target: %w", err), "", "")
+						return fmt.Errorf("canonical retirement cutover is pending automatic recovery: %w", err)
 					}
-					retiredState, err := retireManagedState(store, state.SessionID)
+					retiredState, err := waitForCanonicalRetirementCompletion(command.Context(), store, state.SessionID, recoveryWait)
 					if err != nil {
-						return restoreManagedRoute(err, "", "")
+						return fmt.Errorf("canonical retirement is committed and pending daemon completion: %w", err)
 					}
-					var retiredSnapshot string
-					if state.NativeSnapshot.Path != "" && !nativeSnapshotAlreadyRetired {
-						retiredSnapshot, err = retireCanonicalNativeSnapshot(store, nativeRoot, state.SessionID, state.NativeSnapshot.Path, target.Path, retiredState)
-						if err != nil {
-							return restoreManagedRoute(err, retiredState, "")
+					freshSessions, err := codex.LoadSessions(home)
+					if err != nil {
+						return fmt.Errorf("refresh Codex route after canonical retirement: %w", err)
+					}
+					if freshSession, findErr := findSession(freshSessions, state.SessionID); findErr == nil {
+						freshMountedTarget, routeErr := canonicalMountRoute(home, mount, freshSession.RolloutPath)
+						if routeErr != nil {
+							return routeErr
 						}
-					}
-					if err := clearRetirementControl(retiredState); err != nil {
-						return restoreManagedRoute(err, retiredState, retiredSnapshot)
+						if _, err := waitForTargetPrefix(command.Context(), freshMountedTarget, target, mountWait); err != nil {
+							return fmt.Errorf("canonical retirement committed but current mounted route failed prefix verification: %w", err)
+						}
 					}
 					result.RetiredState = retiredState
 				} else {
@@ -1613,12 +2365,17 @@ func newFSRecoverCommand() *cobra.Command {
 				if _, err := recoverInterruptedCanonicalMigration(home, store, filepath.Join(home, "fold-native"), recoveredState); err != nil {
 					return err
 				}
+				if _, pending, err := readRetirementRequest(store, recoveredState.SessionID); err != nil {
+					return err
+				} else if pending {
+					result.PendingRetirements++
+				}
 				result.Recovered++
 			}
 			if jsonOutput {
 				return writeJSON(command, result)
 			}
-			_, err = fmt.Fprintf(command.OutOrStdout(), "dry_run=%t selected=%d recovered=%d\n", result.DryRun, len(result.SessionIDs), result.Recovered)
+			_, err = fmt.Fprintf(command.OutOrStdout(), "dry_run=%t selected=%d recovered=%d pending_retirements=%d\n", result.DryRun, len(result.SessionIDs), result.Recovered, result.PendingRetirements)
 			return err
 		},
 	}
@@ -1631,6 +2388,91 @@ func newFSRecoverCommand() *cobra.Command {
 }
 
 func recoverInterruptedCanonicalMigration(home string, store string, nativeRoot string, state vfs.SessionState) (recovered bool, resultErr error) {
+	return recoverInterruptedCanonicalMigrationWithSessionLoader(home, store, nativeRoot, state, func() ([]codex.Session, error) {
+		return codex.LoadSessions(home)
+	}, nil)
+}
+
+func recoverInterruptedCanonicalMigrationsWithSnapshot(home string, store string, nativeRoot string, states []vfs.SessionState, sessions []codex.Session) (retiredSessions []string, resultErr error) {
+	return recoverInterruptedCanonicalMigrationsWithOwnerHandoff(home, store, nativeRoot, states, sessions, nil)
+}
+
+func recoverInterruptedCanonicalMigrationsWithOwnerHandoff(
+	home string,
+	store string,
+	nativeRoot string,
+	states []vfs.SessionState,
+	sessions []codex.Session,
+	handoff canonicalRetirementOwnerHandoff,
+) (retiredSessions []string, resultErr error) {
+	var recoveryErrors []error
+	for _, state := range states {
+		changed, err := recoverInterruptedCanonicalMigrationWithSnapshotAndHandoff(home, store, nativeRoot, state, sessions, handoff)
+		if changed {
+			retiredSessions = append(retiredSessions, state.SessionID)
+		}
+		if err != nil {
+			recoveryErrors = append(recoveryErrors, fmt.Errorf("recover interrupted canonical migration %s: %w", state.SessionID, err))
+		}
+	}
+	return retiredSessions, errors.Join(recoveryErrors...)
+}
+
+func detachCompletedManagedSession(filesystem *mountfs.Filesystem, sessionID string, expectedRoute string, known map[string]uint64, knownRoutes map[string]string, knownPacks map[string]string, commit func() error) error {
+	if err := filesystem.RemoveSessionAtWithCommit(sessionID, expectedRoute, commit); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("detach completed managed session %s: %w", sessionID, err)
+	}
+	delete(known, sessionID)
+	delete(knownRoutes, sessionID)
+	delete(knownPacks, sessionID)
+	return nil
+}
+
+func recoverInterruptedCanonicalMigrationWithSnapshot(home string, store string, nativeRoot string, state vfs.SessionState, sessions []codex.Session) (recovered bool, resultErr error) {
+	return recoverInterruptedCanonicalMigrationWithSnapshotAndHandoff(home, store, nativeRoot, state, sessions, nil)
+}
+
+func recoverInterruptedCanonicalMigrationWithSnapshotAndHandoff(home string, store string, nativeRoot string, state vfs.SessionState, sessions []codex.Session, handoff canonicalRetirementOwnerHandoff) (recovered bool, resultErr error) {
+	return recoverInterruptedCanonicalMigrationWithSessionLoader(home, store, nativeRoot, state, func() ([]codex.Session, error) {
+		return sessions, nil
+	}, handoff)
+}
+
+func recoverInterruptedCanonicalMigrationWithSessionLoader(home string, store string, nativeRoot string, state vfs.SessionState, loadSessions func() ([]codex.Session, error), handoff canonicalRetirementOwnerHandoff) (recovered bool, resultErr error) {
+	return recoverInterruptedCanonicalMigrationWithOptions(home, store, nativeRoot, state, loadSessions, handoff, nil)
+}
+
+func recoverInterruptedCanonicalMigrationWithOptions(
+	home string,
+	store string,
+	nativeRoot string,
+	state vfs.SessionState,
+	loadSessions func() ([]codex.Session, error),
+	handoff canonicalRetirementOwnerHandoff,
+	hook canonicalRetirementRecoveryHook,
+) (recovered bool, resultErr error) {
+	deletionLock, err := storage.AcquireOperationLock(store, "session-deletions")
+	if err != nil {
+		return false, fmt.Errorf("serialize interrupted migration recovery with explicit deletion: %w", err)
+	}
+	defer func() { resultErr = errors.Join(resultErr, deletionLock.Close()) }()
+	if _, err := vfs.LoadSessionDeletion(store, state.SessionID); err == nil {
+		return false, fmt.Errorf("explicit deletion tombstone supersedes interrupted canonical migration %s", state.SessionID)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return false, fmt.Errorf("inspect deletion authority before interrupted migration recovery: %w", err)
+	}
+	return recoverInterruptedCanonicalMigrationWithOptionsLocked(home, store, nativeRoot, state, loadSessions, handoff, hook)
+}
+
+func recoverInterruptedCanonicalMigrationWithOptionsLocked(
+	home string,
+	store string,
+	nativeRoot string,
+	state vfs.SessionState,
+	loadSessions func() ([]codex.Session, error),
+	handoff canonicalRetirementOwnerHandoff,
+	hook canonicalRetirementRecoveryHook,
+) (recovered bool, resultErr error) {
 	retainedPath := filepath.Join(store, "fs", "snapshots", state.SessionID, "native.jsonl")
 	if filepath.Clean(state.NativeSnapshot.Path) != filepath.Clean(retainedPath) {
 		return false, nil
@@ -1653,7 +2495,7 @@ func recoverInterruptedCanonicalMigration(home string, store string, nativeRoot 
 		return false, nil
 	}
 	defer func() { resultErr = errors.Join(resultErr, guard.Close()) }()
-	sessions, err := codex.LoadSessions(home)
+	sessions, err := loadSessions()
 	if err != nil {
 		return false, err
 	}
@@ -1665,7 +2507,7 @@ func recoverInterruptedCanonicalMigration(home string, store string, nativeRoot 
 	if err != nil {
 		return false, err
 	}
-	source, err := hashPath(sourcePath)
+	source, err := hashStableCanonicalNativeFile(nativeRoot, sourcePath)
 	if errors.Is(err, os.ErrNotExist) {
 		return false, nil
 	}
@@ -1685,14 +2527,86 @@ func recoverInterruptedCanonicalMigration(home string, store string, nativeRoot 
 	if source.Bytes != state.BaseBytes || source.SHA256 != state.BaseSHA256 || source.Bytes != state.NativeSnapshot.Bytes || source.SHA256 != state.NativeSnapshot.SHA256 {
 		return false, errors.New("interrupted canonical migration source no longer matches the managed base")
 	}
-	retiredState, err := retireManagedState(store, state.SessionID)
+	relativeRoute, err := canonicalRelativeRoute(home, current.RolloutPath)
 	if err != nil {
 		return false, err
 	}
-	if _, err := retireCanonicalNativeSnapshot(store, nativeRoot, state.SessionID, state.NativeSnapshot.Path, sourcePath, retiredState); err != nil {
-		if restoreErr := restoreManagedState(store, state.SessionID, retiredState); restoreErr != nil {
-			return false, errors.Join(err, restoreErr)
+	requestRoute := "/" + filepath.ToSlash(relativeRoute)
+	request, err := createRetirementRequest(store, state.SessionID, state.Generation, requestRoute, source)
+	if err != nil {
+		return false, fmt.Errorf("publish interrupted migration retirement request: %w", err)
+	}
+	if err := runCanonicalRetirementHook(hook, state.SessionID, retirementPhaseRequestPublished); err != nil {
+		return false, err
+	}
+	if handoff == nil {
+		// A standalone CLI has no authority to detach a live filesystem owner.
+		// The durable request is sufficient for the daemon to finish atomically.
+		return false, nil
+	}
+	activeDirectory := filepath.Join(filepath.Clean(store), "fs", "sessions", state.SessionID)
+	commit := func() error {
+		if _, err := vfs.LoadSessionDeletion(store, state.SessionID); err == nil {
+			return errors.New("explicit deletion tombstone supersedes interrupted migration cutover")
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
 		}
+		binding, err := loadCurrentRetirementStateBinding(activeDirectory, state.SessionID, request.Generation)
+		if err != nil || binding.StateSHA256 != request.StateSHA256 || binding.CheckpointSequence != request.CheckpointSequence || binding.CheckpointSHA256 != request.CheckpointSHA256 {
+			return publishRetirementCutoverRejectionAt(activeDirectory, request, "managed checkpoint changed before interrupted migration cutover")
+		}
+		freshCurrent, err := codex.LoadSession(home, state.SessionID)
+		if errors.Is(err, codex.ErrSessionNotFound) {
+			return publishRetirementCutoverRejectionAt(activeDirectory, request, "session route disappeared before interrupted migration cutover")
+		}
+		if err != nil {
+			return fmt.Errorf("refresh Codex metadata at interrupted migration cutover: %w", err)
+		}
+		freshRelativeRoute, err := canonicalRelativeRoute(home, freshCurrent.RolloutPath)
+		if err != nil || "/"+filepath.ToSlash(freshRelativeRoute) != request.Route {
+			return publishRetirementCutoverRejectionAt(activeDirectory, request, "session route changed before interrupted migration cutover")
+		}
+		freshSourcePath, err := canonicalNativeRoute(home, nativeRoot, freshCurrent.RolloutPath)
+		if err != nil || filepath.Clean(freshSourcePath) != filepath.Clean(sourcePath) {
+			return publishRetirementCutoverRejectionAt(activeDirectory, request, "native source route changed before interrupted migration cutover")
+		}
+		if !canonicalNativeFileStillMatches(nativeRoot, freshSourcePath, source) {
+			return publishRetirementCutoverRejectionAt(activeDirectory, request, "native source changed before interrupted migration cutover")
+		}
+		return writeRetirementAcknowledgementAt(activeDirectory, request)
+	}
+	if err := handoff(state.SessionID, request.Route, commit); err != nil {
+		if errors.Is(err, errRetirementCutoverRejected) {
+			return false, nil
+		}
+		if errors.Is(err, mountfs.ErrManagedSessionRouteChanged) {
+			if rejectErr := ensureRetirementRejectionAt(activeDirectory, request, "managed owner route changed before interrupted migration cutover"); rejectErr != nil {
+				return false, errors.Join(err, rejectErr)
+			}
+			return false, nil
+		}
+		return false, fmt.Errorf("handoff interrupted canonical migration owner: %w", err)
+	}
+	if err := runCanonicalRetirementHook(hook, state.SessionID, retirementPhaseOwnerDetached); err != nil {
+		return false, err
+	}
+	retiredState, err := retireManagedStateForRecovery(store, state.SessionID, activeDirectory)
+	if err != nil {
+		return false, err
+	}
+	if err := runCanonicalRetirementHook(hook, state.SessionID, retirementPhaseStateRetired); err != nil {
+		return false, err
+	}
+	if _, err := retireCanonicalNativeSnapshot(store, nativeRoot, state.SessionID, state.NativeSnapshot.Path, sourcePath, retiredState); err != nil {
+		return false, err
+	}
+	if err := runCanonicalRetirementHook(hook, state.SessionID, retirementPhaseNativeRetired); err != nil {
+		return false, err
+	}
+	if err := removeManagedSessionRegistryEntryIfPresent(store, state.SessionID); err != nil {
+		return false, fmt.Errorf("remove completed migration from durable managed session registry: %w", err)
+	}
+	if err := clearRetirementRequestLast(retiredState, request, true, hook, state.SessionID); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -1823,6 +2737,44 @@ func openManagedSession(ctx context.Context, store string, state vfs.SessionStat
 	return managed, resolver, nil
 }
 
+func openPackOnlyVerifiedManagedSession(ctx context.Context, store string, state vfs.SessionState) (*vfs.Session, *pack.Resolver, error) {
+	packReport, err := pack.Doctor(ctx, store)
+	if err != nil {
+		return nil, nil, err
+	}
+	if packReport.ManifestCount == 0 || packReport.IssueCount != 0 || packReport.VerifiedManifestCount != packReport.ManifestCount {
+		return nil, nil, fmt.Errorf("pack-only recovery proof failed: %d issue(s)", packReport.IssueCount)
+	}
+	managed, resolver, err := openManagedSession(ctx, store, state)
+	if err != nil {
+		return nil, nil, err
+	}
+	foldReport, err := fold.DoctorWithOptions(ctx, store, fold.DoctorOptions{Reader: resolver})
+	if err != nil {
+		_ = resolver.Close()
+		return nil, nil, err
+	}
+	if foldReport.IssueCount != 0 || foldReport.ManifestCount != packReport.ManifestCount || foldReport.VerifiedManifestCount != foldReport.ManifestCount {
+		_ = resolver.Close()
+		return nil, nil, fmt.Errorf("fold pack-only recovery proof failed: %d issue(s)", foldReport.IssueCount)
+	}
+	return managed, resolver, nil
+}
+
+func validateRetiredNativeProofForState(store string, state vfs.SessionState, proof vfs.NativeRetirementProof) error {
+	if proof.SessionID != state.SessionID {
+		return errors.New("native retirement proof belongs to another managed session")
+	}
+	if proof.StateGeneration >= state.Generation {
+		return errors.New("native retirement proof is not earlier than the current managed state")
+	}
+	expectedSnapshot := filepath.Join(filepath.Clean(store), "fs", "snapshots", state.SessionID, "native.jsonl")
+	if filepath.Clean(proof.Snapshot.Path) != filepath.Clean(expectedSnapshot) {
+		return errors.New("native retirement proof does not reference this session's canonical snapshot")
+	}
+	return vfs.ValidateNativeRetirementProofForState(store, state, proof)
+}
+
 func currentPackForStates(store string, states []vfs.SessionState) (string, error) {
 	current, err := pack.CurrentGeneration(store)
 	if err == nil {
@@ -1839,6 +2791,36 @@ func currentPackForStates(store string, states []vfs.SessionState) (string, erro
 		return "", nil
 	}
 	return "", err
+}
+
+func upsertCanonicalManagedState(
+	store string,
+	filesystem *mountfs.Filesystem,
+	state vfs.SessionState,
+	route string,
+	known map[string]uint64,
+	knownRoutes map[string]string,
+	knownPacks map[string]string,
+	openState func(vfs.SessionState) (*vfs.Session, *pack.Resolver, error),
+) error {
+	managed, resolver, err := openState(state)
+	if err != nil {
+		return err
+	}
+	if err := filesystem.UpsertSessionAtOwned(state.SessionID, route, managed, resolver); err != nil {
+		return err
+	}
+	recovered := managed.State()
+	if recovered.SessionID != state.SessionID || recovered.Generation == 0 {
+		return errors.New("opened managed session returned an invalid recovered state")
+	}
+	if err := writeMountAcknowledgement(store, state.SessionID, recovered.Generation, route); err != nil {
+		return err
+	}
+	known[state.SessionID] = recovered.Generation
+	knownRoutes[state.SessionID] = route
+	knownPacks[state.SessionID] = resolver.Generation()
+	return nil
 }
 
 func managedState(store string, sessionID string) (vfs.SessionState, error) {
@@ -1895,7 +2877,12 @@ func startupStorageGC(ctx context.Context, store string) (storage.StorageGCResul
 	if err := requireStorageHealth(ctx, store); err != nil {
 		return storage.StorageGCResult{}, false, nil
 	}
-	result, err := storage.Collect(ctx, storage.GCOptions{StoreDir: store, Apply: true})
+	result, err := storage.Collect(ctx, storage.GCOptions{
+		StoreDir: store, Apply: true,
+		AuthorizePackGenerationRemoval: func(ctx context.Context, candidate storage.GCCandidate) (storage.PackGenerationRemovalGuard, error) {
+			return pack.AuthorizeGenerationRemoval(ctx, store, candidate)
+		},
+	})
 	return result, true, err
 }
 
@@ -1909,9 +2896,83 @@ func startStorageMaintenance(
 	go func() {
 		defer close(done)
 		defer debug.FreeOSMemory()
-		_, _, err := run(ctx, store)
+		result, ran, err := run(ctx, store)
 		if err != nil && !errors.Is(err, context.Canceled) {
 			_, _ = fmt.Fprintf(diagnostics, "storage maintenance failed: %v\n", err)
+		} else if ran && result.RetainedUnprovedCount != 0 {
+			_, _ = fmt.Fprintf(diagnostics, "storage maintenance retained %d candidate(s) (%d apparent bytes) without exact durable deletion proof\n", result.RetainedUnprovedCount, result.RetainedUnprovedApparentBytes)
+		}
+	}()
+	return done
+}
+
+func storageStatusSnapshot(inventory storage.Inventory, scanErr error, observedAt time.Time) fskitstatus.Snapshot {
+	snapshot := fskitstatus.Snapshot{
+		Component: "storage",
+		State:     "healthy",
+		UpdatedAt: observedAt.UTC().Format(time.RFC3339Nano),
+		Summary:   "Session storage accounting is available",
+	}
+	if scanErr != nil {
+		snapshot.State = "recovering"
+		snapshot.Summary = "Session storage accounting is temporarily unavailable"
+		snapshot.Detail = scanErr.Error()
+		return snapshot
+	}
+	logicalBytes := inventory.LogicalSessionBytes
+	physicalBytes := inventory.TotalPhysicalBytes
+	snapshot.LogicalBytes = &logicalBytes
+	snapshot.PhysicalBytes = &physicalBytes
+	if inventory.IssueCount != 0 {
+		snapshot.State = "recovering"
+		snapshot.Summary = "Session storage accounting needs review"
+		snapshot.Detail = fmt.Sprintf("storage inventory reported %d issue(s)", inventory.IssueCount)
+	}
+	return snapshot
+}
+
+func startStorageStatusReporter(
+	ctx context.Context,
+	diagnostics io.Writer,
+	store string,
+	statusPath string,
+	interval time.Duration,
+	after <-chan struct{},
+	scan func(context.Context, storage.Options) (storage.Inventory, error),
+	publish func(string, fskitstatus.Snapshot) error,
+) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if after != nil {
+			select {
+			case <-ctx.Done():
+				return
+			case <-after:
+			}
+		}
+		if interval <= 0 {
+			interval = time.Minute
+		}
+		publishCurrent := func() {
+			inventory, err := scan(ctx, storage.Options{StoreDir: store, AllowMetadataIssues: true})
+			if errors.Is(err, context.Canceled) {
+				return
+			}
+			if publishErr := publish(statusPath, storageStatusSnapshot(inventory, err, time.Now())); publishErr != nil {
+				_, _ = fmt.Fprintf(diagnostics, "write storage status: %v\n", publishErr)
+			}
+		}
+		publishCurrent()
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				publishCurrent()
+			}
 		}
 	}()
 	return done
@@ -2148,6 +3209,148 @@ func waitForTargetMatch(ctx context.Context, target string, expected vfs.NativeF
 		select {
 		case <-ctx.Done():
 			return vfs.NativeFile{}, ctx.Err()
+		case <-time.After(25 * time.Millisecond):
+		}
+	}
+}
+
+func waitForTargetPrefix(ctx context.Context, target string, expected vfs.NativeFile, timeout time.Duration) (vfs.NativeFile, error) {
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	deadline := time.Now().Add(timeout)
+	for {
+		file, matches, err := hashPathPrefix(target, expected.Bytes, expected.SHA256)
+		if err == nil && matches {
+			return file, nil
+		}
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return vfs.NativeFile{}, err
+		}
+		if time.Now().After(deadline) {
+			return vfs.NativeFile{}, errors.New("timed out waiting for committed mounted-session prefix")
+		}
+		select {
+		case <-ctx.Done():
+			return vfs.NativeFile{}, ctx.Err()
+		case <-time.After(25 * time.Millisecond):
+		}
+	}
+}
+
+func hashPathPrefix(path string, expectedBytes int64, expectedSHA256 string) (vfs.NativeFile, bool, error) {
+	if expectedBytes < 0 || !validRetirementSHA256(expectedSHA256) {
+		return vfs.NativeFile{}, false, errors.New("valid prefix identity is required")
+	}
+	before, err := os.Lstat(path)
+	if err != nil {
+		return vfs.NativeFile{}, false, err
+	}
+	if !before.Mode().IsRegular() || before.Size() < expectedBytes {
+		return vfs.NativeFile{}, false, nil
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return vfs.NativeFile{}, false, err
+	}
+	opened, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return vfs.NativeFile{}, false, err
+	}
+	if !opened.Mode().IsRegular() || !os.SameFile(before, opened) || opened.Size() < expectedBytes {
+		_ = file.Close()
+		return vfs.NativeFile{}, false, errors.New("prefix target changed while it was opened")
+	}
+	hasher := sha256.New()
+	bytesRead, readErr := io.CopyN(hasher, file, expectedBytes)
+	closeErr := file.Close()
+	if err := errors.Join(readErr, closeErr); err != nil {
+		return vfs.NativeFile{}, false, err
+	}
+	after, err := os.Lstat(path)
+	if err != nil || !after.Mode().IsRegular() || !os.SameFile(opened, after) || after.Size() < expectedBytes {
+		if err == nil {
+			err = errors.New("prefix target changed while it was read")
+		}
+		return vfs.NativeFile{}, false, err
+	}
+	digest := hex.EncodeToString(hasher.Sum(nil))
+	return vfs.NativeFile{Path: path, Bytes: after.Size(), SHA256: digest}, bytesRead == expectedBytes && digest == expectedSHA256, nil
+}
+
+func hashManagedSessionVisible(ctx context.Context, session *vfs.Session) (vfs.NativeFile, error) {
+	if session == nil {
+		return vfs.NativeFile{}, errors.New("managed session is required")
+	}
+	reader, err := session.OpenReader()
+	if err != nil {
+		return vfs.NativeFile{}, err
+	}
+	size := reader.Size()
+	hasher := sha256.New()
+	buffer := make([]byte, 64<<10)
+	var offset int64
+	for offset < size {
+		chunk := buffer
+		if remaining := size - offset; int64(len(chunk)) > remaining {
+			chunk = chunk[:remaining]
+		}
+		n, readErr := reader.ReadAt(ctx, chunk, offset)
+		if n > 0 {
+			_, _ = hasher.Write(chunk[:n])
+			offset += int64(n)
+		}
+		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			return vfs.NativeFile{}, errors.Join(readErr, reader.Close())
+		}
+		if n == 0 {
+			return vfs.NativeFile{}, errors.Join(io.ErrUnexpectedEOF, reader.Close())
+		}
+	}
+	if err := reader.Close(); err != nil {
+		return vfs.NativeFile{}, err
+	}
+	return vfs.NativeFile{Bytes: size, SHA256: hex.EncodeToString(hasher.Sum(nil))}, nil
+}
+
+func waitForCanonicalRetirementCompletion(ctx context.Context, store string, sessionID string, timeout time.Duration) (string, error) {
+	if timeout <= 0 {
+		timeout = 15 * time.Second
+	}
+	deadline := time.Now().Add(timeout)
+	for {
+		pending, err := discoverPendingCanonicalRetirements(store)
+		if err != nil {
+			return "", err
+		}
+		stillPending := false
+		for _, transaction := range pending {
+			if transaction.SessionID == sessionID {
+				stillPending = true
+				break
+			}
+		}
+		activePath := filepath.Join(filepath.Clean(store), "fs", "sessions", sessionID)
+		_, activeErr := os.Lstat(activePath)
+		if !stillPending && errors.Is(activeErr, os.ErrNotExist) {
+			retired, globErr := filepath.Glob(filepath.Join(filepath.Clean(store), "fs", "retired", sessionID+"-*"))
+			if globErr != nil {
+				return "", globErr
+			}
+			if len(retired) != 0 {
+				sort.Strings(retired)
+				return retired[len(retired)-1], nil
+			}
+		} else if activeErr != nil && !errors.Is(activeErr, os.ErrNotExist) {
+			return "", activeErr
+		}
+		if time.Now().After(deadline) {
+			return "", errors.New("timed out waiting for request-last retirement completion")
+		}
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
 		case <-time.After(25 * time.Millisecond):
 		}
 	}

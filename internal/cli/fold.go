@@ -169,6 +169,24 @@ func doctorFoldStore(ctx context.Context, storeDir string) (fold.DoctorResult, e
 	return fold.DoctorResult{}, fmt.Errorf("open current pack for fold verification: %w", err)
 }
 
+// gcFoldStore mirrors doctorFoldStore: manifest verification must be able to
+// resolve packed objects, otherwise a pack-only store reports every managed
+// manifest invalid and GC refuses to run.
+func gcFoldStore(ctx context.Context, storeDir string, apply bool) (fold.GCResult, error) {
+	resolver, err := pack.Open(storeDir, pack.OpenOptions{CacheBytes: -1})
+	if err == nil {
+		defer resolver.Close()
+		return fold.GCWithOptions(ctx, storeDir, fold.GCOptions{Apply: apply, Reader: resolver})
+	}
+	current := filepath.Join(filepath.Clean(storeDir), "packs", "CURRENT")
+	if _, currentErr := os.Lstat(current); errors.Is(currentErr, os.ErrNotExist) {
+		return fold.GC(ctx, storeDir, apply)
+	} else if currentErr != nil {
+		return fold.GCResult{}, currentErr
+	}
+	return fold.GCResult{}, fmt.Errorf("open current pack for fold GC: %w", err)
+}
+
 func newGCCommand() *cobra.Command {
 	var codexHome string
 	var storeDir string
@@ -184,7 +202,7 @@ func newGCCommand() *cobra.Command {
 				return err
 			}
 			storeDir = resolveFoldStore(home, storeDir)
-			result, err := fold.GC(command.Context(), storeDir, apply)
+			result, err := gcFoldStore(command.Context(), storeDir, apply)
 			if err != nil {
 				return err
 			}

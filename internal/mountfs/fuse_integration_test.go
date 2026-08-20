@@ -114,8 +114,9 @@ func TestRealFuseMountNativeFileOperations(t *testing.T) {
 		Source:  fold.ManifestSource{Bytes: int64(len(source)), SHA256: digestHex},
 		Parts:   []fold.Part{{Kind: fold.PartResidual, Object: fold.ObjectRef{SHA256: digestHex, RawBytes: int64(len(source))}}},
 	}
+	persistMountManifestFixture(t, fold.ManifestPath(root, manifest.Session.ID), manifest)
 	managed, err := vfs.OpenSession(context.Background(), vfs.SessionOptions{
-		Root: root, ManifestPath: filepath.Join(root, "manifest.json"), Manifest: manifest,
+		Root: root, ManifestPath: fold.ManifestPath(root, manifest.Session.ID), Manifest: manifest,
 		Reader: fuseFixtureReader{digestHex: source}, NativeSnapshot: vfs.NativeFile{Path: nativePath, Bytes: int64(len(source)), SHA256: digestHex},
 	})
 	if err != nil {
@@ -504,8 +505,9 @@ func TestRealFuseCanonicalManagedRemovalCanBeReaddedAtSamePath(t *testing.T) {
 		Source:  fold.ManifestSource{Bytes: int64(len(firstManagedBytes)), SHA256: digestHex},
 		Parts:   []fold.Part{{Kind: fold.PartResidual, Object: fold.ObjectRef{SHA256: digestHex, RawBytes: int64(len(firstManagedBytes))}}},
 	}
+	persistMountManifestFixture(t, fold.ManifestPath(managedRoot, manifest.Session.ID), manifest)
 	managedOptions := vfs.SessionOptions{
-		Root: managedRoot, ManifestPath: filepath.Join(root, "manifest.json"), Manifest: manifest,
+		Root: managedRoot, ManifestPath: fold.ManifestPath(managedRoot, manifest.Session.ID), Manifest: manifest,
 		Reader: fuseFixtureReader{digestHex: firstManagedBytes},
 		NativeSnapshot: vfs.NativeFile{
 			Path: managedNativePath, Bytes: int64(len(firstManagedBytes)), SHA256: digestHex,

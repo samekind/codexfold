@@ -15,3 +15,13 @@ Include the affected version or commit, operating system, impact, and a minimal 
 ## Data Handling
 
 Tests and bug reports must use generated or redacted fixtures. A contributor must never commit a real Codex rollout, Codex state database, credential, signing identity export, provisioning profile, or production service definition.
+
+## Local Trust Boundary
+
+Managed-deletion receipts defend against crashes, stale or replaced paths, interrupted replay, and cooperating concurrent CodexFold processes. Ordinary processes running as a different unprivileged account cannot modify a correctly permissioned store. Receipt hashes are integrity bindings, however, not keyed authentication against the account that owns the store.
+
+CodexFold therefore does not claim that purge receipt v3 is a security boundary against `root` or a malicious same-UID process that can coherently rewrite store paths, metadata, tombstones, receipts, and checkpoints. Such an actor is inside the current local trust boundary. Reports and readiness claims must state this limitation rather than presenting crash-safe deletion as protection from a hostile store owner.
+
+Physical managed deletion requires an explicit platform identity proof for the quarantine root and every recorded entry. Receipts that predate the proof/source fields, omit them, or mix fields from different platform proof profiles do not carry deletion authority even if their version is still `3` and their remaining hashes are structurally valid.
+
+On Linux, device/inode/UID/GID, file length and content hashes, and `statx.mnt_id` do not substitute for a durable inode generation. CodexFold requires both `statx` birth time from the same open descriptor and a nonzero `FS_IOC_GETVERSION` value. If either capability is absent, unsupported, zero, inconsistent, or changes during capture, physical purge fails closed and preserves the tombstone and quarantine.

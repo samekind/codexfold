@@ -5,12 +5,16 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/samekind/codexfold/internal/fold"
 	"github.com/samekind/codexfold/internal/storage"
@@ -70,6 +74,338 @@ func TestSessionAppendPersistsWithoutHydratingBase(t *testing.T) {
 	defer reopenedReader.Close()
 	if got := readHandle(t, reopenedReader); !bytes.Equal(got, want) {
 		t.Fatalf("reopened bytes differ: got=%q want=%q", got, want)
+	}
+}
+
+func TestOpenSessionCannotFollowManifestDirectorySymlinkOutsideStore(t *testing.T) {
+	root := t.TempDir()
+	manifest, reader, _ := sessionFixture(t, root)
+	manifestPath := fold.ManifestPath(root, manifest.Session.ID)
+	external := t.TempDir()
+	externalManifest := filepath.Join(external, filepath.Base(manifestPath))
+	data, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(externalManifest, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(filepath.Join(root, "manifests")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(external, filepath.Join(root, "manifests")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenSession(context.Background(), SessionOptions{
+		Root: root, ManifestPath: manifestPath, Manifest: manifest, Reader: reader,
+		NativeSnapshot: NativeFile{Path: manifest.Session.RolloutPath, Bytes: manifest.Source.Bytes, SHA256: manifest.Source.SHA256},
+	}); err == nil {
+		t.Fatal("managed session followed a manifest directory symlink outside the store")
+	}
+}
+
+func TestManagedSessionCannotFollowSessionDirectorySymlinkOutsideStore(t *testing.T) {
+	root := t.TempDir()
+	manifest, reader, _ := sessionFixture(t, root)
+	_ = openFixtureSession(t, root, manifest, reader, nil)
+	sessionsPath := filepath.Join(root, "fs", "sessions")
+	externalSessions := filepath.Join(t.TempDir(), "sessions")
+	if err := os.Rename(sessionsPath, externalSessions); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(externalSessions, sessionsPath); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := DiscoverSessionStatesDetailed(root); err == nil {
+		t.Fatal("managed state discovery followed a session root symlink outside the store")
+	}
+	if _, err := OpenSession(context.Background(), SessionOptions{
+		Root: root, ManifestPath: fold.ManifestPath(root, manifest.Session.ID), Manifest: manifest, Reader: reader,
+		NativeSnapshot: NativeFile{Path: manifest.Session.RolloutPath, Bytes: manifest.Source.Bytes, SHA256: manifest.Source.SHA256},
+	}); err == nil {
+		t.Fatal("managed session opened delta data through a session root symlink outside the store")
+	}
+}
+
+func TestOpenSessionRecoversAbandonedInitialPublicationStages(t *testing.T) {
+	tests := []struct {
+		name    string
+		prepare func(t *testing.T, root string, manifest fold.Manifest)
+	}{
+		{
+			name: "staging directory created",
+			prepare: func(t *testing.T, root string, manifest fold.Manifest) {
+				createInitialStagingFixture(t, root, manifest, false, false)
+			},
+		},
+		{
+			name: "staged delta synced",
+			prepare: func(t *testing.T, root string, manifest fold.Manifest) {
+				createInitialStagingFixture(t, root, manifest, true, false)
+			},
+		},
+		{
+			name: "staged state synced before publish",
+			prepare: func(t *testing.T, root string, manifest fold.Manifest) {
+				createInitialStagingFixture(t, root, manifest, true, true)
+			},
+		},
+		{
+			name: "legacy directory created",
+			prepare: func(t *testing.T, root string, manifest fold.Manifest) {
+				directory := filepath.Join(root, "fs", "sessions", manifest.Session.ID)
+				if err := os.MkdirAll(directory, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "legacy delta and temporary state created",
+			prepare: func(t *testing.T, root string, manifest fold.Manifest) {
+				directory := filepath.Join(root, "fs", "sessions", manifest.Session.ID)
+				if err := os.MkdirAll(directory, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(directory, "delta.jsonl"), nil, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(directory, "writer.lease"), []byte("123\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(directory, ".state-killed.tmp"), []byte("{\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			manifest, reader, source := sessionFixture(t, root)
+			if err := os.MkdirAll(filepath.Join(root, "fs", "sessions"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			test.prepare(t, root, manifest)
+
+			session := openFixtureSession(t, root, manifest, reader, nil)
+			handle, err := session.OpenReader()
+			if err != nil {
+				t.Fatalf("OpenReader after recovery: %v", err)
+			}
+			if got := readHandle(t, handle); !bytes.Equal(got, source) {
+				t.Fatalf("recovered bytes = %q, want %q", got, source)
+			}
+			_ = handle.Close()
+
+			statePath := filepath.Join(root, "fs", "sessions", manifest.Session.ID, "state.json")
+			if _, err := LoadSessionState(statePath); err != nil {
+				t.Fatalf("published state is invalid: %v", err)
+			}
+			entries, err := os.ReadDir(filepath.Join(root, "fs", "sessions"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, entry := range entries {
+				if isInitialSessionStagingName(entry.Name()) {
+					t.Fatalf("abandoned staging remains after recovery: %s", entry.Name())
+				}
+			}
+		})
+	}
+}
+
+func TestOpenSessionDoesNotDiscardUnrecognizedMissingStateDirectory(t *testing.T) {
+	root := t.TempDir()
+	manifest, reader, _ := sessionFixture(t, root)
+	directory := filepath.Join(root, "fs", "sessions", manifest.Session.ID)
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	deltaPath := filepath.Join(directory, "delta.jsonl")
+	contents := []byte("possibly committed session bytes")
+	if err := os.WriteFile(deltaPath, contents, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := OpenSession(context.Background(), SessionOptions{
+		Root: root, ManifestPath: fold.ManifestPath(root, manifest.Session.ID), Manifest: manifest, Reader: reader,
+		NativeSnapshot: NativeFile{Path: manifest.Session.RolloutPath, Bytes: manifest.Source.Bytes, SHA256: manifest.Source.SHA256},
+	})
+	if err == nil {
+		t.Fatal("OpenSession should reject an unrecognized missing-state directory")
+	}
+	got, readErr := os.ReadFile(deltaPath)
+	if readErr != nil || !bytes.Equal(got, contents) {
+		t.Fatalf("unrecognized data changed: got=%q err=%v", got, readErr)
+	}
+}
+
+func TestOpenSessionRejectsEscapingSessionIDsBeforeCreatingFilesystemState(t *testing.T) {
+	root := t.TempDir()
+	manifest, reader, _ := sessionFixture(t, root)
+	for _, sessionID := range []string{"../escaped", "nested/session", `nested\session`, ".."} {
+		manifest.Session.ID = sessionID
+		_, err := OpenSession(context.Background(), SessionOptions{
+			Root: root, ManifestPath: fold.ManifestPath(root, manifest.Session.ID), Manifest: manifest, Reader: reader,
+			NativeSnapshot: NativeFile{Path: manifest.Session.RolloutPath, Bytes: manifest.Source.Bytes, SHA256: manifest.Source.SHA256},
+		})
+		if err == nil {
+			t.Fatalf("OpenSession accepted unsafe session ID %q", sessionID)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(root, "fs")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unsafe session ID created managed filesystem state: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "escaped")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unsafe session ID escaped the session root: %v", err)
+	}
+}
+
+func TestConcurrentInitialOpenPublishesOneCompleteSession(t *testing.T) {
+	root := t.TempDir()
+	manifest, reader, _ := sessionFixture(t, root)
+	const opens = 8
+	start := make(chan struct{})
+	results := make(chan error, opens)
+	var wait sync.WaitGroup
+	for range opens {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			<-start
+			session, err := OpenSession(context.Background(), SessionOptions{
+				Root: root, ManifestPath: fold.ManifestPath(root, manifest.Session.ID), Manifest: manifest, Reader: reader,
+				NativeSnapshot: NativeFile{Path: manifest.Session.RolloutPath, Bytes: manifest.Source.Bytes, SHA256: manifest.Source.SHA256},
+			})
+			if err == nil && session.State().Generation != 1 {
+				err = fmt.Errorf("generation = %d, want 1", session.State().Generation)
+			}
+			results <- err
+		}()
+	}
+	close(start)
+	wait.Wait()
+	close(results)
+	for err := range results {
+		if err != nil {
+			t.Fatalf("concurrent OpenSession: %v", err)
+		}
+	}
+
+	directory := filepath.Join(root, "fs", "sessions", manifest.Session.ID)
+	if _, err := LoadSessionState(filepath.Join(directory, "state.json")); err != nil {
+		t.Fatalf("published state is invalid: %v", err)
+	}
+	entries, err := os.ReadDir(filepath.Dir(directory))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if isInitialSessionStagingName(entry.Name()) {
+			t.Fatalf("concurrent publication left staging directory %s", entry.Name())
+		}
+	}
+}
+
+func TestOpenSessionWithWriterPublishesCompleteLockedSession(t *testing.T) {
+	root := t.TempDir()
+	manifest, reader, source := sessionFixture(t, root)
+	session, writer, err := OpenSessionWithWriter(context.Background(), SessionOptions{
+		Root: root, ManifestPath: fold.ManifestPath(root, manifest.Session.ID), Manifest: manifest, Reader: reader,
+		NativeSnapshot: NativeFile{Path: manifest.Session.RolloutPath, Bytes: manifest.Source.Bytes, SHA256: manifest.Source.SHA256},
+	})
+	if err != nil {
+		t.Fatalf("OpenSessionWithWriter: %v", err)
+	}
+	if writer == nil {
+		t.Fatal("OpenSessionWithWriter returned no reserved writer")
+	}
+	if _, err := session.OpenWriter(); !errors.Is(err, ErrWriterBusy) {
+		t.Fatalf("second writer error = %v, want ErrWriterBusy", err)
+	}
+	if _, err := writer.Append(context.Background(), []byte("-tail")); err != nil {
+		t.Fatalf("reserved writer append: %v", err)
+	}
+	if err := writer.Sync(); err != nil {
+		t.Fatalf("reserved writer sync: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("reserved writer close: %v", err)
+	}
+
+	reopened := openFixtureSession(t, root, manifest, reader, nil)
+	handle, err := reopened.OpenReader()
+	if err != nil {
+		t.Fatalf("OpenReader after reserved writer: %v", err)
+	}
+	defer handle.Close()
+	want := append(append([]byte(nil), source...), []byte("-tail")...)
+	if got := readHandle(t, handle); !bytes.Equal(got, want) {
+		t.Fatalf("bytes after reserved writer = %q, want %q", got, want)
+	}
+}
+
+func TestInitialSessionLeaseWaitHonorsContextCancellation(t *testing.T) {
+	root := t.TempDir()
+	manifest, reader, _ := sessionFixture(t, root)
+	parent := filepath.Join(root, "fs", "sessions")
+	if err := os.MkdirAll(parent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := acquireWriterLease(filepath.Join(parent, initialSessionLockName(manifest.Session.ID)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = unlockWriterFile(lease)
+		_ = lease.Close()
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	_, err = OpenSession(ctx, SessionOptions{
+		Root: root, ManifestPath: fold.ManifestPath(root, manifest.Session.ID), Manifest: manifest, Reader: reader,
+		NativeSnapshot: NativeFile{Path: manifest.Session.RolloutPath, Bytes: manifest.Source.Bytes, SHA256: manifest.Source.SHA256},
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("OpenSession error = %v, want context deadline", err)
+	}
+	if _, err := os.Stat(filepath.Join(parent, manifest.Session.ID)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("canceled initialization exposed a session directory: %v", err)
+	}
+}
+
+func TestOpenSessionPreservesUnrecognizedStagingData(t *testing.T) {
+	root := t.TempDir()
+	manifest, reader, _ := sessionFixture(t, root)
+	parent := filepath.Join(root, "fs", "sessions")
+	if err := os.MkdirAll(parent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	staging, err := os.MkdirTemp(parent, initialSessionStagingNamePrefix(manifest.Session.ID)+"*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	unknownPath := filepath.Join(staging, "unknown.data")
+	contents := []byte("must not be deleted")
+	if err := os.WriteFile(unknownPath, contents, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	session, err := OpenSession(context.Background(), SessionOptions{
+		Root: root, ManifestPath: fold.ManifestPath(root, manifest.Session.ID), Manifest: manifest, Reader: reader,
+		NativeSnapshot: NativeFile{Path: manifest.Session.RolloutPath, Bytes: manifest.Source.Bytes, SHA256: manifest.Source.SHA256},
+	})
+	if err != nil {
+		t.Fatalf("OpenSession with unrelated staging: %v", err)
+	}
+	if session.State().SessionID != manifest.Session.ID {
+		t.Fatalf("published state = %#v", session.State())
+	}
+	got, readErr := os.ReadFile(unknownPath)
+	if readErr != nil || !bytes.Equal(got, contents) {
+		t.Fatalf("unrecognized staging data changed: got=%q err=%v", got, readErr)
 	}
 }
 
@@ -175,7 +511,7 @@ func TestSessionBudgetRejectsCopyOnWriteBeforeCreatingBacking(t *testing.T) {
 	manifest, reader, source := sessionFixture(t, root)
 	checker := &vfsRejectingChecker{}
 	session, err := OpenSession(context.Background(), SessionOptions{
-		Root: root, ManifestPath: filepath.Join(root, "manifest.json"), Manifest: manifest, Reader: reader,
+		Root: root, ManifestPath: fold.ManifestPath(root, manifest.Session.ID), Manifest: manifest, Reader: reader,
 		NativeSnapshot: NativeFile{Path: manifest.Session.RolloutPath, Bytes: manifest.Source.Bytes, SHA256: manifest.Source.SHA256},
 		Budget:         checker,
 	})
@@ -212,7 +548,7 @@ func TestSessionBudgetRejectsMaterializeBeforeCreatingTarget(t *testing.T) {
 	manifest, reader, _ := sessionFixture(t, root)
 	checker := &vfsRejectingChecker{}
 	session, err := OpenSession(context.Background(), SessionOptions{
-		Root: root, ManifestPath: filepath.Join(root, "manifest.json"), Manifest: manifest, Reader: reader,
+		Root: root, ManifestPath: fold.ManifestPath(root, manifest.Session.ID), Manifest: manifest, Reader: reader,
 		NativeSnapshot: NativeFile{Path: manifest.Session.RolloutPath, Bytes: manifest.Source.Bytes, SHA256: manifest.Source.SHA256},
 		Budget:         checker,
 	})
@@ -242,7 +578,7 @@ func TestRetireNativeSnapshotKeepsManagedSessionReadableAndRestartable(t *testin
 		t.Fatal(err)
 	}
 	session, err := OpenSession(context.Background(), SessionOptions{
-		Root: root, ManifestPath: filepath.Join(root, "manifest.json"), Manifest: manifest, Reader: reader,
+		Root: root, ManifestPath: fold.ManifestPath(root, manifest.Session.ID), Manifest: manifest, Reader: reader,
 		NativeSnapshot: NativeFile{Path: hiddenSnapshot, Bytes: manifest.Source.Bytes, SHA256: manifest.Source.SHA256},
 	})
 	if err != nil {
@@ -289,7 +625,7 @@ func TestRetireNativeSnapshotKeepsManagedSessionReadableAndRestartable(t *testin
 	}
 	_ = handle.Close()
 	restarted, err := OpenSession(context.Background(), SessionOptions{
-		Root: root, ManifestPath: filepath.Join(root, "manifest.json"), Manifest: manifest, Reader: reader,
+		Root: root, ManifestPath: fold.ManifestPath(root, manifest.Session.ID), Manifest: manifest, Reader: reader,
 	})
 	if err != nil {
 		t.Fatalf("restart without native snapshot: %v", err)
@@ -304,6 +640,361 @@ func TestRetireNativeSnapshotKeepsManagedSessionReadableAndRestartable(t *testin
 	_ = restartedHandle.Close()
 }
 
+func TestRetireNativeSnapshotKeepsPreparedProofWhenStatePublicationFails(t *testing.T) {
+	root := t.TempDir()
+	manifest, reader, _ := sessionFixture(t, root)
+	hiddenSnapshot := filepath.Join(root, "fs", "snapshots", "session", "native.jsonl")
+	if err := os.MkdirAll(filepath.Dir(hiddenSnapshot), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(manifest.Session.RolloutPath, hiddenSnapshot); err != nil {
+		t.Fatal(err)
+	}
+	native := NativeFile{Path: hiddenSnapshot, Bytes: manifest.Source.Bytes, SHA256: manifest.Source.SHA256}
+	session, err := OpenSession(context.Background(), SessionOptions{
+		Root: root, ManifestPath: filepath.Join(root, "manifests", "session.json"), Manifest: manifest, Reader: reader, NativeSnapshot: native,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	visible, err := session.MaterializeCurrent(context.Background(), filepath.Join(root, "visible-proof.jsonl"), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer, err := session.OpenWriter()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	generations := filepath.Join(root, "fs", "sessions", "session", stateGenerationsDirectoryName)
+	if err := os.RemoveAll(generations); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(generations, []byte("block checkpoint publication"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	proof, err := session.RetireNativeSnapshot(native, visible)
+	if err == nil {
+		t.Fatal("broken checkpoint path allowed native retirement state publication")
+	}
+	if proof.Snapshot != native || proof.StateGeneration != 1 {
+		t.Fatalf("prepared retirement proof = %#v", proof)
+	}
+	proofPath := filepath.Join(root, "fs", "sessions", "session", NativeRetirementFilename)
+	loaded, loadErr := LoadNativeRetirementProof(proofPath)
+	if loadErr != nil || loaded != proof {
+		t.Fatalf("prepared proof was not retained: proof=%#v err=%v", loaded, loadErr)
+	}
+	persisted, _, readErr := readSessionState(filepath.Join(root, "fs", "sessions", "session", "state.json"))
+	if readErr != nil || persisted.Generation != proof.StateGeneration || persisted.NativeSnapshot != native {
+		t.Fatalf("failed publication changed primary state: state=%#v err=%v", persisted, readErr)
+	}
+	if err := os.Remove(hiddenSnapshot); err != nil {
+		t.Fatal(err)
+	}
+	if retired, err := NativeSnapshotAlreadyRetired(root, persisted); err == nil || retired {
+		t.Fatalf("equal-generation prepared proof authorized a missing snapshot: retired=%t err=%v", retired, err)
+	}
+}
+
+func TestRetireNativeSnapshotBindsAndRemovesNonemptySidecar(t *testing.T) {
+	root := t.TempDir()
+	manifest, reader, _ := sessionFixture(t, root)
+	hiddenSnapshot := filepath.Join(root, "fs", "snapshots", "session", "native.jsonl")
+	if err := os.MkdirAll(filepath.Dir(hiddenSnapshot), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(manifest.Session.RolloutPath, hiddenSnapshot); err != nil {
+		t.Fatal(err)
+	}
+	sidecarPath := filepath.Join(filepath.Dir(hiddenSnapshot), "._native.jsonl")
+	sidecarBytes := []byte("nonempty appledouble metadata")
+	if err := os.WriteFile(sidecarPath, sidecarBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	native := NativeFile{Path: hiddenSnapshot, Bytes: manifest.Source.Bytes, SHA256: manifest.Source.SHA256}
+	session, err := OpenSession(context.Background(), SessionOptions{
+		Root: root, ManifestPath: filepath.Join(root, "manifests", "session.json"), Manifest: manifest, Reader: reader, NativeSnapshot: native,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	visible, err := session.MaterializeCurrent(context.Background(), filepath.Join(root, "visible-sidecar-proof.jsonl"), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer, err := session.OpenWriter()
+	if err != nil {
+		t.Fatal(err)
+	}
+	proof, err := session.RetireNativeSnapshot(native, visible)
+	if closeErr := writer.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if proof.Version != nativeRetirementVersion || proof.Sidecar == nil || proof.Sidecar.Path != sidecarPath || proof.Sidecar.Bytes != int64(len(sidecarBytes)) || proof.Sidecar.SHA256 != digestBytes(sidecarBytes) {
+		t.Fatalf("native sidecar proof = %#v", proof.Sidecar)
+	}
+	for _, path := range []string{hiddenSnapshot, sidecarPath} {
+		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("proved native retirement artifact remains at %s: %v", path, err)
+		}
+	}
+}
+
+func TestCompleteNativeSnapshotRetirementPreservesUnprovedNonemptySidecar(t *testing.T) {
+	root := t.TempDir()
+	snapshotPath := filepath.Join(root, "fs", "snapshots", "session", "native.jsonl")
+	if err := os.MkdirAll(filepath.Dir(snapshotPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	snapshotBytes := []byte("snapshot")
+	sidecarBytes := []byte("unproved sidecar")
+	if err := os.WriteFile(snapshotPath, snapshotBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sidecarPath := filepath.Join(filepath.Dir(snapshotPath), "._native.jsonl")
+	if err := os.WriteFile(sidecarPath, sidecarBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	proof := NativeRetirementProof{
+		Version: legacyNativeRetirementVersion, SessionID: "session", StateGeneration: 1,
+		RetiredAt: time.Now().UTC().Format(time.RFC3339Nano),
+		Snapshot:  NativeFile{Path: snapshotPath, Bytes: int64(len(snapshotBytes)), SHA256: digestBytes(snapshotBytes)},
+		Visible:   NativeFile{Path: filepath.Join(root, "visible.jsonl"), Bytes: int64(len(snapshotBytes)), SHA256: digestBytes(snapshotBytes)},
+	}
+	if err := CompleteNativeSnapshotRetirement(root, proof); err == nil {
+		t.Fatal("legacy proof removed a nonempty sidecar without exact identity")
+	}
+	for path, want := range map[string][]byte{snapshotPath: snapshotBytes, sidecarPath: sidecarBytes} {
+		if got, err := os.ReadFile(path); err != nil || !bytes.Equal(got, want) {
+			t.Fatalf("unproved retirement artifact changed at %s: got=%q err=%v", path, got, err)
+		}
+	}
+}
+
+func TestCompleteNativeSnapshotRetirementReplaysCrashAfterAtomicStaging(t *testing.T) {
+	root, snapshotPath, _, proof := nativeRetirementCompletionFixture(t, false)
+	proofSHA256, err := nativeRetirementProofDigest(proof)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stagingPath := filepath.Join(root, "fs", "native-retirement-staging", proof.SessionID, proofSHA256)
+	markerPath := filepath.Join(root, "fs", "native-retirements", proof.SessionID, proofSHA256+".json")
+	crash := errors.New("simulated crash after native snapshot staging")
+	previousHook := nativeRetirementHook
+	defer func() { nativeRetirementHook = previousHook }()
+	nativeRetirementHook = func(phase string) error {
+		if phase == nativeRetirementPhaseStaged {
+			return crash
+		}
+		return nil
+	}
+	if err := CompleteNativeSnapshotRetirement(root, proof); !errors.Is(err, crash) {
+		t.Fatalf("staging crash error = %v, want %v", err, crash)
+	}
+	if _, err := os.Lstat(snapshotPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("canonical snapshot remained after atomic staging: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(stagingPath, "native.jsonl")); err != nil {
+		t.Fatalf("exact snapshot did not remain in deterministic staging: %v", err)
+	}
+	if _, err := os.Lstat(markerPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("deletion marker was published before the staging crash: %v", err)
+	}
+
+	nativeRetirementHook = nil
+	if err := CompleteNativeSnapshotRetirement(root, proof); err != nil {
+		t.Fatalf("replay staged native retirement: %v", err)
+	}
+	if _, err := os.Lstat(stagingPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("replayed native retirement staging remains: %v", err)
+	}
+	if _, err := os.Lstat(markerPath); err != nil {
+		t.Fatalf("durable native retirement deletion marker missing: %v", err)
+	}
+}
+
+func TestCompleteNativeSnapshotRetirementPreservesCanonicalReplacementAfterStaging(t *testing.T) {
+	root, snapshotPath, _, proof := nativeRetirementCompletionFixture(t, false)
+	replacement := []byte("replacement snapshot must survive")
+	crash := errors.New("simulated crash after replacement appeared")
+	previousHook := nativeRetirementHook
+	defer func() { nativeRetirementHook = previousHook }()
+	nativeRetirementHook = func(phase string) error {
+		if phase != nativeRetirementPhaseStaged {
+			return nil
+		}
+		if err := os.MkdirAll(filepath.Dir(snapshotPath), 0o700); err != nil {
+			return err
+		}
+		if err := os.WriteFile(snapshotPath, replacement, 0o600); err != nil {
+			return err
+		}
+		return crash
+	}
+	if err := CompleteNativeSnapshotRetirement(root, proof); !errors.Is(err, crash) {
+		t.Fatalf("replacement crash error = %v, want %v", err, crash)
+	}
+
+	nativeRetirementHook = nil
+	if err := CompleteNativeSnapshotRetirement(root, proof); err != nil {
+		t.Fatalf("replay retirement with canonical replacement: %v", err)
+	}
+	if got, err := os.ReadFile(snapshotPath); err != nil || !bytes.Equal(got, replacement) {
+		t.Fatalf("canonical replacement changed: got=%q err=%v", got, err)
+	}
+	proofSHA256, err := nativeRetirementProofDigest(proof)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(filepath.Join(root, "fs", "native-retirement-staging", proof.SessionID, proofSHA256)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("proved staging remains after replacement-preserving replay: %v", err)
+	}
+}
+
+func TestCompleteNativeSnapshotRetirementPreservesUnknownSnapshotDirectoryContent(t *testing.T) {
+	root, snapshotPath, _, proof := nativeRetirementCompletionFixture(t, false)
+	unknownPath := filepath.Join(filepath.Dir(snapshotPath), "foreign.data")
+	unknown := []byte("unknown content must survive")
+	if err := os.WriteFile(unknownPath, unknown, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := CompleteNativeSnapshotRetirement(root, proof); err == nil {
+		t.Fatal("unknown snapshot directory content was accepted for retirement")
+	}
+	if got, err := os.ReadFile(unknownPath); err != nil || !bytes.Equal(got, unknown) {
+		t.Fatalf("unknown snapshot directory content changed: got=%q err=%v", got, err)
+	}
+	if got, err := os.ReadFile(snapshotPath); err != nil || digestBytes(got) != proof.Snapshot.SHA256 {
+		t.Fatalf("proved snapshot changed after unknown-content rejection: got=%q err=%v", got, err)
+	}
+}
+
+func TestCompleteNativeSnapshotRetirementRefusesSymlinkedStagingAncestor(t *testing.T) {
+	root, snapshotPath, _, proof := nativeRetirementCompletionFixture(t, false)
+	outside := t.TempDir()
+	stagingRoot := filepath.Join(root, "fs", "native-retirement-staging")
+	if err := os.Symlink(outside, stagingRoot); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if err := CompleteNativeSnapshotRetirement(root, proof); err == nil {
+		t.Fatal("symlinked native retirement staging ancestor was accepted")
+	}
+	if got, err := os.ReadFile(snapshotPath); err != nil || digestBytes(got) != proof.Snapshot.SHA256 {
+		t.Fatalf("snapshot changed through symlinked staging rejection: got=%q err=%v", got, err)
+	}
+	entries, err := os.ReadDir(outside)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("outside staging target changed: entries=%v err=%v", entries, err)
+	}
+}
+
+func TestCompleteNativeSnapshotRetirementReplaysPartialDeletionAfterDurableMarker(t *testing.T) {
+	root, _, sidecarPath, proof := nativeRetirementCompletionFixture(t, true)
+	crash := errors.New("simulated crash after staged snapshot removal")
+	previousHook := nativeRetirementHook
+	defer func() { nativeRetirementHook = previousHook }()
+	nativeRetirementHook = func(phase string) error {
+		if phase == nativeRetirementPhaseSnapshotRemoved {
+			return crash
+		}
+		return nil
+	}
+	if err := CompleteNativeSnapshotRetirement(root, proof); !errors.Is(err, crash) {
+		t.Fatalf("partial deletion crash error = %v, want %v", err, crash)
+	}
+	proofSHA256, err := nativeRetirementProofDigest(proof)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stagingPath := filepath.Join(root, "fs", "native-retirement-staging", proof.SessionID, proofSHA256)
+	markerPath := filepath.Join(root, "fs", "native-retirements", proof.SessionID, proofSHA256+".json")
+	if _, err := os.Lstat(filepath.Join(stagingPath, "native.jsonl")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("staged snapshot was not removed before simulated crash: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(stagingPath, filepath.Base(sidecarPath))); err != nil {
+		t.Fatalf("proved sidecar did not remain for replay: %v", err)
+	}
+	if _, err := os.Lstat(markerPath); err != nil {
+		t.Fatalf("deletable marker was not durable before physical deletion: %v", err)
+	}
+
+	nativeRetirementHook = nil
+	if err := CompleteNativeSnapshotRetirement(root, proof); err != nil {
+		t.Fatalf("replay partial staged deletion: %v", err)
+	}
+	if _, err := os.Lstat(stagingPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("partial staged deletion did not complete: %v", err)
+	}
+}
+
+func TestCompleteNativeSnapshotRetirementRehashesSameInodeSizeAndMtimeBeforeStaging(t *testing.T) {
+	root, snapshotPath, _, proof := nativeRetirementCompletionFixture(t, false)
+	before, err := os.Lstat(snapshotPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutated := bytes.Repeat([]byte("x"), int(before.Size()))
+	previousHook := nativeRetirementHook
+	defer func() { nativeRetirementHook = previousHook }()
+	nativeRetirementHook = func(phase string) error {
+		if phase != nativeRetirementPhaseVerified {
+			return nil
+		}
+		file, err := os.OpenFile(snapshotPath, os.O_WRONLY, 0)
+		if err != nil {
+			return err
+		}
+		_, writeErr := file.WriteAt(mutated, 0)
+		closeErr := file.Close()
+		if err := errors.Join(writeErr, closeErr); err != nil {
+			return err
+		}
+		return os.Chtimes(snapshotPath, before.ModTime(), before.ModTime())
+	}
+	if err := CompleteNativeSnapshotRetirement(root, proof); err == nil {
+		t.Fatal("same-inode, same-size, restored-mtime mutation was accepted for retirement")
+	}
+	after, err := os.Lstat(snapshotPath)
+	if err != nil {
+		t.Fatalf("mutated snapshot was not preserved: %v", err)
+	}
+	if !os.SameFile(before, after) || before.Size() != after.Size() || !before.ModTime().Equal(after.ModTime()) {
+		t.Fatalf("test did not preserve inode/size/mtime: before=%v after=%v", before, after)
+	}
+	if got, err := os.ReadFile(snapshotPath); err != nil || !bytes.Equal(got, mutated) {
+		t.Fatalf("mutated snapshot bytes changed: got=%q err=%v", got, err)
+	}
+}
+
+func TestLoadNativeRetirementProofRejectsUnknownFields(t *testing.T) {
+	root, _, _, proof := nativeRetirementCompletionFixture(t, false)
+	data, err := json.Marshal(proof)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]any
+	if err := json.Unmarshal(data, &document); err != nil {
+		t.Fatal(err)
+	}
+	document["future_authority"] = true
+	data, err = json.Marshal(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, "native-retirement-with-unknown-field.json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadNativeRetirementProof(path); err == nil {
+		t.Fatal("native retirement proof with unknown authority field was accepted")
+	}
+}
+
 func TestExternalNativeRetirementCannotResurrectSnapshotDuringCopyOnWrite(t *testing.T) {
 	root := t.TempDir()
 	manifest, reader, source := sessionFixture(t, root)
@@ -316,13 +1007,13 @@ func TestExternalNativeRetirementCannotResurrectSnapshotDuringCopyOnWrite(t *tes
 	}
 	native := NativeFile{Path: hiddenSnapshot, Bytes: manifest.Source.Bytes, SHA256: manifest.Source.SHA256}
 	serving, err := OpenSession(context.Background(), SessionOptions{
-		Root: root, ManifestPath: filepath.Join(root, "manifest.json"), Manifest: manifest, Reader: reader, NativeSnapshot: native,
+		Root: root, ManifestPath: fold.ManifestPath(root, manifest.Session.ID), Manifest: manifest, Reader: reader, NativeSnapshot: native,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	maintenance, err := OpenSession(context.Background(), SessionOptions{
-		Root: root, ManifestPath: filepath.Join(root, "manifest.json"), Manifest: manifest, Reader: reader, NativeSnapshot: native,
+		Root: root, ManifestPath: fold.ManifestPath(root, manifest.Session.ID), Manifest: manifest, Reader: reader, NativeSnapshot: native,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -396,13 +1087,13 @@ func TestExternalNativeRetirementCannotResurrectSnapshotDuringCompact(t *testing
 	}
 	native := NativeFile{Path: hiddenSnapshot, Bytes: manifest.Source.Bytes, SHA256: manifest.Source.SHA256}
 	serving, err := OpenSession(context.Background(), SessionOptions{
-		Root: root, ManifestPath: filepath.Join(root, "manifest.json"), Manifest: manifest, Reader: reader, NativeSnapshot: native,
+		Root: root, ManifestPath: fold.ManifestPath(root, manifest.Session.ID), Manifest: manifest, Reader: reader, NativeSnapshot: native,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	maintenance, err := OpenSession(context.Background(), SessionOptions{
-		Root: root, ManifestPath: filepath.Join(root, "manifest.json"), Manifest: manifest, Reader: reader, NativeSnapshot: native,
+		Root: root, ManifestPath: fold.ManifestPath(root, manifest.Session.ID), Manifest: manifest, Reader: reader, NativeSnapshot: native,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -431,7 +1122,9 @@ func TestExternalNativeRetirementCannotResurrectSnapshotDuringCompact(t *testing
 		prepared := manifest
 		prepared.Source = fold.ManifestSource{Bytes: current.Bytes, SHA256: current.SHA256}
 		view, err := NewView(prepared, reader)
-		return PreparedGeneration{ManifestPath: filepath.Join(root, "manifest-compact.json"), Manifest: prepared, View: view}, err
+		manifestPath := filepath.Join(root, "manifests", "generations", manifest.Session.ID, fmt.Sprintf("%020d.json", generation))
+		persistManifestFixture(t, manifestPath, prepared)
+		return PreparedGeneration{ManifestPath: manifestPath, Manifest: prepared, View: view}, err
 	}})
 	if err != nil {
 		t.Fatal(err)
@@ -460,7 +1153,7 @@ func TestNativeSnapshotAlreadyRetiredRequiresExactDurableProof(t *testing.T) {
 	}
 	native := NativeFile{Path: hiddenSnapshot, Bytes: manifest.Source.Bytes, SHA256: manifest.Source.SHA256}
 	session, err := OpenSession(context.Background(), SessionOptions{
-		Root: root, ManifestPath: filepath.Join(root, "manifest.json"), Manifest: manifest, Reader: reader, NativeSnapshot: native,
+		Root: root, ManifestPath: fold.ManifestPath(root, manifest.Session.ID), Manifest: manifest, Reader: reader, NativeSnapshot: native,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -490,6 +1183,37 @@ func TestNativeSnapshotAlreadyRetiredRequiresExactDurableProof(t *testing.T) {
 	stale.NativeSnapshot.SHA256 = strings.Repeat("0", 64)
 	if retired, err := NativeSnapshotAlreadyRetired(root, stale); err == nil || retired {
 		t.Fatalf("mismatched retirement proof accepted: retired=%t err=%v", retired, err)
+	}
+}
+
+func TestCompleteNativeSnapshotRetirementRefusesSymlinkedSnapshotAncestor(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	content := []byte("outside snapshot must survive")
+	outsideSnapshot := filepath.Join(outside, "native.jsonl")
+	if err := os.WriteFile(outsideSnapshot, content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "fs", "snapshots"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(root, "fs", "snapshots", "session")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	proof := NativeRetirementProof{
+		Version: nativeRetirementVersion, SessionID: "session", StateGeneration: 1,
+		RetiredAt: time.Now().UTC().Format(time.RFC3339Nano),
+		Snapshot: NativeFile{
+			Path:  filepath.Join(root, "fs", "snapshots", "session", "native.jsonl"),
+			Bytes: int64(len(content)), SHA256: digestBytes(content),
+		},
+		Visible: NativeFile{Path: filepath.Join(root, "visible.jsonl"), Bytes: int64(len(content)), SHA256: digestBytes(content)},
+	}
+	if err := CompleteNativeSnapshotRetirement(root, proof); err == nil {
+		t.Fatal("symlinked native snapshot ancestor allowed physical deletion")
+	}
+	if got, err := os.ReadFile(outsideSnapshot); err != nil || !bytes.Equal(got, content) {
+		t.Fatalf("outside snapshot changed: got=%q err=%v", got, err)
 	}
 }
 
@@ -582,16 +1306,67 @@ func sessionFixture(t *testing.T, root string) (fold.Manifest, memoryReader, []b
 		source = append(source, partBytes...)
 	}
 	manifest.Source = fold.ManifestSource{Bytes: int64(len(source)), SHA256: digestBytes(source)}
+	persistManifestFixture(t, fold.ManifestPath(root, manifest.Session.ID), manifest)
 	if err := os.WriteFile(manifest.Session.RolloutPath, source, 0o600); err != nil {
 		t.Fatalf("write native snapshot: %v", err)
 	}
 	return manifest, reader, source
 }
 
+func persistManifestFixture(t *testing.T, path string, manifest fold.Manifest) {
+	t.Helper()
+	data, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, append(data, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func createInitialStagingFixture(t *testing.T, root string, manifest fold.Manifest, withDelta bool, withState bool) {
+	t.Helper()
+	parent := filepath.Join(root, "fs", "sessions")
+	staging, err := os.MkdirTemp(parent, initialSessionStagingNamePrefix(manifest.Session.ID)+"*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if withDelta {
+		if err := os.WriteFile(filepath.Join(staging, "delta.jsonl"), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if withState {
+		state := SessionState{
+			Version: sessionStateVersion, SessionID: manifest.Session.ID, Generation: 1,
+			ManifestPath: fold.ManifestPath(root, manifest.Session.ID),
+			ManifestSHA256: func() string {
+				identity, err := captureRegularFileIdentity(fold.ManifestPath(root, manifest.Session.ID))
+				if err != nil {
+					t.Fatal(err)
+				}
+				return identity.SHA256
+			}(),
+			BaseBytes:  manifest.Source.Bytes,
+			BaseSHA256: manifest.Source.SHA256,
+			DeltaPath:  filepath.Join(parent, manifest.Session.ID, "delta.jsonl"),
+			NativeSnapshot: NativeFile{
+				Path: manifest.Session.RolloutPath, Bytes: manifest.Source.Bytes, SHA256: manifest.Source.SHA256,
+			},
+		}
+		if err := writeSessionState(filepath.Join(staging, "state.json"), state); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func openFixtureSession(t *testing.T, root string, manifest fold.Manifest, reader memoryReader, hook func(string) error) *Session {
 	t.Helper()
 	session, err := OpenSession(context.Background(), SessionOptions{
-		Root: root, ManifestPath: filepath.Join(root, "manifest.json"), Manifest: manifest, Reader: reader,
+		Root: root, ManifestPath: fold.ManifestPath(root, manifest.Session.ID), Manifest: manifest, Reader: reader,
 		NativeSnapshot: NativeFile{Path: manifest.Session.RolloutPath, Bytes: manifest.Source.Bytes, SHA256: manifest.Source.SHA256},
 		BeforeCOWPhase: hook,
 	})
@@ -599,6 +1374,37 @@ func openFixtureSession(t *testing.T, root string, manifest fold.Manifest, reade
 		t.Fatalf("OpenSession returned error: %v", err)
 	}
 	return session
+}
+
+func nativeRetirementCompletionFixture(t *testing.T, withSidecar bool) (string, string, string, NativeRetirementProof) {
+	t.Helper()
+	root := t.TempDir()
+	snapshotPath := filepath.Join(root, "fs", "snapshots", "session", "native.jsonl")
+	if err := os.MkdirAll(filepath.Dir(snapshotPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	snapshotBytes := []byte("exact native snapshot bytes")
+	if err := os.WriteFile(snapshotPath, snapshotBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	proof := NativeRetirementProof{
+		Version: nativeRetirementVersion, SessionID: "session", StateGeneration: 1,
+		RetiredAt: time.Now().UTC().Format(time.RFC3339Nano),
+		Snapshot:  NativeFile{Path: snapshotPath, Bytes: int64(len(snapshotBytes)), SHA256: digestBytes(snapshotBytes)},
+		Visible: NativeFile{
+			Path: filepath.Join(root, "visible.jsonl"), Bytes: int64(len(snapshotBytes)), SHA256: digestBytes(snapshotBytes),
+		},
+	}
+	var sidecarPath string
+	if withSidecar {
+		sidecarPath = filepath.Join(filepath.Dir(snapshotPath), "._native.jsonl")
+		sidecarBytes := []byte("exact native sidecar bytes")
+		if err := os.WriteFile(sidecarPath, sidecarBytes, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		proof.Sidecar = &NativeFile{Path: sidecarPath, Bytes: int64(len(sidecarBytes)), SHA256: digestBytes(sidecarBytes)}
+	}
+	return root, snapshotPath, sidecarPath, proof
 }
 
 func readHandle(t *testing.T, handle *ReadHandle) []byte {

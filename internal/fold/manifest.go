@@ -74,6 +74,11 @@ func LoadManifestPath(path string) (Manifest, error) {
 	if err != nil {
 		return Manifest{}, fmt.Errorf("read fold manifest: %w", err)
 	}
+	return DecodeManifest(data)
+}
+
+// DecodeManifest parses and validates one persisted fold manifest.
+func DecodeManifest(data []byte) (Manifest, error) {
 	var manifest Manifest
 	if err := json.Unmarshal(data, &manifest); err != nil {
 		return Manifest{}, fmt.Errorf("decode fold manifest: %w", err)

@@ -10,12 +10,19 @@ import (
 
 const ParentPIDEnvironment = "CODEXFOLD_LAUNCHER_PARENT_PID"
 
+var ErrParentUnavailable = errors.New("CodexFold launcher parent is unavailable")
+
 func MonitorContext(parent context.Context) (context.Context, context.CancelFunc, error) {
 	return monitorParent(parent, os.Getenv(ParentPIDEnvironment), os.Getppid, 50*time.Millisecond)
 }
 
+func ParentUnavailable(ctx context.Context) bool {
+	return errors.Is(context.Cause(ctx), ErrParentUnavailable)
+}
+
 func monitorParent(parent context.Context, value string, currentParent func() int, interval time.Duration) (context.Context, context.CancelFunc, error) {
-	ctx, cancel := context.WithCancel(parent)
+	ctx, cancelCause := context.WithCancelCause(parent)
+	cancel := func() { cancelCause(context.Canceled) }
 	if value == "" {
 		return ctx, cancel, nil
 	}
@@ -26,7 +33,7 @@ func monitorParent(parent context.Context, value string, currentParent func() in
 	}
 	if currentParent == nil || currentParent() != expected {
 		cancel()
-		return nil, nil, errors.New("CodexFold launcher parent is already unavailable")
+		return nil, nil, ErrParentUnavailable
 	}
 	if interval <= 0 {
 		interval = 50 * time.Millisecond
@@ -40,7 +47,7 @@ func monitorParent(parent context.Context, value string, currentParent func() in
 				return
 			case <-ticker.C:
 				if currentParent() != expected {
-					cancel()
+					cancelCause(ErrParentUnavailable)
 					return
 				}
 			}

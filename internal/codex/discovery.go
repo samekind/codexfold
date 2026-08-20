@@ -2,6 +2,7 @@ package codex
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -23,6 +24,8 @@ type Session struct {
 	Archived      bool   `json:"archived"`
 	GitBranch     string `json:"git_branch,omitempty"`
 }
+
+var ErrSessionNotFound = errors.New("Codex session not found")
 
 func ResolveHome(explicit string) (string, error) {
 	if strings.TrimSpace(explicit) != "" {
@@ -88,6 +91,50 @@ func LoadSessions(home string) ([]Session, error) {
 		return nil, fmt.Errorf("iterate Codex sessions: %w", err)
 	}
 	return sessions, nil
+}
+
+// LoadSession reads one current session row for a cutover fence without
+// materializing the full Codex thread table while the filesystem namespace is
+// serialized.
+func LoadSession(home string, sessionID string) (Session, error) {
+	dbPath := filepath.Join(home, "state_5.sqlite")
+	if _, err := os.Stat(dbPath); err != nil {
+		return Session{}, fmt.Errorf("locate Codex state database %s: %w", dbPath, err)
+	}
+	db, err := sql.Open("sqlite", sqliteReadOnlyDSN(dbPath))
+	if err != nil {
+		return Session{}, fmt.Errorf("open Codex state database: %w", err)
+	}
+	defer func() { _ = db.Close() }()
+	if _, err := db.Exec(`pragma busy_timeout = 5000`); err != nil {
+		return Session{}, fmt.Errorf("configure Codex state database: %w", err)
+	}
+	var session Session
+	var archived int64
+	err = db.QueryRow(`
+		select id, title, cwd, rollout_path, model_provider, coalesce(model, ''),
+		       updated_at, archived, coalesce(git_branch, '')
+		from threads
+		where id = ?
+	`, sessionID).Scan(
+		&session.ID,
+		&session.Title,
+		&session.CWD,
+		&session.RolloutPath,
+		&session.ModelProvider,
+		&session.Model,
+		&session.UpdatedAt,
+		&archived,
+		&session.GitBranch,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Session{}, fmt.Errorf("%w: %s", ErrSessionNotFound, sessionID)
+	}
+	if err != nil {
+		return Session{}, fmt.Errorf("read Codex session %s: %w", sessionID, err)
+	}
+	session.Archived = archived != 0
+	return session, nil
 }
 
 func sqliteReadOnlyDSN(path string) string {

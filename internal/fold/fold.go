@@ -536,6 +536,18 @@ func VerifySession(ctx context.Context, storeDir string, sessionID string) (Mani
 	return manifest, nil
 }
 
+// VerifyManifest reconstructs a manifest through the supplied reader and
+// proves the exact byte count and SHA-256 recorded by that manifest.
+func VerifyManifest(ctx context.Context, reader ObjectReader, manifest Manifest) error {
+	if reader == nil {
+		return errors.New("manifest verification reader is required")
+	}
+	if err := validateManifest(manifest); err != nil {
+		return err
+	}
+	return verifyStoredManifest(ctx, reader, manifest)
+}
+
 func verifySourceDigest(hasher hash.Hash, bytesWritten int64, source ManifestSource) error {
 	if bytesWritten != source.Bytes {
 		return fmt.Errorf("reconstructed bytes %d, want %d", bytesWritten, source.Bytes)

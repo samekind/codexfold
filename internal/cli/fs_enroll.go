@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -20,6 +21,8 @@ import (
 	"github.com/samekind/codexfold/internal/vfs"
 	"github.com/spf13/cobra"
 )
+
+const defaultServiceEnrollmentInterval = 5 * time.Minute
 
 type enrollmentFlags struct {
 	codexHome          string
@@ -40,12 +43,13 @@ type FSEnrollmentApplyResult struct {
 }
 
 type FSEnrollmentMaintenanceResult struct {
-	NativeCandidates   int                     `json:"native_candidates"`
-	NativeRetired      int                     `json:"native_retired"`
-	NativeDeferred     int                     `json:"native_deferred"`
-	DeferredSessionIDs []string                `json:"deferred_session_ids,omitempty"`
-	LooseRetirementRan bool                    `json:"loose_retirement_ran"`
-	StorageGC          storage.StorageGCResult `json:"storage_gc"`
+	NativeRetention    storage.NativeSnapshotRetention `json:"native_retention"`
+	NativeCandidates   int                             `json:"native_candidates"`
+	NativeRetired      int                             `json:"native_retired"`
+	NativeDeferred     int                             `json:"native_deferred"`
+	DeferredSessionIDs []string                        `json:"deferred_session_ids,omitempty"`
+	LooseRetirementRan bool                            `json:"loose_retirement_ran"`
+	StorageGC          storage.StorageGCResult         `json:"storage_gc"`
 }
 
 type enrollmentCycleReporter func(FSEnrollmentApplyResult, error)
@@ -81,7 +85,12 @@ var runServiceEnrollmentCycle = runEnrollmentCycle
 var discoverEnrollmentSessionStates = vfs.DiscoverSessionStates
 
 var runEnrollmentStorageGC = func(ctx context.Context, store string) (storage.StorageGCResult, error) {
-	return storage.Collect(ctx, storage.GCOptions{StoreDir: store, Apply: true})
+	return storage.Collect(ctx, storage.GCOptions{
+		StoreDir: store, Apply: true,
+		AuthorizePackGenerationRemoval: func(ctx context.Context, candidate storage.GCCandidate) (storage.PackGenerationRemovalGuard, error) {
+			return pack.AuthorizeGenerationRemoval(ctx, store, candidate)
+		},
+	})
 }
 
 var enrollmentStorageHealthProbe = requireEnrollmentStorageHealth
@@ -113,7 +122,14 @@ func newFSEnrollPlanCommand() *cobra.Command {
 			if flags.jsonOutput {
 				return writeJSON(command, plan)
 			}
-			_, err = fmt.Fprintf(command.OutOrStdout(), "sessions=%d selected=%d observations=%d\n", len(plan.Decisions), len(plan.Selected), len(plan.Observations))
+			if _, err = fmt.Fprintf(command.OutOrStdout(), "sessions=%d selected=%d observations=%d\n", len(plan.Decisions), len(plan.Selected), len(plan.Observations)); err != nil {
+				return err
+			}
+			// Without this line the text report says only that nothing was
+			// selected, and the reason is reachable only through --json.
+			if summary := summarizeUnselectedReasons(plan.Decisions); summary != "" {
+				_, err = fmt.Fprintf(command.OutOrStdout(), "not_selected: %s\n", summary)
+			}
 			return err
 		},
 	}
@@ -140,7 +156,7 @@ func newFSEnrollApplyCommand() *cobra.Command {
 			if flags.jsonOutput {
 				return writeJSON(command, result)
 			}
-			_, err = fmt.Fprintf(command.OutOrStdout(), "selected=%d applied=%d changed=%d managed=%d native_retired=%d native_deferred=%d gc_removed=%d\n", result.Apply.Selected, result.Apply.Applied, result.Apply.SkippedChanged, result.Apply.SkippedManaged, result.Maintenance.NativeRetired, result.Maintenance.NativeDeferred, result.Maintenance.StorageGC.RemovedCount)
+			_, err = fmt.Fprintf(command.OutOrStdout(), "selected=%d applied=%d changed=%d managed=%d native_retention=%s native_retired=%d native_deferred=%d gc_removed=%d\n", result.Apply.Selected, result.Apply.Applied, result.Apply.SkippedChanged, result.Apply.SkippedManaged, result.Maintenance.NativeRetention, result.Maintenance.NativeRetired, result.Maintenance.NativeDeferred, result.Maintenance.StorageGC.RemovedCount)
 			return err
 		},
 	}
@@ -275,6 +291,44 @@ func runPeriodicEnrollment(ctx context.Context, flags enrollmentFlags, interval 
 	}
 }
 
+// summarizeUnselectedReasons counts why each unselected session was held back,
+// most frequent first, so the text report explains a zero selection without
+// requiring --json. A session with no recorded reason is counted as "unknown"
+// rather than silently dropped.
+func summarizeUnselectedReasons(decisions []enroll.Decision) string {
+	counts := make(map[string]int)
+	for _, decision := range decisions {
+		if decision.Selected {
+			continue
+		}
+		if len(decision.Reasons) == 0 {
+			counts["unknown"]++
+			continue
+		}
+		for _, reason := range decision.Reasons {
+			counts[string(reason)]++
+		}
+	}
+	if len(counts) == 0 {
+		return ""
+	}
+	names := make([]string, 0, len(counts))
+	for name := range counts {
+		names = append(names, name)
+	}
+	sort.Slice(names, func(i, j int) bool {
+		if counts[names[i]] != counts[names[j]] {
+			return counts[names[i]] > counts[names[j]]
+		}
+		return names[i] < names[j]
+	})
+	parts := make([]string, 0, len(names))
+	for _, name := range names {
+		parts = append(parts, fmt.Sprintf("%s=%d", name, counts[name]))
+	}
+	return strings.Join(parts, " ")
+}
+
 func addEnrollmentFlags(command *cobra.Command, flags *enrollmentFlags) {
 	command.Flags().StringVar(&flags.codexHome, "codex-home", "", "Codex home directory; defaults to CODEX_HOME or ~/.codex")
 	command.Flags().StringVar(&flags.storeDir, "store", "", "Fold store directory; defaults to <codex-home>/fold-store")
@@ -401,7 +455,11 @@ func enrollmentObservationPath(store string) string {
 }
 
 func runEnrollmentMaintenance(ctx context.Context, home string, store string, newlyApplied int) (FSEnrollmentMaintenanceResult, error) {
-	result := FSEnrollmentMaintenanceResult{}
+	retention, err := storage.LoadRetentionPolicy(store)
+	if err != nil {
+		return FSEnrollmentMaintenanceResult{}, fmt.Errorf("load storage retention policy: %w", err)
+	}
+	result := FSEnrollmentMaintenanceResult{NativeRetention: retention.NativeSnapshots}
 	states, err := discoverEnrollmentSessionStates(store)
 	if err != nil {
 		return result, err
@@ -412,6 +470,11 @@ func runEnrollmentMaintenance(ctx context.Context, home string, store string, ne
 			continue
 		}
 		result.NativeCandidates++
+		if retention.NativeSnapshots == storage.NativeSnapshotRetentionManual {
+			result.NativeDeferred++
+			result.DeferredSessionIDs = append(result.DeferredSessionIDs, state.SessionID)
+			continue
+		}
 		err := runEnrollmentCommand(ctx, []string{"fs", "retire-native", state.SessionID, "--codex-home", home, "--store", store, "--apply"})
 		if err == nil {
 			result.NativeRetired++

@@ -2,6 +2,8 @@ package storage
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -43,12 +45,12 @@ func TestScanClassifiesManagedStorageAndDeduplicatesHardLinks(t *testing.T) {
 	sessionA := filepath.Join(store, "fs", "sessions", "managed-a")
 	deltaA := writeSizedFile(t, filepath.Join(sessionA, "delta.jsonl"), 4)
 	backingA := writeSizedFile(t, filepath.Join(sessionA, "backing-00000000000000000002.jsonl"), 17)
-	writeJSONFile(t, filepath.Join(sessionA, "state.json"), stateFixture("managed-a", manifestA, 100, deltaA, backingA, snapshotA))
+	writeJSONFile(t, filepath.Join(sessionA, "state.json"), stateFixture(t, "managed-a", manifestA, 100, deltaA, backingA, snapshotA))
 
 	sessionB := filepath.Join(store, "fs", "sessions", "managed-b")
 	deltaB := writeSizedFile(t, filepath.Join(sessionB, "delta.jsonl"), 5)
 	writeSizedFile(t, filepath.Join(sessionB, "delta-00000000000000000001.jsonl"), 6)
-	writeJSONFile(t, filepath.Join(sessionB, "state.json"), stateFixture("managed-b", manifestB, 20, deltaB, "", snapshotB))
+	writeJSONFile(t, filepath.Join(sessionB, "state.json"), stateFixture(t, "managed-b", manifestB, 20, deltaB, "", snapshotB))
 
 	scratch := writeSizedFile(t, filepath.Join(sessionB, ".compact-00000000000000000001.jsonl"), 25)
 	stateTemp := writeSizedFile(t, filepath.Join(sessionB, ".state-compact-00000000000000000002.tmp"), 7)
@@ -100,7 +102,7 @@ func TestScanDoesNotCountManagedVirtualRouteAsNativeSource(t *testing.T) {
 	writeJSONFile(t, manifestPath, manifestFixture("session", virtualRoute, 64))
 	sessionRoot := filepath.Join(store, "fs", "sessions", "session")
 	delta := writeSizedFile(t, filepath.Join(sessionRoot, "delta.jsonl"), 3)
-	writeJSONFile(t, filepath.Join(sessionRoot, "state.json"), stateFixture("session", manifestPath, 64, delta, "", ""))
+	writeJSONFile(t, filepath.Join(sessionRoot, "state.json"), stateFixture(t, "session", manifestPath, 64, delta, "", ""))
 
 	inventory, err := Scan(context.Background(), Options{StoreDir: store})
 	if err != nil {
@@ -120,7 +122,7 @@ func TestScanRejectsPathsOutsideTheDeclaredStore(t *testing.T) {
 	manifest := filepath.Join(store, "manifests", "session.json")
 	native := writeSizedFile(t, filepath.Join(root, "native.jsonl"), 4)
 	writeJSONFile(t, manifest, manifestFixture("session", native, 4))
-	writeJSONFile(t, filepath.Join(store, "fs", "sessions", "session", "state.json"), stateFixture(
+	writeJSONFile(t, filepath.Join(store, "fs", "sessions", "session", "state.json"), stateFixture(t,
 		"session",
 		manifest,
 		4,
@@ -161,17 +163,33 @@ func assertUsage(t *testing.T, name string, usage FileUsage, files int, apparent
 
 func manifestFixture(sessionID string, rolloutPath string, sourceBytes int64) map[string]any {
 	return map[string]any{
+		"version": 1,
+		"kind":    "fold-v1",
 		"session": map[string]any{"id": sessionID, "rollout_path": rolloutPath},
-		"source":  map[string]any{"bytes": sourceBytes},
+		"source":  map[string]any{"bytes": sourceBytes, "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+		"parts": []map[string]any{{
+			"kind": "residual",
+			"object": map[string]any{
+				"sha256":    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+				"raw_bytes": sourceBytes,
+			},
+		}},
 	}
 }
 
-func stateFixture(sessionID string, manifestPath string, baseBytes int64, deltaPath string, backingPath string, snapshotPath string) map[string]any {
+func stateFixture(t *testing.T, sessionID string, manifestPath string, baseBytes int64, deltaPath string, backingPath string, snapshotPath string) map[string]any {
+	t.Helper()
+	manifestData, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatalf("read manifest fixture: %v", err)
+	}
+	digest := sha256.Sum256(manifestData)
 	return map[string]any{
-		"version":         1,
+		"version":         2,
 		"session_id":      sessionID,
 		"generation":      2,
 		"manifest_path":   manifestPath,
+		"manifest_sha256": hex.EncodeToString(digest[:]),
 		"base_bytes":      baseBytes,
 		"base_sha256":     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		"delta_path":      deltaPath,

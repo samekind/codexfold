@@ -27,7 +27,7 @@ Passing these checks can justify only `fs-engine-preview`. The following remain 
 - A compiled and mounted `fuse && cgo` adapter with macFUSE authorized by the user.
 - Real archived-session shadow and retained-source canaries.
 - Desktop click, resume, send, tool, fork, archive, restart, sleep/wake, rollback, and upgrade quarantine behavior.
-- Seven incident-free retention days before `production-ready:macos`.
+- Completion of the exact real-client, restart, fault-injection, and recovery matrix with no unresolved incident before `production-ready:macos`; elapsed days alone are not a gate.
 
 ## Latest Result
 

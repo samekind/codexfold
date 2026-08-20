@@ -3,7 +3,9 @@ package vfs
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -47,6 +49,314 @@ func TestRecoverFinishesPublishedCopyOnWriteGeneration(t *testing.T) {
 	defer handle.Close()
 	if got := readHandle(t, handle); !bytes.Equal(got, source) {
 		t.Fatalf("recovered backing differs: got=%q want=%q", got, source)
+	}
+}
+
+func TestRecoverSessionJournalWithWriterLeaseRollsBackDataSyncedCopyOnWrite(t *testing.T) {
+	root := t.TempDir()
+	manifest, reader, source := sessionFixture(t, root)
+	session := openFixtureSession(t, root, manifest, reader, nil)
+	state := session.State()
+	temporary := filepath.Join(session.directory, ".backing-crashed.tmp")
+	if err := os.WriteFile(temporary, source, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stateTemporary := filepath.Join(session.directory, ".state-primary-crashed.tmp")
+	if err := os.WriteFile(stateTemporary, []byte("interrupted primary publication"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	identity, err := hashNativePath(temporary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := appendJournal(session.directory, JournalRecord{
+		OperationID: fmt.Sprintf("cow-%020d", state.Generation), SessionID: state.SessionID,
+		Kind: "copy-on-write", Phase: "data-synced", TempPath: temporary, Native: identity,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	guard, acquired, err := TryAcquireWriterLeaseGuardAtPath(filepath.Join(session.directory, "writer.lease"))
+	if err != nil || !acquired {
+		t.Fatalf("acquire writer guard: acquired=%t err=%v", acquired, err)
+	}
+	defer guard.Close()
+	recovered, err := RecoverSessionJournalWithWriterLease(context.Background(), session.statePath)
+	if err != nil {
+		t.Fatalf("RecoverSessionJournalWithWriterLease: %v", err)
+	}
+	if recovered != state {
+		t.Fatalf("recovered state = %#v, want %#v", recovered, state)
+	}
+	if _, err := os.Stat(temporary); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("journal-owned temporary remains: %v", err)
+	}
+	if _, err := os.Stat(stateTemporary); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("proven state metadata temporary remains: %v", err)
+	}
+	records, err := readJournal(session.directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if latest := records[len(records)-1]; latest.Phase != "rolled-back" || latest.OperationID != fmt.Sprintf("cow-%020d", state.Generation) {
+		t.Fatalf("latest journal record = %#v", latest)
+	}
+	if verified, err := LoadSessionStateWithWriterLease(session.statePath); err != nil || verified != state {
+		t.Fatalf("strict state after replay = %#v, %v", verified, err)
+	}
+	if err := guard.Close(); err != nil {
+		t.Fatal(err)
+	}
+	advanced := openFixtureSession(t, root, manifest, reader, nil)
+	writer, err := advanced.OpenWriter()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.WriteAt(context.Background(), []byte("X"), 0); err != nil {
+		_ = writer.Close()
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if reopened := openFixtureSession(t, root, manifest, reader, nil); reopened.State().Generation != state.Generation+1 {
+		t.Fatalf("reopened state after later COW = %#v", reopened.State())
+	}
+}
+
+func TestRecoverSessionJournalWithWriterLeasePreservesUnsafeCOWTemporary(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		temporary func(*testing.T, string) (string, NativeFile)
+	}{
+		{
+			name: "outside session",
+			temporary: func(t *testing.T, _ string) (string, NativeFile) {
+				path := filepath.Join(t.TempDir(), ".backing-outside.tmp")
+				if err := os.WriteFile(path, []byte("outside evidence"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				identity, err := hashNativePath(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return path, identity
+			},
+		},
+		{
+			name: "symlink",
+			temporary: func(t *testing.T, directory string) (string, NativeFile) {
+				target := filepath.Join(t.TempDir(), "outside.txt")
+				if err := os.WriteFile(target, []byte("symlink target evidence"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				path := filepath.Join(directory, ".backing-symlink.tmp")
+				if err := os.Symlink(target, path); err != nil {
+					t.Fatal(err)
+				}
+				identity, err := hashNativePath(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return path, identity
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			manifest, reader, _ := sessionFixture(t, root)
+			session := openFixtureSession(t, root, manifest, reader, nil)
+			state := session.State()
+			temporary, identity := test.temporary(t, session.directory)
+			if err := appendJournal(session.directory, JournalRecord{
+				OperationID: fmt.Sprintf("cow-%020d", state.Generation), SessionID: state.SessionID,
+				Kind: "copy-on-write", Phase: "data-synced", TempPath: temporary, Native: identity,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			guard, acquired, err := TryAcquireWriterLeaseGuardAtPath(filepath.Join(session.directory, "writer.lease"))
+			if err != nil || !acquired {
+				t.Fatalf("acquire writer guard: acquired=%t err=%v", acquired, err)
+			}
+			defer guard.Close()
+			if _, err := RecoverSessionJournalWithWriterLease(context.Background(), session.statePath); err == nil {
+				t.Fatal("unsafe journal-owned temporary was accepted")
+			}
+			if _, err := os.Lstat(temporary); err != nil {
+				t.Fatalf("unsafe temporary evidence changed: %v", err)
+			}
+			records, err := readJournal(session.directory)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if latest := records[len(records)-1]; latest.Phase != "data-synced" {
+				t.Fatalf("unsafe journal was advanced: %#v", latest)
+			}
+		})
+	}
+}
+
+func TestRecoverSessionJournalWithWriterLeaseFinishesPublishedCopyOnWrite(t *testing.T) {
+	root := t.TempDir()
+	manifest, reader, source := sessionFixture(t, root)
+	session := openFixtureSession(t, root, manifest, reader, nil)
+	state := session.State()
+	backing := filepath.Join(session.directory, fmt.Sprintf("backing-%020d.jsonl", state.Generation+1))
+	if err := os.WriteFile(backing, source, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	identity, err := hashNativePath(backing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	temporary := filepath.Join(session.directory, ".backing-crashed.tmp")
+	identity.Path = temporary
+	candidate := state
+	candidate.Generation++
+	candidate.BackingPath = backing
+	if err := appendJournal(session.directory, JournalRecord{
+		OperationID: fmt.Sprintf("cow-%020d", state.Generation), SessionID: state.SessionID,
+		Kind: "copy-on-write", Phase: "after-file-publish", Candidate: candidate,
+		FinalPath: backing, Native: identity,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	guard, acquired, err := TryAcquireWriterLeaseGuardAtPath(filepath.Join(session.directory, "writer.lease"))
+	if err != nil || !acquired {
+		t.Fatalf("acquire writer guard: acquired=%t err=%v", acquired, err)
+	}
+	defer guard.Close()
+	recovered, err := RecoverSessionJournalWithWriterLease(context.Background(), session.statePath)
+	if err != nil {
+		t.Fatalf("RecoverSessionJournalWithWriterLease: %v", err)
+	}
+	if recovered != candidate {
+		t.Fatalf("recovered state = %#v, want %#v", recovered, candidate)
+	}
+	records, err := readJournal(session.directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if latest := records[len(records)-1]; latest.Phase != "complete" || latest.OperationID != fmt.Sprintf("cow-%020d", state.Generation) {
+		t.Fatalf("latest journal record = %#v", latest)
+	}
+	if verified, err := LoadSessionStateWithWriterLease(session.statePath); err != nil || verified != candidate {
+		t.Fatalf("strict state after replay = %#v, %v", verified, err)
+	}
+}
+
+func TestRecoverSessionJournalWithWriterLeaseAdoptsPinnedCOWCheckpointBeforeRepublish(t *testing.T) {
+	for _, mode := range []string{"checkpoint-temporary", "checkpoint-final", "checkpoint-final-with-identical-orphan"} {
+		t.Run(mode, func(t *testing.T) {
+			root := t.TempDir()
+			manifest, reader, source := sessionFixture(t, root)
+			session := openFixtureSession(t, root, manifest, reader, nil)
+			state := session.State()
+			chain, err := loadStateCheckpointChain(session.directory, state.SessionID, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			request, err := json.Marshal(map[string]string{"checkpoint_sha256": chain.catalog.CheckpointSHA256})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(session.directory, "retire.request.json"), append(request, '\n'), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			backing := filepath.Join(session.directory, fmt.Sprintf("backing-%020d.jsonl", state.Generation+1))
+			if err := os.WriteFile(backing, source, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			identity, err := hashNativePath(backing)
+			if err != nil {
+				t.Fatal(err)
+			}
+			identity.Path = filepath.Join(session.directory, ".backing-checkpointcrash.tmp")
+			candidate := state
+			candidate.Generation++
+			candidate.BackingPath = backing
+			stateData, err := encodeSessionState(candidate)
+			if err != nil {
+				t.Fatal(err)
+			}
+			checkpoint, err := buildStateCheckpoint(candidate, digestStateBytes(stateData), chain.catalog.CheckpointSHA256, chain.catalog.Sequence+1, session.directory, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			checkpointData, err := encodeStateCheckpoint(checkpoint)
+			if err != nil {
+				t.Fatal(err)
+			}
+			checkpointSHA256 := digestStateBytes(checkpointData)
+			checkpointName := stateCheckpointFilename(candidate.Generation, checkpoint.Sequence, checkpointSHA256)
+			generations := filepath.Join(session.directory, stateGenerationsDirectoryName)
+			checkpointTemporary, err := os.CreateTemp(generations, ".state-checkpoint-*.tmp")
+			if err != nil {
+				t.Fatal(err)
+			}
+			checkpointTemporaryPath := checkpointTemporary.Name()
+			if _, err := checkpointTemporary.Write(checkpointData); err != nil {
+				_ = checkpointTemporary.Close()
+				t.Fatal(err)
+			}
+			if err := checkpointTemporary.Sync(); err != nil {
+				_ = checkpointTemporary.Close()
+				t.Fatal(err)
+			}
+			if err := checkpointTemporary.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if mode != "checkpoint-temporary" {
+				checkpointPath := filepath.Join(generations, checkpointName)
+				if err := os.Link(checkpointTemporaryPath, checkpointPath); err != nil {
+					t.Fatal(err)
+				}
+				if err := syncStateDirectory(generations); err != nil {
+					t.Fatal(err)
+				}
+				if mode == "checkpoint-final-with-identical-orphan" {
+					orphanDirectory := filepath.Join(session.directory, "state-orphans")
+					if err := os.Mkdir(orphanDirectory, 0o700); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.WriteFile(filepath.Join(orphanDirectory, checkpointName), checkpointData, 0o600); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			if err := appendJournal(session.directory, JournalRecord{
+				OperationID: fmt.Sprintf("cow-%020d", state.Generation), SessionID: state.SessionID,
+				Kind: "copy-on-write", Phase: "after-file-publish", Candidate: candidate,
+				FinalPath: backing, Native: identity,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			guard, acquired, err := TryAcquireWriterLeaseGuardAtPath(filepath.Join(session.directory, "writer.lease"))
+			if err != nil || !acquired {
+				t.Fatalf("acquire writer guard: acquired=%t err=%v", acquired, err)
+			}
+			defer guard.Close()
+			recovered, err := RecoverSessionJournalWithWriterLease(context.Background(), session.statePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if recovered != candidate {
+				t.Fatalf("recovered COW state=%#v want=%#v", recovered, candidate)
+			}
+			replayed, err := RecoverSessionJournalWithWriterLease(context.Background(), session.statePath)
+			if err != nil || replayed != candidate {
+				t.Fatalf("idempotent COW replay=%#v want=%#v err=%v", replayed, candidate, err)
+			}
+			if _, err := os.Lstat(checkpointTemporaryPath); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("checkpoint temporary remains: %v", err)
+			}
+			records, err := readJournal(session.directory)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if latest := records[len(records)-1]; latest.Phase != "complete" {
+				t.Fatalf("latest COW journal record=%#v", latest)
+			}
+		})
 	}
 }
 
@@ -112,7 +422,9 @@ func TestCompactSwitchesGenerationAndPreservesPinnedReader(t *testing.T) {
 			}
 			preparedReader := memoryReader{digest: data}
 			view, err := NewView(preparedManifest, preparedReader)
-			return PreparedGeneration{ManifestPath: filepath.Join(root, "manifest-generation-2.json"), Manifest: preparedManifest, View: view}, err
+			manifestPath := filepath.Join(root, "manifests", "generations", preparedManifest.Session.ID, "00000000000000000002.json")
+			persistManifestFixture(t, manifestPath, preparedManifest)
+			return PreparedGeneration{ManifestPath: manifestPath, Manifest: preparedManifest, View: view}, err
 		},
 	})
 	if err != nil {
@@ -165,7 +477,9 @@ func TestStorageGCKeepsOldSessionGenerationUntilReaderLeaseCloses(t *testing.T) 
 			Parts:   []fold.Part{{Kind: fold.PartResidual, Object: fold.ObjectRef{SHA256: digest, RawBytes: int64(len(data))}}},
 		}
 		view, err := NewView(prepared, memoryReader{digest: data})
-		return PreparedGeneration{ManifestPath: filepath.Join(root, "manifest-generation-2.json"), Manifest: prepared, View: view}, err
+		manifestPath := filepath.Join(root, "manifests", "generations", prepared.Session.ID, "00000000000000000002.json")
+		persistManifestFixture(t, manifestPath, prepared)
+		return PreparedGeneration{ManifestPath: manifestPath, Manifest: prepared, View: view}, err
 	}})
 	if err != nil {
 		t.Fatal(err)
@@ -190,11 +504,11 @@ func TestStorageGCKeepsOldSessionGenerationUntilReaderLeaseCloses(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if collected.RemovedCount != 1 {
-		t.Fatalf("closed reader generation was not collected: %#v", collected)
+	if collected.RemovedCount != 0 || collected.RetainedUnprovedCount != 1 {
+		t.Fatalf("closed reader generation was not retained without exact deletion proof: %#v", collected)
 	}
-	if _, err := os.Stat(oldDelta); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("old delta remains after reader close: %v", err)
+	if _, err := os.Stat(oldDelta); err != nil {
+		t.Fatalf("unproved old delta was removed after reader close: %v", err)
 	}
 }
 
@@ -221,7 +535,7 @@ func TestCompactRejectsDeltaChangedDuringPreparation(t *testing.T) {
 			digest := digestBytes(data)
 			preparedManifest := fold.Manifest{Version: fold.ManifestVersion, Kind: fold.ManifestKind, Session: fold.ManifestSession{ID: "session"}, Source: fold.ManifestSource{Bytes: int64(len(data)), SHA256: digest}, Parts: []fold.Part{{Kind: fold.PartResidual, Object: fold.ObjectRef{SHA256: digest, RawBytes: int64(len(data))}}}}
 			view, _ := NewView(preparedManifest, memoryReader{digest: data})
-			return PreparedGeneration{ManifestPath: filepath.Join(root, "next.json"), Manifest: preparedManifest, View: view}, nil
+			return PreparedGeneration{ManifestPath: filepath.Join(root, "manifests", "generations", preparedManifest.Session.ID, "00000000000000000002.json"), Manifest: preparedManifest, View: view}, nil
 		},
 	})
 	if err == nil {
@@ -237,7 +551,7 @@ func TestCompactBudgetRejectsBeforeScratchOrPreparation(t *testing.T) {
 	manifest, reader, _ := sessionFixture(t, root)
 	checker := &vfsRejectingChecker{}
 	session, err := OpenSession(context.Background(), SessionOptions{
-		Root: root, ManifestPath: filepath.Join(root, "manifest.json"), Manifest: manifest, Reader: reader,
+		Root: root, ManifestPath: fold.ManifestPath(root, manifest.Session.ID), Manifest: manifest, Reader: reader,
 		NativeSnapshot: NativeFile{Path: manifest.Session.RolloutPath, Bytes: manifest.Source.Bytes, SHA256: manifest.Source.SHA256},
 		Budget:         checker,
 	})
@@ -363,6 +677,219 @@ func TestRecoverInterruptedCompactRemovesJournalOwnedScratch(t *testing.T) {
 	latest := records[len(records)-1]
 	if latest.Phase != "rolled-back" || latest.TempPath != stateTemporary || latest.Native.Path != scratch {
 		t.Fatalf("recovery did not preserve cleanup ownership: %#v", latest)
+	}
+}
+
+func TestRecoverSessionJournalWithWriterLeaseAdoptsPinnedCompactCheckpointBeforeRollback(t *testing.T) {
+	for _, linkFinal := range []bool{false, true} {
+		name := "checkpoint-temporary"
+		if linkFinal {
+			name = "checkpoint-final"
+		}
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			manifest, reader, source := sessionFixture(t, root)
+			session := openFixtureSession(t, root, manifest, reader, nil)
+			state := session.State()
+			directory := session.directory
+			tail := []byte("-retained-compact-predecessor")
+			active, err := os.OpenFile(state.DeltaPath, os.O_APPEND|os.O_WRONLY, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := active.Write(tail); err != nil {
+				_ = active.Close()
+				t.Fatal(err)
+			}
+			if err := active.Sync(); err != nil {
+				_ = active.Close()
+				t.Fatal(err)
+			}
+			if err := active.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err := refreshSessionStateCheckpoint(session.statePath, state); err != nil {
+				t.Fatal(err)
+			}
+			chain, err := loadStateCheckpointChain(directory, state.SessionID, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			request, err := json.Marshal(map[string]string{"checkpoint_sha256": chain.catalog.CheckpointSHA256})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(directory, "retire.request.json"), append(request, '\n'), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			currentBytes := append(append([]byte(nil), source...), tail...)
+			currentSHA256 := digestBytes(currentBytes)
+			compactedManifest := fold.Manifest{
+				Version: fold.ManifestVersion, Kind: fold.ManifestKind,
+				Session: fold.ManifestSession{ID: state.SessionID, RolloutPath: manifest.Session.RolloutPath},
+				Source:  fold.ManifestSource{Bytes: int64(len(currentBytes)), SHA256: currentSHA256},
+				Parts:   []fold.Part{{Kind: fold.PartResidual, Object: fold.ObjectRef{SHA256: currentSHA256, RawBytes: int64(len(currentBytes))}}},
+			}
+			compactedManifestPath := filepath.Join(root, "manifests", "generations", state.SessionID, "00000000000000000002.json")
+			persistManifestFixture(t, compactedManifestPath, compactedManifest)
+			manifestIdentity, _, err := captureManifestIdentity(compactedManifestPath, state.SessionID, int64(len(currentBytes)), currentSHA256)
+			if err != nil {
+				t.Fatal(err)
+			}
+			next := state
+			next.Generation++
+			next.ManifestPath = compactedManifestPath
+			next.ManifestSHA256 = manifestIdentity.SHA256
+			next.BaseBytes = int64(len(currentBytes))
+			next.BaseSHA256 = currentSHA256
+			next.DeltaPath = filepath.Join(directory, fmt.Sprintf("delta-%020d.jsonl", next.Generation))
+			if err := os.WriteFile(next.DeltaPath, nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			scratch := filepath.Join(directory, fmt.Sprintf(".compact-%020d.jsonl", state.Generation))
+			if err := os.WriteFile(scratch, currentBytes, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			native, err := hashNativePath(scratch)
+			if err != nil {
+				t.Fatal(err)
+			}
+			stateTemporary := filepath.Join(directory, fmt.Sprintf(".state-compact-%020d.tmp", next.Generation))
+			if err := os.WriteFile(stateTemporary, []byte("interrupted primary state"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			stateData, err := encodeSessionState(next)
+			if err != nil {
+				t.Fatal(err)
+			}
+			checkpoint, err := buildStateCheckpoint(next, digestStateBytes(stateData), chain.catalog.CheckpointSHA256, chain.catalog.Sequence+1, directory, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			checkpointData, err := encodeStateCheckpoint(checkpoint)
+			if err != nil {
+				t.Fatal(err)
+			}
+			checkpointSHA256 := digestStateBytes(checkpointData)
+			checkpointName := stateCheckpointFilename(next.Generation, checkpoint.Sequence, checkpointSHA256)
+			generations := filepath.Join(directory, stateGenerationsDirectoryName)
+			checkpointTemporary, err := os.CreateTemp(generations, ".state-checkpoint-*.tmp")
+			if err != nil {
+				t.Fatal(err)
+			}
+			checkpointTemporaryPath := checkpointTemporary.Name()
+			if _, err := checkpointTemporary.Write(checkpointData); err != nil {
+				_ = checkpointTemporary.Close()
+				t.Fatal(err)
+			}
+			if err := checkpointTemporary.Sync(); err != nil {
+				_ = checkpointTemporary.Close()
+				t.Fatal(err)
+			}
+			if err := checkpointTemporary.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if linkFinal {
+				if err := os.Link(checkpointTemporaryPath, filepath.Join(generations, checkpointName)); err != nil {
+					t.Fatal(err)
+				}
+				if err := syncStateDirectory(generations); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := appendJournal(directory, JournalRecord{
+				OperationID: fmt.Sprintf("compact-%020d", state.Generation), SessionID: state.SessionID,
+				Kind: "compact", Phase: "state-publishing", Candidate: next,
+				TempPath: stateTemporary, FinalPath: next.DeltaPath, Native: native,
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			guard, acquired, err := TryAcquireWriterLeaseGuardAtPath(filepath.Join(directory, "writer.lease"))
+			if err != nil || !acquired {
+				t.Fatalf("acquire writer guard: acquired=%t err=%v", acquired, err)
+			}
+			defer guard.Close()
+			recovered, err := RecoverSessionJournalWithWriterLease(context.Background(), session.statePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if recovered != next {
+				t.Fatalf("recovered compact state=%#v want=%#v", recovered, next)
+			}
+			for _, removed := range []string{scratch, stateTemporary, checkpointTemporaryPath} {
+				if _, err := os.Lstat(removed); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("compact recovery temporary remains %s: %v", removed, err)
+				}
+			}
+			if _, err := os.Stat(next.DeltaPath); err != nil {
+				t.Fatalf("adopted compact delta was removed: %v", err)
+			}
+			records, err := readJournal(directory)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if latest := records[len(records)-1]; latest.Phase != "complete" {
+				t.Fatalf("latest compact journal record=%#v", latest)
+			}
+		})
+	}
+}
+
+func TestRecoverSessionJournalWithWriterLeaseDoesNotRollbackCurrentCompactDelta(t *testing.T) {
+	root := t.TempDir()
+	manifest, reader, source := sessionFixture(t, root)
+	session := openFixtureSession(t, root, manifest, reader, nil)
+	current := session.State()
+	current.Generation++
+	current.DeltaPath = filepath.Join(session.directory, fmt.Sprintf("delta-%020d.jsonl", current.Generation))
+	if err := os.WriteFile(current.DeltaPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := publishSessionState(session.statePath, current); err != nil {
+		t.Fatal(err)
+	}
+	scratch := filepath.Join(session.directory, fmt.Sprintf(".compact-%020d.jsonl", current.Generation-1))
+	if err := os.WriteFile(scratch, source, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	native, err := hashNativePath(scratch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stateTemporary := filepath.Join(session.directory, fmt.Sprintf(".state-compact-%020d.tmp", current.Generation))
+	if err := os.WriteFile(stateTemporary, []byte("crafted state temporary"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := appendJournal(session.directory, JournalRecord{
+		OperationID: fmt.Sprintf("compact-%020d", current.Generation-1), SessionID: current.SessionID,
+		Kind: "compact", Phase: "prepared", Candidate: current,
+		TempPath: stateTemporary, FinalPath: current.DeltaPath, Native: native,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	guard, acquired, err := TryAcquireWriterLeaseGuardAtPath(filepath.Join(session.directory, "writer.lease"))
+	if err != nil || !acquired {
+		t.Fatalf("acquire writer guard: acquired=%t err=%v", acquired, err)
+	}
+	defer guard.Close()
+	if _, err := RecoverSessionJournalWithWriterLease(context.Background(), session.statePath); err == nil {
+		t.Fatal("crafted compact rollback was accepted")
+	}
+	if _, err := os.Stat(current.DeltaPath); err != nil {
+		t.Fatalf("current compact delta was removed: %v", err)
+	}
+	if _, err := os.Stat(scratch); err != nil {
+		t.Fatalf("crafted compact scratch evidence was removed: %v", err)
+	}
+	records, err := readJournal(session.directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if latest := records[len(records)-1]; latest.Phase != "prepared" {
+		t.Fatalf("crafted compact journal was advanced: %#v", latest)
 	}
 }
 

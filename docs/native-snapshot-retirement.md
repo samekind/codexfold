@@ -1,9 +1,11 @@
 # Native Snapshot Retirement
 
 Canonical migration initially retains the original rollout as a hidden native
-snapshot. This preserves an immediate native fallback while a managed session
-is being validated. After pack-only recovery and client canaries pass, the
-snapshot can be retired to realize the storage savings from folding.
+snapshot. This preserves an immediate native fallback while the managed route
+is established. The default `until-exact-recovery-proof` policy may retire that
+snapshot as soon as exact pack-only reconstruction proof succeeds; the optional
+`until-explicit-retirement` policy keeps it until an explicit command. Neither
+policy requires a fixed observation period or a fixed-size recovery area.
 
 ## Command
 
@@ -30,6 +32,11 @@ Before changing state, the command requires all of the following:
 4. A complete current materialization is written, synchronized, and verified.
 5. Generation, visible bytes, and native snapshot state remain unchanged during
    verification.
+6. The session mutex and exclusive writer lease remain held while the final
+   fence stably re-reads the snapshot and revalidates its path, byte count, and
+   SHA-256. Checkpoint publication separately uses the per-session checkpoint
+   operation lock; final staging and removal revalidate the retained object
+   again rather than claiming that checkpoint lock remains held throughout.
 
 The command writes and synchronizes `native-retirement.json`, atomically clears
 the snapshot from managed state, and only then removes the retained file. The

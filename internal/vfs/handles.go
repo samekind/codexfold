@@ -2,10 +2,14 @@ package vfs
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"os"
+	"path/filepath"
 	"sync"
 )
 
@@ -102,11 +106,16 @@ func (h *ReadHandle) Close() error {
 }
 
 type WriteHandle struct {
-	session   *Session
-	leasePath string
-	lease     *os.File
-	mu        sync.Mutex
-	closed    bool
+	session         *Session
+	leasePath       string
+	lease           *os.File
+	mu              sync.Mutex
+	closed          bool
+	dirty           bool
+	appendHasher    hash.Hash
+	appendHashPath  string
+	appendHashBytes int64
+	appendHashValid bool
 }
 
 func (h *WriteHandle) Append(ctx context.Context, data []byte) (int, error) {
@@ -123,12 +132,20 @@ func (h *WriteHandle) Append(ctx context.Context, data []byte) (int, error) {
 	if state.BackingPath != "" {
 		path = state.BackingPath
 	}
+	if err := h.ensureAppendHash(path); err != nil {
+		return 0, err
+	}
 	file, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
 	if err != nil {
 		return 0, fmt.Errorf("open append target: %w", err)
 	}
 	n, writeErr := file.Write(data)
 	closeErr := file.Close()
+	if n > 0 {
+		_, _ = h.appendHasher.Write(data[:n])
+		h.appendHashBytes += int64(n)
+		h.dirty = true
+	}
 	if writeErr != nil {
 		return n, writeErr
 	}
@@ -157,6 +174,10 @@ func (h *WriteHandle) WriteAt(ctx context.Context, data []byte, offset int64) (i
 	}
 	n, writeErr := file.WriteAt(data, offset)
 	closeErr := file.Close()
+	if n > 0 {
+		h.dirty = true
+		h.appendHashValid = false
+	}
 	if writeErr != nil {
 		return n, writeErr
 	}
@@ -183,12 +204,21 @@ func (h *WriteHandle) Truncate(ctx context.Context, size int64) error {
 	if err != nil {
 		return err
 	}
-	return os.Truncate(path, size)
+	if err := os.Truncate(path, size); err != nil {
+		return err
+	}
+	h.dirty = true
+	h.appendHashValid = false
+	return nil
 }
 
 func (h *WriteHandle) Sync() error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	return h.syncAndCheckpointLocked()
+}
+
+func (h *WriteHandle) syncAndCheckpointLocked() error {
 	if h.closed {
 		return errors.New("writer is closed")
 	}
@@ -201,11 +231,54 @@ func (h *WriteHandle) Sync() error {
 	if err != nil {
 		return err
 	}
-	if err := file.Sync(); err != nil {
-		_ = file.Close()
+	syncErr := file.Sync()
+	closeErr := file.Close()
+	if syncErr != nil || closeErr != nil {
+		return errors.Join(syncErr, closeErr)
+	}
+	if !h.dirty {
+		return nil
+	}
+	var activeIdentity *sessionStateFileIdentity
+	if h.appendHashValid && h.appendHashPath == filepath.Clean(path) {
+		info, err := os.Lstat(path)
+		if err != nil || !info.Mode().IsRegular() || info.Size() != h.appendHashBytes {
+			h.appendHashValid = false
+		} else {
+			identity := sessionStateFileIdentity{Path: filepath.Clean(path), Bytes: h.appendHashBytes, SHA256: hex.EncodeToString(h.appendHasher.Sum(nil))}
+			activeIdentity = &identity
+		}
+	}
+	if err := refreshSessionStateCheckpointWithActiveIdentity(h.session.statePath, state, activeIdentity); err != nil {
 		return err
 	}
-	return file.Close()
+	h.dirty = false
+	return nil
+}
+
+func (h *WriteHandle) ensureAppendHash(path string) error {
+	path = filepath.Clean(path)
+	if h.appendHashValid && h.appendHashPath == path {
+		return nil
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	hasher := sha256.New()
+	bytesRead, copyErr := io.Copy(hasher, file)
+	closeErr := file.Close()
+	if copyErr != nil || closeErr != nil {
+		return errors.Join(copyErr, closeErr)
+	}
+	if stateCheckpointBytesHashed != nil {
+		stateCheckpointBytesHashed(bytesRead)
+	}
+	h.appendHasher = hasher
+	h.appendHashPath = path
+	h.appendHashBytes = bytesRead
+	h.appendHashValid = true
+	return nil
 }
 
 func (h *WriteHandle) Close() error {
@@ -214,17 +287,15 @@ func (h *WriteHandle) Close() error {
 	if h.closed {
 		return nil
 	}
+	var checkpointErr error
+	if h.dirty {
+		checkpointErr = h.syncAndCheckpointLocked()
+	}
 	h.closed = true
 	unlockErr := unlockWriterFile(h.lease)
 	closeErr := h.lease.Close()
 	h.session.mu.Lock()
 	h.session.writerOpen = false
 	h.session.mu.Unlock()
-	if unlockErr != nil {
-		return unlockErr
-	}
-	if closeErr != nil {
-		return closeErr
-	}
-	return nil
+	return errors.Join(checkpointErr, unlockErr, closeErr)
 }

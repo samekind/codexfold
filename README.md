@@ -20,18 +20,21 @@ The requirements and release gates for normal JSONL paths backed transparently b
 
 | Platform | Adapter | Evidence in this release | Readiness |
 |---|---|---|---|
-| macOS 27 | Apple-native Swift FSKit | Real isolated CLI/Desktop, native mount, restart, recovery, performance, and exact-byte Canary | `fs-engine-preview` |
+| macOS 27 | Apple-native Swift FSKit | Historical signed build 102 real-client and native-mount matrix; current worktree requalification is partial | `fs-engine-preview` |
 | Linux | FUSE3 | Real unprivileged mount, mutation, remount, recovery, performance, and user-service lifecycle | Preview; real Codex client validation remains incomplete |
 | Windows | WinFsp | Cross-build and compile coverage | Not runtime-validated |
 
 The transparent filesystem preview has these explicit boundaries:
 
-- macOS now targets an Apple-native Swift FSKit extension connected over a versioned Unix-domain-socket protocol to the Go CodexFold daemon. The signed build 102 App/extension and current helper candidate pass the isolated mounted operation matrix, exact-byte and cache-coherency gates, independently restarted cold/warm `F_NOCACHE` performance rounds, bounded runtime RSS, crash and host-restart recovery, transactional app/binary rollback, current-client regression checks, and real Codex CLI/Desktop acceptance.
-- Release source metadata is `0.3.0 (103)`. Build 103 compiles and passes nested signature verification; the complete mounted and real-client evidence remains attached to behavior-identical build 102 rather than being silently relabeled.
+- macOS now targets an Apple-native Swift FSKit extension connected over a versioned Unix-domain-socket protocol to the Go CodexFold daemon. The signed 2026-07-23 build 102 App/extension and its then-current helper historically passed the isolated mounted-operation, exact-byte, cache-coherency, performance, crash/host-restart, rollback, and real Codex CLI/Desktop matrix. That evidence does not automatically transfer to the current worktree candidate.
+- Release source metadata is `0.3.0 (103)`. Build 103 compiles and passes nested signature verification, while the completed mounted and real-client matrix remains historical build 102 evidence. Changes in the current worktree require their own candidate attachment, real-client workload, restart, fault-injection, and recovery evidence.
 - The earlier synchronous FUSE-T NFS route remains historical validation evidence and a development fallback only. FUSE-T's third-party FSKit backend remains rejected after deterministic byte-loss and cache-invalidation failures; it is not the Apple-native FSKit implementation in this repository.
 - Linux FUSE3 has real unprivileged read, append, copy-on-write, truncate, archive rename, crash recovery, remount, performance, and `systemd --user` lifecycle evidence.
 - Windows has a WinFsp adapter and native Windows Service host that cross-compile, but no real Windows/WinFsp host has validated them yet.
-- The production service and production Codex home remain disabled by default. The isolated macOS candidate has completed Pack-only current-client, restart, rollback, process-recovery, and performance gates. A controlled in-flight host power interruption and the incident-free observation period still block general production promotion.
+- The production service and production Codex home remain disabled by default. The current worktree's isolated flow has observed a real Cockpit **Start**, an isolated Desktop/app-server process chain, and an unchanged production Codex process. It has not yet attached the current CodexFold candidate, observed a real Desktop task mutation through that managed route, or completed candidate-only fault injection and recovery; `codexInstanceAcceptanceComplete`, `codexFoldCandidateAcceptanceComplete`, and `realAcceptanceComplete` therefore remain false. Promotion is blocked by that exact evidence matrix, not by a fixed observation period.
+- CodexFold recovery operates only on CodexFold-owned components. It never quits, restarts, signals, or reopens a running Codex process. On macOS the backend, supervisor, and incident helper are resident; the menu-bar App is restarted after a crash but an explicit user Quit remains a quit.
+- The native macOS menu-bar App shows current health, measured space saved, current read/write speed, compact trends, selectable 1-hour/24-hour/7-day/30-day history, and the timeline of failures that lasted at least ten seconds. A standalone menu-bar launch that has never observed or registered the file-service runtime shows an unconnected state instead of reporting a critical incident. History stores only timestamps, health, counts, byte totals, and aggregate transfer rates, never session content.
+- The current worktree validation has not installed, updated, stopped, restarted, or signaled the production CodexFold service, FSKit App/extension, or LaunchAgent set. Any exact production target requires a new explicit user authorization before an apply or lifecycle operation.
 
 See [the Linux FUSE3 validation](docs/validation-linux-fuse3.md) and [the macOS canary validation](docs/validation-macos-canary.md) for the evidence boundary. The default build remains storage-only; platform mounts require explicit build tags and installed host prerequisites.
 
@@ -107,9 +110,10 @@ Remove an archived session only after containment and recovery proofs pass:
 ```bash
 codexfold remove-contained <contained-session-id> <container-session-id>
 codexfold remove-contained <contained-session-id> <container-session-id> --apply
+codexfold remove-contained recover <contained-session-id> --apply
 ```
 
-The first command is proof-only. `--apply` additionally requires an existing verified fold, a current source SHA-256 match, and a successful temporary unfold. It then isolates the source file, removes the archived thread and associated local state in one SQLite transaction, cleans exact thread-ID references from Codex global state, and finally deletes the isolated source. A tombstone and fold manifest remain for byte-level recovery. Concurrent global-state changes abort the operation instead of being overwritten.
+The first command is proof-only. `--apply` additionally requires an existing verified fold, a current source SHA-256 match, a successful temporary unfold, and repeated native-writer checks. It hashes the source again immediately before isolating it, records each durable removal phase, removes the archived thread and associated local state in one SQLite transaction, cleans exact thread-ID references from the latest Codex global state, revalidates the isolated bytes again, and only then deletes that exact file. A tombstone and fold manifest remain for byte-level recovery. If the process stops at any point, `recover --apply` uses the retained database, tombstone, fold, original path, and pending path state to finish or roll back without guessing. Changed or ambiguous files are preserved.
 
 ## Fork Families And Archival
 
@@ -159,6 +163,7 @@ codexfold gc --apply
 - Existing indexes, manifests, and restore targets are never replaced without an explicit overwrite flag.
 - Contained-session removal is archived-only, proof-first, transaction-guarded, and retains recovery evidence.
 - Fork-family reporting is evidence-only, archive is explicit and recoverable, and neither operation triggers deletion.
+- A canonical `unlink` of a managed session is true deletion, but its physical removal requires the version-3 durable purge receipt and exact locked revalidation described by the product contract. An unmanaged native passthrough file keeps normal filesystem unlink behavior. Archive/unarchive rename never supplies managed deletion authority, and unknown or unproved nonempty managed content is retained and reported.
 
 ## Development
 

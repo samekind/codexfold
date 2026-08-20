@@ -2,9 +2,12 @@ package pack
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -16,7 +19,8 @@ import (
 )
 
 type RetireLooseOptions struct {
-	Apply bool
+	Apply        bool
+	BeforeRemove func(string) error
 }
 
 type RetireLooseResult struct {
@@ -36,6 +40,11 @@ type RetireLooseResult struct {
 // RetireLoose removes only loose objects that the current verified pack can read.
 func RetireLoose(ctx context.Context, storeDir string, options RetireLooseOptions) (RetireLooseResult, error) {
 	result := RetireLooseResult{StoreDir: filepath.Clean(storeDir), DryRun: !options.Apply}
+	guard, err := storage.AcquireManagedSessionDeletionGuard(ctx, storeDir)
+	if err != nil {
+		return RetireLooseResult{}, fmt.Errorf("refusing loose retirement without complete managed-session proof: %w", err)
+	}
+	defer guard.Close()
 	lock, err := storage.AcquireOperationLock(storeDir, "objects")
 	if err != nil {
 		return RetireLooseResult{}, err
@@ -67,6 +76,9 @@ func RetireLoose(ctx context.Context, storeDir string, options RetireLooseOption
 		return RetireLooseResult{}, errors.New("refusing loose retirement: pack-only fold verification is incomplete")
 	}
 	result.VerifiedManifestCount = proof.VerifiedManifestCount
+	if _, err := verifyManagedSessionManifests(ctx, resolver, guard.References); err != nil {
+		return RetireLooseResult{}, err
+	}
 	objectRoot := filepath.Join(storeDir, "objects")
 	err = filepath.WalkDir(objectRoot, func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
@@ -79,7 +91,14 @@ func RetireLoose(ctx context.Context, storeDir string, options RetireLooseOption
 			return nil
 		}
 		digest := strings.TrimSuffix(entry.Name(), ".zst")
-		if !resolver.HasDigest(digest) {
+		if err := fold.ValidateCanonicalLooseObjectPath(storeDir, path, digest); err != nil {
+			return fmt.Errorf("refusing noncanonical loose retirement candidate: %w", err)
+		}
+		packedObject, packed, err := resolver.lookupObject(digest)
+		if err != nil {
+			return err
+		}
+		if !packed {
 			return nil
 		}
 		info, err := entry.Info()
@@ -91,11 +110,44 @@ func RetireLoose(ctx context.Context, storeDir string, options RetireLooseOption
 		if !options.Apply {
 			return nil
 		}
+		initialIdentity, err := fold.CaptureLooseObjectIdentity(path, digest, packedObject.RawBytes)
+		if err != nil {
+			return fmt.Errorf("refusing unproved loose retirement candidate %s: %w", digest, err)
+		}
+		if options.BeforeRemove != nil {
+			if err := options.BeforeRemove(path); err != nil {
+				return err
+			}
+		}
+		current, err := CurrentGeneration(storeDir)
+		if err != nil {
+			return fmt.Errorf("refresh pack CURRENT before loose retirement: %w", err)
+		}
+		if current != resolver.Generation() {
+			return fmt.Errorf("refusing loose retirement: pack CURRENT changed from %s to %s", resolver.Generation(), current)
+		}
+		managed, err := guard.Refresh(ctx, storeDir)
+		if err != nil {
+			return fmt.Errorf("refresh managed-session deletion proof: %w", err)
+		}
+		if len(managed) != len(guard.References) {
+			return errors.New("managed-session deletion proof changed before loose retirement")
+		}
+		if err := verifyPackedLooseRetirementCandidate(ctx, resolver, digest, packedObject.RawBytes); err != nil {
+			return err
+		}
+		finalIdentity, err := fold.CaptureLooseObjectIdentity(path, digest, packedObject.RawBytes)
+		if err != nil {
+			return fmt.Errorf("revalidate loose retirement candidate %s: %w", digest, err)
+		}
+		if !initialIdentity.Same(finalIdentity) {
+			return fmt.Errorf("loose retirement candidate %s changed after exact proof", digest)
+		}
 		if err := os.Remove(path); err != nil {
 			return fmt.Errorf("retire loose object %s: %w", digest, err)
 		}
 		result.RetiredCount++
-		result.RetiredBytes += info.Size()
+		result.RetiredBytes += finalIdentity.StoredBytes
 		return nil
 	})
 	if errors.Is(err, os.ErrNotExist) {
@@ -120,6 +172,47 @@ func RetireLoose(ctx context.Context, storeDir string, options RetireLooseOption
 	}
 	result.AuditPath = auditPath
 	return result, nil
+}
+
+func verifyPackedLooseRetirementCandidate(ctx context.Context, resolver *Resolver, digest string, rawBytes int64) error {
+	reader, err := resolver.OpenObject(ctx, fold.ObjectRef{SHA256: digest, RawBytes: rawBytes})
+	if err != nil {
+		return fmt.Errorf("open packed loose retirement candidate %s: %w", digest, err)
+	}
+	hasher := sha256.New()
+	written, copyErr := io.Copy(hasher, reader)
+	closeErr := reader.Close()
+	if err := errors.Join(copyErr, closeErr); err != nil {
+		return fmt.Errorf("verify packed loose retirement candidate %s: %w", digest, err)
+	}
+	if written != rawBytes {
+		return fmt.Errorf("packed loose retirement candidate %s bytes %d, want %d", digest, written, rawBytes)
+	}
+	if hex.EncodeToString(hasher.Sum(nil)) != digest {
+		return fmt.Errorf("packed loose retirement candidate %s SHA-256 mismatch", digest)
+	}
+	return nil
+}
+
+func verifyManagedSessionManifests(ctx context.Context, resolver *Resolver, references []storage.ManagedSessionReference) (int, error) {
+	verified := 0
+	for _, reference := range references {
+		if err := storage.ValidateManagedSessionReference(reference); err != nil {
+			return 0, fmt.Errorf("verify exact manifest for managed session %s: %w", reference.SessionID, err)
+		}
+		manifest, err := fold.LoadManifestPath(reference.ManifestPath)
+		if err != nil {
+			return 0, fmt.Errorf("load current manifest for managed session %s: %w", reference.SessionID, err)
+		}
+		if manifest.Session.ID != reference.SessionID || manifest.Source.Bytes != reference.BaseBytes || manifest.Source.SHA256 != reference.BaseSHA256 {
+			return 0, fmt.Errorf("managed session %s state does not match its current manifest", reference.SessionID)
+		}
+		if err := fold.VerifyManifest(ctx, resolver, manifest); err != nil {
+			return 0, fmt.Errorf("reconstruct managed session %s from current pack: %w", reference.SessionID, err)
+		}
+		verified++
+	}
+	return verified, nil
 }
 
 func writeRetireAudit(storeDir string, result RetireLooseResult) (string, error) {

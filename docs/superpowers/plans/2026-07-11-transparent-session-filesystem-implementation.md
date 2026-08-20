@@ -12,7 +12,7 @@
 
 ## Alignment Snapshot
 
-Current public status remains `fs-engine-preview`. Tasks 1 through 10 and 12 through 14 are implemented. Task 11 has substantial isolated and bounded real-home macOS evidence, including current-client regression traces, sleep/wake, process-interruption recovery, one idle retained-source managed CLI session surviving an actual host reboot, and a separate durable-journal partial-tail controlled host-interruption recovery. Linux FUSE3 now has real unprivileged operation, crash/restart, performance, mount-policy, and `systemd --user` lifecycle evidence. Windows WinFsp and SCM support are implemented and cross-compile, but lack a real Windows host. The dedicated retention window, Linux client/upgrade/rollback/retention validation, and all real Windows gates remain open.
+Current public status remains `fs-engine-preview`. Tasks 1 through 10 and 12 through 14 are implemented. Task 11 has substantial isolated and bounded real-home macOS evidence, including current-client regression traces, sleep/wake, process-interruption recovery, one idle retained-source managed CLI session surviving an actual host reboot, and a separate durable-journal partial-tail controlled host-interruption recovery. Linux FUSE3 now has real unprivileged operation, crash/restart, performance, mount-policy, and `systemd --user` lifecycle evidence. Windows WinFsp and SCM support are implemented and cross-compile, but lack a real Windows host. The current macOS candidate still needs its exact real-client/restart/fault-injection recovery matrix; Linux client/upgrade/rollback validation and all real Windows gates also remain open. None of these gates uses a fixed calendar duration or reserves a fixed recovery area.
 
 | Task | Status | Current evidence | Remaining work |
 | --- | --- | --- | --- |
@@ -26,11 +26,11 @@ Current public status remains `fs-engine-preview`. Tasks 1 through 10 and 12 thr
 | 8 | Complete | Standalone CLI, guarded lifecycle, bounded planner/apply loop, and isolated automatic-enrollment evidence | Production enablement remains gated by platform readiness |
 | 9 | Complete | Commit `4589ffa`; launchd, real `systemd --user`, Windows SCM compile, and update preflight tests | Windows service runtime and production update promotion remain platform-gated |
 | 10 | Complete | Commit `a1ac76e`; synthetic, crash, race, cross-compile, and 758 MiB evidence | This task proves only the shared engine preview |
-| 11 | Partial | Real macOS CLI/Desktop, FUSE-T, rollback, daemon restart, idle managed-session host reboot, durable-journal partial-tail host interruption, and client-version no-reroute evidence | Complete the retention gate |
+| 11 | Partial | Real macOS CLI/Desktop, FUSE-T, rollback, daemon restart, idle managed-session host reboot, durable-journal partial-tail host interruption, and client-version no-reroute evidence | Complete the exact real-client/restart/fault-injection recovery matrix |
 | 12 | Complete | Bounded planner/apply/service tests plus isolated canonical automatic enrollment, native-writer probing, restart, append, version diagnostics, and failed-cutover evidence | Explicit real-home activation remains externally quiesced |
 | 13 | Complete | Fork graph reports, exact content comparison, guarded official-compatible archive transactions, recovery, static content-change boundaries, and isolated native plus managed FUSE-T round trips | None in this task |
-| 14 | Complete | Physical inventory, hard mutation budgets, lease-aware bounded GC, and truthful projected/actual accounting | Destructive retention remains promotion-gated |
-| 15 | Partial | Current macOS client regression evidence plus restart and controlled in-flight interruption gates; real Linux FUSE3 operation, crash, performance, and systemd lifecycle; Windows WinFsp/SCM cross-compile | Retention windows, Linux client/upgrade/rollback validation, and all real Windows gates remain |
+| 14 | Complete | Physical inventory, hard mutation budgets, exact-proof GC, flexible native-snapshot policy, and truthful projected/actual accounting | No calendar-based destructive gate remains; every removal still needs operation-specific durable proof |
+| 15 | Partial | Current macOS client regression evidence plus restart and controlled in-flight interruption gates; real Linux FUSE3 operation, crash, performance, and systemd lifecycle; Windows WinFsp/SCM cross-compile | macOS evidence matrix, Linux client/upgrade/rollback validation, and all real Windows gates remain |
 
 ## Global Constraints
 
@@ -43,20 +43,20 @@ Current public status remains `fs-engine-preview`. Tasks 1 through 10 and 12 thr
 - `TF-007`: packed reads perform neither per-part loose-object opens nor per-object persistent-index queries.
 - `TF-008`: common and platform-specific performance and memory gates are release blockers.
 - `TF-009`: interrupted commits, migration, compaction, process termination, and host restart recover without byte loss or ambiguous generations.
-- `TF-010`: real routing is unchanged until shadow passes; every canary retains recoverable native state.
+- `TF-010`: real routing is unchanged until shadow passes; current visible bytes remain exactly reconstructable, while migration snapshots follow exact-proof/manual retention policy.
 - `TF-011`: production enrollment discovers existing, new, and forked sessions automatically; per-session setup is canary-only.
 - `TF-012`: packed storage, byte views, write state, generations, doctor, and recovery remain platform-neutral; adapters are independent.
 - `TF-013`: status output uses only `storage-engine`, `fs-engine-preview`, `platform-canary`, `production-ready:<platform>`, and `cross-platform-ready`.
-- `TF-014`: a migration snapshot is not deleted before `production-ready:<platform>` and the per-session retention gate.
+- `TF-014`: migration snapshots are reclaimed only after durable exact reconstruction proof; the default is immediate proof-based retirement, with explicit manual retention available and no fixed-hour/day delay.
 - `TF-015`: client versions are non-blocking diagnostics; runtime access depends on filesystem semantics and integrity gates, not version approval.
 - `TF-016`: FUSE-T or another privileged prerequisite is not installed without explicit user authorization.
 - `TF-017`: canonical namespace activation requires a verified CodexFold mount identity, write-sealed unmounted backing, route normalization, and a watcher that tolerates canonical and mount-alias spellings.
 - `TF-018`: branch classification and archival are conservative, proof-first, explicitly selected, and recoverable.
-- `TF-019`: fully contained archived-session deletion requires exact containment and recovery proof.
+- `TF-019`: archive is rename-only; an explicit canonical unlink is durable true deletion, while the separate `remove-contained` workflow additionally requires archived status, exact containment, and recovery proof.
 - `TF-020`: byte-preserving optimization never invokes content-changing repair, reconciliation, or prompt cleanup implicitly.
 - `TF-021`: full-size copies, retained generations, temporary artifacts, and savings claims obey hard physical-space budgets and accounting.
 - `TF-022`: the public product has no private control-plane runtime or documentation dependency.
-- Mock and fixture evidence never satisfies a gate that names real Codex, a real adapter, client upgrade, host restart, or canary retention.
+- Mock and fixture evidence never satisfies a gate that names real Codex, a real adapter, client upgrade, host restart, or the real-client/restart/fault-injection recovery matrix.
 - Public code and documentation contain no private paths, domains, credentials, real session IDs, or private control-plane dependency.
 
 ## Requirement Coverage
@@ -697,7 +697,7 @@ git commit -m "test: validate transparent filesystem engine preview"
 
 **Interfaces:**
 - Consumes: completed Tasks 1 through 10, explicit system-extension authorization, real Codex versions, selected archived sessions, and retained native snapshots.
-- Produces: actual `platform-canary` evidence or an explicit blocked result; no stronger status without seven-day retention.
+- Produces: actual `platform-canary` evidence or an explicit blocked result; no stronger status until the required real-client workload, restart, fault-injection, and recovery evidence is complete. The observation window is evidence-driven, not a fixed seven-day timer.
 
 - [x] **Step 1: Capture native Codex Desktop and CLI operations**
 
@@ -717,15 +717,15 @@ Select 5–10 archived sessions, fold and pack without source removal, compare e
 
 - [ ] **Step 5: Route retained-source canaries**
 
-Current state: isolated retained-source CLI and Desktop canaries passed direct open, resume, append, tool use, fork, archive/unarchive, daemon restart, rollback, re-migration, and client-version changes without rerouting. One idle retained-source managed CLI session also passed an actual host reboot, post-boot managed resume, exact rollback, and native resume. This step remains open at the public release level because retention evidence is not complete.
+Current state: isolated retained-source CLI and Desktop canaries passed direct open, resume, append, tool use, fork, archive/unarchive, daemon restart, rollback, re-migration, and client-version changes without rerouting. One idle retained-source managed CLI session also passed an actual host reboot, post-boot managed resume, exact rollback, and native resume. This step remains open at the public release level because the current candidate has not completed the full real-client/restart/fault-injection recovery matrix.
 
-After clean shadow and a fail-closed writer check, migrate selected writer-free sessions. Verify Desktop direct click, CLI resume, history, message send, tool use, fork, archive, unarchive, daemon termination, mount restart, sleep/wake, host restart, rollback, and client-version changes without rerouting. Never delete native snapshots before the retention gate.
+After clean shadow and a fail-closed writer check, migrate selected writer-free sessions. Verify Desktop direct click, CLI resume, history, message send, tool use, fork, archive, unarchive, daemon termination, mount restart, sleep/wake, host restart, rollback, and client-version changes without rerouting. Migration snapshots may be reclaimed only after exact pack-only reconstruction proof and according to `storage-policy.json`; no fixed observation duration is required.
 
-- [ ] **Step 6: Start seven-day canary retention**
+- [ ] **Step 6: Run adaptive canary observation until the required evidence matrix is complete**
 
 Current state: not started because the project has not reached `platform-canary`.
 
-Record daemon/mount health, exact-byte doctor, recovery incidents, client versions, and performance. Status remains `platform-canary` during retention; `production-ready:macos` requires the full period with zero unresolved incidents.
+Record daemon/mount health, exact-byte doctor, recovery incidents, client versions, and performance. Status remains `platform-canary` until the entire evidence matrix completes with zero unresolved incidents; elapsed days alone neither satisfy nor block promotion.
 
 - [x] **Step 7: Commit only public sanitized evidence**
 
@@ -738,7 +738,7 @@ No private path, session ID, trace content, credential, or control-plane name ma
 
 ### Task 12: Bounded Automatic Discovery And Enrollment
 
-**Status:** Complete in the current implementation. Production enablement remains gated by platform readiness and retention.
+**Status:** Complete in the current implementation. Production enablement remains gated by the applicable platform evidence matrix.
 
 **Requirements:** `TF-001`, `TF-010`, `TF-011`, `TF-014`, `TF-015`, `TF-021`.
 
@@ -752,7 +752,7 @@ No private path, session ID, trace content, credential, or control-plane name ma
 
 ### Task 13: Conservative Branch Lifecycle And Content-Change Boundary
 
-**Status:** Complete. Conservative family classification, guarded archive execution, exact-contained deletion, and explicit content-changing repair/reconciliation boundaries are implemented and verified.
+**Status:** Complete. Conservative family classification, guarded rename-only archive execution, durable explicit managed deletion, exact-contained deletion, and explicit content-changing repair/reconciliation boundaries are implemented and verified.
 
 **Requirements:** `TF-018`, `TF-019`, `TF-020`.
 
@@ -761,11 +761,12 @@ No private path, session ID, trace content, credential, or control-plane name ma
 - [x] Add read-only fork-family reports that distinguish shared exact content, independent tails, complete containment, active/archived state, and unknown relationships. Never label a branch useless from ancestry, age, title, or size alone.
 - [x] Trace and test the current official Codex archive operation, then add a dry-run-first archive mutation that requires an explicit session selection, revalidates database route and source digest, preserves the rollout, and updates file and state atomically.
 - [x] Keep `remove-contained` as a separate archived-only operation and add integration coverage proving that family classification or archive never triggers deletion automatically.
+- [x] Treat an actual canonical session `unlink` as true deletion: publish a permanent exact tombstone before hiding the managed route, defer for active leases, quarantine only protocol-owned content, and use a durable crash-replayable purge receipt. Archive/unarchive rename must never call this publisher.
 - [x] Add CLI and static boundary regression tests proving `repair-rollout` and `reconcile-rollout` remain the only content-changing reconciliation entrypoints and cannot be called by fold, migrate, compact, enrollment, rollback, GC, archive, or family paths.
 
 ### Task 14: Hard Storage Budgets, Retention, Cleanup, And Reclamation Accounting
 
-**Status:** Complete in the current implementation. Destructive retention promotion remains disabled before platform readiness.
+**Status:** Complete in the current implementation. Destructive cleanup is proof-gated rather than calendar- or platform-status-gated.
 
 **Requirements:** `TF-009`, `TF-014`, `TF-021`.
 
@@ -774,12 +775,12 @@ No private path, session ID, trace content, credential, or control-plane name ma
 - [x] Add a platform-neutral storage inventory that accounts separately for logical session bytes, unique loose objects, packs, native sources, retained snapshots, current fallbacks, active deltas, writable backings, old generations, retirement state, journal-owned recovery files, unowned temporary files, and metadata.
 - [x] Add preflight APIs that calculate projected peak bytes and reject fold, pack, migrate, rollback, compact, enrollment, copy-on-write, materialization, repair, and reconciliation before writing when the hard temporary budget or free-space reserve would be exceeded.
 - [x] Enforce one immutable migration snapshot and one current writable fallback per managed session, one full-session scratch file per transaction, and current-plus-previous pack-generation retention until leases close.
-- [x] Add startup and explicit GC for abandoned temporary files, expired unleased generations, and bounded retired state. Journal-owned recovery files, active leases, and the sole recoverable generation are retained.
+- [x] Add startup and explicit GC that reports name/age/count candidates but removes only producer-owned artifacts carrying exact durable, lock-revalidated deletion proof. Unknown nonempty candidates, journal-owned recovery files, active leases, and the sole recoverable generation are retained.
 - [x] Extend status, doctor, mutation, and GC results with physical inventory, projected peak, projected final, projected reclaimable, and actual reclaimed bytes. Low-space, interrupted-cleanup, retained-fallback, hard-link, lease, and repeated-GC tests pass.
 
-### Task 15: Remaining Platform And Retention Gates
+### Task 15: Remaining Platform Evidence Gates
 
-**Status:** Partial as release evidence; Linux adapter and service execution are now real, but the remaining platform and retention gates still block stronger capability claims.
+**Status:** Partial as release evidence; Linux adapter and service execution are now real, but the remaining platform evidence gates still block stronger capability claims.
 
 **Requirements:** `TF-003`, `TF-008`, `TF-009`, `TF-011`, `TF-012`, `TF-014`, `TF-015`, `TF-017`, `TF-021`.
 
@@ -790,19 +791,19 @@ No private path, session ID, trace content, credential, or control-plane name ma
 - [x] Run a dedicated disposable native-append canary that durably persists one journal and a half-written tail, performs a `reboot -q` host interruption, rejects same-boot verification, and on the next boot proves exact base rollback, valid JSONL, and an empty journal. Verify the independent Pack-only FSKit canary remounts with `fs doctor` healthy.
 - [x] Implement the Linux FUSE3 adapter with explicit `fuse fuse3` build tags and execute real unprivileged read, append, copy-on-write, truncate, canonical rename, native fallback, `SIGKILL` stale-mount recovery, remount, performance, backing-seal, and `systemd --user` install/start/status/stop gates.
 - [x] Implement the Windows WinFsp adapter and native SCM service host, mount probe, configuration, start/stop/status, and restart policy; default and WinFsp binaries and tests cross-compile.
-- [ ] Continue bounded real-home canary observation before any stronger public capability claim; it does not block an explicitly approved deployment.
-- [ ] Execute Linux real-client operation validation, upgrade transparency, rollback, and retention gates.
-- [ ] Execute Windows WinFsp operation, crash/restart, performance, real-client operation validation, upgrade transparency, rollback, and retention gates on a real Windows host.
+- [ ] Complete the bounded macOS real-client/restart/fault-injection recovery matrix before any stronger public capability claim; it does not block an explicitly approved deployment.
+- [ ] Execute Linux real-client operation validation, upgrade transparency, rollback, and equivalent evidence-matrix gates.
+- [ ] Execute Windows WinFsp operation, crash/restart, performance, real-client operation validation, upgrade transparency, rollback, and equivalent evidence-matrix gates on a real Windows host.
 
 ## Plan Self-Review
 
 - `TF-001` through `TF-022` each map to implementation and verification tasks or an explicitly identified storage-engine baseline.
-- Real-client, real-adapter, restart, upgrade, and retention gates remain in Tasks 11 and 15 and cannot be satisfied by Task 10 fixtures.
+- Real-client, real-adapter, restart, upgrade, fault-injection, and recovery gates remain in Tasks 11 and 15 and cannot be satisfied by Task 10 fixtures.
 - FUSE-T is the validated macOS host and FUSE3 is the native-gated Linux host; Windows remains implementation and cross-compile only until independent WinFsp execution passes.
 - The stale migration snapshot is never used as current fallback after virtual writes diverge.
 - The default build remains portable and does not require installed FUSE headers.
 - No task changes a real Codex route before shadow, writer/fingerprint, doctor, mount, and explicit apply gates pass; client-version evidence is diagnostic only.
 - Automatic enrollment remains blocked until Task 12 and Task 14 are complete.
-- Branch archival, exact-contained deletion, and content-changing repair remain separate operations.
+- Branch archival, explicit filesystem deletion, exact-contained deletion, and content-changing repair remain separate operations.
 - No logical deduplication result is presented as physical reclamation without storage accounting.
 - Public product behavior remains independent of any private control plane.

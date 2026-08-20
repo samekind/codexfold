@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"time"
 
 	"github.com/samekind/codexfold/internal/fold"
@@ -33,6 +34,12 @@ type CompactResult struct {
 }
 
 func (s *Session) Compact(ctx context.Context, options CompactOptions) (CompactResult, error) {
+	s.mu.Lock()
+	if s.recoveryDeferred {
+		s.mu.Unlock()
+		return CompactResult{}, ErrSessionRecoveryDeferred
+	}
+	s.mu.Unlock()
 	if options.Prepare == nil {
 		return CompactResult{}, errors.New("compact preparation function is required")
 	}
@@ -97,6 +104,13 @@ func (s *Session) Compact(ctx context.Context, options CompactOptions) (CompactR
 	if preparedDigest != current.SHA256 {
 		return CompactResult{}, errors.New("prepared generation SHA-256 differs from current view")
 	}
+	manifestIdentity, persistedManifest, err := captureManifestIdentity(prepared.ManifestPath, prepared.Manifest.Session.ID, prepared.Manifest.Source.Bytes, prepared.Manifest.Source.SHA256)
+	if err != nil {
+		return CompactResult{}, fmt.Errorf("verify compacted manifest: %w", err)
+	}
+	if !reflect.DeepEqual(persistedManifest, prepared.Manifest) {
+		return CompactResult{}, errors.New("compacted manifest differs from its on-disk contents")
+	}
 	if err := ensureFingerprintUnchanged(activePath, fingerprint); err != nil {
 		return CompactResult{}, err
 	}
@@ -115,6 +129,7 @@ func (s *Session) Compact(ctx context.Context, options CompactOptions) (CompactR
 	next := state
 	next.Generation++
 	next.ManifestPath = prepared.ManifestPath
+	next.ManifestSHA256 = manifestIdentity.SHA256
 	next.BaseBytes = prepared.View.Size()
 	next.BaseSHA256 = current.SHA256
 	next.DeltaPath = newDelta
@@ -137,7 +152,7 @@ func (s *Session) Compact(ctx context.Context, options CompactOptions) (CompactR
 			return CompactResult{}, err
 		}
 	}
-	if err := writeSessionStateWithTemporary(s.statePath, stateTemporary, next); err != nil {
+	if err := publishSessionStateWithTemporary(s.statePath, stateTemporary, next); err != nil {
 		return CompactResult{}, err
 	}
 	s.mu.Lock()

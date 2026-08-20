@@ -53,9 +53,11 @@ func (ExecRunner) Run(ctx context.Context, name string, args ...string) ([]byte,
 }
 
 type Manager struct {
-	UID        int
-	Runner     Runner
-	MountProbe func(string) error
+	UID               int
+	Runner            Runner
+	MountProbe        func(string) error
+	MountProbeTimeout time.Duration
+	mountProbeSlot    chan struct{}
 }
 
 type Status struct {
@@ -281,7 +283,7 @@ func (m Manager) Disable(ctx context.Context, label string) error {
 	return nil
 }
 
-func (m Manager) Status(ctx context.Context, label string, mountPoint string) Status {
+func (m *Manager) Status(ctx context.Context, label string, mountPoint string) Status {
 	result := Status{}
 	output, err := m.runner().Run(ctx, "launchctl", "print", m.domain()+"/"+label)
 	if err != nil {
@@ -307,12 +309,46 @@ func (m Manager) Status(ctx context.Context, label string, mountPoint string) St
 	if probe == nil {
 		probe = ProbeMount
 	}
-	if err := probe(mountPoint); err != nil {
+	probeTimeout := m.MountProbeTimeout
+	if probeTimeout <= 0 {
+		probeTimeout = 2 * time.Second
+	}
+	if m.mountProbeSlot == nil {
+		m.mountProbeSlot = make(chan struct{}, 1)
+	}
+	if err := boundedMountProbe(ctx, probeTimeout, m.mountProbeSlot, probe, mountPoint); err != nil {
 		result.MountError = err.Error()
 	} else {
 		result.MountHealthy = true
 	}
 	return result
+}
+
+func boundedMountProbe(
+	ctx context.Context,
+	timeout time.Duration,
+	probeSlot chan struct{},
+	probe func(string) error,
+	mountPoint string,
+) error {
+	probeCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	select {
+	case probeSlot <- struct{}{}:
+	case <-probeCtx.Done():
+		return fmt.Errorf("mount health probe did not start within %s: %w", timeout, probeCtx.Err())
+	}
+	result := make(chan error, 1)
+	go func() {
+		defer func() { <-probeSlot }()
+		result <- probe(mountPoint)
+	}()
+	select {
+	case err := <-result:
+		return err
+	case <-probeCtx.Done():
+		return fmt.Errorf("mount health probe exceeded %s: %w", timeout, probeCtx.Err())
+	}
 }
 
 func (m Manager) WaitHealthy(ctx context.Context, label string, mountPoint string, timeout time.Duration) (Status, error) {

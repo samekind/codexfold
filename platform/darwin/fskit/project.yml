@@ -15,6 +15,22 @@ targets:
     platform: macOS
     sources:
       - path: Host
+        excludes:
+          - Tests
+          - IncidentMonitorMain.swift
+          - CodexFoldIncidentMonitor.plist
+          - CodexFoldMenuBar.plist
+      - path: Host/CodexFoldIncidentMonitor.plist
+        buildPhase:
+          copyFiles:
+            destination: wrapper
+            subpath: Contents/Library/LaunchAgents
+      - path: Host/CodexFoldMenuBar.plist
+        buildPhase:
+          copyFiles:
+            destination: wrapper
+            subpath: Contents/Library/LaunchAgents
+      - path: Shared/DurableAppGroupFile.swift
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: vip.jstar.codexfold.fskitprofileprobe
@@ -24,11 +40,49 @@ targets:
     dependencies:
       - target: CodexFoldFSKitModule
         embed: true
+      - target: CodexFoldIncidentMonitor
+        embed: true
+        copy:
+          destination: executables
+  CodexFoldIncidentMonitor:
+    type: tool
+    platform: macOS
+    sources:
+      - path: Host/IncidentMonitorMain.swift
+      - path: Host/IncidentPresentation.swift
+      - path: Host/StatusModel.swift
+      - path: Host/Localization.swift
+      - path: Host/StatusViews.swift
+      - path: Shared/DurableAppGroupFile.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: vip.jstar.codexfold.fskitprofileprobe.incident-monitor
+        CODE_SIGN_ENTITLEMENTS: CodexFoldFSKit.entitlements
+        REGISTER_APP_GROUPS: YES
+        SKIP_INSTALL: YES
+  CodexFoldFSKitHostTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: Host/Tests
+      - path: Host/StatusModel.swift
+      - path: Host/Localization.swift
+      - path: Host/StatusViews.swift
+      - path: Host/IncidentPresentation.swift
+      - path: Host/ResidencyConfiguration.swift
+      - path: Shared/DurableAppGroupFile.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: vip.jstar.codexfold.fskitprofileprobe.hosttests
+        GENERATE_INFOPLIST_FILE: YES
+    dependencies:
+      - sdk: XCTest.framework
   CodexFoldFSKitModule:
     type: extensionkit-extension
     platform: macOS
     sources:
       - path: Extension
+      - path: Shared/DurableAppGroupFile.swift
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: vip.jstar.codexfold.fskitprofileprobe.module

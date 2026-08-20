@@ -37,8 +37,13 @@ struct CodexFoldFSKitHost {
                 exit(1)
             }
         }
-        NSApplication.shared.setActivationPolicy(.accessory)
-        NSApplication.shared.terminate(nil)
+        let application = NSApplication.shared
+        let delegate = CodexFoldAppDelegate()
+        application.setActivationPolicy(.accessory)
+        application.delegate = delegate
+        withExtendedLifetime(delegate) {
+            application.run()
+        }
     }
 
     private static func runCommand(_ arguments: [String]) throws -> Int32 {
@@ -48,13 +53,23 @@ struct CodexFoldFSKitHost {
             throw POSIXError(.ENOENT)
         }
         switch arguments.first {
-        case "--app-group-path":
+        case "--app-group-path", "--print-app-group":
             print(root.path)
             return 0
         case "--app-group-write-probe":
             let probe = root.appendingPathComponent("host-write-probe", isDirectory: false)
             try Data("ok\n".utf8).write(to: probe, options: .atomic)
             try FileManager.default.removeItem(at: probe)
+            return 0
+        case "--configure-residency":
+            let encoder = JSONEncoder()
+            encoder.keyEncodingStrategy = .convertToSnakeCase
+            encoder.outputFormatting = [.sortedKeys]
+            let payload = try encoder.encode(ResidencyConfigurator.live().configure())
+            guard let output = String(data: payload, encoding: .utf8) else {
+                throw POSIXError(.EILSEQ)
+            }
+            print(output)
             return 0
         case "--run-helper":
             guard arguments.count >= 2 else {

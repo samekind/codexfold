@@ -6,7 +6,7 @@ CodexFold is an unofficial, local-first tool for measuring, deduplicating, stori
 
 The optimization mechanisms and lifecycle boundaries are defined in [the fold taxonomy](fold-taxonomy.md). Real-corpus storage evidence is recorded separately in [the v0.3 validation](validation-real-corpus-v0.3.md). The bounded-memory production pack format and loose-object retirement gates are specified in [Pack V3](pack-v3.md). Retained-source removal and pack-only rollback are specified in [Native Snapshot Retirement](native-snapshot-retirement.md). Optional exact-record promotion and its negative real-corpus result are specified in [Conservative Fold V2](fold-v2.md).
 
-The current release capability is `storage-engine`. Transparent normal-path session access is a separate product stage defined by `docs/superpowers/specs/2026-07-11-transparent-session-filesystem-design.md`.
+The default release CLI exposes the `storage-engine` surface. The repository's transparent normal-path session capability remains `fs-engine-preview`; it is not production-ready and is governed by `docs/superpowers/specs/2026-07-11-transparent-session-filesystem-design.md`.
 
 ## Safety
 
@@ -17,6 +17,8 @@ The current release capability is `storage-engine`. Transparent normal-path sess
 - Fold commit re-hashes the current source and rejects concurrent changes.
 - Source removal requires stored reconstruction verification and explicit flags.
 - Reports contain hashes, sizes, counts, and JSON paths, never field contents.
+- Archive/unarchive is rename-only. Canonical `unlink` is true deletion, but physical purge requires the permanent tombstone, version-3 exact purge receipt, held-lock revalidation, and platform identity rules in the transparent-filesystem product contract.
+- CodexFold recovery may restart its own resident components after a crash, but it never quits, restarts, signals, or reopens Codex. Production install, update, or lifecycle changes require a new explicit authorization for the exact target.
 
 ## Architecture
 
@@ -61,9 +63,10 @@ This deliberately does not infer containment from titles, fork ancestry, semanti
 
 1. Writes recovery provenance to the fold store.
 2. Revalidates the archived thread in a SQLite transaction.
-3. Renames the source to a same-directory pending path.
-4. Removes exact thread-ID references from Codex global state with an optimistic concurrent-change check.
-5. Cleans dynamic tools, spawn edges, agent assignment references, and the thread row.
-6. Commits the database transaction, then deletes the pending source.
+3. Rechecks native writers and stably hashes the current source again at the mutation boundary.
+4. Renames the source to a same-directory pending path, synchronizes the directory, and revalidates the isolated bytes.
+5. Cleans dynamic tools, spawn edges, agent assignment references, and the thread row in one database transaction.
+6. After the database commit, removes exact thread-ID references from the latest Codex global state with an optimistic concurrent-change check.
+7. Rechecks the pending file and native writers, deletes only the exact proved bytes, and records completion.
 
-Failures before commit restore the original global state and rollout path. The fold manifest remains after success, so byte-level recovery is still possible even though the Codex thread row is gone.
+The tombstone records each phase. `remove-contained recover --apply` restores the exact pending file when the database still contains the archived thread, or finishes global-state cleanup and exact-file removal when the database commit succeeded. Changed, replaced, or ambiguous files are retained. The fold manifest remains after success, so byte-level recovery is still possible even though the Codex thread row is gone.

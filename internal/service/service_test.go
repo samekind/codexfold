@@ -314,12 +314,56 @@ func TestStatusDoesNotTreatLoadedExitedJobAsRunning(t *testing.T) {
 	runner := &recordingRunner{outputs: map[string][]byte{
 		"launchctl print gui/501/com.codexfold.fs": []byte("state = exited\nlast exit code = 1\n"),
 	}}
-	status := (Manager{UID: 501, Runner: runner, MountProbe: func(string) error { return errors.New("not mounted") }}).Status(
+	manager := Manager{UID: 501, Runner: runner, MountProbe: func(string) error { return errors.New("not mounted") }}
+	status := manager.Status(
 		context.Background(), "com.codexfold.fs", filepath.Join(t.TempDir(), "mount"),
 	)
 	if status.DaemonRunning || status.DaemonError == "" {
 		t.Fatalf("loaded exited job was reported as running: %#v", status)
 	}
+}
+
+func TestManagerStatusBoundsHungMountHealthProbe(t *testing.T) {
+	runner := &recordingRunner{outputs: map[string][]byte{
+		"launchctl print gui/501/com.codexfold.fs": []byte("state = running\npid = 123\n"),
+	}}
+	release := make(chan struct{})
+	started := make(chan struct{})
+	probes := 0
+	manager := Manager{
+		UID: 501, Runner: runner, MountProbeTimeout: 20 * time.Millisecond,
+		MountProbe: func(string) error {
+			probes++
+			if probes == 1 {
+				close(started)
+			}
+			<-release
+			return nil
+		},
+	}
+
+	start := time.Now()
+	status := manager.Status(context.Background(), "com.codexfold.fs", filepath.Join(t.TempDir(), "mount"))
+	if status.MountHealthy || !strings.Contains(status.MountError, context.DeadlineExceeded.Error()) {
+		t.Fatalf("hung mount probe status = %#v", status)
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("mount status probe returned after %s", elapsed)
+	}
+	select {
+	case <-started:
+	default:
+		t.Fatal("mount health probe did not start")
+	}
+
+	status = manager.Status(context.Background(), "com.codexfold.fs", filepath.Join(t.TempDir(), "mount"))
+	if status.MountHealthy || !strings.Contains(status.MountError, context.DeadlineExceeded.Error()) {
+		t.Fatalf("second hung mount probe status = %#v", status)
+	}
+	if probes != 1 {
+		t.Fatalf("concurrent hung mount probes = %d, want 1", probes)
+	}
+	close(release)
 }
 
 func TestWaitHealthyRequiresRunningDaemonAndLiveMount(t *testing.T) {

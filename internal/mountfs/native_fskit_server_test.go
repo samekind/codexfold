@@ -13,8 +13,123 @@ import (
 	"time"
 
 	"github.com/samekind/codexfold/internal/fskitproto"
+	"github.com/samekind/codexfold/internal/fskitstatus"
 	"github.com/samekind/codexfold/internal/mountid"
 )
+
+func TestIOActivityCounterTracksSuccessfulVisibleBytes(t *testing.T) {
+	counter := &IOActivityCounter{}
+	counter.recordRead(1024)
+	counter.recordRead(0)
+	counter.recordRead(-1)
+	counter.recordWrite(256)
+	counter.recordWrite(768)
+	totals := counter.Snapshot()
+	if totals.ReadBytes != 1024 || totals.WrittenBytes != 1024 {
+		t.Fatalf("I/O activity totals = %#v", totals)
+	}
+	options := NativeFSKitServerOptions{
+		ResourcePath: "/resource",
+		MountPoint:   "/mount",
+		Activity:     counter,
+	}
+	snapshot := newNativeFSKitDaemonStatusTracker(options).snapshot(
+		options,
+		mountid.Identity{Nonce: "mount-test"},
+		"healthy",
+		"healthy",
+		"",
+	)
+	if snapshot.ReadBytesTotal == nil || *snapshot.ReadBytesTotal != 1024 ||
+		snapshot.WrittenBytesTotal == nil || *snapshot.WrittenBytesTotal != 1024 {
+		t.Fatalf("daemon heartbeat I/O totals = %#v", snapshot)
+	}
+}
+
+func TestNativeFSKitDaemonStatusHeartbeatAdvancesCausally(t *testing.T) {
+	root := t.TempDir()
+	socketRoot := shortNativeFSKitTestDir(t, "cfs-status-")
+	statusPath := filepath.Join(root, "status", "daemon.json")
+	options := NativeFSKitServerOptions{
+		SocketPath:     filepath.Join(socketRoot, "daemon.sock"),
+		ResourcePath:   filepath.Join(root, "resource.bin"),
+		MountPoint:     filepath.Join(root, "mount"),
+		StatusPath:     statusPath,
+		StatusInterval: 20 * time.Millisecond,
+		Token:          bytes.Repeat([]byte{0x61}, 32),
+		Generation:     123,
+		BuildSHA256:    strings.Repeat("d", 64),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- ServeNativeFSKit(ctx, NewCanonical(), options) }()
+	defer func() {
+		cancel()
+		select {
+		case err := <-done:
+			if err != nil && !errors.Is(err, context.Canceled) {
+				t.Errorf("server shutdown: %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Error("server did not stop")
+		}
+	}()
+
+	first := waitForNativeFSKitDaemonStatus(t, statusPath, func(snapshot fskitstatus.Snapshot) bool {
+		return snapshot.State == "healthy" && snapshot.ObservationSequence > 0
+	})
+	second := waitForNativeFSKitDaemonStatus(t, statusPath, func(snapshot fskitstatus.Snapshot) bool {
+		return snapshot.State == "healthy" && snapshot.ObservationSequence > first.ObservationSequence
+	})
+	if first.PublisherInstanceID == "" || first.BackendID == "" {
+		t.Fatalf("first status lacks causal identity: %#v", first)
+	}
+	if second.PublisherInstanceID != first.PublisherInstanceID || second.BackendID != first.BackendID {
+		t.Fatalf("heartbeat identity changed: first=%#v second=%#v", first, second)
+	}
+	if second.MountPoint != options.MountPoint || second.ResourcePath != options.ResourcePath {
+		t.Fatalf("heartbeat paths = mount %q resource %q", second.MountPoint, second.ResourcePath)
+	}
+}
+
+func TestNativeFSKitDaemonStatusTrackerPreservesLogicalBackendAcrossPublisherReplacement(t *testing.T) {
+	options := NativeFSKitServerOptions{ResourcePath: "/private/tmp/codexfold-resource", MountPoint: "/private/tmp/codexfold-mount"}
+	identity := mountid.Identity{Nonce: strings.Repeat("a", 32)}
+	firstTracker := newNativeFSKitDaemonStatusTracker(options)
+	failure := firstTracker.snapshot(options, identity, "unavailable", "backend unavailable", "test")
+	secondTracker := newNativeFSKitDaemonStatusTracker(options)
+	secondTracker.resume(failure)
+	replayed := secondTracker.snapshot(options, identity, "recovering", "backend restarting", "")
+	if firstTracker.publisherInstanceID == secondTracker.publisherInstanceID {
+		t.Fatal("replacement tracker reused publisher identity")
+	}
+	if firstTracker.backendID != secondTracker.backendID {
+		t.Fatalf("logical backend changed: %q != %q", firstTracker.backendID, secondTracker.backendID)
+	}
+	if replayed.IncidentID != failure.IncidentID || replayed.RecoveryStartedAt != failure.RecoveryStartedAt {
+		t.Fatalf("continuous outage identity changed: failure=%#v replayed=%#v", failure, replayed)
+	}
+}
+
+func waitForNativeFSKitDaemonStatus(
+	t *testing.T,
+	path string,
+	accept func(fskitstatus.Snapshot) bool,
+) fskitstatus.Snapshot {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	var last fskitstatus.Snapshot
+	var lastErr error
+	for time.Now().Before(deadline) {
+		last, lastErr = fskitstatus.Read(path)
+		if lastErr == nil && accept(last) {
+			return last
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("daemon status did not converge: last=%#v err=%v", last, lastErr)
+	return fskitstatus.Snapshot{}
+}
 
 func TestNativeFSKitServerPreservesJSONLWritesAndNamespaceMutations(t *testing.T) {
 	root := t.TempDir()
@@ -26,7 +141,8 @@ func TestNativeFSKitServerPreservesJSONLWritesAndNamespaceMutations(t *testing.T
 	}
 	filesystem := NewCanonical()
 	filesystem.SetNativeRoot(nativeRoot)
-	client, stop := startNativeFSKitTestServer(t, filesystem, root)
+	activity := &IOActivityCounter{}
+	client, stop := startNativeFSKitTestServerWithActivity(t, filesystem, root, activity)
 	defer stop()
 	defer client.Close()
 
@@ -82,6 +198,10 @@ func TestNativeFSKitServerPreservesJSONLWritesAndNamespaceMutations(t *testing.T
 	if !bytes.Equal(got, want) {
 		t.Fatalf("visible bytes = %q, want %q", got, want)
 	}
+	// The server records a read after it has written the response frame, so the
+	// client can observe the reply before the counter advances. Wait for the
+	// accounting instead of racing it.
+	waitForNativeFSKitActivity(t, activity, uint64(len(want)), uint64(len(want)))
 	callNativeFSKitHandle(t, client, fskitproto.OpRelease, handle)
 
 	for _, directory := range []string{"/archived_sessions/2026", "/archived_sessions/2026/07", "/archived_sessions/2026/07/17"} {
@@ -419,21 +539,63 @@ func TestNativeFSKitServerPublishesDirectoryResourceWithScopedSocket(t *testing.
 	}
 }
 
-func TestNativeFSKitNodesKeepUnchangedObjectsAndNeverReuseReplacements(t *testing.T) {
-	nodes := nativeFSKitNodes{next: 3, byPath: map[string]nativeFSKitNode{"/": {id: 2}}}
-	first := nodes.node("/sessions/first", "native:1:10")
-	nodes.syncVersion(2)
-	if unchanged := nodes.node("/sessions/first", "native:1:10"); unchanged != first {
+func TestNativeFSKitNodesRemainStableAcrossBackendRestarts(t *testing.T) {
+	firstRun := nativeFSKitNodes{byPath: map[string]nativeFSKitNode{"/": {id: 2}}}
+	first, ok := firstRun.node("/sessions/first", "native:1:10")
+	if !ok {
+		t.Fatal("allocate first node")
+	}
+	other, ok := firstRun.node("/sessions/other", "native:1:20")
+	if !ok {
+		t.Fatal("allocate other node")
+	}
+	secondRun := nativeFSKitNodes{byPath: map[string]nativeFSKitNode{"/": {id: 2}}}
+	otherAfterRestart, ok := secondRun.node("/sessions/other", "native:1:20")
+	if !ok {
+		t.Fatal("allocate other node after restart")
+	}
+	firstAfterRestart, ok := secondRun.node("/sessions/first", "native:1:10")
+	if !ok {
+		t.Fatal("allocate first node after restart")
+	}
+	if firstAfterRestart != first || otherAfterRestart != other {
+		t.Fatalf("node IDs changed across restart: first=%d/%d other=%d/%d", first, firstAfterRestart, other, otherAfterRestart)
+	}
+
+	firstRun.syncVersion(2)
+	unchanged, ok := firstRun.node("/sessions/first", "native:1:10")
+	if !ok {
+		t.Fatal("look up unchanged node")
+	}
+	if unchanged != first {
 		t.Fatalf("unchanged object ID = %d, want %d", unchanged, first)
 	}
-	replaced := nodes.node("/sessions/first", "native:1:11")
-	if replaced == first || replaced <= first {
-		t.Fatalf("replacement object ID = %d, want a fresh ID after %d", replaced, first)
+	replaced, ok := firstRun.node("/sessions/first", "native:1:11")
+	if !ok {
+		t.Fatal("allocate replacement node")
 	}
-	nodes.forget("/sessions/first")
-	recreated := nodes.node("/sessions/first", "native:1:11")
-	if recreated == replaced || recreated <= replaced {
-		t.Fatalf("recreated object ID = %d, want a fresh ID after %d", recreated, replaced)
+	if replaced == first {
+		t.Fatalf("replacement object ID reused %d", first)
+	}
+	firstRun.forget("/sessions/first")
+	recreated, ok := firstRun.node("/sessions/first", "native:1:11")
+	if !ok {
+		t.Fatal("restore replacement node")
+	}
+	if recreated != replaced {
+		t.Fatalf("same object identity changed from %d to %d after cache eviction", replaced, recreated)
+	}
+}
+
+func TestNativeFSKitNodesRejectHashCollisionsInsteadOfAliasingObjects(t *testing.T) {
+	identity := "native:1:10"
+	nodeID := stableNativeFSKitNodeID(identity)
+	nodes := nativeFSKitNodes{
+		byPath: map[string]nativeFSKitNode{"/": {id: 2}},
+		byID:   map[uint64]string{2: "reserved:root", 3: "reserved:health", nodeID: "different-object"},
+	}
+	if allocated, ok := nodes.node("/sessions/first", identity); ok || allocated != 0 {
+		t.Fatalf("collision returned node=%d ok=%t", allocated, ok)
 	}
 }
 
@@ -498,7 +660,6 @@ func TestNativeFSKitServerObjectIDsFollowNativeIdentityNotNamespaceVersion(t *te
 		filesystem: filesystem,
 		nodes: nativeFSKitNodes{
 			version: filesystem.NamespaceVersion(),
-			next:    4,
 			byPath:  map[string]nativeFSKitNode{"/": {id: 2}},
 		},
 	}
@@ -565,8 +726,8 @@ func TestNativeFSKitServerObjectIDsFollowNativeIdentityNotNamespaceVersion(t *te
 	if errno != 0 {
 		t.Fatalf("replacement entry: %v", errno)
 	}
-	if replaced.NodeID == first.NodeID || replaced.NodeID <= first.NodeID {
-		t.Fatalf("replacement object ID = %d, want a fresh ID after %d", replaced.NodeID, first.NodeID)
+	if replaced.NodeID == first.NodeID {
+		t.Fatalf("replacement object reused node ID %d", first.NodeID)
 	}
 }
 
@@ -645,6 +806,15 @@ func TestNativeFSKitServerNormalizesFSKitWholeFileSnapshotsIntoJSONLAppends(t *t
 }
 
 func startNativeFSKitTestServer(t *testing.T, filesystem *Filesystem, root string) (*fskitproto.Client, func()) {
+	return startNativeFSKitTestServerWithActivity(t, filesystem, root, nil)
+}
+
+func startNativeFSKitTestServerWithActivity(
+	t *testing.T,
+	filesystem *Filesystem,
+	root string,
+	activity *IOActivityCounter,
+) (*fskitproto.Client, func()) {
 	t.Helper()
 	socketRoot := shortNativeFSKitTestDir(t, "cfs-")
 	ctx, cancel := context.WithCancel(context.Background())
@@ -652,6 +822,7 @@ func startNativeFSKitTestServer(t *testing.T, filesystem *Filesystem, root strin
 	options := NativeFSKitServerOptions{
 		SocketPath: filepath.Join(socketRoot, "daemon.sock"), ResourcePath: filepath.Join(root, "resource.bin"),
 		Token: bytes.Repeat([]byte{0x42}, 32), Generation: 77, BuildSHA256: strings.Repeat("a", 64),
+		Activity: activity,
 	}
 	go func() { done <- ServeNativeFSKit(ctx, filesystem, options) }()
 	deadline := time.Now().Add(5 * time.Second)
@@ -726,4 +897,21 @@ func callNativeFSKitHandle(t *testing.T, client *fskitproto.Client, operation fs
 	if _, err := client.Call(operation, encoder.Data()); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// waitForNativeFSKitActivity waits for transport accounting to reach the
+// expected totals. The counter advances after the response frame is written, so
+// asserting it immediately after a client call races the server.
+func waitForNativeFSKitActivity(t *testing.T, activity *IOActivityCounter, readBytes uint64, writtenBytes uint64) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	var last IOActivityTotals
+	for time.Now().Before(deadline) {
+		last = activity.Snapshot()
+		if last.ReadBytes == readBytes && last.WrittenBytes == writtenBytes {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("transport I/O activity = %#v, want read=%d write=%d", last, readBytes, writtenBytes)
 }

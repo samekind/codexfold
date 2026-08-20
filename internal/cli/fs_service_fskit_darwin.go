@@ -28,10 +28,37 @@ var runFSKitLaunchServicesCommand = func(ctx context.Context, args ...string) ([
 	return exec.CommandContext(ctx, launchServicesRegister, args...).CombinedOutput()
 }
 
+var runFSKitRegisteredModulesCommand = func(ctx context.Context) ([]byte, error) {
+	return exec.CommandContext(
+		ctx,
+		"/usr/bin/pluginkit",
+		"-m", "-A", "-D", "-v", "-i", service.FSKitModuleIdentifier,
+	).CombinedOutput()
+}
+
+var runFSKitResidencyCommand = func(ctx context.Context, launcher string) ([]byte, error) {
+	return exec.CommandContext(ctx, launcher, "--configure-residency").CombinedOutput()
+}
+
+var runFSKitMenuBarOpenCommand = func(ctx context.Context, appPath string) ([]byte, error) {
+	return exec.CommandContext(ctx, "/usr/bin/open", "-g", appPath).CombinedOutput()
+}
+
+var inspectFSKitMenuBarProcess = fsKitMenuBarProcessRunning
+
+var (
+	listFSKitUserProcessIDs       = userProcessIDs
+	inspectFSKitProcessExecutable = fsKitProcessExecutablePath
+	inspectFSKitProcessCommand    = fsKitProcessCommandLine
+	signalFSKitProcess            = unix.Kill
+)
+
 const (
+	codexFoldFSKitHostProcessName   = "CodexFoldFSKit"
 	codexFoldFSKitModuleProcessName = "CodexFoldFSKitModule"
 	fsKitRegistrationWait           = 15 * time.Second
 	fsKitModuleShutdownWait         = 10 * time.Second
+	fsKitMenuBarLaunchWait          = 5 * time.Second
 )
 
 type darwinFSKitAppTransaction struct {
@@ -40,34 +67,47 @@ type darwinFSKitAppTransaction struct {
 	stageRoot       string
 	stagePath       string
 	appGroupPath    string
+	residency       FSKitResidencyOutcome
+	registration    fsKitTargetRegistrationSnapshot
 	changed         bool
 	hadTarget       bool
 	contentsSwapped bool
 	appInstalled    bool
+	manageResidency bool
 }
 
-func prepareFSKitAppPlatform(ctx context.Context, source string, target string) (fsKitAppTransaction, error) {
+func prepareFSKitAppPlatform(ctx context.Context, source string, target string, manageResidency bool) (fsKitAppTransaction, error) {
 	if !filepath.IsAbs(target) {
 		return nil, errors.New("installed FSKit app path must be absolute")
 	}
 	target = filepath.Clean(target)
+	registration, err := captureFSKitTargetRegistration(ctx, target)
+	if err != nil {
+		return nil, fmt.Errorf("capture FSKit target registration: %w", err)
+	}
 	if source == "" {
-		appGroup, err := refreshFSKitApp(ctx, target)
+		appGroup, residency, err := refreshFSKitApp(ctx, target, manageResidency)
 		if err != nil {
-			return nil, err
+			return nil, errors.Join(err, registration.restore(ctx, target))
 		}
-		return &darwinFSKitAppTransaction{target: target, appGroupPath: appGroup}, nil
+		return &darwinFSKitAppTransaction{
+			target: target, appGroupPath: appGroup, residency: residency, manageResidency: manageResidency,
+			registration: registration,
+		}, nil
 	}
 	if !filepath.IsAbs(source) {
 		return nil, errors.New("FSKit app source path must be absolute")
 	}
 	source = filepath.Clean(source)
 	if source == target {
-		appGroup, err := refreshFSKitApp(ctx, target)
+		appGroup, residency, err := refreshFSKitApp(ctx, target, manageResidency)
 		if err != nil {
-			return nil, err
+			return nil, errors.Join(err, registration.restore(ctx, target))
 		}
-		return &darwinFSKitAppTransaction{target: target, appGroupPath: appGroup}, nil
+		return &darwinFSKitAppTransaction{
+			target: target, appGroupPath: appGroup, residency: residency, manageResidency: manageResidency,
+			registration: registration,
+		}, nil
 	}
 	if err := validateFSKitApp(ctx, source); err != nil {
 		return nil, fmt.Errorf("validate FSKit app source: %w", err)
@@ -79,14 +119,14 @@ func prepareFSKitAppPlatform(ctx context.Context, source string, target string) 
 	targetDigest, targetErr := hashAppBundle(target)
 	if targetErr == nil {
 		if targetDigest == sourceDigest {
-			if err := quiesceFSKitAppForUpdate(ctx); err != nil {
-				return nil, fmt.Errorf("quiesce existing FSKit app: %w", err)
-			}
-			appGroup, err := refreshFSKitApp(ctx, target)
+			appGroup, residency, err := refreshFSKitApp(ctx, target, manageResidency)
 			if err != nil {
-				return nil, err
+				return nil, errors.Join(err, registration.restore(ctx, target))
 			}
-			return &darwinFSKitAppTransaction{target: target, appGroupPath: appGroup}, nil
+			return &darwinFSKitAppTransaction{
+				target: target, appGroupPath: appGroup, residency: residency, manageResidency: manageResidency,
+				registration: registration,
+			}, nil
 		}
 		if err := requireNewerFSKitAppVersion(ctx, source, target); err != nil {
 			return nil, err
@@ -102,7 +142,10 @@ func prepareFSKitAppPlatform(ctx context.Context, source string, target string) 
 	if err != nil {
 		return nil, err
 	}
-	transaction := &darwinFSKitAppTransaction{target: target, source: source, stageRoot: stageRoot, changed: true}
+	transaction := &darwinFSKitAppTransaction{
+		target: target, source: source, stageRoot: stageRoot, changed: true,
+		registration: registration, manageResidency: manageResidency,
+	}
 	stagePath := filepath.Join(stageRoot, filepath.Base(target))
 	transaction.stagePath = stagePath
 	if output, err := exec.CommandContext(ctx, "/usr/bin/ditto", source, stagePath).CombinedOutput(); err != nil {
@@ -121,8 +164,8 @@ func prepareFSKitAppPlatform(ctx context.Context, source string, target string) 
 		return nil, errors.New("staged FSKit app does not match the source bundle")
 	}
 	if targetErr == nil {
-		if err := quiesceFSKitAppForUpdate(ctx); err != nil {
-			_, restoreErr := refreshFSKitApp(ctx, target)
+		if err := quiesceFSKitAppForUpdate(ctx, target); err != nil {
+			_, _, restoreErr := refreshFSKitApp(ctx, target, manageResidency)
 			_ = transaction.Commit()
 			return nil, errors.Join(fmt.Errorf("quiesce existing FSKit app: %w", err), restoreErr)
 		}
@@ -140,62 +183,94 @@ func prepareFSKitAppPlatform(ctx context.Context, source string, target string) 
 		rollbackErr := transaction.Rollback(ctx)
 		return nil, errors.Join(errors.New("installed FSKit app does not match the source bundle"), rollbackErr)
 	}
-	appGroup, err := refreshFSKitApp(ctx, target)
+	appGroup, residency, err := refreshFSKitApp(ctx, target, manageResidency)
 	if err != nil {
 		rollbackErr := transaction.Rollback(ctx)
 		return nil, errors.Join(err, rollbackErr)
 	}
 	transaction.appGroupPath = appGroup
+	transaction.residency = residency
 	return transaction, nil
 }
 
-func refreshFSKitApp(ctx context.Context, appPath string) (string, error) {
-	return validateAndEnableFSKitApp(ctx, appPath)
+func refreshFSKitApp(ctx context.Context, appPath string, manageResidency bool) (string, FSKitResidencyOutcome, error) {
+	return validateAndEnableFSKitApp(ctx, appPath, manageResidency)
 }
 
-func quiesceFSKitAppForUpdate(ctx context.Context) error {
-	return stopCodexFoldFSKitModuleProcesses(ctx)
+func quiesceFSKitAppForUpdate(ctx context.Context, appPath string) error {
+	return stopCodexFoldFSKitModuleProcesses(ctx, appPath)
 }
 
-func unregisterStaleFSKitApps(ctx context.Context, appPath string) error {
-	targetModule, err := service.FSKitModulePath(appPath)
+func unregisterFSKitAppRegistration(ctx context.Context, appPath string) error {
+	output, err := runFSKitLaunchServicesCommand(ctx, "-u", appPath)
+	if err != nil {
+		return commandOutputError("unregister FSKit target app registration", output, err)
+	}
+	return nil
+}
+
+type fsKitTargetRegistrationSnapshot struct {
+	modulePath string
+	registered bool
+}
+
+func captureFSKitTargetRegistration(ctx context.Context, appPath string) (fsKitTargetRegistrationSnapshot, error) {
+	modulePath, err := service.FSKitModulePath(appPath)
+	if err != nil {
+		return fsKitTargetRegistrationSnapshot{}, err
+	}
+	paths, err := registeredFSKitModulePaths(ctx)
+	if err != nil {
+		return fsKitTargetRegistrationSnapshot{}, err
+	}
+	return fsKitTargetRegistrationSnapshot{
+		modulePath: filepath.Clean(modulePath),
+		registered: containsFSKitModulePath(paths, modulePath),
+	}, nil
+}
+
+func (snapshot fsKitTargetRegistrationSnapshot) restore(ctx context.Context, appPath string) error {
+	modulePath, err := service.FSKitModulePath(appPath)
 	if err != nil {
 		return err
+	}
+	modulePath = filepath.Clean(modulePath)
+	if snapshot.modulePath == "" || filepath.Clean(snapshot.modulePath) != modulePath {
+		return errors.New("FSKit target registration snapshot does not match the app")
 	}
 	paths, err := registeredFSKitModulePaths(ctx)
 	if err != nil {
 		return err
 	}
-	for _, modulePath := range staleFSKitModulePaths(paths, targetModule) {
-		parentApp, ok := fsKitParentAppPath(modulePath)
-		if !ok {
-			return fmt.Errorf("FSKit module path has no parent app: %s", modulePath)
-		}
-		if err := unregisterFSKitAppRegistration(ctx, parentApp); err != nil {
-			return err
-		}
+	registered := containsFSKitModulePath(paths, modulePath)
+	if registered == snapshot.registered {
+		return nil
 	}
-	return nil
+	if snapshot.registered {
+		output, err := runFSKitLaunchServicesCommand(ctx, "-f", "-R", "-trusted", appPath)
+		if err != nil {
+			return commandOutputError("restore FSKit target app registration", output, err)
+		}
+		return waitForFSKitModulePath(ctx, modulePath, fsKitRegistrationWait)
+	}
+	if err := unregisterFSKitAppRegistration(ctx, appPath); err != nil {
+		return err
+	}
+	return waitForFSKitModulePathAbsent(ctx, modulePath, fsKitRegistrationWait)
 }
 
-// FSKit keeps a user-level activation state keyed by module identity. Removing
-// a module through pluginkit can leave that state disabled until the next login.
-// Update cleanup therefore removes only a temporary app registration, never the
-// installed module itself.
-func unregisterFSKitAppRegistration(ctx context.Context, appPath string) error {
-	output, err := runFSKitLaunchServicesCommand(ctx, "-u", appPath)
-	if err != nil {
-		return commandOutputError("unregister stale FSKit app registration", output, err)
+func containsFSKitModulePath(paths []string, target string) bool {
+	target = filepath.Clean(target)
+	for _, path := range paths {
+		if filepath.Clean(path) == target {
+			return true
+		}
 	}
-	return nil
+	return false
 }
 
 func registeredFSKitModulePaths(ctx context.Context) ([]string, error) {
-	output, err := exec.CommandContext(
-		ctx,
-		"/usr/bin/pluginkit",
-		"-m", "-A", "-D", "-v", "-i", service.FSKitModuleIdentifier,
-	).CombinedOutput()
+	output, err := runFSKitRegisteredModulesCommand(ctx)
 	if err != nil {
 		return nil, commandOutputError("list FSKit module registrations", output, err)
 	}
@@ -293,6 +368,41 @@ func waitForFSKitModulePath(ctx context.Context, target string, timeout time.Dur
 	}
 }
 
+func waitForFSKitModulePathAbsent(ctx context.Context, target string, timeout time.Duration) error {
+	target = filepath.Clean(target)
+	if timeout <= 0 {
+		timeout = fsKitRegistrationWait
+	}
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	var last []string
+	var lastErr error
+	for {
+		paths, err := registeredFSKitModulePaths(ctx)
+		if err == nil {
+			last = paths
+			lastErr = nil
+			if !containsFSKitModulePath(paths, target) {
+				return nil
+			}
+		} else {
+			lastErr = err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-deadline.C:
+			if lastErr != nil {
+				return fmt.Errorf("FSKit module registration query failed: %w", lastErr)
+			}
+			return fmt.Errorf("FSKit module registration still includes %s: got %v", target, normalizedFSKitModulePaths(last))
+		case <-ticker.C:
+		}
+	}
+}
+
 func waitForFSKitModulePaths(ctx context.Context, want []string, timeout time.Duration) error {
 	if timeout <= 0 {
 		timeout = fsKitRegistrationWait
@@ -345,6 +455,9 @@ func fsKitParentAppPath(modulePath string) (string, bool) {
 
 func (t *darwinFSKitAppTransaction) AppGroupPath() string { return t.appGroupPath }
 func (t *darwinFSKitAppTransaction) Changed() bool        { return t.changed }
+func (t *darwinFSKitAppTransaction) Residency() FSKitResidencyOutcome {
+	return t.residency
+}
 
 // promoteStagedApp preserves an existing app bundle root because macOS can
 // attach launch authorization to that directory's inode. Swapping Contents is
@@ -413,23 +526,26 @@ func (t *darwinFSKitAppTransaction) Rollback(ctx context.Context) error {
 		return nil
 	}
 	if !t.changed {
-		_, err := refreshFSKitApp(ctx, t.target)
-		return err
+		return t.registration.restore(ctx, t.target)
 	}
 	var result error
-	if err := quiesceFSKitAppForUpdate(ctx); err != nil {
+	if err := quiesceFSKitAppForUpdate(ctx, t.target); err != nil {
 		return err
+	}
+	if t.appInstalled && !t.registration.registered {
+		result = errors.Join(result, t.registration.restore(ctx, t.target))
 	}
 	if err := t.rollbackStagedApp(); err != nil {
 		// Preserve the staged previous app for an operator-visible recovery rather
 		// than deleting the only rollback material after a failed restore.
 		return errors.Join(result, err)
 	}
-	if t.hadTarget {
-		if _, err := refreshFSKitApp(ctx, t.target); err != nil {
+	if t.hadTarget && t.registration.registered {
+		if _, _, err := refreshFSKitApp(ctx, t.target, t.manageResidency); err != nil {
 			result = errors.Join(result, err)
 		}
 	}
+	result = errors.Join(result, t.registration.restore(ctx, t.target))
 	t.changed = false
 	return errors.Join(result, t.Commit())
 }
@@ -452,45 +568,153 @@ func (t *darwinFSKitAppTransaction) Commit() error {
 	return errors.Join(result, syncDirectory(filepath.Dir(t.target)))
 }
 
-func validateAndEnableFSKitApp(ctx context.Context, appPath string) (string, error) {
+func validateAndEnableFSKitApp(ctx context.Context, appPath string, manageResidency bool) (string, FSKitResidencyOutcome, error) {
 	if err := validateFSKitApp(ctx, appPath); err != nil {
-		return "", err
+		return "", FSKitResidencyOutcome{}, err
 	}
 	targetModule, err := service.FSKitModulePath(appPath)
 	if err != nil {
-		return "", err
+		return "", FSKitResidencyOutcome{}, err
 	}
 	if output, err := runFSKitLaunchServicesCommand(ctx, "-f", "-R", "-trusted", appPath); err != nil {
-		return "", commandOutputError("register FSKit app", output, err)
+		return "", FSKitResidencyOutcome{}, commandOutputError("register FSKit app", output, err)
 	}
 	if err := waitForFSKitModulePath(ctx, targetModule, fsKitRegistrationWait); err != nil {
-		return "", err
-	}
-	if err := unregisterStaleFSKitApps(ctx, appPath); err != nil {
-		return "", err
-	}
-	if err := waitForFSKitModulePaths(ctx, []string{targetModule}, fsKitRegistrationWait); err != nil {
-		return "", fmt.Errorf("FSKit module registration is ambiguous: %w", err)
+		return "", FSKitResidencyOutcome{}, err
 	}
 	if _, err := ensureFSKitModuleEnabled(service.FSKitModuleIdentifier); err != nil {
-		return "", err
+		return "", FSKitResidencyOutcome{}, err
 	}
 	if output, err := exec.CommandContext(ctx, "/usr/bin/pluginkit", "-e", "use", "-p", "com.apple.fskit.fsmodule", "-i", service.FSKitModuleIdentifier).CombinedOutput(); err != nil {
-		return "", commandOutputError("enable FSKit extension election", output, err)
+		return "", FSKitResidencyOutcome{}, commandOutputError("enable FSKit extension election", output, err)
 	}
 	launcher, err := service.FSKitHostLauncherPath(appPath)
 	if err != nil {
-		return "", err
+		return "", FSKitResidencyOutcome{}, err
 	}
 	output, err := exec.CommandContext(ctx, launcher, "--app-group-path").CombinedOutput()
 	if err != nil {
-		return "", commandOutputError("resolve FSKit App Group path", output, err)
+		return "", FSKitResidencyOutcome{}, commandOutputError("resolve FSKit App Group path", output, err)
 	}
 	appGroup := filepath.Clean(strings.TrimSpace(string(output)))
 	if !filepath.IsAbs(appGroup) || filepath.Base(appGroup) != service.FSKitAppGroupIdentifier {
-		return "", fmt.Errorf("FSKit host returned invalid App Group path %q", appGroup)
+		return "", FSKitResidencyOutcome{}, fmt.Errorf("FSKit host returned invalid App Group path %q", appGroup)
 	}
-	return appGroup, nil
+	if !manageResidency {
+		return appGroup, FSKitResidencyOutcome{}, nil
+	}
+	residency, err := configureFSKitResidency(ctx, launcher)
+	if err != nil {
+		return "", FSKitResidencyOutcome{}, err
+	}
+	return appGroup, residency, nil
+}
+
+func configureFSKitResidency(ctx context.Context, launcher string) (FSKitResidencyOutcome, error) {
+	output, err := runFSKitResidencyCommand(ctx, launcher)
+	if err != nil {
+		return FSKitResidencyOutcome{}, commandOutputError("configure FSKit residency", output, err)
+	}
+	var outcome FSKitResidencyOutcome
+	if err := json.Unmarshal(output, &outcome); err != nil {
+		return FSKitResidencyOutcome{}, fmt.Errorf("decode FSKit residency outcome: %w", err)
+	}
+	if outcome.SchemaVersion != 1 {
+		return FSKitResidencyOutcome{}, fmt.Errorf("unsupported FSKit residency outcome schema %d", outcome.SchemaVersion)
+	}
+	validState := func(state string) bool {
+		switch state {
+		case "enabled", "requires_approval", "not_found", "unavailable":
+			return true
+		default:
+			return false
+		}
+	}
+	if !validState(outcome.IncidentMonitor.State) || !validState(outcome.LaunchAtLogin.State) {
+		return FSKitResidencyOutcome{}, errors.New("FSKit residency outcome contains an invalid service state")
+	}
+	ready := outcome.IncidentMonitor.State == "enabled" && outcome.LaunchAtLogin.State == "enabled"
+	requiresApproval := outcome.IncidentMonitor.State == "requires_approval" || outcome.LaunchAtLogin.State == "requires_approval"
+	if outcome.Ready != ready || outcome.RequiresApproval != requiresApproval {
+		return FSKitResidencyOutcome{}, errors.New("FSKit residency outcome is internally inconsistent")
+	}
+	return outcome, nil
+}
+
+func ensureFSKitMenuBarResidency(ctx context.Context, appPath string) FSKitResidencyServiceOutcome {
+	launcher, err := service.FSKitHostLauncherPath(appPath)
+	if err != nil {
+		return FSKitResidencyServiceOutcome{State: "unavailable", Detail: err.Error()}
+	}
+	running, err := inspectFSKitMenuBarProcess(ctx, launcher)
+	if err != nil {
+		return FSKitResidencyServiceOutcome{State: "unavailable", Detail: err.Error()}
+	}
+	if running {
+		return FSKitResidencyServiceOutcome{State: "enabled"}
+	}
+	output, err := runFSKitMenuBarOpenCommand(ctx, appPath)
+	if err != nil {
+		return FSKitResidencyServiceOutcome{
+			State:  "unavailable",
+			Detail: commandOutputError("start CodexFold menu-bar app", output, err).Error(),
+		}
+	}
+
+	deadline := time.NewTimer(fsKitMenuBarLaunchWait)
+	defer deadline.Stop()
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		running, inspectErr := inspectFSKitMenuBarProcess(ctx, launcher)
+		if inspectErr != nil {
+			return FSKitResidencyServiceOutcome{State: "unavailable", Detail: inspectErr.Error()}
+		}
+		if running {
+			return FSKitResidencyServiceOutcome{State: "enabled"}
+		}
+		select {
+		case <-ctx.Done():
+			return FSKitResidencyServiceOutcome{State: "unavailable", Detail: ctx.Err().Error()}
+		case <-deadline.C:
+			return FSKitResidencyServiceOutcome{
+				State:  "unavailable",
+				Detail: "CodexFold menu-bar app did not remain running after launch",
+			}
+		case <-ticker.C:
+		}
+	}
+}
+
+func fsKitMenuBarProcessRunning(ctx context.Context, launcher string) (bool, error) {
+	pids, err := listFSKitUserProcessIDs(ctx, codexFoldFSKitHostProcessName)
+	if err != nil {
+		return false, fmt.Errorf("inspect CodexFold menu-bar processes: %w", err)
+	}
+	launcher = filepath.Clean(launcher)
+	for _, pid := range pids {
+		executable, commandErr := inspectFSKitProcessExecutable(ctx, pid)
+		if commandErr != nil {
+			return false, fmt.Errorf("inspect CodexFold menu-bar process %d: %w", pid, commandErr)
+		}
+		if executable != launcher {
+			continue
+		}
+		command, commandErr := inspectFSKitProcessCommand(ctx, pid)
+		if commandErr != nil {
+			return false, fmt.Errorf("inspect CodexFold menu-bar process %d arguments: %w", pid, commandErr)
+		}
+		if fsKitMenuBarCommandHasNoArguments(command, launcher) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func fsKitMenuBarCommandHasNoArguments(command, launcher string) bool {
+	command = strings.TrimSpace(command)
+	launcher = filepath.Clean(launcher)
+	return command == launcher || command == filepath.Base(launcher)
 }
 
 func validateFSKitApp(ctx context.Context, appPath string) error {
@@ -640,6 +864,13 @@ func ensureFSKitModuleEnabled(moduleID string) (bool, error) {
 	path := filepath.Join(home, "Library", "Group Containers", "group.com.apple.fskit.settings", "enabledModules.plist")
 	output, err := exec.Command("/usr/bin/plutil", "-convert", "json", "-o", "-", path).CombinedOutput()
 	if err != nil {
+		// macOS may TCC-deny direct reads of Apple's FSKit settings container
+		// from ordinary developer tools. The caller still elects the module with
+		// pluginkit(1); treat this as already-handled rather than hard-failing
+		// acceptance installs that cannot rewrite enabledModules.plist.
+		if fsKitSettingsPermissionDenied(output, err) {
+			return false, nil
+		}
 		return false, commandOutputError("read enabled FSKit modules", output, err)
 	}
 	var modules []string
@@ -653,12 +884,26 @@ func ensureFSKitModuleEnabled(moduleID string) (bool, error) {
 	}
 	command := fmt.Sprintf("Add :%d string %s", len(modules), moduleID)
 	if output, err := exec.Command("/usr/libexec/PlistBuddy", "-c", command, path).CombinedOutput(); err != nil {
+		if fsKitSettingsPermissionDenied(output, err) {
+			return false, nil
+		}
 		return false, commandOutputError("enable FSKit module", output, err)
 	}
 	if output, err := exec.Command("/usr/bin/plutil", "-lint", path).CombinedOutput(); err != nil {
 		return false, commandOutputError("validate enabled FSKit modules", output, err)
 	}
 	return true, nil
+}
+
+func fsKitSettingsPermissionDenied(output []byte, err error) bool {
+	if err == nil {
+		return false
+	}
+	text := strings.ToLower(string(output) + "\n" + err.Error())
+	return strings.Contains(text, "operation not permitted") ||
+		strings.Contains(text, "don't have permission") ||
+		strings.Contains(text, "couldn’t be opened because you don’t have permission") ||
+		strings.Contains(text, "couldn't be opened because you don't have permission")
 }
 
 func userProcessIDs(ctx context.Context, name string) ([]int, error) {
@@ -680,28 +925,101 @@ func userProcessIDs(ctx context.Context, name string) ([]int, error) {
 	return result, nil
 }
 
-func stopCodexFoldFSKitModuleProcesses(ctx context.Context) error {
-	pids, err := userProcessIDs(ctx, codexFoldFSKitModuleProcessName)
+func fsKitProcessExecutablePath(ctx context.Context, pid int) (string, error) {
+	output, err := exec.CommandContext(
+		ctx,
+		"/bin/ps",
+		"-p", strconv.Itoa(pid),
+		"-o", "comm=",
+	).Output()
 	if err != nil {
-		return fmt.Errorf("inspect CodexFold FSKit module processes: %w", err)
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+			return "", nil
+		}
+		return "", err
+	}
+	path := strings.TrimSpace(string(output))
+	if path == "" {
+		return "", nil
+	}
+	return filepath.Clean(path), nil
+}
+
+func fsKitProcessCommandLine(ctx context.Context, pid int) (string, error) {
+	output, err := exec.CommandContext(
+		ctx,
+		"/bin/ps",
+		"-ww",
+		"-p", strconv.Itoa(pid),
+		"-o", "command=",
+	).Output()
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+			return "", nil
+		}
+		return "", err
+	}
+	return strings.TrimSpace(string(output)), nil
+}
+
+func fsKitModuleExecutablePath(appPath string) (string, error) {
+	modulePath, err := service.FSKitModulePath(appPath)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(modulePath, "Contents", "MacOS", codexFoldFSKitModuleProcessName), nil
+}
+
+func fsKitModuleProcessIDs(ctx context.Context, appPath string) ([]int, error) {
+	executable, err := fsKitModuleExecutablePath(appPath)
+	if err != nil {
+		return nil, err
+	}
+	pids, err := listFSKitUserProcessIDs(ctx, codexFoldFSKitModuleProcessName)
+	if err != nil {
+		return nil, fmt.Errorf("inspect CodexFold FSKit module processes: %w", err)
+	}
+	matched := make([]int, 0, len(pids))
+	for _, pid := range pids {
+		current, inspectErr := inspectFSKitProcessExecutable(ctx, pid)
+		if inspectErr != nil {
+			return nil, fmt.Errorf("inspect CodexFold FSKit module process %d: %w", pid, inspectErr)
+		}
+		if current == filepath.Clean(executable) {
+			matched = append(matched, pid)
+		}
+	}
+	return matched, nil
+}
+
+func stopCodexFoldFSKitModuleProcesses(ctx context.Context, appPath string) error {
+	pids, err := fsKitModuleProcessIDs(ctx, appPath)
+	if err != nil {
+		return err
 	}
 	for _, pid := range pids {
-		if err := unix.Kill(pid, unix.SIGTERM); err != nil && !errors.Is(err, unix.ESRCH) {
+		if err := signalFSKitProcess(pid, unix.SIGTERM); err != nil && !errors.Is(err, unix.ESRCH) {
 			return fmt.Errorf("stop CodexFold FSKit module process %d: %w", pid, err)
 		}
 	}
-	if err := waitForNoCodexFoldFSKitModuleProcesses(ctx, fsKitModuleShutdownWait); err != nil {
-		for _, pid := range pids {
-			if killErr := unix.Kill(pid, unix.SIGKILL); killErr != nil && !errors.Is(killErr, unix.ESRCH) {
+	if err := waitForNoCodexFoldFSKitModuleProcesses(ctx, appPath, fsKitModuleShutdownWait); err != nil {
+		remaining, inspectErr := fsKitModuleProcessIDs(ctx, appPath)
+		if inspectErr != nil {
+			return errors.Join(err, inspectErr)
+		}
+		for _, pid := range remaining {
+			if killErr := signalFSKitProcess(pid, unix.SIGKILL); killErr != nil && !errors.Is(killErr, unix.ESRCH) {
 				return errors.Join(err, fmt.Errorf("force-stop CodexFold FSKit module process %d: %w", pid, killErr))
 			}
 		}
-		return waitForNoCodexFoldFSKitModuleProcesses(ctx, fsKitModuleShutdownWait)
+		return waitForNoCodexFoldFSKitModuleProcesses(ctx, appPath, fsKitModuleShutdownWait)
 	}
 	return nil
 }
 
-func waitForNoCodexFoldFSKitModuleProcesses(ctx context.Context, timeout time.Duration) error {
+func waitForNoCodexFoldFSKitModuleProcesses(ctx context.Context, appPath string, timeout time.Duration) error {
 	if timeout <= 0 {
 		timeout = fsKitModuleShutdownWait
 	}
@@ -710,9 +1028,9 @@ func waitForNoCodexFoldFSKitModuleProcesses(ctx context.Context, timeout time.Du
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		pids, err := userProcessIDs(ctx, codexFoldFSKitModuleProcessName)
+		pids, err := fsKitModuleProcessIDs(ctx, appPath)
 		if err != nil {
-			return fmt.Errorf("inspect CodexFold FSKit module processes: %w", err)
+			return err
 		}
 		if len(pids) == 0 {
 			return nil

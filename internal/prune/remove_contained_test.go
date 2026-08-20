@@ -5,9 +5,11 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/samekind/codexfold/internal/codex"
 	"github.com/samekind/codexfold/internal/fold"
@@ -31,7 +33,7 @@ func TestRemoveContainedDryRunProvesWithoutMutation(t *testing.T) {
 
 func TestRemoveContainedApplyCleansStateAndKeepsRecoveryManifest(t *testing.T) {
 	fixture := newRemovalFixture(t)
-	result, err := RemoveContained(context.Background(), fixture.home, fixture.store, fixture.contained, fixture.container, Options{Apply: true})
+	result, err := RemoveContained(context.Background(), fixture.home, fixture.store, fixture.contained, fixture.container, applyRemovalOptions())
 	if err != nil {
 		t.Fatalf("RemoveContained returned error: %v", err)
 	}
@@ -89,7 +91,7 @@ func TestRemoveContainedRollsBackSourceGlobalStateAndTombstoneOnDatabaseFailure(
 		t.Fatalf("close state db: %v", err)
 	}
 
-	if _, err := RemoveContained(context.Background(), fixture.home, fixture.store, fixture.contained, fixture.container, Options{Apply: true}); err == nil {
+	if _, err := RemoveContained(context.Background(), fixture.home, fixture.store, fixture.contained, fixture.container, applyRemovalOptions()); err == nil {
 		t.Fatalf("RemoveContained should fail on incompatible database schema")
 	}
 	if _, err := os.Stat(fixture.contained.RolloutPath); err != nil {
@@ -113,6 +115,246 @@ func TestRemoveContainedRollsBackSourceGlobalStateAndTombstoneOnDatabaseFailure(
 	var count int
 	if err := db.QueryRow(`select count(*) from threads where id = ?`, fixture.contained.ID).Scan(&count); err != nil || count != 1 {
 		t.Fatalf("thread row was not rolled back: count=%d err=%v", count, err)
+	}
+}
+
+func TestRemoveContainedRollsBackWhenDatabaseCommitDoesNotApply(t *testing.T) {
+	fixture := newRemovalFixture(t)
+	commitErr := errors.New("simulated commit failure")
+	previous := commitContainedTransaction
+	commitContainedTransaction = func(tx *sql.Tx) error {
+		_ = tx.Rollback()
+		return commitErr
+	}
+	t.Cleanup(func() { commitContainedTransaction = previous })
+
+	if _, err := RemoveContained(context.Background(), fixture.home, fixture.store, fixture.contained, fixture.container, applyRemovalOptions()); !errors.Is(err, commitErr) {
+		t.Fatalf("commit failure error = %v", err)
+	}
+	assertRemovalState(t, fixture, true)
+	if _, err := os.Lstat(fixture.contained.RolloutPath + ".codexfold-remove-pending"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("commit rollback left pending source: %v", err)
+	}
+	if _, err := os.Lstat(TombstonePath(fixture.store, fixture.contained.ID)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("commit rollback left tombstone: %v", err)
+	}
+}
+
+func TestRemoveContainedFinalizesWhenCommitAppliedButAcknowledgementFails(t *testing.T) {
+	fixture := newRemovalFixture(t)
+	ackErr := errors.New("simulated lost commit acknowledgement")
+	previous := commitContainedTransaction
+	commitContainedTransaction = func(tx *sql.Tx) error {
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+		return ackErr
+	}
+	t.Cleanup(func() { commitContainedTransaction = previous })
+
+	result, err := RemoveContained(context.Background(), fixture.home, fixture.store, fixture.contained, fixture.container, applyRemovalOptions())
+	if !errors.Is(err, ackErr) || !result.Removed {
+		t.Fatalf("lost acknowledgement result=%#v err=%v", result, err)
+	}
+	assertRemovalState(t, fixture, false)
+	data, readErr := os.ReadFile(TombstonePath(fixture.store, fixture.contained.ID))
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	var tombstone Tombstone
+	if err := json.Unmarshal(data, &tombstone); err != nil || tombstone.Phase != removalPhasePurged {
+		t.Fatalf("completed tombstone=%#v err=%v", tombstone, err)
+	}
+}
+
+func TestRemoveContainedRevalidatesSourceImmediatelyBeforeRename(t *testing.T) {
+	fixture := newRemovalFixture(t)
+	changed := []byte("changed after proof\n")
+	options := applyRemovalOptions()
+	options.BeforeRename = func() error {
+		return os.WriteFile(fixture.contained.RolloutPath, changed, 0o644)
+	}
+	if _, err := RemoveContained(context.Background(), fixture.home, fixture.store, fixture.contained, fixture.container, options); err == nil {
+		t.Fatal("source mutation after proof was accepted")
+	}
+	got, err := os.ReadFile(fixture.contained.RolloutPath)
+	if err != nil || !bytes.Equal(got, changed) {
+		t.Fatalf("changed source was not preserved: got=%q err=%v", got, err)
+	}
+	assertRemovalState(t, fixture, true)
+	if _, err := os.Lstat(fixture.contained.RolloutPath + ".codexfold-remove-pending"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("mutation rejection left a pending path: %v", err)
+	}
+	if _, err := os.Lstat(TombstonePath(fixture.store, fixture.contained.ID)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("mutation rejection left a tombstone: %v", err)
+	}
+}
+
+func TestRemoveContainedRequiresWriterProbeAndRejectsActiveWriter(t *testing.T) {
+	fixture := newRemovalFixture(t)
+	if _, err := RemoveContained(context.Background(), fixture.home, fixture.store, fixture.contained, fixture.container, Options{Apply: true}); err == nil {
+		t.Fatal("apply accepted a missing writer probe")
+	}
+	options := applyRemovalOptions()
+	options.WriterActive = func(context.Context, codex.Session) (bool, error) { return true, nil }
+	if _, err := RemoveContained(context.Background(), fixture.home, fixture.store, fixture.contained, fixture.container, options); err == nil {
+		t.Fatal("apply accepted an active writer")
+	}
+	assertRemovalState(t, fixture, true)
+}
+
+func TestRecoverContainedFinalizesCommitInterruptedBeforePurge(t *testing.T) {
+	fixture := newRemovalFixture(t)
+	interrupted := errors.New("simulated process stop after commit")
+	options := applyRemovalOptions()
+	options.AfterCommit = func() error { return interrupted }
+	result, err := RemoveContained(context.Background(), fixture.home, fixture.store, fixture.contained, fixture.container, options)
+	if !errors.Is(err, interrupted) || !result.Removed {
+		t.Fatalf("interrupted removal result=%#v err=%v", result, err)
+	}
+	pending := fixture.contained.RolloutPath + ".codexfold-remove-pending"
+	purge := pending + ".purge"
+	if _, err := os.Lstat(pending); err != nil {
+		t.Fatalf("committed removal did not retain its pending source: %v", err)
+	}
+	global, err := os.ReadFile(filepath.Join(fixture.home, ".codex-global-state.json"))
+	if err != nil || !bytes.Contains(global, []byte(fixture.contained.ID)) {
+		t.Fatalf("test did not stop before global cleanup: err=%v global=%s", err, global)
+	}
+
+	recovered, err := RecoverContained(context.Background(), fixture.home, fixture.store, fixture.contained.ID, applyRemovalOptions())
+	if err != nil {
+		t.Fatalf("RecoverContained returned error: %v", err)
+	}
+	if !recovered.Finalized || recovered.RolledBack {
+		t.Fatalf("unexpected recovery result: %#v", recovered)
+	}
+	assertRemovalState(t, fixture, false)
+	if _, err := os.Lstat(pending); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("recovery did not purge exact pending source: %v", err)
+	}
+	if _, err := os.Lstat(purge); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("recovery left purge staging behind: %v", err)
+	}
+	data, err := os.ReadFile(TombstonePath(fixture.store, fixture.contained.ID))
+	if err != nil {
+		t.Fatalf("read completed tombstone: %v", err)
+	}
+	var tombstone Tombstone
+	if err := json.Unmarshal(data, &tombstone); err != nil || tombstone.Version != 2 || tombstone.Phase != removalPhasePurged || tombstone.RemovedAt == "" {
+		t.Fatalf("completed tombstone=%#v err=%v", tombstone, err)
+	}
+}
+
+func TestRecoverContainedFinalizesInterruptedPurgeStaging(t *testing.T) {
+	fixture := newRemovalFixture(t)
+	interrupted := errors.New("simulated process stop after purge staging")
+	options := applyRemovalOptions()
+	options.AfterPurgeStage = func() error { return interrupted }
+	result, err := RemoveContained(context.Background(), fixture.home, fixture.store, fixture.contained, fixture.container, options)
+	if !errors.Is(err, interrupted) || !result.Removed {
+		t.Fatalf("interrupted removal result=%#v err=%v", result, err)
+	}
+	pending := fixture.contained.RolloutPath + ".codexfold-remove-pending"
+	purge := pending + ".purge"
+	if _, err := os.Lstat(pending); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("purge staging left the pending name: %v", err)
+	}
+	if _, err := os.Lstat(purge); err != nil {
+		t.Fatalf("purge staging did not retain the exact source: %v", err)
+	}
+
+	recovered, err := RecoverContained(context.Background(), fixture.home, fixture.store, fixture.contained.ID, applyRemovalOptions())
+	if err != nil {
+		t.Fatalf("RecoverContained returned error: %v", err)
+	}
+	if !recovered.Finalized || recovered.RolledBack {
+		t.Fatalf("unexpected recovery result: %#v", recovered)
+	}
+	assertRemovalState(t, fixture, false)
+	if _, err := os.Lstat(purge); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("recovery left purge staging behind: %v", err)
+	}
+}
+
+func TestRecoverContainedPreservesChangedPurgeStaging(t *testing.T) {
+	fixture := newRemovalFixture(t)
+	options := applyRemovalOptions()
+	options.AfterPurgeStage = func() error { return errors.New("stop after staging") }
+	if _, err := RemoveContained(context.Background(), fixture.home, fixture.store, fixture.contained, fixture.container, options); err == nil {
+		t.Fatal("test did not stop after purge staging")
+	}
+	purge := fixture.contained.RolloutPath + ".codexfold-remove-pending.purge"
+	changed := []byte("replacement must be preserved\n")
+	if err := os.WriteFile(purge, changed, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := RecoverContained(context.Background(), fixture.home, fixture.store, fixture.contained.ID, applyRemovalOptions()); err == nil {
+		t.Fatal("recovery accepted changed purge staging")
+	}
+	got, err := os.ReadFile(purge)
+	if err != nil || !bytes.Equal(got, changed) {
+		t.Fatalf("changed purge staging was not preserved: got=%q err=%v", got, err)
+	}
+}
+
+func TestRemoveContainedNeverOverwritesExistingPurgeStaging(t *testing.T) {
+	fixture := newRemovalFixture(t)
+	pending := fixture.contained.RolloutPath + ".codexfold-remove-pending"
+	purge := pending + ".purge"
+	foreign := []byte("unrelated existing file\n")
+	options := applyRemovalOptions()
+	options.AfterCommit = func() error {
+		return os.WriteFile(purge, foreign, 0o600)
+	}
+	result, err := RemoveContained(context.Background(), fixture.home, fixture.store, fixture.contained, fixture.container, options)
+	if err == nil || !result.Removed {
+		t.Fatalf("existing purge staging result=%#v err=%v", result, err)
+	}
+	got, readErr := os.ReadFile(purge)
+	if readErr != nil || !bytes.Equal(got, foreign) {
+		t.Fatalf("existing purge staging was overwritten: got=%q err=%v", got, readErr)
+	}
+	if _, statErr := os.Lstat(pending); statErr != nil {
+		t.Fatalf("proved pending source was not preserved: %v", statErr)
+	}
+}
+
+func TestRecoverContainedRollsBackIsolatedSourceWhenDatabaseStillContainsThread(t *testing.T) {
+	fixture := newRemovalFixture(t)
+	manifest, err := fold.LoadManifest(fixture.store, fixture.contained.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending := fixture.contained.RolloutPath + ".codexfold-remove-pending"
+	purge := pending + ".purge"
+	if err := os.Rename(fixture.contained.RolloutPath, pending); err != nil {
+		t.Fatal(err)
+	}
+	tombstone := Tombstone{
+		Version: 2, Kind: "contained-session-removal-v2", Phase: removalPhaseIsolated,
+		PreparedAt:         time.Now().UTC().Format(time.RFC3339Nano),
+		ContainedSessionID: fixture.contained.ID, ContainerSessionID: fixture.container.ID,
+		OriginalRolloutPath: fixture.contained.RolloutPath, PendingRolloutPath: pending, PurgeRolloutPath: purge,
+		SourceBytes: manifest.Source.Bytes, SourceSHA256: manifest.Source.SHA256,
+		RecoveryManifestPath: fold.ManifestPath(fixture.store, fixture.contained.ID),
+	}
+	if err := writeJSONAtomically(TombstonePath(fixture.store, fixture.contained.ID), tombstone, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := RecoverContained(context.Background(), fixture.home, fixture.store, fixture.contained.ID, applyRemovalOptions())
+	if err != nil {
+		t.Fatalf("RecoverContained returned error: %v", err)
+	}
+	if !recovered.RolledBack || recovered.Finalized {
+		t.Fatalf("unexpected recovery result: %#v", recovered)
+	}
+	assertRemovalState(t, fixture, true)
+	if _, err := os.Lstat(pending); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("rollback left pending source: %v", err)
+	}
+	if _, err := os.Lstat(TombstonePath(fixture.store, fixture.contained.ID)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("rollback left tombstone: %v", err)
 	}
 }
 
@@ -142,6 +384,15 @@ func TestCleanGlobalStatePreservesLargeJSONNumbers(t *testing.T) {
 	}
 	if !bytes.Contains(cleaned, []byte("9007199254740993")) {
 		t.Fatalf("large JSON number changed during cleanup: %s", cleaned)
+	}
+}
+
+func applyRemovalOptions() Options {
+	return Options{
+		Apply: true,
+		WriterActive: func(context.Context, codex.Session) (bool, error) {
+			return false, nil
+		},
 	}
 }
 

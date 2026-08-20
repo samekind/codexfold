@@ -3,6 +3,7 @@ package storage
 import (
 	"bufio"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -49,23 +50,36 @@ type Options struct {
 }
 
 type manifestRecord struct {
+	Version int    `json:"version"`
+	Kind    string `json:"kind"`
 	Session struct {
 		ID          string `json:"id"`
 		RolloutPath string `json:"rollout_path"`
 	} `json:"session"`
 	Source struct {
-		Bytes int64 `json:"bytes"`
+		Bytes  int64  `json:"bytes"`
+		SHA256 string `json:"sha256"`
 	} `json:"source"`
+	Parts []struct {
+		Kind   string `json:"kind"`
+		Object struct {
+			SHA256   string `json:"sha256"`
+			RawBytes int64  `json:"raw_bytes"`
+		} `json:"object"`
+	} `json:"parts"`
 }
 
 type stateRecord struct {
-	SessionID    string `json:"session_id"`
-	Generation   uint64 `json:"generation"`
-	ManifestPath string `json:"manifest_path"`
-	BaseBytes    int64  `json:"base_bytes"`
-	DeltaPath    string `json:"delta_path"`
-	BackingPath  string `json:"backing_path"`
-	Native       struct {
+	Version        int    `json:"version"`
+	SessionID      string `json:"session_id"`
+	Generation     uint64 `json:"generation"`
+	ManifestPath   string `json:"manifest_path"`
+	ManifestSHA256 string `json:"manifest_sha256"`
+	BaseBytes      int64  `json:"base_bytes"`
+	BaseSHA256     string `json:"base_sha256"`
+	DeltaPath      string `json:"delta_path"`
+	BackingPath    string `json:"backing_path"`
+	Native         struct {
 		Path string `json:"path"`
 	} `json:"native_snapshot"`
 }
@@ -158,6 +172,11 @@ func prepareScanner(ctx context.Context, options Options) (*scanner, bool, error
 	if err := s.loadStatesAndJournals(); err != nil {
 		return nil, false, err
 	}
+	if err := s.validateManagedReferences(); err != nil {
+		if err := s.metadataIssue(err); err != nil {
+			return nil, false, err
+		}
+	}
 	if err := s.loadCurrentPack(); err != nil {
 		return nil, false, err
 	}
@@ -216,6 +235,13 @@ func (s *scanner) loadStatesAndJournals() error {
 		}
 		directory := filepath.Join(root, entry.Name())
 		statePath := filepath.Join(directory, "state.json")
+		stateInfo, err := os.Lstat(statePath)
+		if err != nil {
+			return fmt.Errorf("inspect managed session state %s: %w", entry.Name(), err)
+		}
+		if !stateInfo.Mode().IsRegular() {
+			return fmt.Errorf("managed session state %s is not a regular file", entry.Name())
+		}
 		data, err := os.ReadFile(statePath)
 		if err != nil {
 			return fmt.Errorf("read managed session state %s: %w", entry.Name(), err)
@@ -224,7 +250,7 @@ func (s *scanner) loadStatesAndJournals() error {
 		if err := json.Unmarshal(data, &state); err != nil {
 			return fmt.Errorf("decode managed session state %s: %w", entry.Name(), err)
 		}
-		if state.SessionID != entry.Name() || state.Generation == 0 || state.BaseBytes < 0 || state.DeltaPath == "" {
+		if (state.Version != 1 && state.Version != 2) || state.SessionID != entry.Name() || state.Generation == 0 || state.ManifestPath == "" || (state.Version == 2 && !validSHA256(state.ManifestSHA256)) || state.BaseBytes < 0 || !validSHA256(state.BaseSHA256) || state.DeltaPath == "" {
 			return fmt.Errorf("invalid managed session state %s", statePath)
 		}
 		state.DeltaPath, err = cleanPathWithin(directory, state.DeltaPath)
@@ -504,6 +530,13 @@ func (s *scanner) addFile(usage *FileUsage, path string, info os.FileInfo) error
 }
 
 func decodeManifest(path string) (manifestRecord, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return manifestRecord{}, fmt.Errorf("inspect manifest %s: %w", path, err)
+	}
+	if !info.Mode().IsRegular() {
+		return manifestRecord{}, fmt.Errorf("manifest %s is not a regular file", path)
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return manifestRecord{}, fmt.Errorf("read manifest %s: %w", path, err)
@@ -512,7 +545,48 @@ func decodeManifest(path string) (manifestRecord, error) {
 	if err := json.Unmarshal(data, &manifest); err != nil {
 		return manifestRecord{}, fmt.Errorf("decode manifest %s: %w", path, err)
 	}
+	if err := validateManifestRecord(manifest); err != nil {
+		return manifestRecord{}, fmt.Errorf("invalid manifest %s: %w", path, err)
+	}
 	return manifest, nil
+}
+
+func validateManifestRecord(manifest manifestRecord) error {
+	if (manifest.Version != 1 || manifest.Kind != "fold-v1") && (manifest.Version != 2 || manifest.Kind != "fold-v2") {
+		return fmt.Errorf("unsupported kind %q version %d", manifest.Kind, manifest.Version)
+	}
+	if manifest.Session.ID == "" || manifest.Session.ID == "." || manifest.Session.ID == ".." || strings.ContainsAny(manifest.Session.ID, "/\\\x00") {
+		return errors.New("unsafe or missing session ID")
+	}
+	if manifest.Source.Bytes < 0 || !validSHA256(manifest.Source.SHA256) {
+		return errors.New("invalid source proof")
+	}
+	var reconstructed int64
+	for index, part := range manifest.Parts {
+		if part.Kind != "residual" && part.Kind != "field" && !(manifest.Version == 2 && part.Kind == "record") {
+			return fmt.Errorf("part %d has unsupported kind %q", index, part.Kind)
+		}
+		if part.Object.RawBytes < 0 || !validSHA256(part.Object.SHA256) {
+			return fmt.Errorf("part %d has an invalid object reference", index)
+		}
+		var overflow bool
+		reconstructed, overflow = addInt64(reconstructed, part.Object.RawBytes)
+		if overflow {
+			return errors.New("reconstructed byte count overflows")
+		}
+	}
+	if reconstructed != manifest.Source.Bytes {
+		return fmt.Errorf("reconstructed bytes %d, want %d", reconstructed, manifest.Source.Bytes)
+	}
+	return nil
+}
+
+func validSHA256(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
 }
 
 func walkIfPresent(root string, walk fs.WalkDirFunc) error {

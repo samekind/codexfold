@@ -67,6 +67,29 @@ func AcquireLease(directory string, label string) (*Lease, error) {
 	return &Lease{file: file, path: path}, nil
 }
 
+// LeaseFilePrefix is the name prefix every lease file written by AcquireLease
+// uses.
+const LeaseFilePrefix = ".lease-"
+
+// RecognizedLeaseContent reports whether content is the payload AcquireLease
+// writes: one decimal process-ID line. A lease leaked by a killed process keeps
+// that payload, so a caller that has already proven the lease is not locked can
+// treat the file as a known artifact instead of unknown content. Liveness must
+// still come from the lock, never from the recorded process ID, because the
+// system reuses process IDs.
+func RecognizedLeaseContent(content []byte) bool {
+	text := strings.TrimSuffix(string(content), "\n")
+	if text == "" || len(text) > 20 {
+		return false
+	}
+	for _, character := range text {
+		if character < '0' || character > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 func (l *Lease) Close() error {
 	if l == nil {
 		return nil

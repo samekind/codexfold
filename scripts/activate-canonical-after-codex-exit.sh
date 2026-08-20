@@ -8,9 +8,20 @@ STORE="${2:?CodexFold store is required}"
 MOUNT="${3:?mount path is required}"
 NATIVE_ROOT="${4:?native root is required}"
 BIN="${5:?CodexFold binary is required}"
-REOPEN_APP="${6:-1}"
+REOPEN_APP="${6:-0}"
 CRITICAL_IDS_FILE="${7:-${CODEXFOLD_CRITICAL_IDS_FILE:-}}"
+ALLOW_SERVICE_ROLLBACK="${8:-0}"
 RUN_ROOT="${STORE}/activation/canonical-$(date '+%Y%m%d-%H%M%S')"
+
+case "${REOPEN_APP}" in
+  0) ;;
+  1) echo "CodexFold never reopens Codex; start Codex manually after reviewing activation evidence" >&2; exit 2 ;;
+  *) echo "REOPEN_APP must be 0 or 1" >&2; exit 2 ;;
+esac
+case "${ALLOW_SERVICE_ROLLBACK}" in
+  0|1) ;;
+  *) echo "ALLOW_SERVICE_ROLLBACK must be 0 or 1" >&2; exit 2 ;;
+esac
 
 mkdir -p "${RUN_ROOT}"
 exec >"${RUN_ROOT}/run.log" 2>&1
@@ -20,17 +31,20 @@ finish() {
   exit_code=$?
   if (( exit_code != 0 )); then
     if (( activated == 1 )); then
-      "${BIN}" fs service stop --apply || true
-      if "${BIN}" fs namespace deactivate --apply \
-        --codex-home "${CODEX_HOME}" --mount "${MOUNT}" --native-root "${NATIVE_ROOT}"; then
-        "${BIN}" fs service start --apply \
-          --codex-home "${CODEX_HOME}" --mount "${MOUNT}" || true
+      if [[ "${ALLOW_SERVICE_ROLLBACK}" == "1" ]]; then
+        "${BIN}" fs service stop --apply || true
+        if "${BIN}" fs namespace deactivate --apply \
+          --codex-home "${CODEX_HOME}" --mount "${MOUNT}" --native-root "${NATIVE_ROOT}"; then
+          "${BIN}" fs service start --apply \
+            --codex-home "${CODEX_HOME}" --mount "${MOUNT}" || true
+        fi
+      else
+        printf '%s\n' \
+          'Activation failed after namespace publication. No service stop, start, or namespace rollback was attempted because explicit rollback authorization was not supplied.' \
+          >"${RUN_ROOT}/ROLLBACK_REQUIRED"
       fi
     fi
     date '+%Y-%m-%dT%H:%M:%S%z' >"${RUN_ROOT}/FAILED"
-  fi
-  if [[ "${REOPEN_APP}" == "1" ]]; then
-    open -a /Applications/ChatGPT.app || true
   fi
   exit "${exit_code}"
 }
@@ -146,6 +160,3 @@ jq -e '.active == true' <<<"${namespace_status}" >/dev/null
 
 date '+%Y-%m-%dT%H:%M:%S%z' >"${RUN_ROOT}/COMPLETE"
 trap - EXIT
-if [[ "${REOPEN_APP}" == "1" ]]; then
-  open -a /Applications/ChatGPT.app
-fi

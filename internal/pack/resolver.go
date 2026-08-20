@@ -26,6 +26,8 @@ type OpenOptions struct {
 	BypassOSCache bool
 }
 
+var ErrInvalidCurrent = errors.New("invalid pack CURRENT")
+
 type Resolver struct {
 	directory            string
 	index                Index
@@ -72,14 +74,50 @@ var resolverRegistry = struct {
 }{resources: make(map[resolverResourceKey]*resolverResources)}
 
 func Open(storeDir string, options OpenOptions) (*Resolver, error) {
-	generation, err := CurrentGeneration(storeDir)
+	generation, err := currentOrRecoveredGeneration(context.Background(), storeDir)
 	if err != nil {
 		return nil, err
 	}
 	if options.CacheBytes == 0 {
 		options.CacheBytes = defaultCacheBytes
 	}
-	return openGeneration(filepath.Join(storeDir, "packs", generation), options.CacheBytes, options.BypassOSCache)
+	directory := filepath.Join(storeDir, "packs", generation)
+	resolver, err := openGeneration(directory, options.CacheBytes, options.BypassOSCache)
+	if err == nil {
+		return resolver, nil
+	}
+	initialErr := err
+	lock, lockErr := storage.AcquireOperationLock(storeDir, "objects")
+	if lockErr != nil {
+		return nil, errors.Join(initialErr, lockErr)
+	}
+	defer lock.Close()
+	current, currentErr := CurrentGeneration(storeDir)
+	if currentErr != nil {
+		if errors.Is(currentErr, os.ErrNotExist) || errors.Is(currentErr, ErrInvalidCurrent) {
+			current, currentErr = recoverCurrentGenerationLocked(context.Background(), storeDir)
+		}
+		if currentErr != nil {
+			return nil, errors.Join(initialErr, currentErr)
+		}
+	}
+	if current != generation {
+		generation = current
+		directory = filepath.Join(storeDir, "packs", generation)
+		if resolver, currentOpenErr := openGeneration(directory, options.CacheBytes, options.BypassOSCache); currentOpenErr == nil {
+			return resolver, nil
+		} else {
+			initialErr = errors.Join(initialErr, currentOpenErr)
+		}
+	}
+	if repairErr := repairGenerationIndex(directory); repairErr != nil {
+		return nil, errors.Join(initialErr, repairErr)
+	}
+	resolver, repairOpenErr := openGeneration(directory, options.CacheBytes, options.BypassOSCache)
+	if repairOpenErr != nil {
+		return nil, errors.Join(initialErr, repairOpenErr)
+	}
+	return resolver, nil
 }
 
 func CurrentGeneration(storeDir string) (string, error) {
@@ -89,7 +127,7 @@ func CurrentGeneration(storeDir string) (string, error) {
 	}
 	generation := strings.TrimSpace(string(current))
 	if !safeGeneration(generation) {
-		return "", fmt.Errorf("unsafe pack generation %q", generation)
+		return "", fmt.Errorf("%w: unsafe pack generation %q", ErrInvalidCurrent, generation)
 	}
 	return generation, nil
 }
@@ -99,6 +137,11 @@ func openGeneration(directory string, cacheBytes int64, bypassOSCache bool) (*Re
 	if cacheBytes < 0 {
 		cacheBytes = 0
 	}
+	generationRoot, err := openPackGenerationRoot(directory)
+	if err != nil {
+		return nil, err
+	}
+	defer generationRoot.Close()
 	key := resolverResourceKey{directory: directory, cacheBytes: cacheBytes, bypassOSCache: bypassOSCache}
 	resolverRegistry.Lock()
 	defer resolverRegistry.Unlock()
@@ -106,7 +149,7 @@ func openGeneration(directory string, cacheBytes int64, bypassOSCache bool) (*Re
 		shared.references++
 		return resolverFromResources(shared), nil
 	}
-	shared, err := loadResolverResources(key)
+	shared, err := loadResolverResources(key, generationRoot)
 	if err != nil {
 		return nil, err
 	}
@@ -115,7 +158,112 @@ func openGeneration(directory string, cacheBytes int64, bypassOSCache bool) (*Re
 	return resolverFromResources(shared), nil
 }
 
-func loadResolverResources(key resolverResourceKey) (*resolverResources, error) {
+func openPackGenerationRoot(directory string) (*os.Root, error) {
+	directory = filepath.Clean(directory)
+	generation := filepath.Base(directory)
+	packsDir := filepath.Dir(directory)
+	if filepath.Base(packsDir) != "packs" || !safeGeneration(generation) {
+		return nil, errors.New("pack generation path is not canonical")
+	}
+	storeRoot, err := os.OpenRoot(filepath.Dir(packsDir))
+	if err != nil {
+		return nil, fmt.Errorf("open pack store root: %w", err)
+	}
+	defer storeRoot.Close()
+	packsInfo, err := storeRoot.Lstat("packs")
+	if err != nil {
+		return nil, fmt.Errorf("inspect packs directory: %w", err)
+	}
+	if !packsInfo.IsDir() {
+		return nil, errors.New("packs path is not a plain directory")
+	}
+	packsRoot, err := storeRoot.OpenRoot("packs")
+	if err != nil {
+		return nil, fmt.Errorf("open packs directory: %w", err)
+	}
+	defer packsRoot.Close()
+	if err := validateOpenedPackDirectory(storeRoot, "packs", packsInfo, packsRoot); err != nil {
+		return nil, err
+	}
+	generationInfo, err := packsRoot.Lstat(generation)
+	if err != nil {
+		return nil, fmt.Errorf("inspect pack generation %s: %w", generation, err)
+	}
+	if !generationInfo.IsDir() {
+		return nil, fmt.Errorf("pack generation %s is not a plain directory", generation)
+	}
+	generationRoot, err := packsRoot.OpenRoot(generation)
+	if err != nil {
+		return nil, fmt.Errorf("open pack generation %s: %w", generation, err)
+	}
+	if err := validateOpenedPackDirectory(packsRoot, generation, generationInfo, generationRoot); err != nil {
+		_ = generationRoot.Close()
+		return nil, err
+	}
+	return generationRoot, nil
+}
+
+func validateOpenedPackDirectory(parent *os.Root, name string, before os.FileInfo, openedRoot *os.Root) error {
+	opened, err := openedRoot.Stat(".")
+	if err != nil {
+		return fmt.Errorf("stat opened pack directory %s: %w", name, err)
+	}
+	after, err := parent.Lstat(name)
+	if err != nil {
+		return fmt.Errorf("reinspect pack directory %s: %w", name, err)
+	}
+	if !opened.IsDir() || !after.IsDir() || !os.SameFile(before, opened) || !os.SameFile(opened, after) {
+		return fmt.Errorf("pack directory %s changed while it was opened", name)
+	}
+	return nil
+}
+
+func openPackGenerationFile(root *os.Root, name string) (*os.File, error) {
+	if filepath.Base(name) != name || name == "." || name == ".." {
+		return nil, fmt.Errorf("unsafe pack generation filename %q", name)
+	}
+	before, err := root.Lstat(name)
+	if err != nil {
+		return nil, err
+	}
+	if !before.Mode().IsRegular() {
+		return nil, fmt.Errorf("pack generation file %s is not a regular file", name)
+	}
+	file, err := root.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	opened, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+	after, err := root.Lstat(name)
+	if err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+	if !opened.Mode().IsRegular() || !after.Mode().IsRegular() || !os.SameFile(before, opened) || !os.SameFile(opened, after) {
+		_ = file.Close()
+		return nil, fmt.Errorf("pack generation file %s changed while it was opened", name)
+	}
+	return file, nil
+}
+
+func readPackGenerationFile(root *os.Root, name string) ([]byte, error) {
+	file, err := openPackGenerationFile(root, name)
+	if err != nil {
+		return nil, err
+	}
+	data, readErr := io.ReadAll(file)
+	closeErr := file.Close()
+	if err := errors.Join(readErr, closeErr); err != nil {
+		return nil, err
+	}
+	return data, nil
+}
+
+func loadResolverResources(key resolverResourceKey, generationRoot *os.Root) (*resolverResources, error) {
 	directory := key.directory
 	lease, err := storage.AcquireLease(filepath.Join(directory, "leases"), "resolver")
 	if err != nil {
@@ -135,15 +283,15 @@ func loadResolverResources(key resolverResourceKey) (*resolverResources, error) 
 	}()
 	var index Index
 	var v3 *indexV3
-	if _, statErr := os.Stat(filepath.Join(directory, indexV3MetaFilename)); statErr == nil {
-		v3, err = openIndexV3(directory)
+	if _, statErr := generationRoot.Lstat(indexV3MetaFilename); statErr == nil {
+		v3, err = openIndexV3Root(directory, generationRoot)
 		if err != nil {
 			return nil, err
 		}
 	} else if !errors.Is(statErr, os.ErrNotExist) {
 		return nil, statErr
 	} else {
-		data, readErr := os.ReadFile(filepath.Join(directory, "index.json"))
+		data, readErr := readPackGenerationFile(generationRoot, "index.json")
 		if readErr != nil {
 			return nil, fmt.Errorf("read pack index: %w", readErr)
 		}
@@ -191,7 +339,7 @@ func loadResolverResources(key resolverResourceKey) (*resolverResources, error) 
 		if _, ok := shared.packs[packName]; ok {
 			continue
 		}
-		file, err := os.Open(filepath.Join(directory, packName))
+		file, err := openPackGenerationFile(generationRoot, packName)
 		if err != nil {
 			return nil, fmt.Errorf("open pack %s: %w", packName, err)
 		}

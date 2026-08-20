@@ -4,7 +4,15 @@
 
 The Linux adapter has passed a real FUSE3 gate on Debian 12 as an unprivileged user. The same validation run used a race-enabled binary built with `CGO_ENABLED=1` and `-tags "fuse fuse3"`. The default non-CGo Linux build still compiles to the explicit prerequisite stub and does not silently select FUSE2.
 
-This evidence validates the Linux adapter and the `systemd --user` service lifecycle. It does not validate a real Linux Codex client, a client upgrade, the retention window, or a real Windows host. The project therefore remains `fs-engine-preview`.
+This evidence validates the Linux adapter and the `systemd --user` service lifecycle. It does not validate a real Linux Codex client, a client upgrade, the Linux real-client/restart/fault-injection recovery matrix, or a real Windows host. The project therefore remains `fs-engine-preview`.
+
+## Managed Deletion Identity Boundary
+
+Purge receipt v3 code on Linux now requires an explicit `linux-statx-btime-fs-ioc-getversion-v1` identity proof for the quarantine root and every recorded entry. While each object remains open through one descriptor, CodexFold obtains `statx(..., AT_EMPTY_PATH, STATX_BASIC_STATS | STATX_BTIME)` and `FS_IOC_GETVERSION`, checks the `statx` device/inode/UID/GID against `fstat`, captures the extended-attribute boundary, and repeats the complete identity capture before authorizing any physical removal. The birth time and nonzero inode generation are bound into the receipt tree hash together with the proof and source identifiers.
+
+This is deliberately not a universal Linux capability claim. A filesystem or kernel that does not provide `STATX_BTIME`, rejects `FS_IOC_GETVERSION`, returns a zero generation, or produces inconsistent identity fields cannot authorize physical purge. CodexFold fails closed: the tombstone and quarantined content remain available for diagnosis or a later retry. `statx.mnt_id`, device/inode alone, UID/GID, file bytes, and content hashes are not accepted as substitutes for inode generation.
+
+The Debian 12 evidence below predates this stronger deletion-identity gate. No fresh real-host run has yet proved both `STATX_BTIME` and `FS_IOC_GETVERSION` on the target filesystem, so Linux managed-deletion runtime parity remains unvalidated until that gate is executed successfully. Cross-compilation or mocked syscall tests do not satisfy that evidence requirement.
 
 ## Real Adapter Gate
 

@@ -57,7 +57,14 @@ final class CodexFoldFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations 
             let descriptor = try WireDescriptor(data: descriptorData)
             logger.notice("descriptor decoded generation=\(descriptor.generation, privacy: .public)")
             logger.notice("connecting to daemon socket")
-            let client = try DaemonClient(descriptor: descriptor)
+            let client = try DaemonClient(
+                descriptor: descriptor,
+                resourceURL: url,
+                mountID: volumeID.uuid.uuidString.lowercased(),
+                statusWriter: FrontendStatusWriter(
+                    containerURL: isDirectory.boolValue ? url : url.deletingLastPathComponent()
+                )
+            )
             logger.notice("daemon socket connected; sending ping")
             try client.ping()
             logger.notice("daemon ping succeeded")
@@ -95,16 +102,18 @@ private final class CodexFoldPrefetchChannel {
     let connection: WireConnection
     let handle: UInt64
     let generation: UInt64
+    let clientEpoch: UInt64
     let sharedReadWindow: WireSharedReadWindow?
     private(set) var nativeReadFD: Int32?
     private var closed = false
 
-    init(connection: WireConnection, opened: WireOpenResult, generation: UInt64) {
-        self.connection = connection
-        self.handle = opened.handle
+    init(binding: DaemonOpenBinding, generation: UInt64) {
+        self.connection = binding.connection
+        self.handle = binding.opened.handle
         self.generation = generation
-        self.nativeReadFD = opened.nativeReadFD
-        self.sharedReadWindow = opened.sharedReadWindow
+        self.clientEpoch = binding.clientEpoch
+        self.nativeReadFD = binding.opened.nativeReadFD
+        self.sharedReadWindow = binding.opened.sharedReadWindow
     }
 
     func close(client: DaemonClient) {
@@ -136,6 +145,8 @@ private final class CodexFoldIO {
     let handle: UInt64
     let path: String
     let writable: Bool
+    let openFlags: Int32
+    let clientEpoch: UInt64
     private let foregroundFetchLock = NSLock()
     private let cacheLock = NSLock()
     private let nativeFDLock = NSLock()
@@ -167,6 +178,8 @@ private final class CodexFoldIO {
         handle: UInt64,
         path: String,
         writable: Bool,
+        openFlags: Int32,
+        clientEpoch: UInt64,
         size: UInt64,
         nativeReadFD: Int32? = nil,
         sharedReadWindow: WireSharedReadWindow? = nil
@@ -176,6 +189,8 @@ private final class CodexFoldIO {
         self.handle = handle
         self.path = path
         self.writable = writable
+        self.openFlags = openFlags
+        self.clientEpoch = clientEpoch
         self.fileSize = Self.normalizedFileSize(size)
         let readAheadPolicy = CodexFoldReadAheadPolicy(
             negotiatedReadBytes: connection.maximumReadBytes
@@ -277,6 +292,19 @@ private final class CodexFoldIO {
         invalidatePrefetchChannels()
     }
 
+    var supportsVerifiedWriteReplay: Bool {
+        openFlags & Int32(bitPattern: UInt32(1) << 31) != 0
+    }
+
+    func readForWriteVerification(offset: Int64, length: Int) throws -> Data {
+        try client.read(
+            handle: handle,
+            offset: offset,
+            length: length,
+            connection: connection
+        )
+    }
+
     var usesNativeReadFD: Bool {
         nativeFDLock.lock()
         defer { nativeFDLock.unlock() }
@@ -344,6 +372,12 @@ private final class CodexFoldIO {
             return nil
         }
         if let channel = idlePrefetchChannels.popLast() {
+            if channel.clientEpoch != client.currentEpoch {
+                prefetchChannelCount -= 1
+                prefetchPoolLock.unlock()
+                channel.close(client: client)
+                return try checkoutPrefetchChannel()
+            }
             prefetchPoolLock.unlock()
             return channel
         }
@@ -355,29 +389,19 @@ private final class CodexFoldIO {
         prefetchChannelCount += 1
         prefetchPoolLock.unlock()
 
-        let connection: WireConnection
+        let binding: DaemonOpenBinding
         do {
-            connection = try client.newConnection()
+            binding = try client.openBinding(path, flags: O_RDONLY)
         } catch {
             releasePrefetchChannelReservation()
             throw error
         }
-        let channel: CodexFoldPrefetchChannel
-        do {
-            let opened = try client.open(path, flags: O_RDONLY, connection: connection)
-            channel = CodexFoldPrefetchChannel(
-                connection: connection,
-                opened: opened,
-                generation: generation
-            )
-        } catch {
-            connection.close()
-            releasePrefetchChannelReservation()
-            throw error
-        }
+        let channel = CodexFoldPrefetchChannel(binding: binding, generation: generation)
 
         prefetchPoolLock.lock()
-        let accepted = !prefetchPoolClosed && generation == prefetchPoolGeneration
+        let accepted = !prefetchPoolClosed &&
+            generation == prefetchPoolGeneration &&
+            channel.clientEpoch == client.currentEpoch
         if !accepted {
             prefetchChannelCount -= 1
         }
@@ -431,7 +455,8 @@ private final class CodexFoldIO {
         prefetchPoolLock.lock()
         let retain = healthy &&
             !prefetchPoolClosed &&
-            channel.generation == prefetchPoolGeneration
+            channel.generation == prefetchPoolGeneration &&
+            channel.clientEpoch == client.currentEpoch
         if retain {
             idlePrefetchChannels.append(channel)
         } else {
@@ -895,6 +920,34 @@ private final class CodexFoldItem: FSItem {
         storedIO = io
         lock.unlock()
         return previous
+    }
+
+    func removeIO(ifSame expected: CodexFoldIO) -> CodexFoldIO? {
+        lock.lock()
+        guard storedIO === expected else {
+            lock.unlock()
+            return nil
+        }
+        storedIO = nil
+        lock.unlock()
+        return expected
+    }
+
+    func installIO(
+        _ candidate: CodexFoldIO,
+        requiresWritable: Bool
+    ) -> (selected: CodexFoldIO, discarded: CodexFoldIO?) {
+        lock.lock()
+        if let existing = storedIO,
+           existing.clientEpoch == candidate.clientEpoch,
+           !requiresWritable || existing.writable {
+            lock.unlock()
+            return (existing, candidate)
+        }
+        let previous = storedIO
+        storedIO = candidate
+        lock.unlock()
+        return (candidate, previous)
     }
 
     func invalidateReadCache() {
@@ -1412,8 +1465,12 @@ private final class CodexFoldVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWr
             return
         }
         do {
-            let io = try ensureIO(item, writable: false)
-            let bytesRead = try io.read(client: client, offset: Int64(offset), length: length, into: buffer)
+            let bytesRead = try readWithRecovery(
+                item,
+                offset: Int64(offset),
+                length: length,
+                into: buffer
+            )
             let entry = item.entry
             replyHandler(FSReadFileResult(bytesRead: bytesRead, itemAttributes: attributes(for: entry)), nil)
         } catch {
@@ -1432,10 +1489,12 @@ private final class CodexFoldVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWr
             return
         }
         do {
-            let io = try ensureIO(item, writable: true)
             let previousSize = item.entry.size
-            io.invalidateReadCache()
-            let count = try client.write(handle: io.handle, offset: Int64(offset), data: contents, connection: io.connection)
+            let count = try writeWithRecovery(
+                contents,
+                to: item,
+                offset: Int64(offset)
+            )
             let entry = try client.getattr(item.entry.path)
             let invalidateKernelCache = writeRequiresKernelCacheInvalidation(
                 previousSize: previousSize,
@@ -1541,35 +1600,165 @@ private final class CodexFoldVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWr
         itemLock.unlock()
     }
 
-    private func ensureIO(_ item: CodexFoldItem, writable: Bool) throws -> CodexFoldIO {
-        if let existing = item.io(), !writable || existing.writable {
-            return existing
+    private func ensureIO(
+        _ item: CodexFoldItem,
+        writable: Bool,
+        noLaterThan deadline: Date? = nil
+    ) throws -> CodexFoldIO {
+        if let existing = item.io() {
+            if existing.clientEpoch == client.currentEpoch, !writable || existing.writable {
+                return existing
+            }
+            closeIO(item.removeIO(ifSame: existing))
         }
-        closeIO(item.replaceIO(nil))
-        let connection = try client.newConnection()
         var flags: Int32 = writable ? O_RDWR : O_RDONLY
         if writable && item.entry.path.hasSuffix(".jsonl") && !item.entry.name.hasPrefix("._") {
             flags |= O_APPEND
             flags |= Int32(bitPattern: 1 << 31)
         }
-        do {
-            let opened = try client.open(item.entry.path, flags: flags, connection: connection)
-            let io = CodexFoldIO(
-                client: client,
-                connection: connection,
-                handle: opened.handle,
-                path: item.entry.path,
-                writable: writable,
-                size: item.entry.size,
-                nativeReadFD: opened.nativeReadFD,
-                sharedReadWindow: opened.sharedReadWindow
+        let binding = try client.openBinding(
+            item.entry.path,
+            flags: flags,
+            noLaterThan: deadline
+        )
+        let io = CodexFoldIO(
+            client: client,
+            connection: binding.connection,
+            handle: binding.opened.handle,
+            path: item.entry.path,
+            writable: writable,
+            openFlags: flags,
+            clientEpoch: binding.clientEpoch,
+            size: item.entry.size,
+            nativeReadFD: binding.opened.nativeReadFD,
+            sharedReadWindow: binding.opened.sharedReadWindow
+        )
+        let installed = item.installIO(io, requiresWritable: writable)
+        closeIO(installed.discarded)
+        return installed.selected
+    }
+
+    private func readWithRecovery(
+        _ item: CodexFoldItem,
+        offset: Int64,
+        length: Int,
+        into buffer: FSMutableFileDataBuffer
+    ) throws -> Int {
+        var recoveryDeadline: Date?
+        var attempts = 0
+        while attempts < 8 {
+            let io = try ensureIO(
+                item,
+                writable: false,
+                noLaterThan: recoveryDeadline
             )
-            closeIO(item.replaceIO(io))
-            return io
-        } catch {
-            connection.close()
-            throw error
+            do {
+                return try io.read(
+                    client: client,
+                    offset: offset,
+                    length: length,
+                    into: buffer
+                )
+            } catch {
+                guard isRecoverableBindingError(error) else { throw error }
+                let deadline = recoveryDeadline ?? Date().addingTimeInterval(frontendRecoveryTimeout)
+                recoveryDeadline = deadline
+                try client.recover(
+                    after: error,
+                    observedEpoch: io.clientEpoch,
+                    noLaterThan: deadline
+                )
+                closeIO(item.removeIO(ifSame: io))
+                guard Date() <= deadline else { throw POSIXError(.ETIMEDOUT) }
+                attempts += 1
+            }
         }
+        throw POSIXError(.ETIMEDOUT)
+    }
+
+    private func writeWithRecovery(
+        _ contents: Data,
+        to item: CodexFoldItem,
+        offset: Int64
+    ) throws -> Int {
+        guard !contents.isEmpty else { return 0 }
+        var recoveryDeadline: Date?
+        var outcomeIsUncertain = false
+        var attempts = 0
+
+        while attempts < 8 {
+            let io = try ensureIO(
+                item,
+                writable: true,
+                noLaterThan: recoveryDeadline
+            )
+            io.invalidateReadCache()
+
+            if outcomeIsUncertain {
+                do {
+                    let existing = try io.readForWriteVerification(
+                        offset: offset,
+                        length: contents.count
+                    )
+                    switch wireWriteRecoveryDecision(
+                        existing: existing,
+                        requested: contents,
+                        supportsSnapshotReplay: io.supportsVerifiedWriteReplay
+                    ) {
+                    case .alreadyCommitted:
+                        return contents.count
+                    case .replaySnapshot:
+                        break
+                    case .conflict:
+                        throw POSIXError(.EIO)
+                    }
+                } catch {
+                    guard isRecoverableBindingError(error) else { throw error }
+                    let deadline = recoveryDeadline ?? Date().addingTimeInterval(frontendRecoveryTimeout)
+                    recoveryDeadline = deadline
+                    try client.recover(
+                        after: error,
+                        observedEpoch: io.clientEpoch,
+                        noLaterThan: deadline
+                    )
+                    closeIO(item.removeIO(ifSame: io))
+                    guard Date() <= deadline else { throw POSIXError(.ETIMEDOUT) }
+                    attempts += 1
+                    continue
+                }
+            }
+
+            do {
+                let count = try client.write(
+                    handle: io.handle,
+                    offset: offset,
+                    data: contents,
+                    connection: io.connection
+                )
+                guard count >= 0, count <= contents.count else {
+                    throw POSIXError(.EPROTO)
+                }
+                return count
+            } catch {
+                guard isRecoverableBindingError(error) else { throw error }
+                let deadline = recoveryDeadline ?? Date().addingTimeInterval(frontendRecoveryTimeout)
+                recoveryDeadline = deadline
+                try client.recover(
+                    after: error,
+                    observedEpoch: io.clientEpoch,
+                    noLaterThan: deadline
+                )
+                closeIO(item.removeIO(ifSame: io))
+                outcomeIsUncertain = true
+                guard Date() <= deadline else { throw POSIXError(.ETIMEDOUT) }
+                attempts += 1
+            }
+        }
+        throw POSIXError(.ETIMEDOUT)
+    }
+
+    private func isRecoverableBindingError(_ error: any Error) -> Bool {
+        isWireTransportError(error) || (error as? POSIXError)?.code == .EBADF
     }
 
     private func applyAttributes(

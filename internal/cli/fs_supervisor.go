@@ -26,9 +26,10 @@ func newFSNativeSupervisorCommand() *cobra.Command {
 	var apply, jsonOutput bool
 	command := &cobra.Command{
 		Use:   "supervise",
-		Short: "Keep the native FSKit mount healthy and remount it after daemon or extension failure",
+		Short: "Keep the native FSKit mount present while its backend recovers",
 		Args:  cobra.NoArgs,
 		RunE: func(command *cobra.Command, _ []string) error {
+			command.SetErr(newTimestampedWriter(command.ErrOrStderr()))
 			if !filepath.IsAbs(resourcePath) || !filepath.IsAbs(mountPoint) {
 				return errors.New("absolute FSKit resource and mount paths are required")
 			}
@@ -57,6 +58,7 @@ func newFSNativeSupervisorCommand() *cobra.Command {
 			return service.RunNativeFSKitSupervisor(command.Context(), service.NativeFSKitSupervisorOptions{
 				ResourcePath: result.ResourcePath, MountPoint: result.MountPoint,
 				Interval: result.Interval, ProbeTimeout: result.ProbeTimeout, RecoveryTimeout: result.Recovery,
+				StatusPath: service.FSKitStatusPath(result.ResourcePath, "supervisor"),
 				Event: func(message string) {
 					_, _ = fmt.Fprintf(command.ErrOrStderr(), "native-fskit supervisor: %s\n", message)
 				},

@@ -2,6 +2,7 @@ package codex
 
 import (
 	"database/sql"
+	"errors"
 	"path/filepath"
 	"testing"
 
@@ -49,6 +50,17 @@ func TestLoadSessionsReadsCodexStateDatabase(t *testing.T) {
 	}
 	if sessions[1].ID != "archived" || !sessions[1].Archived || sessions[1].Model != "" {
 		t.Fatalf("unexpected archived session: %#v", sessions[1])
+	}
+
+	active, err := LoadSession(home, "active")
+	if err != nil {
+		t.Fatalf("LoadSession returned error: %v", err)
+	}
+	if active.ID != "active" || active.Archived || active.Model != "model-a" || active.GitBranch != "main" {
+		t.Fatalf("unexpected single active session: %#v", active)
+	}
+	if _, err := LoadSession(home, "missing"); !errors.Is(err, ErrSessionNotFound) {
+		t.Fatalf("LoadSession missing error = %v, want ErrSessionNotFound", err)
 	}
 }
 

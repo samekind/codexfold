@@ -59,7 +59,16 @@ type indexV3 struct {
 }
 
 func openIndexV3(directory string) (*indexV3, error) {
-	data, err := os.ReadFile(filepath.Join(directory, indexV3MetaFilename))
+	root, err := openPackGenerationRoot(directory)
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
+	return openIndexV3Root(filepath.Clean(directory), root)
+}
+
+func openIndexV3Root(directory string, root *os.Root) (*indexV3, error) {
+	data, err := readPackGenerationFile(root, indexV3MetaFilename)
 	if err != nil {
 		return nil, err
 	}
@@ -70,11 +79,11 @@ func openIndexV3(directory string) (*indexV3, error) {
 	if err := validateIndexV3Meta(meta, filepath.Base(directory)); err != nil {
 		return nil, err
 	}
-	objects, err := os.Open(filepath.Join(directory, indexV3ObjectsFile))
+	objects, err := openPackGenerationFile(root, indexV3ObjectsFile)
 	if err != nil {
 		return nil, fmt.Errorf("open pack v3 object index: %w", err)
 	}
-	blocks, err := os.Open(filepath.Join(directory, indexV3BlocksFile))
+	blocks, err := openPackGenerationFile(root, indexV3BlocksFile)
 	if err != nil {
 		_ = objects.Close()
 		return nil, fmt.Errorf("open pack v3 block index: %w", err)

@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -16,11 +18,13 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/samekind/codexfold/internal/buildid"
 	"github.com/samekind/codexfold/internal/fskitproto"
+	"github.com/samekind/codexfold/internal/fskitstatus"
 	"github.com/samekind/codexfold/internal/mountid"
 )
 
@@ -31,9 +35,146 @@ type NativeFSKitServerOptions struct {
 	Generation                 uint64
 	MaxPayload                 uint32
 	BuildSHA256                string
+	StatusPath                 string
+	MountPoint                 string
+	StatusInterval             time.Duration
 	Recorder                   func(string)
+	Activity                   *IOActivityCounter
 	PrewarmSharedMemoryWindows int
 	PrewarmSharedFileWindows   int
+}
+
+type IOActivityTotals struct {
+	ReadBytes    uint64
+	WrittenBytes uint64
+}
+
+type IOActivityCounter struct {
+	readBytes    atomic.Uint64
+	writtenBytes atomic.Uint64
+}
+
+func (c *IOActivityCounter) Snapshot() IOActivityTotals {
+	if c == nil {
+		return IOActivityTotals{}
+	}
+	return IOActivityTotals{
+		ReadBytes:    c.readBytes.Load(),
+		WrittenBytes: c.writtenBytes.Load(),
+	}
+}
+
+func (c *IOActivityCounter) recordRead(bytes int) {
+	if c != nil && bytes > 0 {
+		c.readBytes.Add(uint64(bytes))
+	}
+}
+
+func (c *IOActivityCounter) recordWrite(bytes int) {
+	if c != nil && bytes > 0 {
+		c.writtenBytes.Add(uint64(bytes))
+	}
+}
+
+type nativeFSKitDaemonStatusTracker struct {
+	mu                  sync.Mutex
+	publisherInstanceID string
+	backendID           string
+	observationSequence uint64
+	incidentID          string
+	incidentSince       time.Time
+}
+
+func newNativeFSKitDaemonStatusTracker(options NativeFSKitServerOptions) *nativeFSKitDaemonStatusTracker {
+	var token [16]byte
+	publisherInstanceID := ""
+	if _, err := rand.Read(token[:]); err == nil {
+		publisherInstanceID = "daemon-publisher-" + hex.EncodeToString(token[:])
+	} else {
+		publisherInstanceID = fmt.Sprintf("daemon-publisher-%x", time.Now().UnixNano())
+	}
+	identity := strings.Join([]string{
+		"codexfold-daemon-backend-v1",
+		filepath.Clean(options.ResourcePath),
+		filepath.Clean(options.MountPoint),
+	}, "\x00")
+	digest := sha256.Sum256([]byte(identity))
+	return &nativeFSKitDaemonStatusTracker{
+		publisherInstanceID: publisherInstanceID,
+		backendID:           "daemon-backend-sha256-" + hex.EncodeToString(digest[:]),
+	}
+}
+
+func (t *nativeFSKitDaemonStatusTracker) resume(snapshot fskitstatus.Snapshot) {
+	if t == nil || snapshot.Component != "daemon" || snapshot.BackendID != t.backendID || snapshot.IncidentID == "" {
+		return
+	}
+	since, err := time.Parse(time.RFC3339Nano, snapshot.RecoveryStartedAt)
+	if err != nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.incidentID = snapshot.IncidentID
+	t.incidentSince = since
+}
+
+func (t *nativeFSKitDaemonStatusTracker) snapshot(
+	options NativeFSKitServerOptions,
+	identity mountid.Identity,
+	state string,
+	summary string,
+	detail string,
+) fskitstatus.Snapshot {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.observationSequence != ^uint64(0) {
+		t.observationSequence++
+	}
+	now := time.Now().UTC()
+	unhealthy := state != "healthy"
+	if unhealthy && t.incidentID == "" {
+		var token [16]byte
+		if _, err := rand.Read(token[:]); err == nil {
+			t.incidentID = "daemon-incident-" + hex.EncodeToString(token[:])
+		} else {
+			t.incidentID = fmt.Sprintf("daemon-incident-%x", now.UnixNano())
+		}
+		t.incidentSince = now
+	}
+	snapshot := fskitstatus.Snapshot{
+		Component: "daemon", State: state, Summary: summary, Detail: detail,
+		MountID: identity.Nonce, Generation: options.Generation,
+		MountPoint: options.MountPoint, ResourcePath: options.ResourcePath, PID: os.Getpid(),
+		ObservationSequence: t.observationSequence,
+		PublisherInstanceID: t.publisherInstanceID,
+		BackendID:           t.backendID,
+	}
+	if options.Activity != nil {
+		activity := options.Activity.Snapshot()
+		readBytes := activity.ReadBytes
+		writtenBytes := activity.WrittenBytes
+		snapshot.ReadBytesTotal = &readBytes
+		snapshot.WrittenBytesTotal = &writtenBytes
+	}
+	if t.incidentID != "" {
+		snapshot.IncidentID = t.incidentID
+		snapshot.RecoveryStartedAt = t.incidentSince.Format(time.RFC3339Nano)
+		snapshot.ElapsedMilliseconds = max(0, now.Sub(t.incidentSince).Milliseconds())
+		if unhealthy {
+			snapshot.Reason = summary
+			snapshot.Impact = "Codex session file operations may wait or fail while the backend is unavailable."
+			snapshot.Recommendations = []string{
+				"Keep Codex running while CodexFold recovers the backend.",
+				"Open CodexFold to inspect the current incident.",
+			}
+		}
+	}
+	if state == "healthy" {
+		t.incidentID = ""
+		t.incidentSince = time.Time{}
+	}
+	return snapshot
 }
 
 const (
@@ -50,6 +191,7 @@ type nativeFSKitServer struct {
 	generation          uint64
 	maxPayload          uint32
 	recorder            func(string)
+	activity            *IOActivityCounter
 	health              []byte
 	startedAt           time.Time
 	nodes               nativeFSKitNodes
@@ -67,8 +209,8 @@ type nativeSharedFileWindowPool struct {
 type nativeFSKitNodes struct {
 	mu      sync.Mutex
 	version uint64
-	next    uint64
 	byPath  map[string]nativeFSKitNode
+	byID    map[uint64]string
 }
 
 type nativeFSKitNode struct {
@@ -95,7 +237,7 @@ type nativeFSKitHandle struct {
 	sharedWindowFlag uint32
 }
 
-func ServeNativeFSKit(ctx context.Context, filesystem *Filesystem, options NativeFSKitServerOptions) error {
+func ServeNativeFSKit(ctx context.Context, filesystem *Filesystem, options NativeFSKitServerOptions) (returnErr error) {
 	if filesystem == nil {
 		return errors.New("FSKit server filesystem is required")
 	}
@@ -107,6 +249,15 @@ func ServeNativeFSKit(ctx context.Context, filesystem *Filesystem, options Nativ
 	}
 	if options.ResourcePath == "" || !filepath.IsAbs(options.ResourcePath) {
 		return errors.New("FSKit resource path must be absolute")
+	}
+	if options.StatusPath != "" && !filepath.IsAbs(options.StatusPath) {
+		return errors.New("FSKit daemon status path must be absolute")
+	}
+	if options.StatusPath != "" && !filepath.IsAbs(options.MountPoint) {
+		return errors.New("FSKit daemon status requires an absolute mount point")
+	}
+	if options.StatusInterval <= 0 {
+		options.StatusInterval = time.Second
 	}
 	if fskitproto.UsesDirectoryResource(options.ResourcePath) {
 		relativeSocket, err := filepath.Rel(filepath.Clean(options.ResourcePath), filepath.Clean(options.SocketPath))
@@ -155,6 +306,46 @@ func ServeNativeFSKit(ctx context.Context, filesystem *Filesystem, options Nativ
 	if err != nil {
 		return fmt.Errorf("generate native FSKit mount identity: %w", err)
 	}
+	identity, err := mountid.Parse([]byte(health))
+	if err != nil {
+		return fmt.Errorf("parse native FSKit mount identity: %w", err)
+	}
+	var statusPublisher *fskitstatus.Publisher
+	statusTracker := newNativeFSKitDaemonStatusTracker(options)
+	if options.StatusPath != "" {
+		statusPublisher = fskitstatus.NewPublisher(options.StatusPath, func(err error) {
+			if options.Recorder != nil {
+				options.Recorder(fmt.Sprintf("status_write_error component=daemon error=%q", err.Error()))
+			}
+		})
+		if previous, readErr := fskitstatus.Read(options.StatusPath); readErr == nil {
+			statusTracker.resume(previous)
+		}
+	}
+	writeStatus := func(state string, summary string, detail string) {
+		statusPublisher.Publish(statusTracker.snapshot(options, identity, state, summary, detail))
+	}
+	writeStatus("recovering", "File service backend is starting", "")
+	var heartbeatCancel context.CancelFunc
+	var heartbeatDone chan struct{}
+	defer func() {
+		if heartbeatCancel != nil {
+			heartbeatCancel()
+			<-heartbeatDone
+		}
+		state := "stopped"
+		summary := "File service backend is stopped"
+		detail := ""
+		if returnErr != nil && ctx.Err() == nil {
+			state = "unavailable"
+			summary = "File service backend stopped unexpectedly"
+			detail = returnErr.Error()
+		}
+		writeStatus(state, summary, detail)
+		closeCtx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+		_ = statusPublisher.Close(closeCtx)
+	}()
 	if err := os.MkdirAll(filepath.Dir(options.SocketPath), 0o700); err != nil {
 		return fmt.Errorf("create FSKit socket directory: %w", err)
 	}
@@ -176,12 +367,13 @@ func ServeNativeFSKit(ctx context.Context, filesystem *Filesystem, options Nativ
 		generation: options.Generation,
 		maxPayload: options.MaxPayload,
 		recorder:   options.Recorder,
+		activity:   options.Activity,
 		health:     []byte(health),
 		startedAt:  time.Now(),
 		nodes: nativeFSKitNodes{
 			version: filesystem.NamespaceVersion(),
-			next:    4,
 			byPath:  map[string]nativeFSKitNode{"/": {id: 2}},
+			byID:    map[uint64]string{2: "reserved:root", 3: "reserved:health"},
 		},
 	}
 	windowBytes := min(nativeFSKitSharedWindowBytes, int(options.MaxPayload)-4)
@@ -207,6 +399,23 @@ func ServeNativeFSKit(ctx context.Context, filesystem *Filesystem, options Nativ
 	if err := writeNativeFSKitResource(options.ResourcePath, descriptor); err != nil {
 		return err
 	}
+	writeStatus("healthy", "File service backend is available", "")
+	heartbeatCtx, cancelHeartbeat := context.WithCancel(ctx)
+	heartbeatCancel = cancelHeartbeat
+	heartbeatDone = make(chan struct{})
+	go func() {
+		defer close(heartbeatDone)
+		ticker := time.NewTicker(options.StatusInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-heartbeatCtx.Done():
+				return
+			case <-ticker.C:
+				writeStatus("healthy", "File service backend is available", "")
+			}
+		}
+	}()
 	go func() {
 		<-ctx.Done()
 		_ = listener.Close()
@@ -303,6 +512,9 @@ func writeNativeFSKitResource(resourcePath string, data []byte) error {
 		return fmt.Errorf("publish FSKit resource: %w", err)
 	}
 	committed = true
+	if err := syncDirectory(filepath.Dir(descriptorPath)); err != nil {
+		return fmt.Errorf("sync FSKit resource directory: %w", err)
+	}
 	return nil
 }
 
@@ -391,6 +603,12 @@ func (c *nativeFSKitConnection) streamRead(request fskitproto.Frame) (handled bo
 	if !exists || handleState.health {
 		return false, false, 0, nil
 	}
+	delivered := 0
+	defer func() {
+		if handled && responseWritten && err == nil {
+			c.server.activity.recordRead(delivered)
+		}
+	}()
 	response := fskitproto.Frame{
 		Kind:       fskitproto.KindResponse,
 		Op:         request.Op,
@@ -415,6 +633,7 @@ func (c *nativeFSKitConnection) streamRead(request fskitproto.Frame) (handled bo
 			}
 			return sendNativeFile(c.conn, file, fileOffset, count)
 		})
+		delivered = n
 	}
 	if !handled {
 		if handleState.sharedWindow != nil && handleState.sharedWindowFlag != 0 && length <= handleState.sharedWindow.capacity {
@@ -425,6 +644,7 @@ func (c *nativeFSKitConnection) streamRead(request fskitproto.Frame) (handled bo
 				length,
 			)
 			if windowHandled {
+				delivered = windowBytes
 				transport := "shared_window"
 				if handleState.sharedWindowFlag == fskitproto.FlagSharedFileWindow {
 					transport = "shared_file_window"
@@ -442,6 +662,7 @@ func (c *nativeFSKitConnection) streamRead(request fskitproto.Frame) (handled bo
 				length,
 			)
 			if sharedHandled {
+				delivered = sharedBytes
 				c.server.record(fmt.Sprintf("io=read_result handle=%d offset=%d bytes=%d duration_ns=%d transport=shared_fd", handle, offset, sharedBytes, time.Since(startedAt).Nanoseconds()))
 				return true, sharedWritten, 0, sharedErr
 			}
@@ -461,6 +682,7 @@ func (c *nativeFSKitConnection) streamRead(request fskitproto.Frame) (handled bo
 			}
 			return fskitproto.WriteFramePayload(c.conn, chunk)
 		})
+		delivered = n
 		c.server.record(fmt.Sprintf("io=read_result handle=%d offset=%d bytes=%d duration_ns=%d", handle, offset, n, time.Since(startedAt).Nanoseconds()))
 		if streamErr != nil {
 			return true, started, 0, streamErr
@@ -901,6 +1123,7 @@ func (c *nativeFSKitConnection) dispatch(operation fskitproto.Op, payload []byte
 		if errno != 0 {
 			return nil, int32(errno)
 		}
+		c.server.activity.recordRead(n)
 		encoder := fskitproto.NewEncoder(4 + n)
 		encoder.Bytes(buffer[:n])
 		return encoder.Data(), 0
@@ -921,6 +1144,7 @@ func (c *nativeFSKitConnection) dispatch(operation fskitproto.Op, payload []byte
 		if errno != 0 {
 			return nil, int32(errno)
 		}
+		c.server.activity.recordWrite(n)
 		if attribute, attrErrno := c.server.filesystem.Getattr(handleState.path); attrErrno == 0 {
 			c.server.record(fmt.Sprintf("write_result handle=%d reported=%d normalized=%t visible=%d", handle, n, normalized, attribute.Size))
 		}
@@ -1275,16 +1499,30 @@ func (s *nativeFSKitServer) entry(name string) (fskitproto.Entry, syscall.Errno)
 	case syscall.S_IFLNK:
 		entryType = fskitproto.EntrySymlink
 	}
-	nodeID := s.nodes.node(cleaned, attribute.ObjectID)
+	nodeID, ok := s.nodes.node(cleaned, attribute.ObjectID)
+	if !ok {
+		s.record(fmt.Sprintf("node_id_collision path=%q object_id=%q", cleaned, attribute.ObjectID))
+		return fskitproto.Entry{}, syscall.EIO
+	}
 	parentID := uint64(1)
 	if cleaned == "/" {
 		parentID = 1
 	} else {
 		parentPath := path.Dir(cleaned)
 		if parentAttribute, parentErrno := s.filesystem.Getattr(parentPath); parentErrno == 0 {
-			parentID = s.nodes.node(parentPath, parentAttribute.ObjectID)
+			var parentOK bool
+			parentID, parentOK = s.nodes.node(parentPath, parentAttribute.ObjectID)
+			if !parentOK {
+				s.record(fmt.Sprintf("node_id_collision path=%q object_id=%q", parentPath, parentAttribute.ObjectID))
+				return fskitproto.Entry{}, syscall.EIO
+			}
 		} else {
-			parentID = s.nodes.node(parentPath, "")
+			var parentOK bool
+			parentID, parentOK = s.nodes.node(parentPath, "")
+			if !parentOK {
+				s.record(fmt.Sprintf("node_id_collision path=%q", parentPath))
+				return fskitproto.Entry{}, syscall.EIO
+			}
 		}
 	}
 	allocated := uint64(0)
@@ -1318,22 +1556,52 @@ func (n *nativeFSKitNodes) acceptVersion(version uint64) {
 	n.mu.Unlock()
 }
 
-func (n *nativeFSKitNodes) node(name string, objectID string) uint64 {
+func (n *nativeFSKitNodes) node(name string, objectID string) (uint64, bool) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	if name == "/" {
+		n.ensureIndexes()
+		n.byPath[name] = nativeFSKitNode{id: 2, objectID: objectID}
+		return 2, true
+	}
+	identity := objectID
+	if identity == "" {
+		identity = "path:" + name
+	}
 	if node, exists := n.byPath[name]; exists {
-		if node.objectID == "" && objectID != "" {
-			node.objectID = objectID
-			n.byPath[name] = node
-		}
-		if objectID == "" || node.objectID == objectID {
-			return node.id
+		if node.objectID == identity {
+			return node.id, true
 		}
 	}
-	nodeID := n.next
-	n.next++
-	n.byPath[name] = nativeFSKitNode{id: nodeID, objectID: objectID}
-	return nodeID
+	n.ensureIndexes()
+	nodeID := stableNativeFSKitNodeID(identity)
+	if existing, exists := n.byID[nodeID]; exists && existing != identity {
+		return 0, false
+	}
+	n.byID[nodeID] = identity
+	n.byPath[name] = nativeFSKitNode{id: nodeID, objectID: identity}
+	return nodeID, true
+}
+
+func (n *nativeFSKitNodes) ensureIndexes() {
+	if n.byPath == nil {
+		n.byPath = make(map[string]nativeFSKitNode)
+	}
+	if n.byID != nil {
+		return
+	}
+	n.byID = map[uint64]string{2: "reserved:root", 3: "reserved:health"}
+	for _, node := range n.byPath {
+		if node.id >= 4 && node.objectID != "" {
+			n.byID[node.id] = node.objectID
+		}
+	}
+}
+
+func stableNativeFSKitNodeID(objectID string) uint64 {
+	digest := sha256.Sum256([]byte("codexfold-fskit-node-v1\x00" + objectID))
+	// IDs 1-3 are reserved by FSKit, the volume root, and the health file.
+	return 4 + binary.BigEndian.Uint64(digest[:8])%(^(uint64(0))-3)
 }
 
 func (n *nativeFSKitNodes) forget(name string) {

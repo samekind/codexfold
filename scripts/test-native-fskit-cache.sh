@@ -7,6 +7,7 @@ trap 'rm -rf "$out"' EXIT
 
 xcrun swiftc -O \
   -o "$out/codexfold-read-cache-tests" \
+  "$root/platform/darwin/fskit/Shared/DurableAppGroupFile.swift" \
   "$root/platform/darwin/fskit/Extension/Wire.swift" \
   "$root/platform/darwin/fskit/Extension/ReadCache.swift" \
   "$root/platform/darwin/fskit/Tests/ReadCacheTests.swift"

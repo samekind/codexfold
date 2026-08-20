@@ -17,13 +17,15 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-type nativeFSKitOperations struct{}
-
-func defaultNativeFSKitOperations() (NativeFSKitOperations, error) {
-	return nativeFSKitOperations{}, nil
+type nativeFSKitOperations struct {
+	mountStateProbe chan struct{}
 }
 
-func (nativeFSKitOperations) DaemonHealthy(ctx context.Context, resourcePath string) error {
+func defaultNativeFSKitOperations() (NativeFSKitOperations, error) {
+	return &nativeFSKitOperations{mountStateProbe: make(chan struct{}, 1)}, nil
+}
+
+func (*nativeFSKitOperations) DaemonHealthy(ctx context.Context, resourcePath string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -36,9 +38,53 @@ func (nativeFSKitOperations) DaemonHealthy(ctx context.Context, resourcePath str
 	return err
 }
 
-func (nativeFSKitOperations) MountState(ctx context.Context, mountPoint string, timeout time.Duration) (NativeFSKitMountState, error) {
+func (operations *nativeFSKitOperations) MountState(ctx context.Context, mountPoint string, timeout time.Duration) (NativeFSKitMountState, error) {
+	if timeout <= 0 {
+		timeout = 2 * time.Second
+	}
+	return boundedNativeFSKitMountState(ctx, timeout, operations.mountStateProbe, func(probeCtx context.Context) (NativeFSKitMountState, error) {
+		return probeNativeFSKitMountState(probeCtx, mountPoint)
+	})
+}
+
+type nativeFSKitMountStateResult struct {
+	state NativeFSKitMountState
+	err   error
+}
+
+func boundedNativeFSKitMountState(
+	ctx context.Context,
+	timeout time.Duration,
+	probeSlot chan struct{},
+	probe func(context.Context) (NativeFSKitMountState, error),
+) (NativeFSKitMountState, error) {
+	probeCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	select {
+	case probeSlot <- struct{}{}:
+	case <-probeCtx.Done():
+		return NativeFSKitMountState{}, fmt.Errorf("native FSKit mount health probe did not start within %s: %w", timeout, probeCtx.Err())
+	}
+	result := make(chan nativeFSKitMountStateResult, 1)
+	go func() {
+		defer func() { <-probeSlot }()
+		state, err := probe(probeCtx)
+		result <- nativeFSKitMountStateResult{state: state, err: err}
+	}()
+	select {
+	case result := <-result:
+		return result.state, result.err
+	case <-probeCtx.Done():
+		return NativeFSKitMountState{}, fmt.Errorf("native FSKit mount health probe exceeded %s: %w", timeout, probeCtx.Err())
+	}
+}
+
+func probeNativeFSKitMountState(ctx context.Context, mountPoint string) (NativeFSKitMountState, error) {
 	var stat unix.Statfs_t
 	if err := unix.Statfs(mountPoint, &stat); err != nil {
+		if errors.Is(err, unix.ENOENT) {
+			return NativeFSKitMountState{}, nil
+		}
 		return NativeFSKitMountState{}, err
 	}
 	requested := canonicalMountPath(mountPoint)
@@ -51,13 +97,8 @@ func (nativeFSKitOperations) MountState(ctx context.Context, mountPoint string, 
 	if !state.Owned {
 		return state, nil
 	}
-	if timeout <= 0 {
-		timeout = 2 * time.Second
-	}
-	probeCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
 	for _, directory := range []string{"sessions", "archived_sessions"} {
-		command := exec.CommandContext(probeCtx, "/usr/bin/stat", "-f", "%HT", filepath.Join(mountPoint, directory))
+		command := exec.CommandContext(ctx, "/usr/bin/stat", "-f", "%HT", filepath.Join(mountPoint, directory))
 		if output, err := command.CombinedOutput(); err != nil {
 			return state, fmt.Errorf("probe native FSKit directory %s: %w: %s", directory, err, strings.TrimSpace(string(output)))
 		}
@@ -73,7 +114,7 @@ func (nativeFSKitOperations) MountState(ctx context.Context, mountPoint string, 
 	return state, nil
 }
 
-func (nativeFSKitOperations) Mount(ctx context.Context, resourcePath string, mountPoint string) error {
+func (*nativeFSKitOperations) Mount(ctx context.Context, resourcePath string, mountPoint string) error {
 	if err := os.MkdirAll(mountPoint, 0o700); err != nil {
 		return err
 	}
@@ -88,7 +129,7 @@ func nativeFSKitMountArguments(resourcePath string, mountPoint string) []string 
 	return []string{"-F", "-t", "codexfoldnative", resourcePath, mountPoint}
 }
 
-func (nativeFSKitOperations) Unmount(ctx context.Context, mountPoint string, force bool) error {
+func (*nativeFSKitOperations) Unmount(ctx context.Context, mountPoint string, force bool) error {
 	arguments := []string{mountPoint}
 	if force {
 		arguments = []string{"-f", mountPoint}

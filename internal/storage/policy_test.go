@@ -34,11 +34,58 @@ func TestLoadLimitsUsesBoundedDefaultsAndAllowsStoreOverride(t *testing.T) {
 	}
 }
 
+func TestLoadRetentionPolicyDefaultsToExactProofAndAllowsManualOverride(t *testing.T) {
+	store := t.TempDir()
+	defaults, err := LoadRetentionPolicy(store)
+	if err != nil {
+		t.Fatalf("LoadRetentionPolicy defaults: %v", err)
+	}
+	if defaults.NativeSnapshots != NativeSnapshotRetentionExactProof {
+		t.Fatalf("default native snapshot retention = %q", defaults.NativeSnapshots)
+	}
+	legacyData, err := json.Marshal(map[string]any{"version": 1, "limits": DefaultLimits})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(store, PolicyFilename), append(legacyData, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	legacy, err := LoadRetentionPolicy(store)
+	if err != nil {
+		t.Fatalf("LoadRetentionPolicy legacy policy: %v", err)
+	}
+	if legacy.NativeSnapshots != NativeSnapshotRetentionExactProof {
+		t.Fatalf("legacy policy native snapshot retention = %q", legacy.NativeSnapshots)
+	}
+
+	data, err := json.Marshal(map[string]any{
+		"version": 1,
+		"limits":  DefaultLimits,
+		"retention": map[string]any{
+			"native_snapshots": NativeSnapshotRetentionManual,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(store, PolicyFilename), append(data, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := LoadRetentionPolicy(store)
+	if err != nil {
+		t.Fatalf("LoadRetentionPolicy override: %v", err)
+	}
+	if got.NativeSnapshots != NativeSnapshotRetentionManual {
+		t.Fatalf("native snapshot retention = %q", got.NativeSnapshots)
+	}
+}
+
 func TestLoadLimitsRejectsUnboundedOrUnknownPolicy(t *testing.T) {
 	tests := []string{
 		`{"version":2,"limits":{"max_physical_bytes":1,"max_temporary_bytes":1,"free_space_reserve_bytes":1}}`,
 		`{"version":1,"limits":{"max_physical_bytes":0,"max_temporary_bytes":1,"free_space_reserve_bytes":1}}`,
 		`{"version":1,"limits":{"max_physical_bytes":1,"max_temporary_bytes":1,"free_space_reserve_bytes":1},"extra":true}`,
+		`{"version":1,"limits":{"max_physical_bytes":1,"max_temporary_bytes":1,"free_space_reserve_bytes":1},"retention":{"native_snapshots":"seven-days"}}`,
 	}
 	for index, data := range tests {
 		store := t.TempDir()

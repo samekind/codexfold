@@ -1,5 +1,48 @@
 # macOS Adapter And Canary Validation
 
+## Current Worktree Checkpoint (2026-07-26)
+
+The current worktree must not inherit the completed signed build 102 evidence recorded later in this document. Its isolated Cockpit run has reached only the following boundary:
+
+| Evidence layer | Current worktree result |
+| --- | --- |
+| Runtime implementation | Implemented |
+| Unit and synthetic runtime coverage | Present; not real-candidate evidence |
+| Real isolated Cockpit **Start** | Observed |
+| Isolated Desktop/app-server binding and ancestry | Observed |
+| Protected production Codex process unchanged | Observed at the recorded verification point |
+| Real isolated Desktop task mutation | Not observed |
+| Current CodexFold candidate attached | No |
+| Managed route through that candidate | Not observed |
+| Candidate fault injection/recovery | Zero runs |
+| Backend crash/new-PID respawn evidence | Not recorded |
+| Native incident census/screenshots/exports | Not recorded |
+| Bound native GUI review | Not recorded |
+| `codexInstanceAcceptanceComplete` | `false` |
+| `codexFoldCandidateAcceptanceComplete` | `false` |
+| `realAcceptanceComplete` | `false` |
+| Current candidate native FSKit deployed | No |
+| Production CodexFold/FSKit/LaunchAgent changed by this validation | No |
+
+Current unit and synthetic coverage exercises crash-only menu-bar residency, continuously resident backend/supervisor/incident-helper behavior, durable daemon and supervisor heartbeat identity, outage continuity across UI/helper restart, one shared continuous ten-second incident threshold, exact-occurrence acknowledgement, bounded status-file reads, and durable App Group publication. Passing such tests proves only the exercised code paths. It does not substitute for a real task through the attached current candidate or for candidate-only fault injection, native incident-window presentation, and recovery evidence.
+
+The isolated acceptance evidence contract is now `codexfold.isolated-acceptance.v3`. Version 2 bound the live Go daemon/build but did not prove which Swift FSKit module `fskitd` loaded, so v1/v2 runs and external candidate evidence fail closed and cannot be upgraded or relabeled. A v3 candidate must bind all of the following in one fresh run:
+
+- the prepared current-worktree source snapshot and a candidate-local build manifest that binds that snapshot to the Go binary, signed App, and Swift module artifacts;
+- the signed candidate App and the exact module nested under `Contents/Extensions/CodexFoldFSKitModule.appex`, including bundle/version, team, code-directory hash, executable SHA-256, and directory identity;
+- an exact `pluginkit` registration match for that candidate module path, not merely the shared bundle identifier;
+- an immutable pre-mount module-process snapshot and exactly one newly observed module PID/start/executable/command identity after the real mount;
+- the live Go daemon/build, real mount, isolated SQLite route, and real Cockpit task while those same candidate identities remain attached.
+
+This distinction is material on the current machine: two build-103 modules with the same bundle identifier are registered from older production and Debug paths, and neither is evidence for the current worktree candidate. Likewise, run `isolated-20260726T142819Z` has lost its recorded isolated and protected PID fences and is now historical point-in-time evidence only. It must not be used for live candidate attachment. The next real validation requires a fresh v3 run; retained v1/v2 evidence files must not be edited by hand.
+
+Even valid v3 candidate attachment and a real task do not by themselves complete acceptance. The completion oracle now separates two independent gates:
+
+- `candidateFaultAcceptanceComplete` requires the exact isolated candidate backend PID to receive an explicitly authorized `SIGKILL`, the old PID/start identity to disappear, and a different PID to become healthy with the same executable and command hashes, build, service definition, mount identity, logical backend ID, and updated PID file. The candidate anchor SHA remains unchanged while the validated runtime epoch advances. The existing bounded `SIGSTOP`/`SIGCONT` diagnostic does not satisfy this gate.
+- `nativeIncidentAcceptanceComplete` requires two different occurrence and recovery epochs. For both epochs the combined menu-bar/helper window census must remain zero before ten seconds and become exactly one at or after ten seconds. The first occurrence must retain one window through active, repeated-update, and recovered states; the second must create a different window after recovery. Three exact screenshots, active/recovered conservative exports, five protected/isolated process snapshots, and a review bound to the observed-evidence SHA, window IDs, and screenshot SHAs are mandatory. Status JSON, Swift tests, fault tokens, and handwritten booleans alone remain insufficient.
+
+Both gates revalidate the prepared protected-Codex baseline SHA, current source provenance, immutable candidate evidence SHA, and isolated Desktop/app-server PID/start/ancestry. Missing evidence leaves the individual booleans and `realAcceptanceComplete` false; a retained artifact whose path, SHA, binding, redaction, or runtime identity changes makes verification fail closed. No real crash or GUI evidence has yet been recorded for the current worktree.
+
 ## Transparent Enrollment And Restart Readiness (2026-07-25)
 
 The isolated Apple-native FSKit canary now treats client version information as
@@ -86,10 +129,12 @@ the mounted FSKit evidence is still attributed to behavior-identical build
   applied to both cold paths. Aggregate service RSS was 169,088 KiB, below the
   256 MiB gate. Results are observations, not general throughput guarantees.
 
-This closes the executable non-destructive Pack-only, current-client, fork,
-rollback, restart, process-recovery, and performance gates for the isolated
-macOS candidate. General production promotion still requires the dedicated
-incident-free observation period.
+This closed the executable non-destructive Pack-only, current-client, fork,
+rollback, restart, process-recovery, and performance gates for that historical
+signed build 102 candidate only. It does not transfer to the current worktree
+candidate. Current promotion is evidence-driven by the exact real-client,
+restart, fault-injection, and recovery matrix rather than a fixed observation
+period.
 
 ## Controlled In-Flight Host Interruption (2026-07-24)
 
@@ -129,8 +174,8 @@ The durable local `PASS.json` records the pre-recovery partial SHA, both boot
 identities, verifier PID, final size/SHA, and zero journals. The harness first
 passed an uncounted arm/kill/verify preflight and a negative same-boot check;
 the latter refused recovery and preserved both the partial target and journal.
-This closes the in-flight macOS journal-recovery gate only. It does not shorten
-the incident-free retention requirement or authorize real-home migration.
+This closes the in-flight macOS journal-recovery gate only. It does not complete
+the remaining real-client/restart/fault-injection matrix or authorize real-home migration.
 
 ## Native FSKit Development Checkpoint
 
@@ -144,15 +189,15 @@ The post-matrix aggregate RSS was 164,688 KiB: 91,472 KiB for the Go daemon, 43,
 
 Sanitized operation traces from real isolated Codex CLI `0.144.3`, bundled CLI `0.145.0-alpha.30`, and Desktop `26.715.72359+5718` were imported as exact-version contracts. The current Desktop trace includes real history reads, parent writes and sync, UI fork creation, child writes and sync, namespace enumeration, metadata access, and release behavior. Four exact contracts are present, compatibility evaluation for the current bundled CLI and Desktop is approved without quarantine, and `fs doctor` reports all storage, route, client, daemon, mount, and recovery components healthy.
 
-The current candidate passed real managed CLI and Desktop resume, durable append, a real repository fix with `go test ./...`, the official CLI fork flow, the Desktop `Continue in new task from here` flow, parent/child isolation, official archive/unarchive, managed service restart, host reboot, full-history recovery, and post-restart continuation. Build 102 then resumed the same managed parent through the current bundled CLI, recovered the prior fix rationale, inspected the real source and tests, and ran `go test ./...` successfully. The final managed parent contained 919,038 bytes and 636 valid JSONL records. Its original 393,640-byte folded base and every previously recorded full-file prefix remained byte-identical while all later writes stayed in the append delta; no writable backing was created. The build 102 Desktop app-server used the isolated Codex home and Electron data directory, and twice read the complete 919,038-byte managed parent without changing its SHA-256. The independently writable native Desktop child contained 882,688 bytes and 607 valid records, matched its native backing exactly, and had no managed-session state. The parent's database update preceded the child creation, the child turn did not update the parent, and branch-specific markers never crossed back into the parent.
+That signed build 102 candidate passed real managed CLI and Desktop resume, durable append, a real repository fix with `go test ./...`, the official CLI fork flow, the Desktop `Continue in new task from here` flow, parent/child isolation, official archive/unarchive, managed service restart, host reboot, full-history recovery, and post-restart continuation. Build 102 then resumed the same managed parent through the current bundled CLI, recovered the prior fix rationale, inspected the real source and tests, and ran `go test ./...` successfully. The final managed parent contained 919,038 bytes and 636 valid JSONL records. Its original 393,640-byte folded base and every previously recorded full-file prefix remained byte-identical while all later writes stayed in the append delta; no writable backing was created. The build 102 Desktop app-server used the isolated Codex home and Electron data directory, and twice read the complete 919,038-byte managed parent without changing its SHA-256. The independently writable native Desktop child contained 882,688 bytes and 607 valid records, matched its native backing exactly, and had no managed-session state. The parent's database update preceded the child creation, the child turn did not update the parent, and branch-specific markers never crossed back into the parent.
 
-One intentionally interrupted slow-provider CLI turn emitted a client-local rollout-writer `EIO` before Codex reopened the file. The daemon trace contains no failed write for that event; all retry appends and the final `fsync` succeeded, the pre-interruption full-file SHA-256 remained an exact prefix, and all resulting records parsed. A subsequent normal real CLI turn completed without the warning. This is retained as interruption evidence, not counted as a clean client pass. Production activation, production service loading, and real-home migration remain disabled while the incident-free retention window remains open; the separate controlled in-flight host-interruption gate is recorded above.
+One intentionally interrupted slow-provider CLI turn emitted a client-local rollout-writer `EIO` before Codex reopened the file. The daemon trace contains no failed write for that event; all retry appends and the final `fsync` succeeded, the pre-interruption full-file SHA-256 remained an exact prefix, and all resulting records parsed. A subsequent normal real CLI turn completed without the warning. This is retained as interruption evidence, not counted as a clean client pass. Production activation, production service loading, and real-home migration remain disabled until the exact current-candidate evidence matrix has no unresolved incident; the separate controlled in-flight host-interruption gate is recorded above.
 
 The FUSE-T evidence below is retained as historical compatibility and regression evidence. It is not the terminal architecture and must not be used to claim Apple-native FSKit readiness.
 
 ## Historical FUSE-T Status
 
-The FUSE-T macOS adapter and isolated real Codex CLI and Desktop canaries have passed for read, append, resume, fork, child-session enrollment, canonical archive/unarchive moves, launchd restart, rollback, namespace deactivation, and unknown-version quarantine. A retained-source CLI canary survived an actual host reboot while managed, then resumed through the recovered mount and rolled back to an exact native JSONL. The currently installed CLI and Desktop versions also passed exact compatibility and isolated retained-source canaries. Process-level interruption recovery now covers append, compaction, migration, and rollback, and a managed session passed an actual Deep Idle sleep/wake cycle followed by a real model turn. The separate native-append in-flight host-interruption canary now has its own exact journal evidence above. The user Codex home now uses the canonical namespace with ordinary sessions remaining native passthrough and one explicitly selected retained-source canary managed for observation. The project remains at `fs-engine-preview` because that canary has not completed retention and the seven-day incident-free gate has not completed.
+The FUSE-T macOS adapter and isolated real Codex CLI and Desktop canaries have passed for read, append, resume, fork, child-session enrollment, canonical archive/unarchive moves, launchd restart, rollback, namespace deactivation, and unknown-version quarantine. A retained-source CLI canary survived an actual host reboot while managed, then resumed through the recovered mount and rolled back to an exact native JSONL. The then-installed CLI and Desktop versions also passed exact compatibility and isolated retained-source canaries. Process-level interruption recovery covered append, compaction, migration, and rollback, and a managed session passed an actual Deep Idle sleep/wake cycle followed by a real model turn. The separate native-append in-flight host-interruption canary has its own exact journal evidence above. During that historical observation only, the user Codex home used the canonical namespace with ordinary sessions remaining native passthrough and one explicitly selected retained-source canary; this sentence is not a statement that production routing or services are currently enabled. The project remains at `fs-engine-preview` because each current candidate must complete its exact real-client workload, restart, fault-injection, and recovery matrix; promotion is evidence-driven and is not gated by a fixed number of calendar days.
 
 Backend selection evidence on 2026-07-17:
 
@@ -189,7 +234,7 @@ Additional bounded automatic-enrollment evidence on 2026-07-16:
 Additional synchronous-write and canonical-activation evidence on 2026-07-16:
 
 - Canonical activation preserved all 2,313 native rollouts. The mounted and native path/size/mtime inventories matched exactly, and the pre/post underlying native inventory also matched path, size, mtime, inode, mode, owner, and group. Explicit critical canaries retained full SHA-256 checks. Ordinary sessions remained native passthrough and the managed-session count stayed zero.
-- The one-shot background activation job completed the namespace switch but failed before reopening Desktop because macOS denied that LaunchAgent a recursive traversal of the network-volume-backed mount. Foreground Codex processes could traverse the same mount. The activation script now inventories the underlying native tree instead of recursively hashing or traversing the mounted tree, rechecks Desktop, CLI, and app-server quiescence immediately before activation, and retries preflight if Codex reopens. The user reopened Desktop manually; no rollout content was changed by the failed reopen step.
+- The one-shot background activation job completed the namespace switch but failed before reopening Desktop because macOS denied that LaunchAgent a recursive traversal of the network-volume-backed mount. Foreground Codex processes could traverse the same mount. The activation script now inventories the underlying native tree instead of recursively hashing or traversing the mounted tree, rechecks Desktop, CLI, and app-server quiescence immediately before activation, and retries preflight if Codex reopens. The user reopened Desktop manually; no rollout content was changed by the failed reopen step. This is historical evidence: the current activation script has no Codex reopen capability and rejects `REOPEN_APP=1`, so the user must start Codex manually after reviewing activation evidence.
 - The first dedicated real-home migration passed exact shadow verification and 10,000 random reads, but a real CLI turn exposed a corruption bug: the original 97,388-byte prefix remained exact while the final JSONL contained a partially overwritten record. The canary was rolled back and restored byte-for-byte before further work.
 - The real write trace showed that Codex opens rollout JSONL with `O_RDWR` and explicit offsets. A same-handle JSONL append guard was added, but the failing FUSE-T regression proved that the macOS NFS client could merge two same-offset `pwrite` calls before either reached CodexFold. Per-open and global libfuse `direct_io`, plus disabled NFS attribute caching, did not change that behavior.
 - Updating only the mounted localhost NFS volume with `mount -u -o sync` made the previously deterministic stale-offset regression pass. The Darwin adapter now withholds its health identity until that update succeeds and `MNT_SYNCHRONOUS` is visible through `statfs`; a failure unmounts the host instead of advertising readiness. No global NFS configuration, patched FUSE-T binary, privileged helper, or system-wide mount change is used.
@@ -345,12 +390,11 @@ A direct `SIGTERM` stopped the foreground service and removed the mount cleanly.
 
 ## Remaining Gates
 
-The following gates are still open:
+The following gate is still open:
 
-- Completion of the dedicated retained-source user-home canary retention window.
-- Seven incident-free days after reaching `platform-canary`.
+- Completion of the current candidate's real-client workload, restart, fault-injection, and recovery matrix with no unresolved filesystem or corruption incident. This is evidence-driven, not a fixed seven-day timer, and does not reserve a fixed disk region.
 
-Until every applicable gate passes, the project must keep the capability at `fs-engine-preview`, retain original JSONL files, and avoid changing real Codex routes.
+Until every applicable gate passes, the project must keep the capability at `fs-engine-preview` and avoid changing real Codex routes. Disposable or explicitly approved canaries may reclaim a migration snapshot after exact pack-only reconstruction proof under the configured proof/manual retention policy.
 
 ## Reproducible Test Commands
 

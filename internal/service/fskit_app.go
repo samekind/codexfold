@@ -42,3 +42,25 @@ func FSKitModulePath(appPath string) (string, error) {
 func DefaultFSKitResourcePath(userHome string) string {
 	return filepath.Join(filepath.Clean(userHome), "Library", "Group Containers", FSKitAppGroupIdentifier, FSKitResourceDirectoryName)
 }
+
+func FSKitStatusDirectory(resourcePath string) string {
+	cleaned := filepath.Clean(resourcePath)
+	for current := cleaned; ; current = filepath.Dir(current) {
+		if filepath.Base(current) == FSKitAppGroupIdentifier {
+			defaultResource := filepath.Join(current, FSKitResourceDirectoryName)
+			if cleaned == defaultResource {
+				return filepath.Join(current, "status")
+			}
+			return filepath.Join(cleaned, "status")
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			break
+		}
+	}
+	return filepath.Join(filepath.Dir(cleaned), "status")
+}
+
+func FSKitStatusPath(resourcePath, component string) string {
+	return filepath.Join(FSKitStatusDirectory(resourcePath), component+".json")
+}

@@ -23,18 +23,18 @@ Every implementation plan, task, test report, release note, and control-plane st
 | `TF-007` | Packed runtime reads do not open loose object files per manifest part and do not perform a persistent-index lookup per object. The concrete durable and runtime index formats are selected by implementation evidence and must satisfy the performance and recovery gates. |
 | `TF-008` | Performance and memory must satisfy the platform gates in this contract; functional correctness alone is insufficient. |
 | `TF-009` | Daemon termination, host restart, interrupted commit, interrupted migration, and interrupted compaction recover without byte loss or generation ambiguity. |
-| `TF-010` | Real session routing is unchanged until shadow verification passes; canary sessions retain native fallbacks. |
+| `TF-010` | Real session routing is unchanged until shadow verification passes. A migration initially retains a native snapshot, but it may be reclaimed as soon as exact pack-only reconstruction proof succeeds under the configured retention policy; current visible bytes must always remain exactly reconstructable. |
 | `TF-011` | Production operation requires no per-session setup: existing sessions are bulk-enrolled under policy, new sessions and forks are discovered automatically, and all sessions remain directly openable during enrollment. |
 | `TF-012` | Core pack, read, append, copy-on-write, generation, journal, and recovery logic is platform-neutral; macOS, Linux, and Windows use separate adapters and independent readiness gates. |
 | `TF-013` | Capability claims use only the canonical status terms in this contract. |
-| `TF-014` | Native fallback deletion is disabled until platform production readiness and per-session retention gates pass. |
+| `TF-014` | Native snapshot reclamation requires durable exact reconstruction proof for the affected session. The default policy reclaims immediately after that proof succeeds; an operator may instead require explicit retirement. No fixed 24-hour/seven-day delay or fixed-size recovery area is required. |
 | `TF-015` | Codex client versions and build identities are diagnostic metadata, never filesystem write permission. A version change may schedule non-blocking regression validation, but it may not pause enrollment, reroute a session, or force native materialization. Runtime safety is determined by byte integrity, writer state, mount health, storage budget, journal recovery, and native-equivalent filesystem semantics. |
 | `TF-016` | Platform filesystem prerequisites requiring elevated or system-extension approval are installed only after explicit user authorization. |
 | `TF-017` | A canonical mount may never degrade into a writable ordinary directory or expose stale session files. The unmounted backing directory is empty and write-sealed, activation requires a live CodexFold mount identity, and service start succeeds only after the daemon, required platform mount policy, and operational mount probe are healthy. Desktop realpath rewrites from `CODEX_HOME/sessions` or `archived_sessions` into the mount alias are synchronously normalized in the Codex state database, and the route watcher accepts either spelling without exiting. |
 | `TF-018` | Fork-family classification and branch archival are conservative, evidence-driven, and dry-run-first. Fork ancestry, age, size, or title alone never proves that a branch is useless. An archive mutation requires explicit user selection or an explicit policy, revalidates current Codex state and rollout bytes, and preserves a recoverable session. |
-| `TF-019` | Deleting a fully duplicated branch is limited to an archived session whose applicable JSONL record sequence is proven exactly and completely contained in another retained session. Apply additionally requires current-source and temporary-unfold recovery proof, transactional Codex state cleanup, and a retained tombstone and manifest. Similarity and fork ancestry are not deletion evidence. |
+| `TF-019` | Archive and deletion are distinct filesystem actions. Moving a session between `sessions` and `archived_sessions` is rename-only and never authorizes deletion. An explicit canonical `unlink` issued by Codex or the user is true deletion: CodexFold must first publish a permanent tombstone identifying the exact managed state, route, and manifest, wait for writer/reader leases to release, quarantine the exact owned tree, and physically remove it only through a durable crash-replayable purge receipt. Separately, the `remove-contained` workflow may propose deletion only for an archived session whose applicable JSONL record sequence is proven exactly and completely contained in another retained session; similarity, ancestry, age, name, and size are never deletion authority. |
 | `TF-020` | Byte-preserving storage optimization never changes rollout bytes. Repair, reconciliation, prompt cleanup, message removal, or any other content-changing operation is a separate explicit workflow that writes a separately verified output and is never run implicitly by fold, migration, compaction, enrollment, GC, or rollback. |
-| `TF-021` | Full-size transaction files, retained native snapshots, writable fallbacks, old pack generations, recovery artifacts, and temporary files are governed by hard preflight and retention budgets. Successful and abandoned temporary artifacts are cleaned automatically. Status and completion reports separate logical bytes, physical store bytes, retained source/fallback bytes, temporary/recovery bytes, projected reclamation, and actual reclaimed bytes; no physical-saving claim is allowed while equivalent full copies still occupy disk. |
+| `TF-021` | Full-size transaction files, retained native snapshots, writable fallbacks, old pack generations, recovery artifacts, and temporary files are governed by hard preflight and retention budgets. Protocol-owned successful or abandoned artifacts are cleaned automatically only after durable producer-specific proof is revalidated while the relevant mutation locks remain held. Unknown or unproved nonempty content is retained and reported, never age-, name-, count-, mtime-, lease-, or journal-status-deleted. Status and completion reports separate logical bytes, physical store bytes, retained source/fallback bytes, temporary/recovery bytes, projected reclamation, actual reclaimed bytes, and unproved retained bytes; no physical-saving claim is allowed while equivalent full copies still occupy disk. |
 | `TF-022` | CodexFold is a standalone public product. Its public code, CLI, daemon, service definitions, configuration, storage formats, doctor, GC, rollback, and enrollment contain no dependency on or reference to a private control plane. External package managers or operators may install and supervise CodexFold only from outside the product boundary. |
 
 ### Decision Hierarchy
@@ -55,7 +55,7 @@ An implementation change is therefore acceptable only when its requirement cover
 - Each plan starts with a complete requirement-to-task coverage table for `TF-001` through `TF-022`.
 - A requirement with no implementation or verification task blocks plan approval.
 - Completion reports list fresh evidence by requirement ID and state any unmet ID explicitly.
-- Mock, fixture, or synthetic evidence cannot satisfy a requirement that names real Codex, a real platform adapter, a client upgrade, a host restart, or a canary period.
+- Mock, fixture, or synthetic evidence cannot satisfy a requirement that names real Codex, a real platform adapter, a client upgrade, a host restart, or the real-client/restart/fault-injection recovery matrix.
 - Later plans may add stricter gates but may not replace an exact requirement with a weaker proxy.
 
 ## Canonical Status Terms
@@ -84,7 +84,7 @@ Passing unit tests, successful materialization, a mounted filesystem, one succes
 - Preserve independent append histories for forked sessions while sharing identical base objects.
 - Keep active writer state out of background compaction.
 - Recover from daemon termination, host restart, interrupted pack commit, interrupted manifest generation, and interrupted migration.
-- Keep a verified native source fallback until the platform canary retention gate expires.
+- Keep the migration snapshot until exact pack-only reconstruction proof succeeds; then follow `storage-policy.json` (`until-exact-recovery-proof` by default, or `until-explicit-retirement`).
 - Provide platform-neutral core behavior with macOS, Linux, and Windows adapters.
 - Expose status, doctor, migrate, rollback, compact, compatibility, and benchmark operations through the standalone CLI.
 
@@ -96,7 +96,7 @@ Passing unit tests, successful materialization, a mounted filesystem, one succes
 - Treating fork ancestry as byte containment.
 - Claiming identical APFS, ext4, or NTFS metadata that Codex does not observe.
 - Migrating real user sessions during engine development.
-- Deleting native fallbacks before canary and rollback gates pass.
+- Deleting native snapshots without exact durable reconstruction proof or contrary to the configured retention policy.
 - Treating strict byte-prefix ancestry as the only reusable-content shape.
 - Automatically deciding that a branch is useless from age, title, size, or fork ancestry.
 - Running repair, reconciliation, prompt cleanup, or other content-changing transforms as part of byte-preserving optimization.
@@ -161,7 +161,7 @@ Pack creation is transactional:
 4. Atomically publish the immutable generation directory.
 5. Atomically switch `packs/CURRENT` to the verified generation.
 6. Synchronize the pack directories and generation pointer.
-7. Leave loose objects and the previous generation in place until doctor and retention gates permit GC.
+7. Leave loose objects and previous generations in place until a producer-specific durable proof authorizes their exact removal; candidate name, age, count, lease state, or journal phase alone is never deletion authority.
 
 Manifest object references remain digest-based and do not encode physical pack locations.
 
@@ -325,15 +325,27 @@ Rollback creates or reuses a current native writable backing:
 4. Atomically route Codex state to the verified native backing.
 5. Release the lease only after the native route is durable.
 
-The original snapshot may be reused only when its byte count and SHA-256 still equal the current visible session. Native fallback deletion is disabled until the target platform reaches `production-ready:<platform>` and the individual session passes its retention period without integrity or recovery failures.
+The original snapshot may be reused only when its byte count and SHA-256 still equal the current visible session. Reclaiming that migration snapshot requires a complete pack-only reconstruction proof bound to the session and current state. The default `storage-policy.json` mode, `until-exact-recovery-proof`, reclaims it as soon as that proof succeeds; `until-explicit-retirement` retains it until an explicit command. Neither mode depends on a calendar duration or a reserved recovery partition.
 
 Automatic fallback is required when doctor detects an unreadable virtual generation, corrupt pack or manifest, an unresolved journal entry, or a mount that cannot be restored within the canary recovery threshold. It may route only a native backing proven equal to the latest committed visible bytes. If current bytes cannot be reconstructed and verified, it blocks the affected session and destructive automation for explicit recovery rather than silently routing a stale snapshot.
 
-The first production release defaults to canary-only migration. Bulk migration requires a separate explicit command and a clean doctor result.
+## Runtime Failure Containment And User Notification
 
-After platform production readiness, enrollment is policy-driven rather than manual:
+CodexFold owns recovery of its own backend, mount, supervisor, menu-bar UI, and incident monitor. A CodexFold fault never authorizes CodexFold to quit, restart, signal, reopen, or otherwise operate a running Codex process. Recovery keeps the last-known-good mounted view available where possible and retries managed-state refresh every second during the first ten seconds of one incident. Launchd keeps the backend, supervisor, and independent incident helper continuously resident. The menu-bar App uses crash-only residency: launchd restarts an abnormal exit, while an explicit user Quit is a successful exit and remains stopped until the user launches it again or a later explicitly authorized install/repair action does so.
 
-- Existing eligible sessions are discovered from Codex state and bulk-enrolled in bounded batches.
+The native macOS menu-bar App and its independent incident-monitor helper read only durable App Group status channels. The daemon and supervisor publish a durable heartbeat every second by default, including stable backend and incident identities, a publisher instance/epoch, a monotonic observation sequence, the incident start, and elapsed time. Missing, malformed, explicitly unavailable, stale, or non-advancing managed/daemon/supervisor status is itself an outage after runtime registration or the first live runtime observation; a standalone, unregistered menu-bar launch with no runtime evidence remains visibly unconnected and does not synthesize a critical incident. An old healthy file or a rewritten timestamp is not recovery evidence. Recovery requires a causally newer publisher epoch/sequence for the same backend identity.
+
+The menu-bar App shows current health and the measured storage reduction without requiring a command-line status check. The backend publishes bounded logical and physical storage totals once per minute after startup storage maintenance, plus cumulative successful read/write byte counters once per second; the UI derives transfer rates from causally advancing counters and never from session contents. The menu-bar item shows the current savings percentage, its popover shows the latest measured totals, transfer rates, and a compact trend, and the dashboard provides one-hour, 24-hour, seven-day, and 30-day storage and I/O views plus a timeline of incidents that crossed the ten-second presentation threshold. UI history contains only timestamps, health, counts, byte totals, and aggregate transfer rates, uses progressively coarser samples for older periods, and never records session content.
+
+Managed, daemon, and supervisor failures use one continuous ten-second presentation threshold. A `.failed` label does not bypass that threshold, and a menu-bar or helper restart does not reset a publisher-proved outage duration. If one occurrence has not recovered after ten continuous seconds, exactly one native window is presented across both processes. It states the user-visible reason, impact, recommended actions, and expandable technical details, and it can export a conservatively redacted diagnostic report. Acknowledgement is scoped to the exact durable incident identity and start time, or to one synthesized channel outage until a healthy baseline; matching reason/impact text never merges different durable occurrences. Closing the window acknowledges only that occurrence, and a trustworthy recovery or later healthy baseline clears the acknowledgement.
+
+The incident UI has no service-control or Codex-control capability. It never runs `sudo`, probes the sudo credential cache, asks for a password, or elevates automatically. It may report the current account's read-only macOS `admin`-group membership so a recommendation can explain whether a later, explicitly chosen repair may require system authorization. Registering the independent crash-only menu-bar LaunchAgent or bundled incident helper is part of an explicit CodexFold install/repair action; ordinary menu-bar launch only inspects registration state and never creates persistence. A required macOS approval must be surfaced to the user rather than silently reported as resident. After the service transaction commits, that same explicit install/repair action launches the verified CodexFold menu-bar App in the current login session and reports residency ready only after the running executable path matches the installed App. Failure to launch the menu bar leaves the backend and incident helper untouched, reports current-session residency unavailable, and never operates Codex. Build, test, diagnosis, canary, or recovery work does not authorize installing, updating, stopping, starting, restarting, or signaling a production CodexFold, FSKit, or LaunchAgent target; each such production mutation requires a new explicit user authorization for that exact target.
+
+Installing the canonical service is the explicit product-level authorization for bounded automatic enrollment. Its default enrollment loop is deliberately small and stability-gated; direct foreground `fs serve` remains opt-in and does not enroll automatically.
+
+After canonical service activation, enrollment is policy-driven rather than manual:
+
+- Existing eligible sessions are discovered from Codex state and enrolled in bounded batches.
 - Newly created sessions and forks remain normal native files while actively written, are discovered automatically, and enter shadow verification when stable.
 - A session remains directly openable from its native path until the virtual route transaction commits.
 - No user action is required to enroll, open, resume, fork, compact, or re-enroll a normal session.
@@ -341,12 +353,23 @@ After platform production readiness, enrollment is policy-driven rather than man
 
 ## Branch Cleanup And Content-Change Boundary
 
-Storage sharing, branch archival, exact-contained deletion, and content-changing repair are four separate operations:
+Storage sharing, branch archival, explicit filesystem deletion, exact-contained deletion, and content-changing repair are separate operations:
 
 1. **Storage sharing** preserves every byte and may reuse exact fields, records, or content-defined chunks found anywhere in any session.
 2. **Branch classification and archival** reports evidence first. It may recommend an archive candidate, but it never mutates from ancestry, age, title, or size alone and never removes recovery ability.
-3. **Exact-contained deletion** applies only to an already archived session after complete direct containment and recovery proof. It is not a side effect of folding, packing, enrollment, compaction, or GC.
-4. **Repair, reconciliation, and prompt cleanup** change content and therefore write a separate verified output. They never replace either source implicitly and never participate in byte-identical savings claims.
+3. **Explicit filesystem deletion** begins only when Codex or the user actually unlinks the canonical session path. It publishes durable deletion authority before hiding the route, survives restart, waits for active leases, and purges only the exactly proven protocol-owned tree. Archive/unarchive rename never enters this path.
+4. **Exact-contained deletion** is a separate optional `remove-contained` workflow. It applies only to an already archived session after complete direct containment and recovery proof; classification alone never invokes it. Apply mode rechecks native writers and source bytes immediately before isolation, records each durable phase, stages physical removal with an atomic no-replace rename, and supports explicit recovery that either restores the archived source when the database still owns it or finishes the exact pending removal after commit. Changed or ambiguous files are retained.
+5. **Repair, reconciliation, and prompt cleanup** change content and therefore write a separate verified output. They never replace either source implicitly and never participate in byte-identical savings claims.
+
+### Managed Deletion Proof Profile
+
+The current managed-deletion authorization format is purge receipt v3. The receipt binds the deletion operation token, tombstone SHA-256, quarantine root, complete tree SHA-256, exact entry list, staged/removal progress, and for each entry its relative path, kind, mode, device, inode, UID, GID, platform generation/birth time, extended-attribute identity, and regular-file byte count/SHA-256. Through the tombstone it also binds the original managed state, manifest, route, operation token, and initial checkpoint lineage. Publication and replay serialize through the global session-deletion operation lock; publication additionally holds the per-session checkpoint lock, while replay holds the writer lease and repeatedly revalidates the recorded checkpoint, state, manifest, and exact no-follow, same-device objects before every destructive step. A legacy tombstone or receipt cannot borrow v3 authority.
+
+On Darwin, v3 binds device, inode, Darwin generation, birth time, UID, and GID. It permits only the specifically proved `com.apple.provenance` extended attribute and hashes its exact identity; any other unproved xattr, any ACL, any nonzero BSD flags, a symlink, a special file, or a device-boundary crossing prevents purge. Receipt publication does not freeze metadata: if any bound object or metadata changes afterward, replay refuses physical removal. Darwin quarantine moves use `renameatx_np(..., RENAME_EXCL)`.
+
+On Linux, quarantine moves use `renameat2(..., RENAME_NOREPLACE)`. The v3 Linux proof profile requires an explicit source-tagged identity captured from the same open descriptor: `statx(..., AT_EMPTY_PATH, STATX_BASIC_STATS | STATX_BTIME)` plus a nonzero inode generation from `FS_IOC_GETVERSION`. The `statx` device, inode, UID, and GID must agree with `fstat`; birth time, generation, proof/source identifiers, exact regular-file bytes, same-device traversal, and the absence of unproved xattrs are bound into the receipt tree hash. `statx.mnt_id`, device/inode alone, ownership, and content hashes do not substitute for generation. A kernel or filesystem that omits birth time, rejects the ioctl, returns zero generation, or produces inconsistent identity fails closed and retains the quarantine. This is a conditional Linux capability, not a universal filesystem claim; real platform evidence must prove both facilities on the target filesystem before Linux deletion readiness is reported. Platforms without the required safe no-replace move and exact metadata validation also fail closed.
+
+Crash/replay tests cover interruption before and after quarantine rename, physical unlink, and progress publication, plus durable restart replay and normal cooperating multi-process execution under the operation lock. This evidence establishes the tested state-machine behavior; it is not a claim of a real physical-power-loss purge run. It also is not an adversarial boundary against `root` or a malicious same-UID process able to coherently rewrite protected paths and every associated tombstone, checkpoint, receipt, and metadata object. Receipt hashes are integrity bindings, not keyed authentication against the store owner.
 
 ## Storage Budget And Reclamation Accounting
 
@@ -354,7 +377,7 @@ Before any operation that can create a full-size session copy or a new store gen
 
 The default retention model is cardinality-bounded:
 
-- A managed session has at most one immutable migration snapshot and at most one current native writable fallback. A current fallback must replace or reuse stale current-fallback state rather than accumulate another full copy.
+- A managed session has at most one immutable migration snapshot and at most one current native writable fallback. A current fallback must replace or reuse stale current-fallback state rather than accumulate another full copy. The migration snapshot follows the configured proof/manual policy above, never a fixed-hour or fixed-day timer.
 - One transaction may create at most one full-session scratch file for the affected session. Named historical copies such as `native-before`, `fold-before`, `merged`, and `repaired` are not implicit recovery generations.
 - Pack publication retains the current generation and only the immediately previous verified generation while a lease or rollback window requires it. Older unleased generations are GC candidates.
 - Startup recovery removes abandoned temporary artifacts only after journal analysis proves that they are not the sole committed or recoverable generation.
@@ -433,7 +456,7 @@ Production readiness on one platform requires all of the following:
 - Native and virtual operation-trace equivalence for every operation Codex actually uses.
 - Client upgrade compatibility run before destructive migration resumes.
 - Successful automatic or explicit rollback to a native source.
-- Seven-day canary retention with no unresolved filesystem, corruption, or recovery incident.
+- Evidence-based canary observation that completes the required real-client workload, restart, fault-injection, and recovery matrix with no unresolved filesystem or corruption incident. Observation length is adaptive rather than a fixed number of days and must not reserve a fixed disk region.
 
 One successful session or one successful model turn is evidence for that case only and cannot satisfy these gates.
 
@@ -446,9 +469,9 @@ Promotion follows this exact order:
 | `Shadow` | Virtual reads are compared block-by-block and by complete SHA-256 with native files; Codex still uses native routes | Disabled |
 | `Canary` | Five to ten archived sessions route through the target platform adapter | Disabled |
 | `Resume` | Codex CLI and Desktop directly open, resume, continue, fork, archive, and unarchive canary sessions | Disabled |
-| `Stable` | A bounded set of long-idle archived sessions remains routed through the adapter for the retention period | Delayed until `production-ready:<platform>` and the per-session retention gate pass |
-| `General` | All eligible existing and newly discovered stable sessions enroll by policy | Allowed only by the proven retention policy |
-| `Active` | Actively written sessions use append delta and copy-on-write behavior | Last stage; fallback retention remains mandatory during its own canary |
+| `Stable` | A bounded set of long-idle archived sessions completes the real-client, restart, fault-injection, and recovery matrix | Native snapshots follow exact-proof/manual policy; no fixed observation duration |
+| `General` | All eligible existing and newly discovered stable sessions enroll by policy | Allowed only after the required evidence matrix has no unresolved integrity or recovery incident |
+| `Active` | Actively written sessions use append delta and copy-on-write behavior | Last stage; current bytes remain exactly reconstructable while migration snapshots follow exact-proof/manual policy |
 
 A single SHA-256 mismatch, unexpected Codex file operation, unresolved crash-recovery error, or failed rollback blocks promotion to the next stage.
 

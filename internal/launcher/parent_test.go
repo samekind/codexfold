@@ -21,6 +21,9 @@ func TestMonitorParentCancelsWhenLauncherDisappears(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("launcher parent loss did not cancel the context")
 	}
+	if !ParentUnavailable(ctx) {
+		t.Fatalf("launcher parent loss cause = %v, want ErrParentUnavailable", context.Cause(ctx))
+	}
 }
 
 func TestMonitorParentRejectsInvalidOrAlreadyLostLauncher(t *testing.T) {
@@ -42,5 +45,19 @@ func TestMonitorParentIsDisabledWithoutLauncherEnvironment(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("unset launcher environment canceled an ordinary process")
 	default:
+	}
+}
+
+func TestMonitorParentKeepsOrdinaryCancellationDistinctFromParentLoss(t *testing.T) {
+	parent, stop := context.WithCancel(context.Background())
+	ctx, cancel, err := monitorParent(parent, "42", func() int { return 42 }, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cancel()
+	stop()
+	<-ctx.Done()
+	if ParentUnavailable(ctx) {
+		t.Fatalf("ordinary cancellation was classified as launcher parent loss: %v", context.Cause(ctx))
 	}
 }

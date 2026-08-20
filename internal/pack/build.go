@@ -22,10 +22,11 @@ import (
 )
 
 type BuildOptions struct {
-	BlockBytes    int64
-	PackBytes     int64
-	Budget        storage.Checker
-	BeforePublish func() error
+	BlockBytes           int64
+	PackBytes            int64
+	Budget               storage.Checker
+	BeforePublish        func() error
+	AfterPublicationHead func() error
 }
 
 type BuildResult struct {
@@ -65,6 +66,10 @@ func Build(ctx context.Context, storeDir string, options BuildOptions) (BuildRes
 		return BuildResult{}, err
 	}
 	defer lock.Close()
+	previousGeneration, previousSequence, err := currentPublicationForBuild(ctx, storeDir)
+	if err != nil {
+		return BuildResult{}, fmt.Errorf("establish pack publication base: %w", err)
+	}
 	referenceDirectory, err := os.MkdirTemp(storeDir, ".pack-references-")
 	if err != nil {
 		return BuildResult{}, err
@@ -130,8 +135,8 @@ func Build(ctx context.Context, storeDir string, options BuildOptions) (BuildRes
 	defer encoder.Close()
 	store := fold.NewObjectStore(storeDir)
 	var packedSource *Resolver
-	if _, err := CurrentGeneration(storeDir); err == nil {
-		packedSource, err = Open(storeDir, OpenOptions{CacheBytes: -1})
+	if previousGeneration != "" {
+		packedSource, err = openGeneration(filepath.Join(storeDir, "packs", previousGeneration), -1, false)
 		if err != nil {
 			return BuildResult{}, err
 		}
@@ -249,8 +254,24 @@ func Build(ctx context.Context, storeDir string, options BuildOptions) (BuildRes
 	if err := writeIndexV3Meta(temporaryDir, meta); err != nil {
 		return BuildResult{}, err
 	}
+	if err := writeRecoveryArchive(storeDir, temporaryDir, meta); err != nil {
+		return BuildResult{}, err
+	}
 	if err := verifyGeneration(ctx, temporaryDir); err != nil {
 		return BuildResult{}, fmt.Errorf("verify candidate pack generation: %w", err)
+	}
+	recoveryCatalog, err := VerifyRecoveryDirectory(ctx, storeDir, temporaryDir)
+	if err != nil {
+		return BuildResult{}, fmt.Errorf("verify candidate pack recovery archive: %w", err)
+	}
+	candidateResolver, err := openGeneration(temporaryDir, 0, false)
+	if err != nil {
+		return BuildResult{}, fmt.Errorf("open candidate pack generation: %w", err)
+	}
+	verifyManifestErr := verifyRecoveryAndLiveManifests(ctx, storeDir, temporaryDir, recoveryCatalog, candidateResolver)
+	closeCandidateErr := candidateResolver.Close()
+	if err := errors.Join(verifyManifestErr, closeCandidateErr); err != nil {
+		return BuildResult{}, fmt.Errorf("verify candidate recovery manifests: %w", err)
 	}
 	finalDir := filepath.Join(packsDir, generation)
 	if err := os.Rename(temporaryDir, finalDir); err != nil {
@@ -261,6 +282,21 @@ func Build(ctx context.Context, storeDir string, options BuildOptions) (BuildRes
 	}
 	if options.BeforePublish != nil {
 		if err := options.BeforePublish(); err != nil {
+			return BuildResult{}, err
+		}
+	}
+	if previousSequence == ^uint64(0) {
+		return BuildResult{}, errors.New("pack publication sequence cannot advance")
+	}
+	marker, err := markGenerationPublished(finalDir, previousSequence+1, previousGeneration)
+	if err != nil {
+		return BuildResult{}, fmt.Errorf("publish pack generation marker: %w", err)
+	}
+	if err := publishPublicationHead(packsDir, marker); err != nil {
+		return BuildResult{}, fmt.Errorf("publish authoritative pack generation head: %w", err)
+	}
+	if options.AfterPublicationHead != nil {
+		if err := options.AfterPublicationHead(); err != nil {
 			return BuildResult{}, err
 		}
 	}

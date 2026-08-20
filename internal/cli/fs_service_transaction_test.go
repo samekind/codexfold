@@ -17,9 +17,10 @@ type rollbackTestApp struct {
 	rollback func() error
 }
 
-func (a *rollbackTestApp) AppGroupPath() string { return "/tmp/group.vip.jstar.codexfold" }
-func (a *rollbackTestApp) Changed() bool        { return a.changed }
-func (a *rollbackTestApp) Commit() error        { return nil }
+func (a *rollbackTestApp) AppGroupPath() string             { return "/tmp/group.vip.jstar.codexfold" }
+func (a *rollbackTestApp) Changed() bool                    { return a.changed }
+func (a *rollbackTestApp) Residency() FSKitResidencyOutcome { return FSKitResidencyOutcome{} }
+func (a *rollbackTestApp) Commit() error                    { return nil }
 func (a *rollbackTestApp) Rollback(context.Context) error {
 	if a.rollback == nil {
 		return nil
@@ -141,6 +142,18 @@ func TestRollbackFailedFirstInstallDoesNotStartAService(t *testing.T) {
 	}
 }
 
+func TestPreserveServiceRestartRequirementDoesNotForgetAnAlreadyStoppedService(t *testing.T) {
+	if !preserveServiceRestartRequirement(true, true, false) {
+		t.Fatal("an unchanged app transaction forgot that the previous service was already stopped")
+	}
+	if preserveServiceRestartRequirement(false, true, false) {
+		t.Fatal("an unchanged app that was never stopped unexpectedly requested a restart")
+	}
+	if !preserveServiceRestartRequirement(false, true, true) {
+		t.Fatal("a changed app with an existing definition did not request rollback restart")
+	}
+}
+
 func TestValidateLaunchdChildProcessRequiresLockOwnerToBelongToHost(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("launchd child ancestry is macOS-only")
@@ -153,7 +166,7 @@ func TestValidateLaunchdChildProcessRequiresLockOwnerToBelongToHost(t *testing.T
 	defer lock.Close()
 
 	status := validateLaunchdChildProcess(service.Status{DaemonRunning: true, DaemonPID: os.Getppid()}, lockPath, "test")
-	if !status.DaemonRunning || status.DaemonError != "" {
+	if !status.DaemonRunning || status.DaemonError != "" || status.DaemonPID != os.Getpid() {
 		t.Fatalf("valid child process was rejected: %#v", status)
 	}
 	status = validateLaunchdChildProcess(service.Status{DaemonRunning: true, DaemonPID: os.Getppid() + 1}, lockPath, "test")

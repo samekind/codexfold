@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -547,7 +548,7 @@ func TestCanonicalFilesystemManagedSessionMasksRetainedSnapshotAtCurrentRoute(t 
 	}
 }
 
-func TestCanonicalFilesystemNativePreferenceFallsBackToManagedWithoutPathLoss(t *testing.T) {
+func TestCanonicalFilesystemNativePreferenceNeverFallsBackToManaged(t *testing.T) {
 	root := t.TempDir()
 	route := "/sessions/2026/07/14/rollout-retirement.jsonl"
 	nativePath := nativePathFromRoot(root, route)
@@ -596,14 +597,135 @@ func TestCanonicalFilesystemNativePreferenceFallsBackToManagedWithoutPathLoss(t 
 	if err := os.Remove(nativePath); err != nil {
 		t.Fatal(err)
 	}
-	if got := read(); !bytes.Equal(got, managedBytes) {
-		t.Fatalf("fallback bytes = %q, want managed %q", got, managedBytes)
+	assertUnavailable := func(operation string, errno syscall.Errno) {
+		t.Helper()
+		if errno != syscall.ENOENT && errno != syscall.EAGAIN {
+			t.Fatalf("%s errno=%v, want ENOENT or EAGAIN", operation, errno)
+		}
 	}
-	if err := os.WriteFile(nativePath, nativeBytes, 0o600); err != nil {
+	if _, errno := filesystem.Getattr(route); errno == 0 {
+		t.Fatal("Getattr exposed managed metadata after the native target disappeared")
+	} else {
+		assertUnavailable("Getattr", errno)
+	}
+	if handle, errno := filesystem.Open(route, os.O_RDONLY); errno == 0 {
+		_ = filesystem.Release(handle)
+		t.Fatal("read Open exposed managed bytes after the native target disappeared")
+	} else {
+		assertUnavailable("read Open", errno)
+	}
+	if handle, errno := filesystem.Open(route, os.O_WRONLY|os.O_APPEND); errno == 0 {
+		_ = filesystem.Release(handle)
+		t.Fatal("write Open exposed managed bytes after the native target disappeared")
+	} else {
+		assertUnavailable("write Open", errno)
+	}
+	restoredNativeBytes := []byte("native-restored\n")
+	if err := os.WriteFile(nativePath, restoredNativeBytes, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if got := read(); !bytes.Equal(got, nativeBytes) {
-		t.Fatalf("restored native bytes = %q, want %q", got, nativeBytes)
+	if got := read(); !bytes.Equal(got, restoredNativeBytes) {
+		t.Fatalf("restored native bytes = %q, want %q", got, restoredNativeBytes)
+	}
+}
+
+func TestCanonicalFilesystemRemoveSessionAtWithCommitRejectsChangedRoute(t *testing.T) {
+	filesystem := NewCanonical()
+	oldRoute := "/sessions/2026/07/14/route-before-retirement.jsonl"
+	newRoute := "/archived_sessions/route-before-retirement.jsonl"
+	managedBytes := []byte("managed-current\n")
+	if err := filesystem.AddSessionAt("session", oldRoute, mountSessionFixture(t, "session", managedBytes)); err != nil {
+		t.Fatal(err)
+	}
+	if err := filesystem.MoveSessionAt("session", newRoute); err != nil {
+		t.Fatalf("MoveSessionAt: %v", err)
+	}
+
+	commitCalled := false
+	err := filesystem.RemoveSessionAtWithCommit("session", oldRoute, func() error {
+		commitCalled = true
+		return nil
+	})
+	if !errors.Is(err, ErrManagedSessionRouteChanged) {
+		t.Fatalf("RemoveSessionAtWithCommit error=%v, want ErrManagedSessionRouteChanged", err)
+	}
+	if commitCalled {
+		t.Fatal("route fence failure invoked the durable commit")
+	}
+	assertCanonicalManagedBytes(t, filesystem, newRoute, managedBytes)
+
+	if err := filesystem.RemoveSessionAtWithCommit("session", newRoute, func() error {
+		commitCalled = true
+		return nil
+	}); err != nil {
+		t.Fatalf("RemoveSessionAtWithCommit at current route: %v", err)
+	}
+	if !commitCalled {
+		t.Fatal("successful route-fenced removal did not invoke the durable commit")
+	}
+	if _, errno := filesystem.Getattr(newRoute); errno != syscall.ENOENT {
+		t.Fatalf("retired managed route errno=%v, want ENOENT", errno)
+	}
+}
+
+func TestCanonicalFilesystemRemoveSessionAtWithCommitFailureKeepsOwner(t *testing.T) {
+	filesystem := NewCanonical()
+	route := "/sessions/2026/07/14/commit-failure.jsonl"
+	managedBytes := []byte("managed-current\n")
+	if err := filesystem.AddSessionAt("session", route, mountSessionFixture(t, "session", managedBytes)); err != nil {
+		t.Fatal(err)
+	}
+
+	commitFailure := errors.New("injected durable commit failure")
+	err := filesystem.RemoveSessionAtWithCommit("session", route, func() error {
+		return commitFailure
+	})
+	if !errors.Is(err, commitFailure) {
+		t.Fatalf("RemoveSessionAtWithCommit error=%v, want commit failure", err)
+	}
+	assertCanonicalManagedBytes(t, filesystem, route, managedBytes)
+}
+
+func TestCanonicalFilesystemRemoveSessionAtWithCommitDefersToDeletionPublication(t *testing.T) {
+	filesystem := NewCanonical()
+	route := "/sessions/2026/07/14/deletion-publication.jsonl"
+	managedBytes := []byte("managed-current\n")
+	if err := filesystem.AddSessionAt("session", route, mountSessionFixture(t, "session", managedBytes)); err != nil {
+		t.Fatal(err)
+	}
+
+	filesystem.mu.Lock()
+	filesystem.publishingManagedDeletions["session"] = struct{}{}
+	filesystem.mu.Unlock()
+	commitCalled := false
+	err := filesystem.RemoveSessionAtWithCommit("session", route, func() error {
+		commitCalled = true
+		return nil
+	})
+	if !errors.Is(err, ErrManagedSessionDeletionInProgress) {
+		t.Fatalf("RemoveSessionAtWithCommit error=%v, want ErrManagedSessionDeletionInProgress", err)
+	}
+	if commitCalled {
+		t.Fatal("deletion publication conflict invoked the durable retirement commit")
+	}
+
+	filesystem.mu.Lock()
+	delete(filesystem.publishingManagedDeletions, "session")
+	filesystem.mu.Unlock()
+	assertCanonicalManagedBytes(t, filesystem, route, managedBytes)
+}
+
+func assertCanonicalManagedBytes(t *testing.T, filesystem *Filesystem, route string, want []byte) {
+	t.Helper()
+	handle, errno := filesystem.Open(route, os.O_RDONLY)
+	if errno != 0 {
+		t.Fatalf("Open %q errno=%v", route, errno)
+	}
+	defer filesystem.Release(handle)
+	got := make([]byte, len(want))
+	n, errno := filesystem.Read(handle, got, 0)
+	if errno != 0 || n != len(want) || !bytes.Equal(got, want) {
+		t.Fatalf("Read %q = %d errno=%v bytes=%q, want %q", route, n, errno, got, want)
 	}
 }
 
@@ -1032,6 +1154,191 @@ func TestCanonicalFilesystemSupportsFSKitOpenUnlinkStaging(t *testing.T) {
 	}
 }
 
+func TestCanonicalFilesystemPublishesDeletionBeforeManagedUnlink(t *testing.T) {
+	session := mountSessionFixture(t, "delete-session", []byte("managed\n"))
+	state := session.State()
+	filesystem := NewCanonical()
+	route := "/sessions/2026/07/25/delete-session.jsonl"
+	if err := filesystem.AddSessionAt("delete-session", route, session); err != nil {
+		t.Fatal(err)
+	}
+	called := 0
+	filesystem.SetSessionDeletionPublisher(func(got vfs.SessionState, gotRoute string) error {
+		called++
+		if got != state || gotRoute != route {
+			t.Fatalf("deletion publisher proof = %#v route=%q", got, gotRoute)
+		}
+		_, err := vfs.PublishSessionDeletion(filepath.Dir(filepath.Dir(state.ManifestPath)), got, gotRoute)
+		return err
+	})
+	if errno := filesystem.Unlink(route); errno != 0 {
+		t.Fatalf("managed Unlink errno=%v", errno)
+	}
+	if called != 1 {
+		t.Fatalf("deletion publisher calls=%d, want 1", called)
+	}
+	if _, errno := filesystem.Getattr(route); errno != syscall.ENOENT {
+		t.Fatalf("deleted route errno=%v, want ENOENT", errno)
+	}
+	if err := filesystem.UpsertSessionAt("delete-session", route, session); err == nil {
+		t.Fatal("reload re-mounted a session with a durable deletion tombstone")
+	}
+	if _, err := os.Lstat(vfs.SessionDeletionPath(filepath.Dir(filepath.Dir(state.ManifestPath)), "delete-session")); err != nil {
+		t.Fatalf("deletion tombstone missing: %v", err)
+	}
+}
+
+func TestCanonicalFilesystemFailedDeletionPublicationLeavesPathVisible(t *testing.T) {
+	session := mountSessionFixture(t, "delete-failure", []byte("managed\n"))
+	filesystem := NewCanonical()
+	route := "/sessions/2026/07/25/delete-failure.jsonl"
+	if err := filesystem.AddSessionAt("delete-failure", route, session); err != nil {
+		t.Fatal(err)
+	}
+	failure := errors.New("injected deletion publication failure")
+	filesystem.SetSessionDeletionPublisher(func(vfs.SessionState, string) error { return failure })
+	if errno := filesystem.Unlink(route); errno == 0 {
+		t.Fatal("failed deletion publication returned success")
+	}
+	if _, errno := filesystem.Getattr(route); errno != 0 {
+		t.Fatalf("failed deletion publication hid path: errno=%v", errno)
+	}
+}
+
+func TestCanonicalFilesystemDeletionPublicationDoesNotBlockOtherSessions(t *testing.T) {
+	filesystem := NewCanonical()
+	deletingRoute := "/sessions/2026/07/25/delete-slow.jsonl"
+	otherRoute := "/sessions/2026/07/25/other.jsonl"
+	if err := filesystem.AddSessionAt("delete-slow", deletingRoute, mountSessionFixture(t, "delete-slow", []byte("delete\n"))); err != nil {
+		t.Fatal(err)
+	}
+	if err := filesystem.AddSessionAt("other", otherRoute, mountSessionFixture(t, "other", []byte("other\n"))); err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	filesystem.SetSessionDeletionPublisher(func(vfs.SessionState, string) error {
+		close(entered)
+		<-release
+		return nil
+	})
+	unlinked := make(chan syscall.Errno, 1)
+	go func() { unlinked <- filesystem.Unlink(deletingRoute) }()
+	<-entered
+	lookup := make(chan syscall.Errno, 1)
+	go func() {
+		_, errno := filesystem.Getattr(otherRoute)
+		lookup <- errno
+	}()
+	select {
+	case errno := <-lookup:
+		if errno != 0 {
+			t.Fatalf("other session lookup errno=%v", errno)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("deletion publisher held the global filesystem lock")
+	}
+	close(release)
+	if errno := <-unlinked; errno != 0 {
+		t.Fatalf("managed Unlink errno=%v", errno)
+	}
+}
+
+func TestCanonicalFilesystemArchiveRenameDoesNotPublishDeletion(t *testing.T) {
+	session := mountSessionFixture(t, "archive-session", []byte("managed\n"))
+	filesystem := NewCanonical()
+	oldRoute := "/sessions/2026/07/25/archive-session.jsonl"
+	newRoute := "/archived_sessions/archive-session.jsonl"
+	if err := filesystem.AddSessionAt("archive-session", oldRoute, session); err != nil {
+		t.Fatal(err)
+	}
+	called := 0
+	filesystem.SetSessionDeletionPublisher(func(vfs.SessionState, string) error {
+		called++
+		return errors.New("archive must not delete")
+	})
+	if errno := filesystem.Rename(oldRoute, newRoute); errno != 0 {
+		t.Fatalf("archive Rename errno=%v", errno)
+	}
+	if called != 0 {
+		t.Fatalf("archive rename invoked deletion publisher %d time(s)", called)
+	}
+	if _, errno := filesystem.Getattr(newRoute); errno != 0 {
+		t.Fatalf("archived route errno=%v", errno)
+	}
+}
+
+func TestCanonicalFilesystemFSKitOpenUnlinkPublishesBeforeHiddenRemoval(t *testing.T) {
+	session := mountSessionFixture(t, "open-delete", []byte("managed\n"))
+	state := session.State()
+	filesystem := NewCanonical()
+	route := "/sessions/2026/07/25/open-delete.jsonl"
+	hidden := "/sessions/2026/07/25/.nfs.open-delete"
+	if err := filesystem.AddSessionAt("open-delete", route, session); err != nil {
+		t.Fatal(err)
+	}
+	called := 0
+	filesystem.SetSessionDeletionPublisher(func(got vfs.SessionState, gotRoute string) error {
+		called++
+		if gotRoute != route {
+			t.Fatalf("open unlink published route=%q, want %q", gotRoute, route)
+		}
+		_, err := vfs.PublishSessionDeletion(filepath.Dir(filepath.Dir(state.ManifestPath)), got, gotRoute)
+		return err
+	})
+	if errno := filesystem.Rename(route, hidden); errno != 0 {
+		t.Fatalf("open unlink Rename errno=%v", errno)
+	}
+	if called != 1 {
+		t.Fatalf("open unlink publisher calls=%d, want 1", called)
+	}
+	if errno := filesystem.Unlink(hidden); errno != 0 {
+		t.Fatalf("hidden Unlink errno=%v", errno)
+	}
+	if _, errno := filesystem.Getattr(route); errno != syscall.ENOENT {
+		t.Fatalf("original route errno=%v, want ENOENT", errno)
+	}
+}
+
+func TestCanonicalFilesystemOpenWriterFinishesAfterManagedUnlink(t *testing.T) {
+	session := mountSessionFixture(t, "open-writer-delete", []byte("managed\n"))
+	state := session.State()
+	store := filepath.Dir(filepath.Dir(state.ManifestPath))
+	filesystem := NewCanonical()
+	route := "/sessions/2026/07/25/open-writer-delete.jsonl"
+	if err := filesystem.AddSessionAt("open-writer-delete", route, session); err != nil {
+		t.Fatal(err)
+	}
+	var tombstone vfs.SessionDeletion
+	filesystem.SetSessionDeletionPublisher(func(got vfs.SessionState, gotRoute string) error {
+		var err error
+		tombstone, err = vfs.PublishSessionDeletion(store, got, gotRoute)
+		return err
+	})
+	handle, errno := filesystem.Open(route, os.O_RDWR)
+	if errno != 0 {
+		t.Fatalf("Open writer errno=%v", errno)
+	}
+	if errno := filesystem.Unlink(route); errno != 0 {
+		t.Fatalf("managed Unlink errno=%v", errno)
+	}
+	if n, errno := filesystem.Write(handle, []byte("X"), 0); errno != 0 || n != 1 {
+		t.Fatalf("write after unlink n=%d errno=%v", n, errno)
+	}
+	if errno := filesystem.Release(handle); errno != 0 {
+		t.Fatalf("release deleted writer errno=%v", errno)
+	}
+	if completed, err := vfs.AdvanceSessionDeletion(store, tombstone); err != nil || !completed {
+		t.Fatalf("replay after writer close completed=%t err=%v", completed, err)
+	}
+	if _, errno := filesystem.Getattr(route); errno != syscall.ENOENT {
+		t.Fatalf("deleted route revived: errno=%v", errno)
+	}
+	if _, err := os.Lstat(tombstone.SessionPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("deleted session state revived: %v", err)
+	}
+}
+
 func TestCanonicalFilesystemRenamesOpenNativeReader(t *testing.T) {
 	root := t.TempDir()
 	directory := filepath.Join(root, "sessions", "2026", "07", "12")
@@ -1308,7 +1615,8 @@ func mountFixture(t *testing.T) (*Filesystem, []byte) {
 		t.Fatalf("write native: %v", err)
 	}
 	manifest := fold.Manifest{Version: fold.ManifestVersion, Kind: fold.ManifestKind, Session: fold.ManifestSession{ID: "session", RolloutPath: nativePath}, Source: fold.ManifestSource{Bytes: int64(len(source)), SHA256: hexDigest}, Parts: []fold.Part{{Kind: fold.PartResidual, Object: fold.ObjectRef{SHA256: hexDigest, RawBytes: int64(len(source))}}}}
-	session, err := vfs.OpenSession(context.Background(), vfs.SessionOptions{Root: root, ManifestPath: filepath.Join(root, "manifest.json"), Manifest: manifest, Reader: mountReader{hexDigest: source}, NativeSnapshot: vfs.NativeFile{Path: nativePath, Bytes: int64(len(source)), SHA256: hexDigest}})
+	persistMountManifestFixture(t, fold.ManifestPath(root, manifest.Session.ID), manifest)
+	session, err := vfs.OpenSession(context.Background(), vfs.SessionOptions{Root: root, ManifestPath: fold.ManifestPath(root, manifest.Session.ID), Manifest: manifest, Reader: mountReader{hexDigest: source}, NativeSnapshot: vfs.NativeFile{Path: nativePath, Bytes: int64(len(source)), SHA256: hexDigest}})
 	if err != nil {
 		t.Fatalf("OpenSession: %v", err)
 	}
@@ -1324,12 +1632,16 @@ func mountSessionFixture(t *testing.T, sessionID string, source []byte) *vfs.Ses
 	root := t.TempDir()
 	digest := sha256.Sum256(source)
 	hexDigest := hex.EncodeToString(digest[:])
-	nativePath := filepath.Join(root, "native.jsonl")
+	nativePath := filepath.Join(root, "fs", "snapshots", sessionID, "native.jsonl")
+	if err := os.MkdirAll(filepath.Dir(nativePath), 0o700); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(nativePath, source, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	manifest := fold.Manifest{Version: fold.ManifestVersion, Kind: fold.ManifestKind, Session: fold.ManifestSession{ID: sessionID, RolloutPath: nativePath}, Source: fold.ManifestSource{Bytes: int64(len(source)), SHA256: hexDigest}, Parts: []fold.Part{{Kind: fold.PartResidual, Object: fold.ObjectRef{SHA256: hexDigest, RawBytes: int64(len(source))}}}}
-	session, err := vfs.OpenSession(context.Background(), vfs.SessionOptions{Root: root, ManifestPath: filepath.Join(root, "manifest.json"), Manifest: manifest, Reader: mountReader{hexDigest: source}, NativeSnapshot: vfs.NativeFile{Path: nativePath, Bytes: int64(len(source)), SHA256: hexDigest}})
+	persistMountManifestFixture(t, fold.ManifestPath(root, manifest.Session.ID), manifest)
+	session, err := vfs.OpenSession(context.Background(), vfs.SessionOptions{Root: root, ManifestPath: fold.ManifestPath(root, manifest.Session.ID), Manifest: manifest, Reader: mountReader{hexDigest: source}, NativeSnapshot: vfs.NativeFile{Path: nativePath, Bytes: int64(len(source)), SHA256: hexDigest}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1342,9 +1654,24 @@ func mountSessionWithNativeSnapshot(t *testing.T, sessionID string, source []byt
 	digest := sha256.Sum256(source)
 	hexDigest := hex.EncodeToString(digest[:])
 	manifest := fold.Manifest{Version: fold.ManifestVersion, Kind: fold.ManifestKind, Session: fold.ManifestSession{ID: sessionID, RolloutPath: nativePath}, Source: fold.ManifestSource{Bytes: int64(len(source)), SHA256: hexDigest}, Parts: []fold.Part{{Kind: fold.PartResidual, Object: fold.ObjectRef{SHA256: hexDigest, RawBytes: int64(len(source))}}}}
-	session, err := vfs.OpenSession(context.Background(), vfs.SessionOptions{Root: root, ManifestPath: filepath.Join(root, "manifest.json"), Manifest: manifest, Reader: mountReader{hexDigest: source}, NativeSnapshot: vfs.NativeFile{Path: nativePath, Bytes: int64(len(source)), SHA256: hexDigest}})
+	persistMountManifestFixture(t, fold.ManifestPath(root, manifest.Session.ID), manifest)
+	session, err := vfs.OpenSession(context.Background(), vfs.SessionOptions{Root: root, ManifestPath: fold.ManifestPath(root, manifest.Session.ID), Manifest: manifest, Reader: mountReader{hexDigest: source}, NativeSnapshot: vfs.NativeFile{Path: nativePath, Bytes: int64(len(source)), SHA256: hexDigest}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return session
+}
+
+func persistMountManifestFixture(t *testing.T, path string, manifest fold.Manifest) {
+	t.Helper()
+	data, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, append(data, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
 }

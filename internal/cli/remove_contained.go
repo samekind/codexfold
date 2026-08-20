@@ -1,6 +1,8 @@
 package cli
 
 import (
+	"context"
+	"errors"
 	"fmt"
 
 	"github.com/samekind/codexfold/internal/codex"
@@ -36,7 +38,7 @@ func newRemoveContainedCommand() *cobra.Command {
 				return err
 			}
 			result, err := prune.RemoveContained(command.Context(), home, resolveFoldStore(home, storeDir), containedSession, containerSession, prune.Options{
-				Apply: apply, IncludeSessionMeta: includeSessionMeta,
+				Apply: apply, IncludeSessionMeta: includeSessionMeta, WriterActive: removeContainedWriterActive,
 			})
 			if err != nil {
 				return err
@@ -57,7 +59,54 @@ func newRemoveContainedCommand() *cobra.Command {
 	command.Flags().BoolVar(&includeSessionMeta, "include-session-meta", false, "Require the first session_meta record to match exactly")
 	command.Flags().BoolVar(&apply, "apply", false, "Remove the verified archived session; omitted means proof-only dry-run")
 	command.Flags().BoolVar(&jsonOutput, "json", false, "Emit JSON output")
+	command.AddCommand(newRemoveContainedRecoverCommand())
 	return command
+}
+
+func newRemoveContainedRecoverCommand() *cobra.Command {
+	var codexHome string
+	var storeDir string
+	var apply bool
+	var jsonOutput bool
+	command := &cobra.Command{
+		Use:   "recover <contained-session-id>",
+		Short: "Finish or roll back one interrupted contained-session removal",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(command *cobra.Command, args []string) error {
+			if !apply {
+				return errors.New("contained-session recovery requires --apply")
+			}
+			home, err := codex.ResolveHome(codexHome)
+			if err != nil {
+				return err
+			}
+			result, err := prune.RecoverContained(command.Context(), home, resolveFoldStore(home, storeDir), args[0], prune.Options{
+				Apply: true, WriterActive: removeContainedWriterActive,
+			})
+			if err != nil {
+				return err
+			}
+			if jsonOutput {
+				return writeJSON(command, result)
+			}
+			_, err = fmt.Fprintf(command.OutOrStdout(), "session=%s rolled_back=%t finalized=%t source=%s pending=%s\n",
+				result.SessionID, result.RolledBack, result.Finalized, result.SourcePath, result.PendingPath)
+			return err
+		},
+	}
+	command.Flags().StringVar(&codexHome, "codex-home", "", "Codex home directory; defaults to CODEX_HOME or ~/.codex")
+	command.Flags().StringVar(&storeDir, "store", "", "Fold store directory; defaults to <codex-home>/fold-store")
+	command.Flags().BoolVar(&apply, "apply", false, "Apply deterministic contained-session removal recovery")
+	command.Flags().BoolVar(&jsonOutput, "json", false, "Emit JSON output")
+	return command
+}
+
+func removeContainedWriterActive(ctx context.Context, session codex.Session) (bool, error) {
+	writers, err := enrollmentWriterProbe(ctx, []codex.Session{session})
+	if err != nil {
+		return false, fmt.Errorf("probe native session writers: %w", err)
+	}
+	return writers[session.ID], nil
 }
 
 func valueOrDash(value string) string {

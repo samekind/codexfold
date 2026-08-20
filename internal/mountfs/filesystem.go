@@ -24,6 +24,11 @@ import (
 	"github.com/samekind/codexfold/internal/vfs"
 )
 
+var (
+	ErrManagedSessionDeletionInProgress = errors.New("managed session deletion publication is in progress")
+	ErrManagedSessionRouteChanged       = errors.New("managed session route changed before owner retirement")
+)
+
 type Attr struct {
 	Mode                uint32    `json:"mode"`
 	UID                 uint32    `json:"uid"`
@@ -137,8 +142,20 @@ type directoryState struct {
 }
 
 type Filesystem struct {
-	mu                sync.RWMutex
-	loadMu            sync.Mutex
+	mu     sync.RWMutex
+	loadMu sync.Mutex
+	// loadRetry bounds how long an unclassified session-load failure is retried
+	// before it reaches Codex. A managed route stays registered while
+	// enrollment swaps pack generations underneath it, so an access inside that
+	// window must pause and continue instead of reporting a hard I/O failure.
+	loadRetryBudget   time.Duration
+	loadRetryInterval time.Duration
+	loadRetrySleep    func(time.Duration)
+	// loadRecorder receives one line per session-load incident transition:
+	// first failure, recovery, and budget exhaustion. It is deliberately not
+	// called per attempt, because a per-attempt line turns a single outage into
+	// thousands of identical lines that hide the transition that mattered.
+	loadRecorder      func(string)
 	sessions          map[string]*vfs.Session
 	owners            map[string]*sessionOwner
 	paths             map[string]string
@@ -164,6 +181,10 @@ type Filesystem struct {
 	namespaceVersion               atomic.Uint64
 	activeIO                       atomic.Int64
 	lastIO                         atomic.Int64
+	deletionPublisher              func(vfs.SessionState, string) error
+	pendingManagedUnlinks          map[string]string
+	publishingManagedDeletions     map[string]struct{}
+	deletedManagedSessions         map[string]struct{}
 }
 
 func New() *Filesystem {
@@ -192,6 +213,9 @@ func NewCanonical() *Filesystem {
 		handles: make(map[uint64]*fileHandle), nativeAppends: make(map[string]*nativeAppendState),
 		nativeNamespaceRefreshInFlight: make(map[string]uint32),
 		nativeInternalMutations:        make(map[string]time.Time),
+		pendingManagedUnlinks:          make(map[string]string),
+		publishingManagedDeletions:     make(map[string]struct{}),
+		deletedManagedSessions:         make(map[string]struct{}),
 		next:                           1, canonical: true,
 	}
 	filesystem.namespaceVersion.Store(1)
@@ -485,6 +509,10 @@ func (f *Filesystem) AddSessionOwned(sessionID string, session *vfs.Session, clo
 		return errors.Join(errors.New("safe session ID and session are required"), owner.retire())
 	}
 	f.mu.Lock()
+	if _, deleted := f.deletedManagedSessions[sessionID]; deleted {
+		f.mu.Unlock()
+		return errors.Join(errors.New("managed session has a durable deletion tombstone"), owner.retire())
+	}
 	if _, exists := f.sessions[sessionID]; exists {
 		f.mu.Unlock()
 		return errors.Join(errors.New("session is already mounted"), owner.retire())
@@ -529,6 +557,10 @@ func (f *Filesystem) AddSessionAtOwned(sessionID string, name string, session *v
 		return errors.Join(errors.New("canonical filesystem, safe session ID, path, and session are required"), owner.retire())
 	}
 	f.mu.Lock()
+	if _, deleted := f.deletedManagedSessions[sessionID]; deleted {
+		f.mu.Unlock()
+		return errors.Join(errors.New("managed session has a durable deletion tombstone"), owner.retire())
+	}
 	if _, exists := f.sessions[sessionID]; exists {
 		f.mu.Unlock()
 		return errors.Join(errors.New("session is already mounted"), owner.retire())
@@ -561,6 +593,14 @@ func (f *Filesystem) UpsertSessionAtOwned(sessionID string, name string, session
 		return errors.Join(errors.New("canonical filesystem, safe session ID, path, and session are required"), owner.retire())
 	}
 	f.mu.Lock()
+	if _, deleted := f.deletedManagedSessions[sessionID]; deleted {
+		f.mu.Unlock()
+		return errors.Join(errors.New("managed session has a durable deletion tombstone"), owner.retire())
+	}
+	if _, publishing := f.publishingManagedDeletions[sessionID]; publishing {
+		f.mu.Unlock()
+		return errors.Join(errors.New("managed session deletion publication is in progress"), owner.retire())
+	}
 	f.ensureDirectoryChainLocked(path.Dir(cleaned))
 	var previousPath string
 	for route, currentID := range f.paths {
@@ -601,6 +641,9 @@ func (f *Filesystem) MoveSessionAt(sessionID string, name string) error {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if _, publishing := f.publishingManagedDeletions[sessionID]; publishing {
+		return errors.New("managed session deletion publication is in progress")
+	}
 	if _, exists := f.sessions[sessionID]; !exists {
 		return os.ErrNotExist
 	}
@@ -631,6 +674,17 @@ func (f *Filesystem) MoveSessionAt(sessionID string, name string) error {
 }
 
 func (f *Filesystem) PreferNativeSession(sessionID string) error {
+	return f.PreferNativeSessionWithCommit(sessionID, nil)
+}
+
+// PreferNativeSessionWithCommit publishes the durable authority marker while
+// namespace opens are blocked. The native-first switch becomes observable only
+// after commit succeeds.
+func (f *Filesystem) PreferNativeSessionWithCommit(sessionID string, commit func() error) error {
+	return f.PreferNativeSessionAtWithCommit(sessionID, "", commit)
+}
+
+func (f *Filesystem) PreferNativeSessionAtWithCommit(sessionID string, expectedRoute string, commit func() error) error {
 	if !f.canonical || !safeSessionID(sessionID) {
 		return errors.New("canonical filesystem and safe session ID are required")
 	}
@@ -639,18 +693,58 @@ func (f *Filesystem) PreferNativeSession(sessionID string) error {
 	if _, exists := f.sessions[sessionID]; !exists {
 		return os.ErrNotExist
 	}
+	if expectedRoute != "" && f.paths[cleanPath(expectedRoute)] != sessionID {
+		return errors.New("managed session route changed before native cutover")
+	}
+	if commit != nil {
+		if err := commit(); err != nil {
+			return err
+		}
+	}
 	f.nativeFirst[sessionID] = struct{}{}
 	return nil
 }
 
 func (f *Filesystem) RemoveSession(sessionID string) error {
+	return f.RemoveSessionWithCommit(sessionID, nil)
+}
+
+// RemoveSessionWithCommit keeps route lookup serialized until the durable
+// retirement authority is published. A crash after commit but before the
+// in-memory maps are changed is safe because process state disappears while
+// the durable marker remains.
+func (f *Filesystem) RemoveSessionWithCommit(sessionID string, commit func() error) error {
+	return f.RemoveSessionAtWithCommit(sessionID, "", commit)
+}
+
+func (f *Filesystem) RemoveSessionAtWithCommit(sessionID string, expectedRoute string, commit func() error) error {
 	if !safeSessionID(sessionID) {
 		return errors.New("safe session ID is required")
 	}
 	f.mu.Lock()
+	if _, publishing := f.publishingManagedDeletions[sessionID]; publishing {
+		f.mu.Unlock()
+		return ErrManagedSessionDeletionInProgress
+	}
 	if _, exists := f.sessions[sessionID]; !exists {
+		if commit != nil {
+			if err := commit(); err != nil {
+				f.mu.Unlock()
+				return err
+			}
+		}
 		f.mu.Unlock()
 		return os.ErrNotExist
+	}
+	if expectedRoute != "" && f.paths[cleanPath(expectedRoute)] != sessionID {
+		f.mu.Unlock()
+		return ErrManagedSessionRouteChanged
+	}
+	if commit != nil {
+		if err := commit(); err != nil {
+			f.mu.Unlock()
+			return err
+		}
 	}
 	owner := f.owners[sessionID]
 	delete(f.sessions, sessionID)
@@ -659,6 +753,7 @@ func (f *Filesystem) RemoveSession(sessionID string) error {
 	for route, currentID := range f.paths {
 		if currentID == sessionID {
 			delete(f.paths, route)
+			delete(f.pendingManagedUnlinks, route)
 			f.bumpDirectoryGenerationLocked(path.Dir(route), time.Now())
 		}
 	}
@@ -685,6 +780,7 @@ func (f *Filesystem) CloseSessions() error {
 	for route := range f.paths {
 		f.bumpDirectoryGenerationLocked(path.Dir(route), time.Now())
 		delete(f.paths, route)
+		delete(f.pendingManagedUnlinks, route)
 	}
 	for retained := range f.retained {
 		delete(f.retained, retained)
@@ -716,6 +812,37 @@ func (f *Filesystem) SetOwnedSessionLoader(loader func(string) (*vfs.Session, io
 	f.mu.Lock()
 	f.loader = loader
 	f.mu.Unlock()
+}
+
+// SetSessionDeletionPublisher installs the durable authority required before
+// a canonical managed path can be unlinked.
+func (f *Filesystem) SetSessionDeletionPublisher(publisher func(vfs.SessionState, string) error) {
+	f.mu.Lock()
+	f.deletionPublisher = publisher
+	f.mu.Unlock()
+}
+
+// HideDeletedSessionAt keeps any native backing path from reappearing after a
+// durable managed-session deletion, including after a daemon restart.
+func (f *Filesystem) HideDeletedSessionAt(sessionID string, name string) error {
+	cleaned := cleanPath(name)
+	if !f.canonical || !safeSessionID(sessionID) || !canonicalSessionPath(cleaned) {
+		return errors.New("canonical filesystem, safe session ID, and path are required")
+	}
+	f.mu.Lock()
+	f.deletedManagedSessions[sessionID] = struct{}{}
+	if current, exists := f.retained[cleaned]; exists {
+		f.mu.Unlock()
+		if current == sessionID {
+			return nil
+		}
+		return errors.New("deleted session path is already retained by another session")
+	}
+	f.retained[cleaned] = sessionID
+	f.bumpDirectoryGenerationLocked(path.Dir(cleaned), time.Now())
+	f.mu.Unlock()
+	f.bumpNamespaceVersion()
+	return nil
 }
 
 func (f *Filesystem) ReadDir(name string) ([]string, syscall.Errno) {
@@ -1091,9 +1218,81 @@ func (f *Filesystem) Read(handleID uint64, destination []byte, offset int64) (in
 	}
 	n, err := handle.read.ReadAt(context.Background(), destination, offset)
 	if err != nil && !errors.Is(err, io.EOF) {
-		return n, errnoFor(err)
+		errno := errnoFor(err)
+		if errno != syscall.EIO {
+			return n, errno
+		}
+		// An unclassified read failure is the shape a pack generation swap
+		// produces: this handle's resolver was opened against a generation that
+		// is no longer current, so retrying the same resolver would fail
+		// identically forever. Reload the session once and retry against the
+		// current generation. A plain retry is not enough here.
+		retried, retryErrno := f.rereadThroughReloadedSession(handle, destination, offset)
+		if retryErrno == 0 {
+			return retried, 0
+		}
+		return n, retryErrno
 	}
 	return n, 0
+}
+
+// rereadThroughReloadedSession replaces one read-only managed handle's session
+// and reader with a freshly loaded generation, then retries the read exactly
+// once. It refuses to touch a handle that owns a writer or native file, because
+// replacing those would abandon append state. On any failure the handle keeps
+// its original session and reader so the caller can report the original errno.
+func (f *Filesystem) rereadThroughReloadedSession(handle *fileHandle, destination []byte, offset int64) (int, syscall.Errno) {
+	if handle.write != nil || handle.native != nil || handle.session == nil {
+		return 0, syscall.EIO
+	}
+	sessionID := handle.session.State().SessionID
+	if sessionID == "" {
+		return 0, syscall.EIO
+	}
+	f.invalidateSession(sessionID)
+	session, owner, errno := f.loadSessionForPath(sessionID)
+	if errno != 0 {
+		return 0, errno
+	}
+	if owner != nil && !owner.acquire() {
+		return 0, syscall.EIO
+	}
+	reader, err := session.OpenReader()
+	if err != nil {
+		_ = owner.release()
+		return 0, errnoFor(err)
+	}
+	n, readErr := reader.ReadAt(context.Background(), destination, offset)
+	if readErr != nil && !errors.Is(readErr, io.EOF) {
+		_ = reader.Close()
+		_ = owner.release()
+		return 0, errnoFor(readErr)
+	}
+	previousReader := handle.read
+	previousOwner := handle.owner
+	handle.session = session
+	handle.owner = owner
+	handle.read = reader
+	if previousReader != nil {
+		_ = previousReader.Close()
+	}
+	_ = previousOwner.release()
+	f.recordSessionLoad("session_read_reloaded", sessionID, 1, 0, syscall.EIO)
+	return n, 0
+}
+
+// invalidateSession drops one cached session so the next load reopens it
+// against the current generation. The retained owner is retired, not closed
+// outright, so an in-flight reader on the old generation finishes normally.
+func (f *Filesystem) invalidateSession(sessionID string) {
+	f.mu.Lock()
+	owner := f.owners[sessionID]
+	delete(f.sessions, sessionID)
+	delete(f.owners, sessionID)
+	f.mu.Unlock()
+	if owner != nil {
+		_ = owner.retire()
+	}
 }
 
 // StreamNativeRead exposes only a stable, ordinary native file range to the
@@ -1605,18 +1804,58 @@ func (f *Filesystem) Rename(oldName string, newName string) syscall.Errno {
 		f.bumpNamespaceVersion()
 		return 0
 	}
-	defer f.mu.Unlock()
+	if _, pending := f.pendingManagedUnlinks[oldPath]; pending {
+		f.mu.Unlock()
+		return syscall.EPERM
+	}
 	if _, exists := f.directories[path.Dir(newPath)]; !exists {
 		root := f.nativeRoot
 		info, err := os.Stat(nativePathFromRoot(root, path.Dir(newPath)))
 		if root == "" || err != nil || !info.IsDir() {
+			f.mu.Unlock()
 			return syscall.ENOENT
 		}
 	}
 	if _, exists := f.paths[newPath]; exists {
+		f.mu.Unlock()
 		return syscall.EEXIST
 	}
-	if err := moveManagedXattrCarrier(f.nativeRoot, oldPath, newPath); err != nil {
+	if openUnlinkRename {
+		publisher := f.deletionPublisher
+		session := f.sessions[sessionID]
+		if publisher == nil || session == nil {
+			f.mu.Unlock()
+			return syscall.EPERM
+		}
+		if _, publishing := f.publishingManagedDeletions[sessionID]; publishing {
+			f.mu.Unlock()
+			return syscall.EBUSY
+		}
+		if err := moveManagedXattrCarrier(f.nativeRoot, oldPath, newPath); err != nil {
+			f.mu.Unlock()
+			return errnoFor(err)
+		}
+		f.publishingManagedDeletions[sessionID] = struct{}{}
+		state := session.State()
+		f.mu.Unlock()
+		publishErr := publisher(state, oldPath)
+		f.mu.Lock()
+		delete(f.publishingManagedDeletions, sessionID)
+		if f.paths[oldPath] != sessionID || f.sessions[sessionID] != session {
+			rollbackErr := moveManagedXattrCarrier(f.nativeRoot, newPath, oldPath)
+			f.mu.Unlock()
+			return errnoFor(errors.Join(errors.New("managed session changed during deletion publication"), rollbackErr))
+		}
+		if publishErr != nil {
+			rollbackErr := moveManagedXattrCarrier(f.nativeRoot, newPath, oldPath)
+			f.mu.Unlock()
+			return errnoFor(errors.Join(publishErr, rollbackErr))
+		}
+		f.pendingManagedUnlinks[newPath] = sessionID
+		f.deletedManagedSessions[sessionID] = struct{}{}
+		f.retained[oldPath] = sessionID
+	} else if err := moveManagedXattrCarrier(f.nativeRoot, oldPath, newPath); err != nil {
+		f.mu.Unlock()
 		return errnoFor(err)
 	}
 	delete(f.paths, oldPath)
@@ -1631,6 +1870,7 @@ func (f *Filesystem) Rename(oldName string, newName string) syscall.Errno {
 			handle.path = newPath
 		}
 	}
+	f.mu.Unlock()
 	f.bumpNamespaceVersion()
 	return 0
 }
@@ -1640,22 +1880,60 @@ func (f *Filesystem) Unlink(name string) syscall.Errno {
 		return syscall.EPERM
 	}
 	cleaned := cleanPath(name)
-	f.mu.RLock()
-	_, managed := f.paths[cleaned]
+	f.mu.Lock()
+	sessionID, managed := f.paths[cleaned]
 	busy := f.nativePathBusyLocked(cleaned)
-	f.mu.RUnlock()
 	if managed {
-		if fskitOpenUnlinkPath(cleaned) {
-			f.mu.Lock()
-			delete(f.paths, cleaned)
-			delete(f.retained, cleaned)
-			f.bumpDirectoryGenerationLocked(path.Dir(cleaned), time.Now())
+		owner := f.owners[sessionID]
+		if pendingSessionID, pending := f.pendingManagedUnlinks[cleaned]; pending {
+			if pendingSessionID != sessionID {
+				f.mu.Unlock()
+				return syscall.EIO
+			}
+		} else {
+			publisher := f.deletionPublisher
+			session := f.sessions[sessionID]
+			if publisher == nil || session == nil || fskitOpenUnlinkPath(cleaned) {
+				f.mu.Unlock()
+				return syscall.EPERM
+			}
+			if _, publishing := f.publishingManagedDeletions[sessionID]; publishing {
+				f.mu.Unlock()
+				return syscall.EBUSY
+			}
+			f.publishingManagedDeletions[sessionID] = struct{}{}
+			state := session.State()
 			f.mu.Unlock()
-			f.bumpNamespaceVersion()
-			return 0
+			publishErr := publisher(state, cleaned)
+			f.mu.Lock()
+			delete(f.publishingManagedDeletions, sessionID)
+			if f.paths[cleaned] != sessionID || f.sessions[sessionID] != session {
+				f.mu.Unlock()
+				return syscall.EAGAIN
+			}
+			if publishErr != nil {
+				f.mu.Unlock()
+				return errnoFor(publishErr)
+			}
+			owner = f.owners[sessionID]
+			f.deletedManagedSessions[sessionID] = struct{}{}
+			f.retained[cleaned] = sessionID
 		}
-		return syscall.EPERM
+		delete(f.sessions, sessionID)
+		delete(f.owners, sessionID)
+		delete(f.nativeFirst, sessionID)
+		for route, currentID := range f.paths {
+			if currentID == sessionID {
+				delete(f.paths, route)
+				delete(f.pendingManagedUnlinks, route)
+				f.bumpDirectoryGenerationLocked(path.Dir(route), time.Now())
+			}
+		}
+		f.mu.Unlock()
+		f.bumpNamespaceVersion()
+		return errnoFor(owner.retire())
 	}
+	f.mu.Unlock()
 	if busy {
 		return syscall.EBUSY
 	}
@@ -1777,17 +2055,26 @@ func (f *Filesystem) sessionForPath(name string) (*vfs.Session, *sessionOwner, s
 		sessionID := f.paths[cleaned]
 		session := f.sessions[sessionID]
 		owner := f.owners[sessionID]
+		_, publishingDeletion := f.publishingManagedDeletions[sessionID]
+		_, deleted := f.deletedManagedSessions[sessionID]
 		_, nativeFirst := f.nativeFirst[sessionID]
 		root := f.nativeRoot
 		_, retained := f.retained[cleaned]
 		f.mu.RUnlock()
+		if publishingDeletion {
+			return nil, nil, syscall.EBUSY
+		}
+		if deleted {
+			return nil, nil, syscall.ENOENT
+		}
 		if session == nil {
 			return nil, nil, syscall.ENOENT
 		}
 		if nativeFirst && root != "" && !retained {
-			if info, err := os.Stat(nativePathFromRoot(root, cleaned)); err == nil && !info.IsDir() {
-				return nil, nil, syscall.ENOENT
-			}
+			// Once native authority has been durably acknowledged, an unavailable
+			// native target must never fall back to writable managed state. Doing so
+			// would create two append histories under one retirement generation.
+			return nil, nil, syscall.ENOENT
 		}
 		return session, owner, 0
 	}
@@ -1795,6 +2082,90 @@ func (f *Filesystem) sessionForPath(name string) (*vfs.Session, *sessionOwner, s
 		return nil, nil, syscall.ENOENT
 	}
 	sessionID := strings.TrimSuffix(strings.TrimPrefix(cleaned, "/"), ".jsonl")
+	return f.loadSessionForPath(sessionID)
+}
+
+// Session-load defaults. The budget matches the ten-second incident threshold:
+// inside it a store transition self-heals silently, and only a failure that
+// outlives it becomes a reported incident. The attempt cap and the one-second
+// interval ceiling exist because the service's loader performs a full store
+// discovery per attempt while holding its own lock; a short fixed interval
+// would turn one stalled session into a discovery storm.
+const (
+	defaultSessionLoadBudget   = 10 * time.Second
+	defaultSessionLoadInterval = 25 * time.Millisecond
+	maximumSessionLoadInterval = time.Second
+	maximumSessionLoadAttempts = 12
+)
+
+// loadSessionForPath retries only the unclassified load failure that Codex
+// would otherwise observe as EIO. Classified outcomes keep their exact errno
+// and are never retried, so a permanently missing or forbidden route still
+// fails immediately.
+func (f *Filesystem) loadSessionForPath(sessionID string) (*vfs.Session, *sessionOwner, syscall.Errno) {
+	budget := f.loadRetryBudget
+	if budget <= 0 {
+		budget = defaultSessionLoadBudget
+	}
+	interval := f.loadRetryInterval
+	if interval <= 0 {
+		interval = defaultSessionLoadInterval
+	}
+	sleep := f.loadRetrySleep
+	if sleep == nil {
+		sleep = time.Sleep
+	}
+	started := time.Now()
+	attempts := 0
+	for {
+		session, owner, errno := f.loadSessionOnce(sessionID)
+		attempts++
+		if errno != syscall.EIO {
+			if attempts > 1 {
+				f.recordSessionLoad("session_load_recovered", sessionID, attempts, time.Since(started), errno)
+			}
+			return session, owner, errno
+		}
+		if attempts == 1 {
+			f.recordSessionLoad("session_load_deferred", sessionID, attempts, 0, errno)
+		}
+		remaining := budget - time.Since(started)
+		if remaining <= 0 || attempts >= maximumSessionLoadAttempts {
+			f.recordSessionLoad("session_load_failed", sessionID, attempts, time.Since(started), errno)
+			return nil, nil, errno
+		}
+		interval = min(interval, remaining)
+		sleep(interval)
+		interval = min(interval*2, maximumSessionLoadInterval)
+	}
+}
+
+// recordSessionLoad reports the session, attempt count, and elapsed time, which
+// is what makes a client-visible I/O error correlatable with the store
+// transition that caused it. The service stamps its log at the writer, so no
+// timestamp is added here.
+func (f *Filesystem) recordSessionLoad(event string, sessionID string, attempts int, elapsed time.Duration, errno syscall.Errno) {
+	f.mu.RLock()
+	recorder := f.loadRecorder
+	f.mu.RUnlock()
+	if recorder == nil {
+		return
+	}
+	recorder(fmt.Sprintf("event=%s session=%s attempts=%d elapsed_ms=%d errno=%d",
+		event, sessionID, attempts, elapsed.Milliseconds(), int(errno)))
+}
+
+// SetSessionLoadRecorder installs the session-load incident recorder.
+func (f *Filesystem) SetSessionLoadRecorder(recorder func(string)) {
+	f.mu.Lock()
+	f.loadRecorder = recorder
+	f.mu.Unlock()
+}
+
+// loadSessionOnce performs exactly one load attempt. It never holds the global
+// load mutex across a wait, so one session stalled inside a store transition
+// cannot block first access to every other session.
+func (f *Filesystem) loadSessionOnce(sessionID string) (*vfs.Session, *sessionOwner, syscall.Errno) {
 	f.mu.RLock()
 	session := f.sessions[sessionID]
 	owner := f.owners[sessionID]
@@ -2078,6 +2449,8 @@ func errnoFor(err error) syscall.Errno {
 	}
 	switch {
 	case errors.Is(err, vfs.ErrWriterBusy):
+		return syscall.EBUSY
+	case errors.Is(err, vfs.ErrSessionDeletionBusy):
 		return syscall.EBUSY
 	case errors.Is(err, errNativeAppendPending):
 		return syscall.EBUSY

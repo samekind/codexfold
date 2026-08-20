@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"time"
 
@@ -22,6 +23,7 @@ type SessionOptions struct {
 	Manifest       fold.Manifest
 	Reader         ObjectReader
 	NativeSnapshot NativeFile
+	DeferRecovery  bool
 	Budget         storage.Checker
 	BeforeCOWPhase func(string) error
 }
@@ -35,6 +37,7 @@ type Session struct {
 	readerLeases     map[uint64]int
 	readerLeaseFiles map[uint64]*storage.Lease
 	writerOpen       bool
+	recoveryDeferred bool
 	budget           storage.Checker
 	beforeCOWPhase   func(string) error
 }
@@ -45,7 +48,10 @@ type VisibleInfo struct {
 	Generation uint64
 }
 
-var ErrWriterBusy = errors.New("session writer lease is already held")
+var (
+	ErrWriterBusy              = errors.New("session writer lease is already held")
+	ErrSessionRecoveryDeferred = errors.New("session recovery is deferred to periodic reload")
+)
 
 type WriterLeaseGuard struct {
 	file *os.File
@@ -67,6 +73,27 @@ func openSession(ctx context.Context, options SessionOptions, reserveWriter bool
 	if options.Root == "" || options.ManifestPath == "" || !safeSessionID(options.Manifest.Session.ID) {
 		return nil, nil, errors.New("session root, manifest path, and safe session ID are required")
 	}
+	if options.DeferRecovery && reserveWriter {
+		return nil, nil, ErrSessionRecoveryDeferred
+	}
+	openError := func(err error) error {
+		if !options.DeferRecovery || errors.Is(err, ErrSessionRecoveryDeferred) {
+			return err
+		}
+		return fmt.Errorf("%w: %w", ErrSessionRecoveryDeferred, err)
+	}
+	manifestPath := filepath.Clean(options.ManifestPath)
+	manifestRoot := filepath.Join(filepath.Clean(options.Root), "manifests")
+	if !pathWithin(manifestRoot, manifestPath) || manifestPath == manifestRoot {
+		return nil, nil, errors.New("session manifest must be inside the managed manifest directory")
+	}
+	manifestIdentity, persistedManifest, err := captureManifestIdentity(manifestPath, options.Manifest.Session.ID, options.Manifest.Source.Bytes, options.Manifest.Source.SHA256)
+	if err != nil {
+		return nil, nil, openError(fmt.Errorf("verify requested session manifest: %w", err))
+	}
+	if !reflect.DeepEqual(persistedManifest, options.Manifest) {
+		return nil, nil, openError(errors.New("requested session manifest differs from its on-disk contents"))
+	}
 	budget := options.Budget
 	if budget == nil {
 		guard, err := storage.DefaultGuard(options.Root)
@@ -80,18 +107,28 @@ func openSession(ctx context.Context, options SessionOptions, reserveWriter bool
 		return nil, nil, err
 	}
 	directory := filepath.Join(options.Root, "fs", "sessions", options.Manifest.Session.ID)
-	if err := os.MkdirAll(directory, 0o700); err != nil {
-		return nil, nil, fmt.Errorf("create virtual session directory: %w", err)
-	}
+	statePath := filepath.Join(directory, "state.json")
 	leasePath := filepath.Join(directory, "writer.lease")
+	var state SessionState
 	var reservedLease *os.File
-	if reserveWriter {
-		reservedLease, err = acquireWriterLease(leasePath)
+	if options.DeferRecovery {
+		state, err = InspectSessionState(statePath)
 		if err != nil {
+			return nil, nil, openError(fmt.Errorf("inspect published session state: %w", err))
+		}
+	} else {
+		if err := os.MkdirAll(filepath.Dir(directory), 0o700); err != nil {
+			return nil, nil, fmt.Errorf("create virtual sessions directory: %w", err)
+		}
+		state, err = LoadSessionState(statePath)
+		if errors.Is(err, os.ErrNotExist) {
+			state, reservedLease, err = publishInitialSession(ctx, options, view, directory, reserveWriter)
+			if err != nil {
+				return nil, nil, err
+			}
+		} else if err != nil {
 			return nil, nil, err
 		}
-	} else if err := cleanupStaleWriterLease(leasePath); err != nil {
-		return nil, nil, err
 	}
 	cleanupReservedLease := func() {
 		if reservedLease == nil {
@@ -100,76 +137,88 @@ func openSession(ctx context.Context, options SessionOptions, reserveWriter bool
 		_ = unlockWriterFile(reservedLease)
 		_ = reservedLease.Close()
 	}
-	statePath := filepath.Join(directory, "state.json")
-	state, err := loadSessionState(statePath)
-	if errors.Is(err, os.ErrNotExist) {
-		if err := verifyNativeFile(options.NativeSnapshot); err != nil {
-			cleanupReservedLease()
-			return nil, nil, err
-		}
-		deltaPath := filepath.Join(directory, "delta.jsonl")
-		delta, err := os.OpenFile(deltaPath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
+	if !options.DeferRecovery && reservedLease == nil && reserveWriter {
+		reservedLease, err = acquireWriterLease(leasePath)
 		if err != nil {
-			cleanupReservedLease()
-			return nil, nil, fmt.Errorf("create session delta: %w", err)
-		}
-		if err := delta.Sync(); err != nil {
-			_ = delta.Close()
-			cleanupReservedLease()
-			return nil, nil, fmt.Errorf("sync session delta: %w", err)
-		}
-		if err := delta.Close(); err != nil {
-			cleanupReservedLease()
-			return nil, nil, fmt.Errorf("close session delta: %w", err)
-		}
-		state = SessionState{Version: sessionStateVersion, SessionID: options.Manifest.Session.ID, Generation: 1, ManifestPath: filepath.Clean(options.ManifestPath), BaseBytes: view.Size(), BaseSHA256: options.Manifest.Source.SHA256, DeltaPath: deltaPath, NativeSnapshot: options.NativeSnapshot}
-		if err := writeSessionState(statePath, state); err != nil {
-			cleanupReservedLease()
 			return nil, nil, err
 		}
-	} else if err != nil {
+	} else if !options.DeferRecovery && reservedLease == nil {
+		if err := cleanupStaleWriterLease(leasePath); err != nil {
+			return nil, nil, err
+		}
+	}
+	if state.SessionID != options.Manifest.Session.ID || state.ManifestPath != manifestPath || state.ManifestSHA256 != manifestIdentity.SHA256 || state.BaseBytes != view.Size() || state.BaseSHA256 != options.Manifest.Source.SHA256 || state.NativeSnapshot != options.NativeSnapshot {
 		cleanupReservedLease()
-		return nil, nil, err
-	} else {
-		if state.SessionID != options.Manifest.Session.ID || state.ManifestPath != filepath.Clean(options.ManifestPath) || state.BaseBytes != view.Size() || state.BaseSHA256 != options.Manifest.Source.SHA256 || state.NativeSnapshot != options.NativeSnapshot {
+		return nil, nil, openError(errors.New("persisted session state does not match the requested manifest"))
+	}
+	if !pathWithin(directory, state.DeltaPath) || (state.BackingPath != "" && !pathWithin(directory, state.BackingPath)) {
+		cleanupReservedLease()
+		return nil, nil, openError(errors.New("persisted session state contains an unsafe data path"))
+	}
+	if info, err := managedRegularFileInfo(options.Root, state.DeltaPath); err != nil {
+		cleanupReservedLease()
+		return nil, nil, openError(fmt.Errorf("stat session delta: %w", err))
+	} else if !info.Mode().IsRegular() {
+		cleanupReservedLease()
+		return nil, nil, openError(errors.New("session delta is not a regular file"))
+	}
+	if state.BackingPath != "" {
+		if info, err := managedRegularFileInfo(options.Root, state.BackingPath); err != nil {
 			cleanupReservedLease()
-			return nil, nil, errors.New("persisted session state does not match the requested manifest")
-		}
-		if !pathWithin(directory, state.DeltaPath) || (state.BackingPath != "" && !pathWithin(directory, state.BackingPath)) {
+			return nil, nil, openError(fmt.Errorf("stat session backing: %w", err))
+		} else if !info.Mode().IsRegular() {
 			cleanupReservedLease()
-			return nil, nil, errors.New("persisted session state contains an unsafe data path")
-		}
-		if _, err := os.Stat(state.DeltaPath); err != nil {
-			cleanupReservedLease()
-			return nil, nil, fmt.Errorf("stat session delta: %w", err)
-		}
-		if state.BackingPath != "" {
-			if _, err := os.Stat(state.BackingPath); err != nil {
-				cleanupReservedLease()
-				return nil, nil, fmt.Errorf("stat session backing: %w", err)
-			}
+			return nil, nil, openError(errors.New("session backing is not a regular file"))
 		}
 	}
 	session := &Session{
 		state: state, statePath: statePath, directory: directory, view: view,
 		readerLeases: make(map[uint64]int), readerLeaseFiles: make(map[uint64]*storage.Lease),
-		budget: budget, beforeCOWPhase: options.BeforeCOWPhase,
+		recoveryDeferred: options.DeferRecovery, budget: budget, beforeCOWPhase: options.BeforeCOWPhase,
 	}
 	var writer *WriteHandle
 	if reservedLease != nil {
 		session.writerOpen = true
 		writer = &WriteHandle{session: session, leasePath: leasePath, lease: reservedLease}
 	}
-	if err := session.recover(ctx); err != nil {
+	if options.DeferRecovery {
+		return session, nil, nil
+	}
+	if err := session.recover(ctx, reservedLease != nil); err != nil {
 		if writer != nil {
 			_ = writer.Close()
 		}
 		return nil, nil, err
 	}
-	if recovered, err := loadSessionState(statePath); err == nil {
+	if recovered, err := LoadSessionState(statePath); err == nil {
 		session.state = recovered
 	}
 	return session, writer, nil
+}
+
+func managedRegularFileInfo(root string, path string) (os.FileInfo, error) {
+	root = filepath.Clean(root)
+	path = filepath.Clean(path)
+	if !filepath.IsAbs(root) || !pathWithin(root, path) || path == root {
+		return nil, errors.New("managed file is outside its store")
+	}
+	relative, err := filepath.Rel(root, path)
+	if err != nil {
+		return nil, err
+	}
+	storeRoot, err := os.OpenRoot(root)
+	if err != nil {
+		return nil, err
+	}
+	defer storeRoot.Close()
+	info, err := storeRoot.Lstat(relative)
+	if err != nil {
+		return nil, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return nil, errors.New("managed file is not a regular file")
+	}
+	return info, nil
 }
 
 func (s *Session) State() SessionState {
@@ -272,6 +321,10 @@ func (s *Session) releaseReader(generation uint64) error {
 
 func (s *Session) OpenWriter() (*WriteHandle, error) {
 	s.mu.Lock()
+	if s.recoveryDeferred {
+		s.mu.Unlock()
+		return nil, ErrSessionRecoveryDeferred
+	}
 	if s.writerOpen {
 		s.mu.Unlock()
 		return nil, ErrWriterBusy
@@ -470,7 +523,7 @@ func (s *Session) ensureBacking(ctx context.Context) (string, error) {
 	next := s.state
 	next.Generation++
 	next.BackingPath = backingPath
-	if err := writeSessionState(s.statePath, next); err != nil {
+	if err := publishSessionState(s.statePath, next); err != nil {
 		return "", err
 	}
 	s.state = next
@@ -482,7 +535,6 @@ func (s *Session) ensureBacking(ctx context.Context) (string, error) {
 	}
 	return backingPath, nil
 }
-
 func (s *Session) MaterializeCurrent(ctx context.Context, target string, overwrite bool) (NativeFile, error) {
 	if target == "" {
 		return NativeFile{}, errors.New("materialize target is required")

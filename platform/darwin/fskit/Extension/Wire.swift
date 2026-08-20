@@ -20,6 +20,344 @@ private let sharedReadFDMarker: UInt8 = 0x53
 private let sharedWindowFDMarker: UInt8 = 0x57
 private let sharedFileWindowFDMarker: UInt8 = 0x52
 private let socketBufferBytes: Int32 = 4 * 1024 * 1024
+private let socketIdleTimeout: TimeInterval = 2
+private let frontendAppGroupIdentifier = "group.vip.jstar.codexfold"
+let frontendRecoveryTimeout: TimeInterval = 10
+
+func isWireTransportError(_ error: any Error) -> Bool {
+    let code: POSIXErrorCode?
+    if let posix = error as? POSIXError {
+        code = posix.code
+    } else {
+        let cocoa = error as NSError
+        code = cocoa.domain == NSPOSIXErrorDomain
+            ? POSIXErrorCode(rawValue: Int32(cocoa.code))
+            : nil
+    }
+    guard let code else { return false }
+    switch code {
+    case .EPIPE,
+         .ECONNABORTED,
+         .ECONNREFUSED,
+         .ECONNRESET,
+         .ENETDOWN,
+         .ENETRESET,
+         .ENETUNREACH,
+         .ENOTCONN,
+         .EHOSTDOWN,
+         .EHOSTUNREACH,
+         .ESTALE,
+         .ETIMEDOUT:
+        return true
+    default:
+        return false
+    }
+}
+
+private func transportErrorSummary(_ error: any Error) -> String {
+    if let posix = error as? POSIXError {
+        return "POSIX \(posix.code.rawValue): \(posix.localizedDescription)"
+    }
+    let cocoa = error as NSError
+    if cocoa.domain == NSPOSIXErrorDomain {
+        return "POSIX \(cocoa.code): \(cocoa.localizedDescription)"
+    }
+    return String(describing: error)
+}
+
+enum WireWriteRecoveryDecision: Equatable {
+    case alreadyCommitted
+    case replaySnapshot
+    case conflict
+}
+
+func wireWriteRecoveryDecision(
+    existing: Data,
+    requested: Data,
+    supportsSnapshotReplay: Bool
+) -> WireWriteRecoveryDecision {
+    if existing == requested {
+        return .alreadyCommitted
+    }
+    if supportsSnapshotReplay,
+       existing.count < requested.count,
+       requested.starts(with: existing) {
+        return .replaySnapshot
+    }
+    return .conflict
+}
+
+struct FrontendRecoveryStatus {
+    enum State: String {
+        case healthy
+        case recovering
+        case unavailable
+    }
+
+    let state: State
+    let updatedAt: Date
+    let summary: String
+    let detail: String
+    let mountID: String
+    let generation: UInt64
+    let recoveryStartedAt: Date?
+    let recoveryDeadlineAt: Date?
+    let elapsedMilliseconds: Int
+    let lastTransportError: String?
+    let incidentID: String?
+}
+
+final class FrontendStatusWriter {
+    private let queue = DispatchQueue(
+        label: "vip.jstar.codexfold.fskit.frontend-status",
+        qos: .utility
+    )
+    private let statusDirectory: URL?
+    private let onError: ((any Error) -> Void)?
+
+    init(containerURL: URL? = FileManager.default.containerURL(
+        forSecurityApplicationGroupIdentifier: frontendAppGroupIdentifier
+    ), onError: ((any Error) -> Void)? = nil) {
+        statusDirectory = containerURL?.appendingPathComponent("status", isDirectory: true)
+        self.onError = onError
+    }
+
+    func publish(_ status: FrontendRecoveryStatus) {
+        guard let statusDirectory else { return }
+        queue.async { [onError] in
+            do {
+                try Self.write(status, to: statusDirectory)
+            } catch {
+                onError?(error)
+            }
+        }
+    }
+
+#if CODEXFOLD_RECOVERY_TESTS
+    func waitForPendingWrites() {
+        queue.sync {}
+    }
+#endif
+
+    private static func write(_ status: FrontendRecoveryStatus, to directory: URL) throws {
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        var payload: [String: Any] = [
+            "schemaVersion": 1,
+            "component": "frontend",
+            "state": status.state.rawValue,
+            "updatedAt": formatter.string(from: status.updatedAt),
+            "summary": status.summary,
+            "detail": status.detail,
+            "mountID": status.mountID,
+            "generation": NSNumber(value: status.generation),
+            "elapsedMilliseconds": status.elapsedMilliseconds,
+            "recoveryStartedAt": status.recoveryStartedAt.map { formatter.string(from: $0) } ?? NSNull(),
+            "recoveryDeadlineAt": status.recoveryDeadlineAt.map { formatter.string(from: $0) } ?? NSNull(),
+            "lastTransportError": status.lastTransportError ?? NSNull(),
+            "incidentID": status.incidentID ?? NSNull(),
+        ]
+        if let incidentID = status.incidentID, let startedAt = status.recoveryStartedAt {
+            payload["incident"] = [
+                "id": incidentID,
+                "since": formatter.string(from: startedAt),
+                "reason": status.lastTransportError ?? status.summary,
+                "impact": "File operations are waiting for the CodexFold backend.",
+                "recommendations": [
+                    "Open CodexFold to inspect service status.",
+                    "Keep Codex running while CodexFold attempts recovery.",
+                ],
+            ]
+        }
+        let data = try JSONSerialization.data(
+            withJSONObject: payload,
+            options: [.prettyPrinted, .sortedKeys]
+        )
+        try DurableAppGroupFile.write(
+            data,
+            to: directory.appendingPathComponent("frontend.json", isDirectory: false)
+        )
+    }
+}
+
+final class BackendRecoveryCoordinator {
+    typealias Reconnect = (_ deadline: Date) throws -> UInt64
+
+    private let condition = NSCondition()
+    private let mountID: String
+    private let timeout: TimeInterval
+    private let retryDelay: TimeInterval
+    private let statusWriter: FrontendStatusWriter?
+    private var nextRunID: UInt64 = 1
+    private var activeRunID: UInt64?
+    private var completed: [UInt64: Result<UInt64, any Error>] = [:]
+    private var generation: UInt64
+
+    init(
+        mountID: String,
+        generation: UInt64,
+        timeout: TimeInterval = frontendRecoveryTimeout,
+        retryDelay: TimeInterval = 0.1,
+        statusWriter: FrontendStatusWriter? = FrontendStatusWriter()
+    ) {
+        self.mountID = mountID
+        self.generation = generation
+        self.timeout = max(0, timeout)
+        self.retryDelay = max(0.001, retryDelay)
+        self.statusWriter = statusWriter
+    }
+
+    func markHealthy() {
+        let currentGeneration = condition.withLock { generation }
+        statusWriter?.publish(FrontendRecoveryStatus(
+            state: .healthy,
+            updatedAt: Date(),
+            summary: "CodexFold file service is available",
+            detail: "The FSKit frontend is connected to the backend.",
+            mountID: mountID,
+            generation: currentGeneration,
+            recoveryStartedAt: nil,
+            recoveryDeadlineAt: nil,
+            elapsedMilliseconds: 0,
+            lastTransportError: nil,
+            incidentID: nil
+        ))
+    }
+
+    @discardableResult
+    func recover(
+        noLaterThan callerDeadline: Date,
+        after transportError: any Error,
+        reconnect: Reconnect
+    ) throws -> UInt64 {
+        let runID: UInt64
+        let startedAt: Date
+        let deadline: Date
+        let incidentID: String
+        var leader = false
+
+        condition.lock()
+        if let activeRunID {
+            runID = activeRunID
+            startedAt = Date()
+            deadline = callerDeadline
+            incidentID = ""
+        } else {
+            runID = nextRunID
+            nextRunID &+= 1
+            activeRunID = runID
+            startedAt = Date()
+            deadline = min(callerDeadline, startedAt.addingTimeInterval(timeout))
+            incidentID = UUID().uuidString.lowercased()
+            leader = true
+        }
+        condition.unlock()
+
+        if !leader {
+            return try waitForCompletion(of: runID, noLaterThan: callerDeadline)
+        }
+
+        let initialError = transportErrorSummary(transportError)
+        statusWriter?.publish(FrontendRecoveryStatus(
+            state: .recovering,
+            updatedAt: startedAt,
+            summary: "CodexFold file service is recovering",
+            detail: "The frontend is keeping the mount present while it reconnects.",
+            mountID: mountID,
+            generation: currentGeneration(),
+            recoveryStartedAt: startedAt,
+            recoveryDeadlineAt: deadline,
+            elapsedMilliseconds: 0,
+            lastTransportError: initialError,
+            incidentID: incidentID
+        ))
+
+        var lastError: any Error = transportError
+        while Date() < deadline {
+            do {
+                let recoveredGeneration = try reconnect(deadline)
+                finish(runID: runID, result: .success(recoveredGeneration))
+                let finishedAt = Date()
+                statusWriter?.publish(FrontendRecoveryStatus(
+                    state: .healthy,
+                    updatedAt: finishedAt,
+                    summary: "CodexFold file service recovered",
+                    detail: "Waiting file operations can continue on the recovered backend.",
+                    mountID: mountID,
+                    generation: recoveredGeneration,
+                    recoveryStartedAt: startedAt,
+                    recoveryDeadlineAt: deadline,
+                    elapsedMilliseconds: Self.elapsedMilliseconds(from: startedAt, to: finishedAt),
+                    lastTransportError: initialError,
+                    incidentID: incidentID
+                ))
+                return recoveredGeneration
+            } catch {
+                lastError = error
+            }
+
+            let now = Date()
+            guard now < deadline else { break }
+            Thread.sleep(forTimeInterval: min(retryDelay, deadline.timeIntervalSince(now)))
+        }
+
+        finish(runID: runID, result: .failure(lastError))
+        let failedAt = Date()
+        statusWriter?.publish(FrontendRecoveryStatus(
+            state: .unavailable,
+            updatedAt: failedAt,
+            summary: "CodexFold file service needs attention",
+            detail: "The frontend could not reconnect within ten seconds; the mount remains present.",
+            mountID: mountID,
+            generation: currentGeneration(),
+            recoveryStartedAt: startedAt,
+            recoveryDeadlineAt: deadline,
+            elapsedMilliseconds: Self.elapsedMilliseconds(from: startedAt, to: failedAt),
+            lastTransportError: transportErrorSummary(lastError),
+            incidentID: incidentID
+        ))
+        throw lastError
+    }
+
+    private func waitForCompletion(of runID: UInt64, noLaterThan deadline: Date) throws -> UInt64 {
+        condition.lock()
+        defer { condition.unlock() }
+        while completed[runID] == nil {
+            guard condition.wait(until: deadline) else {
+                throw POSIXError(.ETIMEDOUT)
+            }
+        }
+        return try completed[runID]!.get()
+    }
+
+    private func finish(runID: UInt64, result: Result<UInt64, any Error>) {
+        condition.lock()
+        if case .success(let recoveredGeneration) = result {
+            generation = recoveredGeneration
+        }
+        completed[runID] = result
+        if completed.count > 32, let oldest = completed.keys.min() {
+            completed.removeValue(forKey: oldest)
+        }
+        if activeRunID == runID {
+            activeRunID = nil
+        }
+        condition.broadcast()
+        condition.unlock()
+    }
+
+    private func currentGeneration() -> UInt64 {
+        condition.withLock { generation }
+    }
+
+    private static func elapsedMilliseconds(from start: Date, to end: Date) -> Int {
+        max(0, Int(end.timeIntervalSince(start) * 1_000))
+    }
+}
 
 enum WireOperation: UInt8 {
     case hello = 1
@@ -295,6 +633,12 @@ struct WireOpenResult {
     let sharedReadWindow: WireSharedReadWindow?
 }
 
+struct DaemonOpenBinding {
+    let connection: WireConnection
+    let opened: WireOpenResult
+    let clientEpoch: UInt64
+}
+
 enum WireReadResult {
     case copied(Data)
     case sharedWindow(count: Int)
@@ -457,9 +801,12 @@ final class WireConnection {
         max(0, maxPayload - MemoryLayout<UInt32>.size)
     }
 
-    init(descriptor: WireDescriptor) throws {
+    init(
+        descriptor: WireDescriptor,
+        idleTimeout: TimeInterval = socketIdleTimeout
+    ) throws {
         self.descriptor = descriptor
-        try connect()
+        try connect(idleTimeout: idleTimeout)
         var hello = WireWriter()
         hello.bytes(descriptor.token)
         hello.uint32(
@@ -631,7 +978,7 @@ final class WireConnection {
         lock.unlock()
     }
 
-    private func connect() throws {
+    private func connect(idleTimeout requestedIdleTimeout: TimeInterval) throws {
         let descriptor = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
         guard descriptor >= 0 else {
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
@@ -641,6 +988,33 @@ final class WireConnection {
         var socketBuffer = socketBufferBytes
         _ = setsockopt(descriptor, SOL_SOCKET, SO_RCVBUF, &socketBuffer, socklen_t(MemoryLayout<Int32>.size))
         _ = setsockopt(descriptor, SOL_SOCKET, SO_SNDBUF, &socketBuffer, socklen_t(MemoryLayout<Int32>.size))
+        let boundedIdleTimeout = max(0.001, requestedIdleTimeout)
+        let seconds = floor(boundedIdleTimeout)
+        var idleTimeout = timeval(
+            tv_sec: Int(seconds),
+            tv_usec: Int32((boundedIdleTimeout - seconds) * 1_000_000)
+        )
+        let receiveTimeoutResult = setsockopt(
+            descriptor,
+            SOL_SOCKET,
+            SO_RCVTIMEO,
+            &idleTimeout,
+            socklen_t(MemoryLayout<timeval>.size)
+        )
+        let receiveTimeoutError = errno
+        let sendTimeoutResult = setsockopt(
+            descriptor,
+            SOL_SOCKET,
+            SO_SNDTIMEO,
+            &idleTimeout,
+            socklen_t(MemoryLayout<timeval>.size)
+        )
+        let sendTimeoutError = errno
+        guard receiveTimeoutResult == 0, sendTimeoutResult == 0 else {
+            let code = receiveTimeoutResult == 0 ? sendTimeoutError : receiveTimeoutError
+            Darwin.close(descriptor)
+            throw POSIXError(POSIXErrorCode(rawValue: code) ?? .EIO)
+        }
         var address = sockaddr_un()
         address.sun_family = sa_family_t(AF_UNIX)
         let pathBytes = Array(self.descriptor.socketPath.utf8CString)
@@ -828,6 +1202,9 @@ final class WireConnection {
             }
             if amount < 0 {
                 if errno == EINTR { continue }
+                if errno == EAGAIN || errno == EWOULDBLOCK {
+                    throw POSIXError(.ETIMEDOUT)
+                }
                 throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
             }
             completed += amount
@@ -883,6 +1260,9 @@ final class WireConnection {
         }
 
         if received < 0 {
+            if receiveError == EAGAIN || receiveError == EWOULDBLOCK {
+                throw POSIXError(.ETIMEDOUT)
+            }
             throw POSIXError(POSIXErrorCode(rawValue: receiveError) ?? .EIO)
         }
         let usedControl = min(controlLength, control.count)
@@ -962,6 +1342,9 @@ final class WireConnection {
             }
             if amount < 0 {
                 if errno == EINTR { continue }
+                if errno == EAGAIN || errno == EWOULDBLOCK {
+                    throw POSIXError(.ETIMEDOUT)
+                }
                 throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
             }
             guard amount > 0 else {
@@ -980,43 +1363,140 @@ final class WireConnection {
 }
 
 final class DaemonClient {
-    let descriptor: WireDescriptor
-    private let control: WireConnection
-
-    init(descriptor: WireDescriptor) throws {
-        self.descriptor = descriptor
-        control = try WireConnection(descriptor: descriptor)
+    private struct Snapshot {
+        let descriptor: WireDescriptor
+        let control: WireConnection
+        let epoch: UInt64
     }
 
-    func newConnection() throws -> WireConnection {
-        try WireConnection(descriptor: descriptor)
+    private let stateLock = NSLock()
+    private let retiredConnectionQueue = DispatchQueue(
+        label: "vip.jstar.codexfold.fskit.retired-connections",
+        qos: .utility
+    )
+    private let resourceURL: URL?
+    private let recovery: BackendRecoveryCoordinator
+    private var storedDescriptor: WireDescriptor
+    private var control: WireConnection
+    private var epoch: UInt64 = 1
+
+    init(
+        descriptor: WireDescriptor,
+        resourceURL: URL? = nil,
+        mountID: String = "unknown",
+        statusWriter: FrontendStatusWriter? = FrontendStatusWriter()
+    ) throws {
+        self.resourceURL = resourceURL
+        storedDescriptor = descriptor
+        control = try WireConnection(descriptor: descriptor)
+        recovery = BackendRecoveryCoordinator(
+            mountID: mountID,
+            generation: descriptor.generation,
+            statusWriter: statusWriter
+        )
+    }
+
+    deinit {
+        stateLock.withLock { control }.close()
+    }
+
+    var currentEpoch: UInt64 {
+        stateLock.withLock { epoch }
+    }
+
+    func openBinding(_ path: String, flags: Int32, noLaterThan deadline: Date? = nil) throws -> DaemonOpenBinding {
+        guard flags & (O_CREAT | O_EXCL | O_TRUNC) == 0 else {
+            throw POSIXError(.EINVAL)
+        }
+        let operationDeadline = deadline ?? Date().addingTimeInterval(frontendRecoveryTimeout)
+        var attempts = 0
+        while attempts < 8 {
+            let connectionSnapshot = try makeConnection(noLaterThan: operationDeadline)
+            do {
+                let opened = try open(path, flags: flags, connection: connectionSnapshot.connection)
+                guard currentEpoch == connectionSnapshot.epoch else {
+                    if let nativeReadFD = opened.nativeReadFD {
+                        Darwin.close(nativeReadFD)
+                    }
+                    try? handleOperation(
+                        .release,
+                        handle: opened.handle,
+                        connection: connectionSnapshot.connection
+                    )
+                    connectionSnapshot.connection.close()
+                    attempts += 1
+                    continue
+                }
+                return DaemonOpenBinding(
+                    connection: connectionSnapshot.connection,
+                    opened: opened,
+                    clientEpoch: connectionSnapshot.epoch
+                )
+            } catch {
+                connectionSnapshot.connection.close()
+                guard isWireTransportError(error) else { throw error }
+                try recover(
+                    after: error,
+                    observedEpoch: connectionSnapshot.epoch,
+                    noLaterThan: operationDeadline
+                )
+                attempts += 1
+            }
+        }
+        throw POSIXError(.ETIMEDOUT)
+    }
+
+    func recover(
+        after error: any Error,
+        observedEpoch: UInt64,
+        noLaterThan deadline: Date
+    ) throws {
+        guard isWireTransportError(error) || (error as? POSIXError)?.code == .EBADF else {
+            throw error
+        }
+        guard currentEpoch == observedEpoch else { return }
+        _ = try recovery.recover(noLaterThan: deadline, after: error) { [weak self] deadline in
+            guard let self else { throw POSIXError(.ECANCELED) }
+            return try self.reconnect(noLaterThan: deadline)
+        }
     }
 
     func ping() throws {
-        _ = try control.request(.ping)
+        _ = try readOnlyControlRequest(.ping)
+        recovery.markHealthy()
     }
 
     func getattr(_ path: String) throws -> WireEntry {
         var writer = WireWriter()
         writer.string(path)
-        var reader = WireReader(try control.request(.getattr, payload: writer.data))
-        let entry = try WireEntry(reader: &reader, includesContentGeneration: control.supportsContentGeneration)
-        try reader.finish()
-        return entry
+        return try withReadOnlyControl { control in
+            var reader = WireReader(try control.request(.getattr, payload: writer.data))
+            let entry = try WireEntry(
+                reader: &reader,
+                includesContentGeneration: control.supportsContentGeneration
+            )
+            try reader.finish()
+            return entry
+        }
     }
 
     func readDir(_ path: String) throws -> [WireEntry] {
         var writer = WireWriter()
         writer.string(path)
-        var reader = WireReader(try control.request(.readDir, payload: writer.data))
-        let count = Int(try reader.uint32())
-        var entries: [WireEntry] = []
-        entries.reserveCapacity(count)
-        for _ in 0..<count {
-            entries.append(try WireEntry(reader: &reader, includesContentGeneration: control.supportsContentGeneration))
+        return try withReadOnlyControl { control in
+            var reader = WireReader(try control.request(.readDir, payload: writer.data))
+            let count = Int(try reader.uint32())
+            var entries: [WireEntry] = []
+            entries.reserveCapacity(count)
+            for _ in 0..<count {
+                entries.append(try WireEntry(
+                    reader: &reader,
+                    includesContentGeneration: control.supportsContentGeneration
+                ))
+            }
+            try reader.finish()
+            return entries
         }
-        try reader.finish()
-        return entries
     }
 
     func open(_ path: String, flags: Int32, connection: WireConnection) throws -> WireOpenResult {
@@ -1089,15 +1569,33 @@ final class DaemonClient {
     }
 
     func create(_ path: String, flags: Int32) throws -> (WireConnection, UInt64, WireEntry) {
-        let connection = try newConnection()
+        let deadline = Date().addingTimeInterval(frontendRecoveryTimeout)
+        let connectionSnapshot = try makeConnection(noLaterThan: deadline)
+        let connection = connectionSnapshot.connection
         var writer = WireWriter()
         writer.string(path)
         writer.uint32(UInt32(bitPattern: flags))
-        var reader = WireReader(try connection.request(.create, payload: writer.data))
-        let handle = try reader.uint64()
-        let entry = try WireEntry(reader: &reader, includesContentGeneration: connection.supportsContentGeneration)
-        try reader.finish()
-        return (connection, handle, entry)
+        do {
+            var reader = WireReader(try connection.request(.create, payload: writer.data))
+            let handle = try reader.uint64()
+            let entry = try WireEntry(
+                reader: &reader,
+                includesContentGeneration: connection.supportsContentGeneration
+            )
+            try reader.finish()
+            return (connection, handle, entry)
+        } catch {
+            connection.close()
+            guard isWireTransportError(error) else { throw error }
+            try? recover(
+                after: error,
+                observedEpoch: connectionSnapshot.epoch,
+                noLaterThan: deadline
+            )
+            // The create may already have reached the daemon. Replaying it here
+            // would turn an unknown outcome into a duplicate mutation.
+            throw POSIXError(.EIO)
+        }
     }
 
     func read(
@@ -1201,45 +1699,57 @@ final class DaemonClient {
         var writer = WireWriter()
         writer.string(path)
         writer.int64(Int64(size))
-        _ = try control.request(.truncate, payload: writer.data)
+        try withMutationControl { control in
+            _ = try control.request(.truncate, payload: writer.data)
+        }
     }
 
     func mkdir(_ path: String, mode: UInt32) throws {
         var writer = WireWriter()
         writer.string(path)
         writer.uint32(mode)
-        _ = try control.request(.mkdir, payload: writer.data)
+        try withMutationControl { control in
+            _ = try control.request(.mkdir, payload: writer.data)
+        }
     }
 
     func rename(_ oldPath: String, _ newPath: String) throws {
         var writer = WireWriter()
         writer.string(oldPath)
         writer.string(newPath)
-        _ = try control.request(.rename, payload: writer.data)
+        try withMutationControl { control in
+            _ = try control.request(.rename, payload: writer.data)
+        }
     }
 
     func remove(_ path: String, directory: Bool) throws {
         var writer = WireWriter()
         writer.string(path)
-        _ = try control.request(directory ? .rmdir : .unlink, payload: writer.data)
+        try withMutationControl { control in
+            _ = try control.request(directory ? .rmdir : .unlink, payload: writer.data)
+        }
     }
 
     func statfs() throws -> WireStatFS {
-        var reader = WireReader(try control.request(.statfs))
-        let result = try WireStatFS(reader: &reader)
-        try reader.finish()
-        return result
+        return try withReadOnlyControl { control in
+            var reader = WireReader(try control.request(.statfs))
+            let result = try WireStatFS(reader: &reader)
+            try reader.finish()
+            return result
+        }
     }
 
     func sync() throws {
-        _ = try control.request(.sync)
+        _ = try readOnlyControlRequest(.sync)
     }
 
     func namespaceVersion() throws -> UInt64 {
-        var reader = WireReader(try control.request(.namespaceVersion))
-        let version = try reader.uint64()
-        try reader.finish()
-        return version
+        return try withReadOnlyControl { control in
+            var reader = WireReader(try control.request(.namespaceVersion))
+            let version = try reader.uint64()
+            try reader.finish()
+            return version
+        }
     }
 
     func setAttributes(
@@ -1259,17 +1769,21 @@ final class DaemonClient {
         writer.uint32(gid)
         writer.time(accessTime)
         writer.time(modifyTime)
-        _ = try control.request(.setattr, payload: writer.data)
+        try withMutationControl { control in
+            _ = try control.request(.setattr, payload: writer.data)
+        }
     }
 
     func getXattr(_ path: String, name: String) throws -> Data {
         var writer = WireWriter()
         writer.string(path)
         writer.string(name)
-        var reader = WireReader(try control.request(.getXattr, payload: writer.data))
-        let value = try reader.bytes(limit: defaultMaxPayload)
-        try reader.finish()
-        return value
+        return try withReadOnlyControl { control in
+            var reader = WireReader(try control.request(.getXattr, payload: writer.data))
+            let value = try reader.bytes(limit: defaultMaxPayload)
+            try reader.finish()
+            return value
+        }
     }
 
     func setXattr(_ path: String, name: String, value: Data, policy: UInt32) throws {
@@ -1278,23 +1792,133 @@ final class DaemonClient {
         writer.string(name)
         writer.uint32(policy)
         writer.bytes(value)
-        _ = try control.request(.setXattr, payload: writer.data)
+        try withMutationControl { control in
+            _ = try control.request(.setXattr, payload: writer.data)
+        }
     }
 
     func listXattrs(_ path: String) throws -> [String] {
         var writer = WireWriter()
         writer.string(path)
-        var reader = WireReader(try control.request(.listXattrs, payload: writer.data))
-        let count = Int(try reader.uint32())
-        guard count <= defaultMaxPayload / 4 else {
-            throw POSIXError(.E2BIG)
+        return try withReadOnlyControl { control in
+            var reader = WireReader(try control.request(.listXattrs, payload: writer.data))
+            let count = Int(try reader.uint32())
+            guard count <= defaultMaxPayload / 4 else {
+                throw POSIXError(.E2BIG)
+            }
+            var attributes: [String] = []
+            attributes.reserveCapacity(count)
+            for _ in 0..<count {
+                attributes.append(try reader.string(limit: 4096))
+            }
+            try reader.finish()
+            return attributes
         }
-        var attributes: [String] = []
-        attributes.reserveCapacity(count)
-        for _ in 0..<count {
-            attributes.append(try reader.string(limit: 4096))
+    }
+
+    private func readOnlyControlRequest(
+        _ operation: WireOperation,
+        payload: Data = Data()
+    ) throws -> Data {
+        try withReadOnlyControl { control in
+            try control.request(operation, payload: payload)
         }
-        try reader.finish()
-        return attributes
+    }
+
+    private func withReadOnlyControl<T>(
+        _ operation: (WireConnection) throws -> T
+    ) throws -> T {
+        let deadline = Date().addingTimeInterval(frontendRecoveryTimeout)
+        var attempts = 0
+        var lastTransportError: (any Error)?
+        while attempts < 8, Date() <= deadline {
+            let current = snapshot()
+            do {
+                let result = try operation(current.control)
+                guard currentEpoch == current.epoch else {
+                    attempts += 1
+                    continue
+                }
+                return result
+            } catch {
+                guard isWireTransportError(error) else { throw error }
+                lastTransportError = error
+                try recover(after: error, observedEpoch: current.epoch, noLaterThan: deadline)
+                attempts += 1
+            }
+        }
+        throw lastTransportError ?? POSIXError(.ETIMEDOUT)
+    }
+
+    private func withMutationControl<T>(
+        _ operation: (WireConnection) throws -> T
+    ) throws -> T {
+        let deadline = Date().addingTimeInterval(frontendRecoveryTimeout)
+        let current = snapshot()
+        do {
+            return try operation(current.control)
+        } catch {
+            guard isWireTransportError(error) else { throw error }
+            try? recover(after: error, observedEpoch: current.epoch, noLaterThan: deadline)
+            // The daemon may have committed the request before the socket failed.
+            throw POSIXError(.EIO)
+        }
+    }
+
+    private func makeConnection(noLaterThan deadline: Date) throws -> (connection: WireConnection, epoch: UInt64) {
+        var attempts = 0
+        var lastTransportError: (any Error)?
+        while attempts < 8, Date() <= deadline {
+            let current = snapshot()
+            do {
+                let connection = try WireConnection(descriptor: current.descriptor)
+                guard currentEpoch == current.epoch else {
+                    connection.close()
+                    attempts += 1
+                    continue
+                }
+                return (connection, current.epoch)
+            } catch {
+                guard isWireTransportError(error) else { throw error }
+                lastTransportError = error
+                try recover(after: error, observedEpoch: current.epoch, noLaterThan: deadline)
+                attempts += 1
+            }
+        }
+        throw lastTransportError ?? POSIXError(.ETIMEDOUT)
+    }
+
+    private func snapshot() -> Snapshot {
+        stateLock.withLock {
+            Snapshot(descriptor: storedDescriptor, control: control, epoch: epoch)
+        }
+    }
+
+    private func reconnect(noLaterThan deadline: Date) throws -> UInt64 {
+        guard let resourceURL else { throw POSIXError(.ENOTRECOVERABLE) }
+        let remaining = deadline.timeIntervalSinceNow
+        guard remaining > 0 else { throw POSIXError(.ETIMEDOUT) }
+        let refreshedDescriptor = try WireDescriptor(resourceURL: resourceURL)
+        let refreshedControl = try WireConnection(
+            descriptor: refreshedDescriptor,
+            idleTimeout: min(socketIdleTimeout, remaining)
+        )
+        do {
+            _ = try refreshedControl.request(.ping)
+        } catch {
+            refreshedControl.close()
+            throw error
+        }
+        let previous = stateLock.withLock { () -> WireConnection in
+            let previous = control
+            storedDescriptor = refreshedDescriptor
+            control = refreshedControl
+            epoch &+= 1
+            return previous
+        }
+        retiredConnectionQueue.async {
+            previous.close()
+        }
+        return refreshedDescriptor.generation
     }
 }

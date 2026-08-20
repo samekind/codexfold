@@ -14,10 +14,12 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/klauspost/compress/zstd"
 	"github.com/samekind/codexfold/internal/fold"
 	"github.com/samekind/codexfold/internal/storage"
+	"github.com/samekind/codexfold/internal/vfs"
 )
 
 func TestBuildAndResolverReadExactRandomRanges(t *testing.T) {
@@ -155,7 +157,7 @@ func TestBuildWritesBoundedV3IndexAndResolverKeepsNoObjectMap(t *testing.T) {
 	}
 }
 
-func TestResolverRejectsUnsortedV3ObjectIndex(t *testing.T) {
+func TestResolverRepairsUnsortedV3ObjectIndexFromRecoveryArchive(t *testing.T) {
 	root := t.TempDir()
 	refs := putObjects(t, root, []byte("unsorted-a"), []byte("unsorted-b"))
 	writeManifest(t, root, "session", refs)
@@ -174,8 +176,936 @@ func TestResolverRejectsUnsortedV3ObjectIndex(t *testing.T) {
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Open(root, OpenOptions{}); err == nil || !strings.Contains(err.Error(), "strictly sorted") {
-		t.Fatalf("unsorted v3 index error = %v", err)
+	resolver, err := Open(root, OpenOptions{})
+	if err != nil {
+		t.Fatalf("repair unsorted v3 index: %v", err)
+	}
+	defer resolver.Close()
+	for index, ref := range refs {
+		buffer := make([]byte, ref.RawBytes)
+		if _, err := resolver.ReadAt(context.Background(), ref, buffer, 0); err != nil {
+			t.Fatalf("read repaired object %d: %v", index, err)
+		}
+	}
+	repaired, err := os.ReadFile(path)
+	if err != nil || bytes.Equal(repaired, data) {
+		t.Fatalf("runtime index was not restored: equal_corrupt=%t err=%v", bytes.Equal(repaired, data), err)
+	}
+}
+
+func TestResolverRefusesIndexRepairWhenRecoveryArchiveIsCorrupt(t *testing.T) {
+	root := t.TempDir()
+	refs := putObjects(t, root, []byte("protected-index-a"), []byte("protected-index-b"))
+	writeManifest(t, root, "session", refs)
+	result, err := Build(context.Background(), root, BuildOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory := filepath.Join(root, "packs", result.Generation)
+	if err := os.WriteFile(filepath.Join(directory, indexV3ObjectsFile), []byte("corrupt"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(directory, recoveryArchiveFilename), []byte("corrupt"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(root, OpenOptions{}); err == nil {
+		t.Fatal("resolver repaired an index without a valid recovery archive")
+	}
+}
+
+func TestOpenRecoversCurrentIndexAndManifests(t *testing.T) {
+	root := t.TempDir()
+	value := bytes.Repeat([]byte("recoverable-session\n"), 200)
+	refs := putObjects(t, root, value)
+	writeManifest(t, root, "session", refs)
+	result, err := Build(context.Background(), root, BuildOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	persistManagedManifestFixture(t, root, "session", value)
+	directory := filepath.Join(root, "packs", result.Generation)
+	for _, path := range []string{
+		filepath.Join(root, "packs", "CURRENT"),
+		filepath.Join(directory, indexV3MetaFilename),
+		filepath.Join(directory, indexV3ObjectsFile),
+		filepath.Join(directory, indexV3BlocksFile),
+		filepath.Join(root, "manifests", "session.json"),
+	} {
+		if err := os.Remove(path); err != nil {
+			t.Fatal(err)
+		}
+	}
+	resolver, err := Open(root, OpenOptions{})
+	if err != nil {
+		t.Fatalf("recover current pack: %v", err)
+	}
+	defer resolver.Close()
+	if _, err := RepairCurrentManifests(root); err != nil {
+		t.Fatalf("recover manifests: %v", err)
+	}
+	buffer := make([]byte, len(value))
+	if _, err := resolver.ReadAt(context.Background(), refs[0], buffer, 0); err != nil || !bytes.Equal(buffer, value) {
+		t.Fatalf("read recovered bytes: equal=%t err=%v", bytes.Equal(buffer, value), err)
+	}
+	manifest, err := fold.LoadManifest(root, "session")
+	if err != nil || manifest.Source.Bytes != int64(len(value)) {
+		t.Fatalf("load recovered manifest: %#v err=%v", manifest.Source, err)
+	}
+}
+
+func TestRepairCurrentManifestsDoesNotRestoreUnmanagedManifest(t *testing.T) {
+	root := t.TempDir()
+	refs := putObjects(t, root, []byte("unmanaged-manifest"))
+	writeManifest(t, root, "session", refs)
+	if _, err := Build(context.Background(), root, BuildOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	manifestPath := fold.ManifestPath(root, "session")
+	if err := os.Remove(manifestPath); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := RepairCurrentManifests(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restored != 0 {
+		t.Fatalf("restored unmanaged manifests = %d, want 0", restored)
+	}
+	if _, err := os.Lstat(manifestPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unmanaged manifest was resurrected: %v", err)
+	}
+}
+
+func TestRepairCurrentManifestsDoesNotResurrectManifestFirstDeletion(t *testing.T) {
+	root := t.TempDir()
+	value := []byte("manifest-first-explicit-deletion")
+	refs := putObjects(t, root, value)
+	writeManifest(t, root, "session", refs)
+	if _, err := Build(context.Background(), root, BuildOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	state := persistManagedManifestFixture(t, root, "session", value)
+	tombstone, err := vfs.PublishSessionDeletion(root, state, "/sessions/2026/07/25/session.jsonl")
+	if err != nil {
+		t.Fatalf("publish deletion tombstone: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(tombstone.RetiredManifestPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(tombstone.ManifestPath, tombstone.RetiredManifestPath); err != nil {
+		t.Fatalf("stage manifest-first deletion crash phase: %v", err)
+	}
+
+	restored, err := RepairCurrentManifests(root)
+	if err != nil {
+		t.Fatalf("repair around pending deletion: %v", err)
+	}
+	if restored != 0 {
+		t.Fatalf("restored tombstoned manifests = %d, want 0", restored)
+	}
+	if _, err := os.Lstat(tombstone.ManifestPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("tombstoned manifest was resurrected: %v", err)
+	}
+	if got, err := os.ReadFile(tombstone.RetiredManifestPath); err != nil || len(got) == 0 {
+		t.Fatalf("retired manifest changed during repair: bytes=%d err=%v", len(got), err)
+	}
+	completed, err := vfs.AdvanceSessionDeletion(root, tombstone)
+	if err != nil || !completed {
+		t.Fatalf("advance deletion after repair completed=%t err=%v", completed, err)
+	}
+	if _, err := os.Lstat(tombstone.SessionPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("deleted session state remains live: %v", err)
+	}
+}
+
+func TestRepairCurrentManifestsRestoresLiveSessionButSkipsPendingDeletion(t *testing.T) {
+	root := t.TempDir()
+	deletedValue := []byte("deleted-session-manifest")
+	liveValue := []byte("live-session-manifest")
+	writeManifest(t, root, "deleted", putObjects(t, root, deletedValue))
+	writeManifest(t, root, "live", putObjects(t, root, liveValue))
+	if _, err := Build(context.Background(), root, BuildOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	deletedState := persistManagedManifestFixture(t, root, "deleted", deletedValue)
+	persistManagedManifestFixture(t, root, "live", liveValue)
+	tombstone, err := vfs.PublishSessionDeletion(root, deletedState, "/sessions/2026/07/25/deleted.jsonl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(tombstone.RetiredManifestPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(tombstone.ManifestPath, tombstone.RetiredManifestPath); err != nil {
+		t.Fatal(err)
+	}
+	liveManifestPath := fold.ManifestPath(root, "live")
+	if err := os.Remove(liveManifestPath); err != nil {
+		t.Fatal(err)
+	}
+
+	restored, err := RepairCurrentManifests(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restored != 1 {
+		t.Fatalf("restored manifests = %d, want only the live session", restored)
+	}
+	if _, err := os.Lstat(tombstone.ManifestPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("pending deletion manifest was resurrected: %v", err)
+	}
+	liveManifest, err := fold.LoadManifestPath(liveManifestPath)
+	if err != nil || liveManifest.Session.ID != "live" || liveManifest.Source.SHA256 != digestBytes(liveValue) {
+		t.Fatalf("live manifest was not restored exactly: session=%q sha=%q err=%v", liveManifest.Session.ID, liveManifest.Source.SHA256, err)
+	}
+	if completed, err := vfs.AdvanceSessionDeletion(root, tombstone); err != nil || !completed {
+		t.Fatalf("advance pending deletion completed=%t err=%v", completed, err)
+	}
+}
+
+func TestRepairCurrentManifestsFailsClosedOnUnreadableDeletionTombstone(t *testing.T) {
+	root := t.TempDir()
+	value := []byte("unreadable-deletion-tombstone")
+	refs := putObjects(t, root, value)
+	writeManifest(t, root, "session", refs)
+	if _, err := Build(context.Background(), root, BuildOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	persistManagedManifestFixture(t, root, "session", value)
+	manifestPath := fold.ManifestPath(root, "session")
+	if err := os.Remove(manifestPath); err != nil {
+		t.Fatal(err)
+	}
+	tombstonePath := vfs.SessionDeletionPath(root, "session")
+	if err := os.MkdirAll(filepath.Dir(tombstonePath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(tombstonePath, []byte("{\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	currentPath := filepath.Join(root, "packs", "CURRENT")
+	if err := os.Remove(currentPath); err != nil {
+		t.Fatal(err)
+	}
+
+	if restored, err := RepairCurrentManifests(root); err == nil {
+		t.Fatalf("manifest repair accepted an unreadable tombstone: restored=%d", restored)
+	}
+	if _, err := os.Lstat(manifestPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("manifest was restored without valid deletion discovery: %v", err)
+	}
+	if _, err := os.Lstat(currentPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("pack CURRENT was recovered before deletion discovery succeeded: %v", err)
+	}
+}
+
+func TestBuildRejectsRecoveryManifestWithWrongSourceDigest(t *testing.T) {
+	root := t.TempDir()
+	refs := putObjects(t, root, []byte("manifest-source-proof"))
+	writeManifest(t, root, "session", refs)
+	manifest, err := fold.LoadManifest(root, "session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest.Source.SHA256 = strings.Repeat("0", sha256.Size*2)
+	data, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(fold.ManifestPath(root, "session"), append(data, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Build(context.Background(), root, BuildOptions{}); err == nil {
+		t.Fatal("pack build published a recovery archive whose manifest cannot reconstruct its declared source")
+	}
+	if _, err := os.Lstat(filepath.Join(root, "packs", publicationHeadFilename)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("failed build published an authoritative head: %v", err)
+	}
+}
+
+func TestRecoverCurrentDoesNotPromoteUnpublishedGeneration(t *testing.T) {
+	root := t.TempDir()
+	refs := putObjects(t, root, []byte("published-generation"))
+	writeManifest(t, root, "session", refs)
+	first, err := Build(context.Background(), root, BuildOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stop := errors.New("stop before publication")
+	if _, err := Build(context.Background(), root, BuildOptions{BeforePublish: func() error { return stop }}); !errors.Is(err, stop) {
+		t.Fatalf("interrupted build error = %v, want %v", err, stop)
+	}
+	if err := os.Remove(filepath.Join(root, "packs", "CURRENT")); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := RecoverCurrentGeneration(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered != first.Generation {
+		t.Fatalf("recovered generation = %s, want last authoritative %s", recovered, first.Generation)
+	}
+}
+
+func TestOpenKeepsServingCurrentDuringPublicationHeadWindow(t *testing.T) {
+	root := t.TempDir()
+	refs := putObjects(t, root, []byte("publication-window"))
+	writeManifest(t, root, "session", refs)
+	first, err := Build(context.Background(), root, BuildOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reached := make(chan struct{})
+	release := make(chan struct{})
+	buildDone := make(chan error, 1)
+	go func() {
+		_, err := Build(context.Background(), root, BuildOptions{AfterPublicationHead: func() error {
+			close(reached)
+			<-release
+			return nil
+		}})
+		buildDone <- err
+	}()
+	<-reached
+	resolver, openErr := Open(root, OpenOptions{})
+	if openErr == nil {
+		if resolver.Generation() != first.Generation {
+			openErr = fmt.Errorf("resolver generation = %s, want still-current %s", resolver.Generation(), first.Generation)
+		}
+		_ = resolver.Close()
+	}
+	close(release)
+	buildErr := <-buildDone
+	if openErr != nil {
+		t.Fatalf("Open during publication window: %v", openErr)
+	}
+	if buildErr != nil {
+		t.Fatalf("Build after publication window: %v", buildErr)
+	}
+}
+
+func TestRecoverCurrentRollsForwardUniqueMarkerSuccessor(t *testing.T) {
+	root := t.TempDir()
+	refs := putObjects(t, root, []byte("uncommitted-marker"))
+	writeManifest(t, root, "session", refs)
+	first, err := Build(context.Background(), root, BuildOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stop := errors.New("stop before marker")
+	if _, err := Build(context.Background(), root, BuildOptions{BeforePublish: func() error { return stop }}); !errors.Is(err, stop) {
+		t.Fatalf("interrupted build error = %v, want %v", err, stop)
+	}
+	entries, err := os.ReadDir(filepath.Join(root, "packs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var candidate string
+	for _, entry := range entries {
+		if entry.IsDir() && safeGeneration(entry.Name()) && entry.Name() != first.Generation {
+			candidate = entry.Name()
+			break
+		}
+	}
+	if candidate == "" {
+		t.Fatal("interrupted build did not leave a candidate generation")
+	}
+	if _, err := markGenerationPublished(filepath.Join(root, "packs", candidate), 2, first.Generation); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(root, "packs", "CURRENT")); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := RecoverCurrentGeneration(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered != candidate {
+		t.Fatalf("recovered generation = %s, want unique prepared successor %s", recovered, candidate)
+	}
+	head, _, err := readPublicationHead(filepath.Join(root, "packs"))
+	if err != nil || head.Generation != candidate || head.Sequence != 2 {
+		t.Fatalf("rolled-forward publication head=%#v err=%v", head, err)
+	}
+}
+
+func TestBuildContinuesAfterRecoveringUniqueMarkerSuccessor(t *testing.T) {
+	root := t.TempDir()
+	refs := putObjects(t, root, []byte("build-after-successor-recovery"))
+	writeManifest(t, root, "session", refs)
+	first, err := Build(context.Background(), root, BuildOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stop := errors.New("stop before marker")
+	if _, err := Build(context.Background(), root, BuildOptions{BeforePublish: func() error { return stop }}); !errors.Is(err, stop) {
+		t.Fatalf("interrupted build error = %v, want %v", err, stop)
+	}
+	entries, err := os.ReadDir(filepath.Join(root, "packs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var successor string
+	for _, entry := range entries {
+		if entry.IsDir() && safeGeneration(entry.Name()) && entry.Name() != first.Generation {
+			successor = entry.Name()
+			break
+		}
+	}
+	if successor == "" {
+		t.Fatal("interrupted build did not leave a candidate generation")
+	}
+	if _, err := markGenerationPublished(filepath.Join(root, "packs", successor), 2, first.Generation); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(root, "packs", "CURRENT")); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := Build(context.Background(), root, BuildOptions{})
+	if err != nil {
+		t.Fatalf("build after successor recovery: %v", err)
+	}
+	head, marker, err := readPublicationHead(filepath.Join(root, "packs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if head.Generation != result.Generation || head.Sequence != 3 || marker.PreviousGeneration != successor {
+		t.Fatalf("publication after recovered build: head=%#v marker=%#v successor=%s result=%s", head, marker, successor, result.Generation)
+	}
+}
+
+func TestRecoverCurrentRefusesForkedMarkerSuccessors(t *testing.T) {
+	root := t.TempDir()
+	refs := putObjects(t, root, []byte("forked-publication-marker"))
+	writeManifest(t, root, "session", refs)
+	first, err := Build(context.Background(), root, BuildOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stop := errors.New("stop before marker")
+	for attempt := 0; attempt < 2; attempt++ {
+		if _, err := Build(context.Background(), root, BuildOptions{BeforePublish: func() error { return stop }}); !errors.Is(err, stop) {
+			t.Fatalf("interrupted build %d error = %v", attempt, err)
+		}
+	}
+	entries, err := os.ReadDir(filepath.Join(root, "packs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	marked := 0
+	for _, entry := range entries {
+		if !entry.IsDir() || !safeGeneration(entry.Name()) || entry.Name() == first.Generation {
+			continue
+		}
+		if _, err := markGenerationPublished(filepath.Join(root, "packs", entry.Name()), 2, first.Generation); err != nil {
+			t.Fatal(err)
+		}
+		marked++
+	}
+	if marked != 2 {
+		t.Fatalf("marked successor count = %d, want 2", marked)
+	}
+	if err := os.Remove(filepath.Join(root, "packs", "CURRENT")); err != nil {
+		t.Fatal(err)
+	}
+	if recovered, err := RecoverCurrentGeneration(context.Background(), root); err == nil {
+		t.Fatalf("forked publication successors recovered as %s", recovered)
+	}
+	if _, err := os.Lstat(filepath.Join(root, "packs", "CURRENT")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("forked recovery republished CURRENT: %v", err)
+	}
+}
+
+func TestRecoverCurrentRefusesCorruptLatestPublishedGeneration(t *testing.T) {
+	root := t.TempDir()
+	refs := putObjects(t, root, []byte("no-published-downgrade"))
+	writeManifest(t, root, "session", refs)
+	if _, err := Build(context.Background(), root, BuildOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	latest, err := Build(context.Background(), root, BuildOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(root, "packs", "CURRENT")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "packs", latest.Generation, recoveryArchiveFilename), []byte("corrupt"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if recovered, err := RecoverCurrentGeneration(context.Background(), root); err == nil {
+		t.Fatalf("corrupt latest published generation recovered as %s", recovered)
+	}
+	if _, err := os.Lstat(filepath.Join(root, "packs", "CURRENT")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("failed recovery republished CURRENT: %v", err)
+	}
+}
+
+func TestRecoverCurrentRefusesMissingLatestPublishedDirectory(t *testing.T) {
+	root := t.TempDir()
+	refs := putObjects(t, root, []byte("missing-latest-generation"))
+	writeManifest(t, root, "session", refs)
+	first, err := Build(context.Background(), root, BuildOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	latest, err := Build(context.Background(), root, BuildOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(root, "packs", "CURRENT")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(filepath.Join(root, "packs", latest.Generation)); err != nil {
+		t.Fatal(err)
+	}
+	if recovered, err := RecoverCurrentGeneration(context.Background(), root); err == nil {
+		t.Fatalf("missing latest directory downgraded to %s (previous %s)", recovered, first.Generation)
+	}
+	if _, err := os.Lstat(filepath.Join(root, "packs", "CURRENT")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("failed recovery republished CURRENT: %v", err)
+	}
+}
+
+func TestBuildMigratesLegacyCurrentWithoutPublicationHead(t *testing.T) {
+	root := t.TempDir()
+	refs := putObjects(t, root, []byte("legacy-publication-migration"))
+	writeManifest(t, root, "session", refs)
+	legacy, err := Build(context.Background(), root, BuildOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyDir := filepath.Join(root, "packs", legacy.Generation)
+	for _, path := range []string{
+		filepath.Join(root, "packs", publicationHeadFilename),
+		filepath.Join(legacyDir, publishedMarkerFilename),
+		filepath.Join(legacyDir, recoveryArchiveFilename),
+	} {
+		if err := os.Remove(path); err != nil {
+			t.Fatal(err)
+		}
+	}
+	next, err := Build(context.Background(), root, BuildOptions{})
+	if err != nil {
+		t.Fatalf("build after legacy publication migration: %v", err)
+	}
+	head, marker, err := readPublicationHead(filepath.Join(root, "packs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if head.Generation != next.Generation || head.Sequence != 2 || marker.PreviousGeneration != legacy.Generation {
+		t.Fatalf("migrated publication chain: head=%#v marker=%#v legacy=%s next=%s", head, marker, legacy.Generation, next.Generation)
+	}
+}
+
+func TestBuildResolvesLegacyPublicationChainBeforePublishingHead(t *testing.T) {
+	t.Run("unique complete chain", func(t *testing.T) {
+		root := t.TempDir()
+		refs := putObjects(t, root, []byte("complete-publication-chain"))
+		writeManifest(t, root, "session", refs)
+		first, err := Build(context.Background(), root, BuildOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Build(context.Background(), root, BuildOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		third, err := Build(context.Background(), root, BuildOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		packsDir := filepath.Join(root, "packs")
+		if err := os.Remove(filepath.Join(packsDir, publicationHeadFilename)); err != nil {
+			t.Fatal(err)
+		}
+		if err := publishCurrent(packsDir, first.Generation); err != nil {
+			t.Fatal(err)
+		}
+
+		result, err := Build(context.Background(), root, BuildOptions{})
+		if err != nil {
+			t.Fatalf("build after reconstructing complete publication chain: %v", err)
+		}
+		head, marker, err := readPublicationHead(packsDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if head.Generation != result.Generation || head.Sequence != 4 || marker.PreviousGeneration != third.Generation {
+			t.Fatalf("reconstructed publication chain: head=%#v marker=%#v third=%s result=%s", head, marker, third.Generation, result.Generation)
+		}
+	})
+
+	for _, test := range []struct {
+		name           string
+		candidateCount int
+		sequence       uint64
+	}{
+		{name: "fork", candidateCount: 2, sequence: 2},
+		{name: "sequence gap", candidateCount: 1, sequence: 3},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			refs := putObjects(t, root, []byte("invalid-publication-chain"))
+			writeManifest(t, root, "session", refs)
+			first, err := Build(context.Background(), root, BuildOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			stop := errors.New("stop before marker")
+			for attempt := 0; attempt < test.candidateCount; attempt++ {
+				if _, err := Build(context.Background(), root, BuildOptions{BeforePublish: func() error { return stop }}); !errors.Is(err, stop) {
+					t.Fatalf("interrupted build %d error = %v, want %v", attempt, err, stop)
+				}
+			}
+			packsDir := filepath.Join(root, "packs")
+			entries, err := os.ReadDir(packsDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			marked := 0
+			for _, entry := range entries {
+				if !entry.IsDir() || !safeGeneration(entry.Name()) || entry.Name() == first.Generation {
+					continue
+				}
+				if _, err := markGenerationPublished(filepath.Join(packsDir, entry.Name()), test.sequence, first.Generation); err != nil {
+					t.Fatal(err)
+				}
+				marked++
+			}
+			if marked != test.candidateCount {
+				t.Fatalf("marked candidate count = %d, want %d", marked, test.candidateCount)
+			}
+			if err := os.Remove(filepath.Join(packsDir, publicationHeadFilename)); err != nil {
+				t.Fatal(err)
+			}
+
+			if _, err := Build(context.Background(), root, BuildOptions{}); err == nil {
+				t.Fatal("build accepted an invalid publication chain")
+			}
+			if _, err := os.Lstat(filepath.Join(packsDir, publicationHeadFilename)); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("invalid publication chain persisted PUBLISHED: %v", err)
+			}
+		})
+	}
+}
+
+func TestRepairCurrentManifestsDoesNotResurrectRemovedSession(t *testing.T) {
+	root := t.TempDir()
+	value := []byte("removed-managed-session")
+	refs := putObjects(t, root, value)
+	writeManifest(t, root, "session", refs)
+	if _, err := Build(context.Background(), root, BuildOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	persistManagedManifestFixture(t, root, "session", value)
+	manifestPath := fold.ManifestPath(root, "session")
+	if err := os.Remove(manifestPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(filepath.Join(root, "fs", "sessions", "session")); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := RepairCurrentManifests(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restored != 0 {
+		t.Fatalf("restored removed session manifests = %d, want 0", restored)
+	}
+	if _, err := os.Lstat(manifestPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("removed session manifest was resurrected: %v", err)
+	}
+}
+
+func TestRepairCurrentManifestsRequiresExactRepublishedManifestVersion(t *testing.T) {
+	root := t.TempDir()
+	value := []byte("managed-manifest-metadata-version")
+	refs := putObjects(t, root, value)
+	writeManifest(t, root, "session", refs)
+	if _, err := Build(context.Background(), root, BuildOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	persistManagedManifestFixture(t, root, "session", value)
+
+	manifestPath := fold.ManifestPath(root, "session")
+	manifest, err := fold.LoadManifestPath(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest.Session.Title = "metadata version B"
+	versionB, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	versionB = append(versionB, '\n')
+	if err := os.WriteFile(manifestPath, versionB, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if restored, err := RepairCurrentManifests(root); err == nil {
+		t.Fatalf("stale state accepted metadata version B: restored=%d", restored)
+	}
+	if current, err := os.ReadFile(manifestPath); err != nil || !bytes.Equal(current, versionB) {
+		t.Fatalf("failed repair changed metadata version B: equal=%t err=%v", bytes.Equal(current, versionB), err)
+	}
+
+	statePath := filepath.Join(root, "fs", "sessions", "session", "state.json")
+	if _, err := vfs.RepublishSessionState(statePath); err != nil {
+		t.Fatalf("republish metadata version B: %v", err)
+	}
+	if _, err := Build(context.Background(), root, BuildOptions{}); err != nil {
+		t.Fatalf("build republished metadata version B: %v", err)
+	}
+	if err := os.Remove(manifestPath); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := RepairCurrentManifests(root)
+	if err != nil {
+		t.Fatalf("restore republished metadata version B: %v", err)
+	}
+	if restored != 1 {
+		t.Fatalf("restored manifests = %d, want 1", restored)
+	}
+	if current, err := os.ReadFile(manifestPath); err != nil || !bytes.Equal(current, versionB) {
+		t.Fatalf("restored manifest is not metadata version B: equal=%t err=%v", bytes.Equal(current, versionB), err)
+	}
+}
+
+func TestRepairCurrentManifestsCannotFollowIntermediateSymlinkOutsideStore(t *testing.T) {
+	root := t.TempDir()
+	value := []byte("managed-manifest-symlink-boundary")
+	refs := putObjects(t, root, value)
+	writeManifest(t, root, "session", refs)
+	if _, err := Build(context.Background(), root, BuildOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	persistManagedManifestFixture(t, root, "session", value)
+	manifestPath := fold.ManifestPath(root, "session")
+	if err := os.Remove(manifestPath); err != nil {
+		t.Fatal(err)
+	}
+	manifestRoot := filepath.Dir(manifestPath)
+	if err := os.Remove(manifestRoot); err != nil {
+		t.Fatal(err)
+	}
+	outside := t.TempDir()
+	if err := os.Symlink(outside, manifestRoot); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	if restored, err := RepairCurrentManifests(root); err == nil {
+		t.Fatalf("recovery followed an intermediate symlink outside the store: restored=%d", restored)
+	}
+	if _, err := os.Lstat(filepath.Join(outside, "session.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("recovery wrote outside the store: %v", err)
+	}
+}
+
+func TestRepairGenerationIndexCannotFollowGenerationSymlinkOutsideStore(t *testing.T) {
+	root := t.TempDir()
+	refs := putObjects(t, root, []byte("generation-root-symlink"))
+	writeManifest(t, root, "session", refs)
+	result, err := Build(context.Background(), root, BuildOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	generationDir := filepath.Join(root, "packs", result.Generation)
+	outside := t.TempDir()
+	outsideGeneration := filepath.Join(outside, result.Generation)
+	if err := os.Rename(generationDir, outsideGeneration); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outsideGeneration, generationDir); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	indexPath := filepath.Join(outsideGeneration, indexV3ObjectsFile)
+	if err := os.Remove(indexPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := repairGenerationIndex(generationDir); err == nil {
+		t.Fatal("generation symlink outside store allowed index recovery")
+	}
+	if _, err := os.Lstat(indexPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("generation symlink recovery wrote outside store: %v", err)
+	}
+}
+
+func TestOpenRejectsGenerationSymlinkOutsideStore(t *testing.T) {
+	root := t.TempDir()
+	refs := putObjects(t, root, []byte("generation-read-root-symlink"))
+	writeManifest(t, root, "session", refs)
+	result, err := Build(context.Background(), root, BuildOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	generationDir := filepath.Join(root, "packs", result.Generation)
+	outside := t.TempDir()
+	outsideGeneration := filepath.Join(outside, result.Generation)
+	if err := os.Rename(generationDir, outsideGeneration); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outsideGeneration, generationDir); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	resolver, err := Open(root, OpenOptions{})
+	if resolver != nil {
+		_ = resolver.Close()
+	}
+	if err == nil {
+		t.Fatal("resolver followed a generation symlink outside the store")
+	}
+	if info, statErr := os.Lstat(generationDir); statErr != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("generation symlink was replaced: mode=%v err=%v", infoMode(info), statErr)
+	}
+	if _, statErr := os.Stat(filepath.Join(outsideGeneration, indexV3MetaFilename)); statErr != nil {
+		t.Fatalf("outside generation changed: %v", statErr)
+	}
+}
+
+func TestOpenRejectsExternalV3IndexSymlinks(t *testing.T) {
+	for _, name := range []string{indexV3MetaFilename, indexV3ObjectsFile, indexV3BlocksFile} {
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			refs := putObjects(t, root, []byte("external-index-symlink-"+name))
+			writeManifest(t, root, "session", refs)
+			result, err := Build(context.Background(), root, BuildOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			target := filepath.Join(root, "packs", result.Generation, name)
+			want, err := os.ReadFile(target)
+			if err != nil {
+				t.Fatal(err)
+			}
+			outside := filepath.Join(t.TempDir(), name)
+			if err := os.WriteFile(outside, want, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Remove(target); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(outside, target); err != nil {
+				t.Skipf("symlinks unavailable: %v", err)
+			}
+
+			resolver, err := Open(root, OpenOptions{})
+			if resolver != nil {
+				_ = resolver.Close()
+			}
+			if err == nil {
+				t.Fatalf("resolver followed external %s symlink", name)
+			}
+			if info, statErr := os.Lstat(target); statErr != nil || info.Mode()&os.ModeSymlink == 0 {
+				t.Fatalf("index symlink was replaced: mode=%v err=%v", infoMode(info), statErr)
+			}
+			if got, readErr := os.ReadFile(outside); readErr != nil || !bytes.Equal(got, want) {
+				t.Fatalf("outside index changed: equal=%t err=%v", bytes.Equal(got, want), readErr)
+			}
+		})
+	}
+}
+
+func TestOpenRejectsExternalPackFileSymlink(t *testing.T) {
+	root := t.TempDir()
+	refs := putObjects(t, root, []byte("external-pack-file-symlink"))
+	writeManifest(t, root, "session", refs)
+	result, err := Build(context.Background(), root, BuildOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(root, "packs", result.Generation, "pack-000001.pack")
+	want, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(t.TempDir(), filepath.Base(target))
+	if err := os.WriteFile(outside, want, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(target); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, target); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	if _, err := VerifyRecovery(context.Background(), root, result.Generation); err == nil {
+		t.Fatal("recovery verification followed an external pack file symlink")
+	}
+	resolver, err := Open(root, OpenOptions{})
+	if resolver != nil {
+		_ = resolver.Close()
+	}
+	if err == nil {
+		t.Fatal("resolver followed an external pack file symlink")
+	}
+	if info, statErr := os.Lstat(target); statErr != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("pack symlink was replaced: mode=%v err=%v", infoMode(info), statErr)
+	}
+	if got, readErr := os.ReadFile(outside); readErr != nil || !bytes.Equal(got, want) {
+		t.Fatalf("outside pack changed: equal=%t err=%v", bytes.Equal(got, want), readErr)
+	}
+}
+
+func TestVerifyRecoveryRejectsExternalArchiveSymlink(t *testing.T) {
+	root := t.TempDir()
+	refs := putObjects(t, root, []byte("external-recovery-archive-symlink"))
+	writeManifest(t, root, "session", refs)
+	result, err := Build(context.Background(), root, BuildOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(root, "packs", result.Generation, recoveryArchiveFilename)
+	want, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(t.TempDir(), recoveryArchiveFilename)
+	if err := os.WriteFile(outside, want, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(target); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, target); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	if _, err := VerifyRecovery(context.Background(), root, result.Generation); err == nil {
+		t.Fatal("recovery verification followed an external recovery archive symlink")
+	}
+	if info, statErr := os.Lstat(target); statErr != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("recovery archive symlink was replaced: mode=%v err=%v", infoMode(info), statErr)
+	}
+	if got, readErr := os.ReadFile(outside); readErr != nil || !bytes.Equal(got, want) {
+		t.Fatalf("outside recovery archive changed: equal=%t err=%v", bytes.Equal(got, want), readErr)
+	}
+}
+
+func infoMode(info os.FileInfo) os.FileMode {
+	if info == nil {
+		return 0
+	}
+	return info.Mode()
+}
+
+func TestRecoveryManifestPublishDoesNotClobberConcurrentTarget(t *testing.T) {
+	root := t.TempDir()
+	data := []byte("manifest target appeared after validation")
+	identity := RecoveryFile{Path: "manifests/session.json", Bytes: int64(len(data)), SHA256: digestBytes(data)}
+	target, err := newRecoveryRestoreTarget(root, identity.Path, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = restoreRecoveryEntryValidated(bytes.NewReader(data), target, identity, func(*os.File) error {
+		return os.WriteFile(target.absolutePath(), []byte("concurrent target"), 0o600)
+	})
+	if err == nil {
+		t.Fatal("manifest recovery clobbered a target that appeared after validation")
+	}
+	if got, readErr := os.ReadFile(target.absolutePath()); readErr != nil || string(got) != "concurrent target" {
+		t.Fatalf("concurrent target changed: %q err=%v", got, readErr)
 	}
 }
 
@@ -323,6 +1253,219 @@ func TestRetireLooseRefusesCorruptPackBeforeDeletion(t *testing.T) {
 	}
 	if _, err := os.Stat(fold.NewObjectStore(root).ObjectPath(refs[0].SHA256)); err != nil {
 		t.Fatalf("corrupt pack retirement removed loose recovery copy: %v", err)
+	}
+}
+
+func TestRetireLooseRefusesDigestNamedFileWithDifferentDecodedBytes(t *testing.T) {
+	root := t.TempDir()
+	refs := putObjects(t, root, []byte("packed authoritative bytes"))
+	writeManifest(t, root, "session", refs)
+	if _, err := Build(context.Background(), root, BuildOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	store := fold.NewObjectStore(root)
+	other, _, err := store.Put([]byte("different loose bytes"), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongCompressed, err := os.ReadFile(store.ObjectPath(other.SHA256))
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate := store.ObjectPath(refs[0].SHA256)
+	if err := os.WriteFile(candidate, wrongCompressed, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(store.ObjectPath(other.SHA256)); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := RetireLoose(context.Background(), root, RetireLooseOptions{Apply: true}); err == nil {
+		t.Fatal("digest-shaped loose filename authorized deletion of unrelated decoded bytes")
+	}
+	if _, err := os.Lstat(candidate); err != nil {
+		t.Fatalf("unproved loose candidate was removed: %v", err)
+	}
+}
+
+func TestRetireLooseRefusesSameSizeInPlaceRewriteAfterProof(t *testing.T) {
+	root := t.TempDir()
+	refs := putObjects(t, root, []byte("retire loose stable bytes"))
+	writeManifest(t, root, "session", refs)
+	if _, err := Build(context.Background(), root, BuildOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	candidate := fold.NewObjectStore(root).ObjectPath(refs[0].SHA256)
+	compressed, err := os.ReadFile(candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = RetireLoose(context.Background(), root, RetireLooseOptions{
+		Apply: true,
+		BeforeRemove: func(path string) error {
+			if path != candidate {
+				return nil
+			}
+			changed := append([]byte(nil), compressed...)
+			changed[len(changed)/2] ^= 0x55
+			if err := os.WriteFile(path, changed, 0o600); err != nil {
+				return err
+			}
+			return os.Chtimes(path, info.ModTime(), info.ModTime())
+		},
+	})
+	if err == nil {
+		t.Fatal("same-size in-place loose rewrite passed retirement final proof")
+	}
+	if current, statErr := os.Stat(candidate); statErr != nil || current.Size() != int64(len(compressed)) {
+		t.Fatalf("changed loose candidate was not preserved: info=%v err=%v", current, statErr)
+	}
+}
+
+func TestRetireLoosePreservesDigestShapedSymlink(t *testing.T) {
+	root := t.TempDir()
+	refs := putObjects(t, root, []byte("packed symlink object"))
+	writeManifest(t, root, "session", refs)
+	if _, err := Build(context.Background(), root, BuildOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	candidate := fold.NewObjectStore(root).ObjectPath(refs[0].SHA256)
+	outside := filepath.Join(t.TempDir(), "outside.zst")
+	data, err := os.ReadFile(candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(outside, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(candidate); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, candidate); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if _, err := RetireLoose(context.Background(), root, RetireLooseOptions{Apply: true}); err == nil {
+		t.Fatal("digest-shaped loose symlink was not reported as unproved")
+	}
+	if info, err := os.Lstat(candidate); err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("digest-shaped loose symlink was removed: info=%v err=%v", info, err)
+	}
+	if got, err := os.ReadFile(outside); err != nil || !bytes.Equal(got, data) {
+		t.Fatalf("outside loose target changed: equal=%t err=%v", bytes.Equal(got, data), err)
+	}
+}
+
+func TestRetireLoosePreservesValidObjectOutsideCanonicalShard(t *testing.T) {
+	root := t.TempDir()
+	refs := putObjects(t, root, []byte("packed object copied into a foreign directory"))
+	writeManifest(t, root, "session", refs)
+	if _, err := Build(context.Background(), root, BuildOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	store := fold.NewObjectStore(root)
+	foreign := filepath.Join(root, "objects", "foreign", refs[0].SHA256+".zst")
+	if err := os.MkdirAll(filepath.Dir(foreign), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(store.ObjectPath(refs[0].SHA256), foreign); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := RetireLoose(context.Background(), root, RetireLooseOptions{Apply: true}); err == nil {
+		t.Fatal("noncanonical packed loose object was accepted for retirement")
+	}
+	if _, err := os.Lstat(foreign); err != nil {
+		t.Fatalf("foreign loose object was removed: %v", err)
+	}
+}
+
+func TestRetireLooseRechecksCurrentBeforeDeletion(t *testing.T) {
+	root := t.TempDir()
+	refs := putObjects(t, root, bytes.Repeat([]byte("current-race-before-retire"), 1000))
+	writeManifest(t, root, "session", refs)
+	first, err := Build(context.Background(), root, BuildOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Build(context.Background(), root, BuildOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	loose := fold.NewObjectStore(root).ObjectPath(refs[0].SHA256)
+	changed := false
+	_, err = RetireLoose(context.Background(), root, RetireLooseOptions{
+		Apply: true,
+		BeforeRemove: func(string) error {
+			if changed {
+				return nil
+			}
+			changed = true
+			return os.WriteFile(filepath.Join(root, "packs", "CURRENT"), []byte(first.Generation+"\n"), 0o600)
+		},
+	})
+	if err == nil {
+		t.Fatal("pack CURRENT race allowed loose retirement")
+	}
+	if _, statErr := os.Stat(loose); statErr != nil {
+		t.Fatalf("loose object removed after CURRENT changed: %v", statErr)
+	}
+}
+
+func TestRetireLooseRechecksPackedCandidateBeforeDeletion(t *testing.T) {
+	root := t.TempDir()
+	refs := putObjects(t, root, bytes.Repeat([]byte("packed candidate rewrite"), 1000))
+	writeManifest(t, root, "session", refs)
+	if _, err := Build(context.Background(), root, BuildOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	resolver, err := Open(root, OpenOptions{CacheBytes: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	object, packed, err := resolver.lookupObject(refs[0].SHA256)
+	if closeErr := resolver.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil || !packed || len(object.Blocks) == 0 {
+		t.Fatalf("resolve packed candidate: packed=%t object=%#v err=%v", packed, object, err)
+	}
+	block := object.Blocks[0]
+	generation, err := CurrentGeneration(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	packPath := filepath.Join(root, "packs", generation, block.Pack)
+	loose := fold.NewObjectStore(root).ObjectPath(refs[0].SHA256)
+	changed := false
+	_, err = RetireLoose(context.Background(), root, RetireLooseOptions{
+		Apply: true,
+		BeforeRemove: func(string) error {
+			if changed {
+				return nil
+			}
+			changed = true
+			file, err := os.OpenFile(packPath, os.O_RDWR, 0)
+			if err != nil {
+				return err
+			}
+			defer file.Close()
+			value := []byte{0}
+			if _, err := file.ReadAt(value, block.PackOffset); err != nil {
+				return err
+			}
+			value[0] ^= 0xff
+			_, err = file.WriteAt(value, block.PackOffset)
+			return err
+		},
+	})
+	if err == nil {
+		t.Fatal("packed object rewrite after proof allowed loose retirement")
+	}
+	if _, statErr := os.Stat(loose); statErr != nil {
+		t.Fatalf("loose object removed after packed candidate changed: %v", statErr)
 	}
 }
 
@@ -674,6 +1817,309 @@ func TestBuildInterruptionKeepsPreviousGenerationCurrent(t *testing.T) {
 	}
 }
 
+func TestPackGenerationRemovalRequiresSurvivingByteCompleteCopies(t *testing.T) {
+	root := t.TempDir()
+	value := bytes.Repeat([]byte("surviving-pack-proof\n"), 1024)
+	refs := putObjects(t, root, value)
+	writeManifest(t, root, "session", refs)
+	first, err := Build(context.Background(), root, BuildOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ref := range refs {
+		if err := os.Remove(fold.NewObjectStore(root).ObjectPath(ref.SHA256)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := Build(context.Background(), root, BuildOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Build(context.Background(), root, BuildOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	result, err := storage.Collect(context.Background(), storage.GCOptions{
+		StoreDir: root, Apply: true, KeepPackGenerations: 2,
+		AuthorizePackGenerationRemoval: func(ctx context.Context, candidate storage.GCCandidate) (storage.PackGenerationRemovalGuard, error) {
+			return AuthorizeGenerationRemoval(ctx, root, candidate)
+		},
+	})
+	if err != nil {
+		t.Fatalf("verified pack cleanup: %v", err)
+	}
+	if result.RemovedCount != 1 {
+		t.Fatalf("verified pack cleanup result = %#v", result)
+	}
+	if _, err := os.Stat(filepath.Join(root, "packs", first.Generation)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("byte-redundant old generation remains: %v", err)
+	}
+}
+
+func TestPackGenerationRemovalKeepsLastGoodPackWhenCurrentBytesAreCorrupt(t *testing.T) {
+	root := t.TempDir()
+	value := bytes.Repeat([]byte("last-good-pack\n"), 1024)
+	refs := putObjects(t, root, value)
+	writeManifest(t, root, "session", refs)
+	first, err := Build(context.Background(), root, BuildOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ref := range refs {
+		if err := os.Remove(fold.NewObjectStore(root).ObjectPath(ref.SHA256)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := Build(context.Background(), root, BuildOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	current, err := Build(context.Background(), root, BuildOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "packs", current.Generation, "pack-000001.pack"), []byte("corrupt"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err = storage.Collect(context.Background(), storage.GCOptions{
+		StoreDir: root, Apply: true, KeepPackGenerations: 2,
+		AuthorizePackGenerationRemoval: func(ctx context.Context, candidate storage.GCCandidate) (storage.PackGenerationRemovalGuard, error) {
+			return AuthorizeGenerationRemoval(ctx, root, candidate)
+		},
+	})
+	if err == nil {
+		t.Fatal("corrupt surviving bytes authorized deletion of the last good pack")
+	}
+	if _, statErr := os.Stat(filepath.Join(root, "packs", first.Generation)); statErr != nil {
+		t.Fatalf("last good pack generation was removed: %v", statErr)
+	}
+}
+
+func TestPackGenerationRemovalPreservesUnknownNonemptyCandidateContent(t *testing.T) {
+	root := t.TempDir()
+	refs := putObjects(t, root, []byte("pack-ownership-proof"))
+	writeManifest(t, root, "session", refs)
+	first, err := Build(context.Background(), root, BuildOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Build(context.Background(), root, BuildOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Build(context.Background(), root, BuildOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	foreign := filepath.Join(root, "packs", first.Generation, "foreign-evidence")
+	if err := os.WriteFile(foreign, []byte("must survive"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-3 * time.Hour)
+	if err := os.Chtimes(filepath.Dir(foreign), old, old); err != nil {
+		t.Fatal(err)
+	}
+	_, err = storage.Collect(context.Background(), storage.GCOptions{
+		StoreDir: root, Apply: true, KeepPackGenerations: 2,
+		AuthorizePackGenerationRemoval: func(ctx context.Context, candidate storage.GCCandidate) (storage.PackGenerationRemovalGuard, error) {
+			return AuthorizeGenerationRemoval(ctx, root, candidate)
+		},
+	})
+	if err == nil {
+		t.Fatal("unknown nonempty pack content was treated as generation ownership proof")
+	}
+	if got, statErr := os.ReadFile(foreign); statErr != nil || string(got) != "must survive" {
+		t.Fatalf("unknown pack evidence changed: got=%q err=%v", got, statErr)
+	}
+}
+
+func TestReadPublishedMarkerRejectsUnknownFields(t *testing.T) {
+	root := t.TempDir()
+	refs := putObjects(t, root, []byte("strict published marker"))
+	writeManifest(t, root, "session", refs)
+	result, err := Build(context.Background(), root, BuildOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, "packs", result.Generation, publishedMarkerFilename)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var marker map[string]any
+	if err := json.Unmarshal(data, &marker); err != nil {
+		t.Fatal(err)
+	}
+	marker["foreign_evidence"] = "must not become pack ownership"
+	data, err = json.MarshalIndent(marker, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, append(data, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := readPublishedMarker(filepath.Dir(path)); err == nil {
+		t.Fatal("published marker with an unknown field was accepted")
+	}
+}
+
+func TestBuildBindsPublicationChainToStableStoreIdentity(t *testing.T) {
+	root := t.TempDir()
+	refs := putObjects(t, root, []byte("stable pack store identity"))
+	writeManifest(t, root, "session", refs)
+	first, err := Build(context.Background(), root, BuildOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstIdentity, err := readPackStoreIdentity(filepath.Join(root, "packs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstMarker, err := readPublishedMarker(filepath.Join(root, "packs", first.Generation))
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := Build(context.Background(), root, BuildOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondIdentity, err := readPackStoreIdentity(filepath.Join(root, "packs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	head, secondMarker, err := readPublicationHead(filepath.Join(root, "packs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstIdentity != secondIdentity || firstMarker.StoreID != firstIdentity.StoreID || secondMarker.StoreID != firstIdentity.StoreID || head.StoreID != firstIdentity.StoreID || head.Generation != second.Generation {
+		t.Fatalf("publication store identity drifted: first=%#v second=%#v first_marker=%#v second_marker=%#v head=%#v", firstIdentity, secondIdentity, firstMarker, secondMarker, head)
+	}
+}
+
+func TestPackGenerationRemovalRejectsGenerationFromAnotherStore(t *testing.T) {
+	source := t.TempDir()
+	sourceRefs := putObjects(t, source, []byte("source store generation"))
+	writeManifest(t, source, "source-session", sourceRefs)
+	sourceBuild, err := Build(context.Background(), source, BuildOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	target := t.TempDir()
+	targetRefs := putObjects(t, target, []byte("target store generation"))
+	writeManifest(t, target, "target-session", targetRefs)
+	targetBuild, err := Build(context.Background(), target, BuildOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sourceBuild.Generation == targetBuild.Generation {
+		t.Fatal("test requires distinct pack generation names")
+	}
+	foreign := filepath.Join(target, "packs", sourceBuild.Generation)
+	if err := os.CopyFS(foreign, os.DirFS(filepath.Join(source, "packs", sourceBuild.Generation))); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = storage.Collect(context.Background(), storage.GCOptions{
+		StoreDir: target, Apply: true, KeepPackGenerations: 1,
+		AuthorizePackGenerationRemoval: func(ctx context.Context, candidate storage.GCCandidate) (storage.PackGenerationRemovalGuard, error) {
+			return AuthorizeGenerationRemoval(ctx, target, candidate)
+		},
+	})
+	if err == nil {
+		t.Fatal("another store's published generation was authorized for deletion")
+	}
+	if _, err := os.Lstat(foreign); err != nil {
+		t.Fatalf("foreign store generation was removed: %v", err)
+	}
+}
+
+func TestPackGenerationRemovalPreservesLegacyUnboundCandidate(t *testing.T) {
+	root := t.TempDir()
+	refs := putObjects(t, root, []byte("legacy candidate must fail closed"))
+	writeManifest(t, root, "session", refs)
+	first, err := Build(context.Background(), root, BuildOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Build(context.Background(), root, BuildOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	directory := filepath.Join(root, "packs", first.Generation)
+	marker, err := readPublishedMarker(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker.Version = legacyPublishedVersion
+	marker.Kind = legacyPublishedKind
+	marker.StoreID = ""
+	data, err := json.MarshalIndent(marker, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(directory, publishedMarkerFilename), append(data, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = storage.Collect(context.Background(), storage.GCOptions{
+		StoreDir: root, Apply: true, KeepPackGenerations: 1,
+		AuthorizePackGenerationRemoval: func(ctx context.Context, candidate storage.GCCandidate) (storage.PackGenerationRemovalGuard, error) {
+			return AuthorizeGenerationRemoval(ctx, root, candidate)
+		},
+	})
+	if err == nil {
+		t.Fatal("legacy unbound pack generation was authorized for deletion")
+	}
+	if _, err := os.Lstat(directory); err != nil {
+		t.Fatalf("legacy unbound generation was removed: %v", err)
+	}
+}
+
+func TestPackGenerationRemovalPreservesReplacementAfterFinalProof(t *testing.T) {
+	root := t.TempDir()
+	refs := putObjects(t, root, []byte("pack staging replacement fence"))
+	writeManifest(t, root, "session", refs)
+	first, err := Build(context.Background(), root, BuildOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Build(context.Background(), root, BuildOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	candidate := filepath.Join(root, "packs", first.Generation)
+	saved := filepath.Join(root, "saved-proved-generation")
+	replacement := filepath.Join(candidate, "foreign-evidence")
+	swapped := false
+
+	_, err = storage.Collect(context.Background(), storage.GCOptions{
+		StoreDir: root, Apply: true, KeepPackGenerations: 1,
+		AuthorizePackGenerationRemoval: func(ctx context.Context, candidate storage.GCCandidate) (storage.PackGenerationRemovalGuard, error) {
+			return AuthorizeGenerationRemoval(ctx, root, candidate)
+		},
+		BeforePackStage: func(current storage.GCCandidate) error {
+			if current.Path != candidate || swapped {
+				return nil
+			}
+			swapped = true
+			if err := os.Rename(candidate, saved); err != nil {
+				return err
+			}
+			if err := os.MkdirAll(candidate, 0o700); err != nil {
+				return err
+			}
+			return os.WriteFile(replacement, []byte("replacement must survive"), 0o600)
+		},
+	})
+	if err == nil {
+		t.Fatal("replacement tree passed staged exact revalidation")
+	}
+	if !swapped {
+		t.Fatal("pack replacement hook did not run")
+	}
+	if got, err := os.ReadFile(replacement); err != nil || string(got) != "replacement must survive" {
+		t.Fatalf("replacement evidence was not restored intact: got=%q err=%v", got, err)
+	}
+	if _, err := os.Lstat(saved); err != nil {
+		t.Fatalf("original proved generation was lost: %v", err)
+	}
+}
+
 func TestBuildBudgetRejectsBeforeCreatingCandidateGeneration(t *testing.T) {
 	root := t.TempDir()
 	refs := putObjects(t, root, []byte("budgeted-pack-object"))
@@ -825,6 +2271,45 @@ func writeManifest(t *testing.T, root string, sessionID string, refs []fold.Obje
 	if err := os.WriteFile(fold.ManifestPath(root, sessionID), data, 0o644); err != nil {
 		t.Fatalf("write manifest: %v", err)
 	}
+}
+
+func persistManagedManifestFixture(t *testing.T, root string, sessionID string, source []byte) vfs.SessionState {
+	t.Helper()
+	manifest, err := fold.LoadManifest(root, sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manifest.Source.Bytes != int64(len(source)) || manifest.Source.SHA256 != digestBytes(source) {
+		t.Fatalf("managed fixture source does not match manifest: source=%#v bytes=%d sha=%s", manifest.Source, len(source), digestBytes(source))
+	}
+	if err := os.WriteFile(manifest.Session.RolloutPath, source, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	nativeSnapshot := filepath.Join(root, "fs", "snapshots", sessionID, "native.jsonl")
+	if err := os.MkdirAll(filepath.Dir(nativeSnapshot), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(manifest.Session.RolloutPath, nativeSnapshot); err != nil {
+		t.Fatal(err)
+	}
+	resolver, err := Open(root, OpenOptions{CacheBytes: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resolver.Close()
+	session, err := vfs.OpenSession(context.Background(), vfs.SessionOptions{
+		Root: root, ManifestPath: fold.ManifestPath(root, sessionID), Manifest: manifest,
+		Reader: resolver, NativeSnapshot: vfs.NativeFile{Path: nativeSnapshot, Bytes: manifest.Source.Bytes, SHA256: manifest.Source.SHA256},
+	})
+	if err != nil {
+		t.Fatalf("publish managed state fixture: %v", err)
+	}
+	return session.State()
+}
+
+func digestBytes(data []byte) string {
+	digest := sha256.Sum256(data)
+	return hex.EncodeToString(digest[:])
 }
 
 func loadCurrentIndex(t *testing.T, root string) Index {

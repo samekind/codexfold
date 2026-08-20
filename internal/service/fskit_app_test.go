@@ -22,6 +22,29 @@ func TestFSKitManagedPathsUseStableAppAndAppGroupLocations(t *testing.T) {
 	if resource != filepath.Join(home, "Library", "Group Containers", FSKitAppGroupIdentifier, FSKitResourceDirectoryName) {
 		t.Fatalf("resource path = %q", resource)
 	}
+	if status := FSKitStatusPath(resource, "daemon"); status != filepath.Join(home, "Library", "Group Containers", FSKitAppGroupIdentifier, "status", "daemon.json") {
+		t.Fatalf("status path = %q", status)
+	}
+}
+
+func TestFSKitStatusPathFindsAppGroupAboveNestedResource(t *testing.T) {
+	group := filepath.Join(t.TempDir(), FSKitAppGroupIdentifier)
+	resource := filepath.Join(group, "nested", "native-fskit")
+	if status := FSKitStatusPath(resource, "supervisor"); status != filepath.Join(resource, "status", "supervisor.json") {
+		t.Fatalf("status path = %q", status)
+	}
+}
+
+func TestFSKitStatusPathScopesIndependentResources(t *testing.T) {
+	group := filepath.Join(t.TempDir(), FSKitAppGroupIdentifier)
+	first := filepath.Join(group, "acceptance-one")
+	second := filepath.Join(group, "acceptance-two")
+	if FSKitStatusPath(first, "daemon") == FSKitStatusPath(second, "daemon") {
+		t.Fatal("independent FSKit resources shared one daemon status path")
+	}
+	if status := FSKitStatusPath(first, "daemon"); status != filepath.Join(first, "status", "daemon.json") {
+		t.Fatalf("scoped status path = %q", status)
+	}
 }
 
 func TestFSKitHostLauncherRejectsNonAppAndRelativePaths(t *testing.T) {

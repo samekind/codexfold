@@ -76,19 +76,20 @@ type FSServiceActionResult struct {
 }
 
 type FSServiceInstallResult struct {
-	Path                  string `json:"path"`
-	DryRun                bool   `json:"dry_run"`
-	Bytes                 int    `json:"bytes"`
-	SupervisorPath        string `json:"supervisor_path,omitempty"`
-	SupervisorBytes       int    `json:"supervisor_bytes,omitempty"`
-	FSKitAppPath          string `json:"fskit_app_path,omitempty"`
-	FSKitLauncherPath     string `json:"fskit_launcher_path,omitempty"`
-	FSKitResourcePath     string `json:"fskit_resource_path,omitempty"`
-	FSKitAppChanged       bool   `json:"fskit_app_changed,omitempty"`
-	BinarySourcePath      string `json:"binary_source_path,omitempty"`
-	BinaryCurrentSHA256   string `json:"binary_current_sha256,omitempty"`
-	BinaryCandidateSHA256 string `json:"binary_candidate_sha256,omitempty"`
-	BinaryChanged         bool   `json:"binary_changed,omitempty"`
+	Path                  string                 `json:"path"`
+	DryRun                bool                   `json:"dry_run"`
+	Bytes                 int                    `json:"bytes"`
+	SupervisorPath        string                 `json:"supervisor_path,omitempty"`
+	SupervisorBytes       int                    `json:"supervisor_bytes,omitempty"`
+	FSKitAppPath          string                 `json:"fskit_app_path,omitempty"`
+	FSKitLauncherPath     string                 `json:"fskit_launcher_path,omitempty"`
+	FSKitResourcePath     string                 `json:"fskit_resource_path,omitempty"`
+	FSKitAppChanged       bool                   `json:"fskit_app_changed,omitempty"`
+	FSKitResidency        *FSKitResidencyOutcome `json:"fskit_residency,omitempty"`
+	BinarySourcePath      string                 `json:"binary_source_path,omitempty"`
+	BinaryCurrentSHA256   string                 `json:"binary_current_sha256,omitempty"`
+	BinaryCandidateSHA256 string                 `json:"binary_candidate_sha256,omitempty"`
+	BinaryChanged         bool                   `json:"binary_changed,omitempty"`
 }
 
 type FSServiceBinaryUpdateResult struct {
@@ -294,6 +295,7 @@ func newFSServiceInstallCommand() *cobra.Command {
 					return err
 				}
 			}
+			manageFSKitResidency := label == serviceLabel
 			var appTransaction fsKitAppTransaction
 			var binaryUpdate *service.BinaryUpdate
 			var definitionUpdates []*service.DefinitionUpdate
@@ -332,12 +334,16 @@ func newFSServiceInstallCommand() *cobra.Command {
 						return err
 					}
 				}
-				appTransaction, err = prepareFSKitAppPlatform(command.Context(), fskitAppSource, fskitAppPath)
+				appTransaction, err = prepareFSKitAppPlatform(command.Context(), fskitAppSource, fskitAppPath, manageFSKitResidency)
 				if err != nil {
 					return err
 				}
 				rollbackInstall = true
-				restartPreviousService = hadExistingDefinition && appTransaction.Changed()
+				restartPreviousService = preserveServiceRestartRequirement(
+					restartPreviousService,
+					hadExistingDefinition,
+					appTransaction.Changed(),
+				)
 				if fskitResource == "" {
 					fskitResource = filepath.Join(appTransaction.AppGroupPath(), service.FSKitResourceDirectoryName)
 				}
@@ -385,11 +391,19 @@ func newFSServiceInstallCommand() *cobra.Command {
 					return err
 				}
 			}
+			serviceEnrollmentInterval, err := resolveServiceEnrollmentInterval(
+				canonicalNamespace,
+				command.Flags().Changed("enrollment-interval"),
+				enrollmentInterval,
+			)
+			if err != nil {
+				return err
+			}
 			options := service.Options{
 				Label: label, BinaryPath: binary, CodexHome: home, StoreDir: store, MountPoint: mount,
 				StdoutPath: filepath.Join(logs, "stdout.log"), StderrPath: filepath.Join(logs, "stderr.log"),
 				CanonicalNamespace: canonicalNamespace, NativeRoot: nativeRoot, OperationTrace: operationTracePath,
-				EnrollmentInterval: enrollmentInterval, EnrollmentStableFor: enrollmentStableFor,
+				EnrollmentInterval: serviceEnrollmentInterval, EnrollmentStableFor: enrollmentStableFor,
 				EnrollmentBatchSize: enrollmentBatchSize, EnrollmentCanary: enrollmentCanary,
 				Frontend: frontend, FSKitResource: fskitResource, LauncherPath: launcherPath,
 			}
@@ -428,6 +442,10 @@ func newFSServiceInstallCommand() *cobra.Command {
 				result.FSKitResourcePath = fskitResource
 				if appTransaction != nil {
 					result.FSKitAppChanged = appTransaction.Changed()
+					if manageFSKitResidency {
+						residency := appTransaction.Residency()
+						result.FSKitResidency = &residency
+					}
 				}
 				supervisorDefinition, err := service.RenderLaunchdSupervisor(options)
 				if err != nil {
@@ -479,8 +497,23 @@ func newFSServiceInstallCommand() *cobra.Command {
 			if cleanupErr != nil {
 				return cleanupErr
 			}
+			if apply && frontend == "native-fskit" && result.FSKitResidency != nil {
+				menuBar := ensureFSKitMenuBarResidency(command.Context(), fskitAppPath)
+				completeFSKitResidency(result.FSKitResidency, menuBar)
+			}
 			if jsonOutput {
 				return writeJSON(command, result)
+			}
+			if result.FSKitResidency != nil {
+				_, err = fmt.Fprintf(
+					command.OutOrStdout(),
+					"dry_run=%t path=%s bytes=%d supervisor=%s residency_ready=%t residency_requires_approval=%t incident_monitor=%s launch_at_login=%s menu_bar=%s\n",
+					result.DryRun, result.Path, result.Bytes, result.SupervisorPath,
+					result.FSKitResidency.Ready, result.FSKitResidency.RequiresApproval,
+					result.FSKitResidency.IncidentMonitor.State, result.FSKitResidency.LaunchAtLogin.State,
+					result.FSKitResidency.MenuBar.State,
+				)
+				return err
 			}
 			_, err = fmt.Fprintf(command.OutOrStdout(), "dry_run=%t path=%s bytes=%d supervisor=%s\n", result.DryRun, result.Path, result.Bytes, result.SupervisorPath)
 			return err
@@ -496,13 +529,33 @@ func newFSServiceInstallCommand() *cobra.Command {
 	command.Flags().StringVar(&fskitAppSource, "fskit-app-source", "", "Signed FSKit app candidate to atomically install or update at --fskit-app")
 	command.Flags().StringVar(&nativeRoot, "native-root", "", "Canonical native backing root; defaults to <codex-home>/fold-native")
 	command.Flags().StringVar(&operationTracePath, "operation-trace", "", "Absolute path for sanitized filesystem operation names")
-	command.Flags().DurationVar(&enrollmentInterval, "enrollment-interval", 0, "Periodic stable-session enrollment interval; zero disables the loop")
+	command.Flags().DurationVar(&enrollmentInterval, "enrollment-interval", 0, "Explicit periodic enrollment interval; canonical services default to 5m, and an explicit zero disables the loop")
 	command.Flags().DurationVar(&enrollmentStableFor, "enrollment-stable-for", time.Hour, "Required unchanged interval before periodic enrollment")
 	command.Flags().IntVar(&enrollmentBatchSize, "enrollment-batch-size", 1, "Maximum sessions enrolled per periodic cycle")
 	command.Flags().BoolVar(&enrollmentCanary, "enrollment-canary", false, "Enable additional isolated-home constraints for periodic validation")
 	command.Flags().BoolVar(&apply, "apply", false, "Write, install, and start the native platform service")
 	command.Flags().BoolVar(&jsonOutput, "json", false, "Emit JSON output")
 	return command
+}
+
+func resolveServiceEnrollmentInterval(canonicalNamespace bool, explicitlySet bool, configured time.Duration) (time.Duration, error) {
+	if configured < 0 {
+		return 0, errors.New("enrollment interval cannot be negative")
+	}
+	if explicitlySet {
+		if configured > 0 && !canonicalNamespace {
+			return 0, errors.New("periodic enrollment requires the canonical namespace")
+		}
+		return configured, nil
+	}
+	if canonicalNamespace {
+		return defaultServiceEnrollmentInterval, nil
+	}
+	return 0, nil
+}
+
+func preserveServiceRestartRequirement(alreadyRequired bool, hadExistingDefinition bool, appChanged bool) bool {
+	return alreadyRequired || (hadExistingDefinition && appChanged)
 }
 
 func rollbackDefinitionUpdates(updates []*service.DefinitionUpdate) error {
@@ -1004,7 +1057,12 @@ func validateLaunchdChildProcess(status service.Status, lockPath string, role st
 	if parentPID != status.DaemonPID {
 		status.DaemonRunning = false
 		status.DaemonError = fmt.Sprintf("%s process lock owner %d belongs to host %d, not launchd host %d", role, lockStatus.PID, parentPID, status.DaemonPID)
+		return status
 	}
+	// Report the process that owns the role lock. The launchd PID is only the
+	// native host wrapper; callers that monitor or recover the backend need the
+	// child process identity that actually serves the filesystem.
+	status.DaemonPID = lockStatus.PID
 	return status
 }
 
@@ -1125,18 +1183,12 @@ func retireManagedState(store string, sessionID string) (string, error) {
 		return "", errors.New("store and session ID are required")
 	}
 	source := filepath.Join(filepath.Clean(store), "fs", "sessions", sessionID)
-	retiredRoot := filepath.Join(filepath.Clean(store), "fs", "retired")
-	if err := os.MkdirAll(retiredRoot, 0o700); err != nil {
-		return "", err
-	}
-	target := filepath.Join(retiredRoot, fmt.Sprintf("%s-%d", sessionID, time.Now().UnixNano()))
-	if err := os.Rename(source, target); err != nil {
-		return "", err
-	}
-	return target, nil
+	return retireManagedStateForRecovery(store, sessionID, source)
 }
 
-func restoreManagedState(store string, sessionID string, retiredPath string) error {
+// restoreManagedStateWithWriterLease is called only while the session's writer
+// lease is already held by the rollback or migration-recovery transaction.
+func restoreManagedStateWithWriterLease(store string, sessionID string, retiredPath string) error {
 	if store == "" || sessionID == "" || retiredPath == "" {
 		return errors.New("store, session ID, and retired state path are required")
 	}
@@ -1144,10 +1196,14 @@ func restoreManagedState(store string, sessionID string, retiredPath string) err
 	if err := os.Rename(filepath.Clean(retiredPath), target); err != nil {
 		return err
 	}
-	if _, err := vfs.RepublishSessionState(filepath.Join(target, "state.json")); err != nil {
+	restored, err := vfs.RepublishSessionStateWithWriterLease(filepath.Join(target, "state.json"))
+	if err != nil {
 		return fmt.Errorf("republish restored managed state: %w", err)
 	}
-	return nil
+	if err := upsertManagedSessionRegistryEntryIfPresent(store, restored.SessionID, restored.Generation); err != nil {
+		return fmt.Errorf("restore managed session registry entry: %w", err)
+	}
+	return clearRetirementControl(target)
 }
 
 func retainCanonicalSnapshot(ctx context.Context, store string, sessionID string, source vfs.NativeFile, budget storage.Checker) (vfs.NativeFile, error) {
@@ -1274,6 +1330,51 @@ func restoreCanonicalSnapshotSource(originalPath string, retainedPath string) er
 	return nil
 }
 
+func preserveCanonicalSnapshotSource(originalPath string, retainedPath string) error {
+	originalPath = filepath.Clean(originalPath)
+	retainedPath = filepath.Clean(retainedPath)
+	if originalPath == "." || retainedPath == "." || originalPath == retainedPath {
+		return errors.New("distinct original and retained snapshot paths are required")
+	}
+	retained, err := hashStableRetirementFile(retainedPath)
+	if err != nil {
+		return fmt.Errorf("verify retained canonical snapshot: %w", err)
+	}
+	if original, err := hashStableRetirementFile(originalPath); err == nil {
+		if original.Bytes != retained.Bytes || original.SHA256 != retained.SHA256 {
+			return errors.New("canonical source differs from retained snapshot")
+		}
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	directory := filepath.Dir(originalPath)
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		return err
+	}
+	if err := os.Link(retainedPath, originalPath); err != nil {
+		if !errors.Is(err, syscall.EXDEV) {
+			return fmt.Errorf("restore canonical source link: %w", err)
+		}
+		if err := copyCanonicalSnapshot(retainedPath, originalPath); err != nil {
+			return fmt.Errorf("restore canonical source copy: %w", err)
+		}
+	}
+	if err := syncRetirementDirectories(directory, filepath.Dir(directory)); err != nil {
+		return err
+	}
+	restored, err := hashStableRetirementFile(originalPath)
+	if err != nil || restored.Bytes != retained.Bytes || restored.SHA256 != retained.SHA256 {
+		_ = os.Remove(originalPath)
+		_ = syncRetirementDirectory(directory)
+		if err == nil {
+			err = errors.New("restored canonical source differs from retained snapshot")
+		}
+		return err
+	}
+	return nil
+}
+
 type mountAcknowledgement struct {
 	Generation uint64 `json:"generation"`
 	Route      string `json:"route"`
@@ -1284,13 +1385,21 @@ const (
 	retirementAcknowledgementFilename = "retire.ack.json"
 )
 
+var (
+	errRetirementRejected        = errors.New("retirement was durably rejected")
+	errRetirementCutoverRejected = errors.New("retirement cutover was durably rejected")
+)
+
 type retirementControl struct {
-	Token      string `json:"token"`
-	Generation uint64 `json:"generation"`
-	Route      string `json:"route"`
-	Bytes      int64  `json:"bytes"`
-	SHA256     string `json:"sha256"`
-	Error      string `json:"error,omitempty"`
+	Token              string `json:"token"`
+	Generation         uint64 `json:"generation"`
+	StateSHA256        string `json:"state_sha256"`
+	CheckpointSequence uint64 `json:"checkpoint_sequence"`
+	CheckpointSHA256   string `json:"checkpoint_sha256"`
+	Route              string `json:"route"`
+	Bytes              int64  `json:"bytes"`
+	SHA256             string `json:"sha256"`
+	Error              string `json:"error,omitempty"`
 }
 
 func createRetirementRequest(store string, sessionID string, generation uint64, route string, target vfs.NativeFile) (retirementControl, error) {
@@ -1298,10 +1407,14 @@ func createRetirementRequest(store string, sessionID string, generation uint64, 
 		return retirementControl{}, errors.New("complete retirement request metadata is required")
 	}
 	directory := filepath.Join(filepath.Clean(store), "fs", "sessions", sessionID)
+	binding, err := loadCurrentRetirementStateBinding(directory, sessionID, generation)
+	if err != nil {
+		return retirementControl{}, fmt.Errorf("bind retirement request to current managed state: %w", err)
+	}
 	if pending, exists, err := readRetirementRequest(store, sessionID); err != nil {
 		return retirementControl{}, err
 	} else if exists {
-		if pending.Generation != generation || pending.Route != route || pending.Bytes != target.Bytes || pending.SHA256 != target.SHA256 {
+		if pending.Generation != generation || pending.StateSHA256 != binding.StateSHA256 || pending.CheckpointSequence != binding.CheckpointSequence || pending.CheckpointSHA256 != binding.CheckpointSHA256 || pending.Route != route || pending.Bytes != target.Bytes || pending.SHA256 != target.SHA256 {
 			return retirementControl{}, errors.New("pending session retirement does not match the requested generation and target")
 		}
 		return pending, nil
@@ -1313,7 +1426,11 @@ func createRetirementRequest(store string, sessionID string, generation uint64, 
 	if _, err := rand.Read(tokenBytes); err != nil {
 		return retirementControl{}, err
 	}
-	request := retirementControl{Token: hex.EncodeToString(tokenBytes), Generation: generation, Route: route, Bytes: target.Bytes, SHA256: target.SHA256}
+	request := retirementControl{
+		Token: hex.EncodeToString(tokenBytes), Generation: generation,
+		StateSHA256: binding.StateSHA256, CheckpointSequence: binding.CheckpointSequence, CheckpointSHA256: binding.CheckpointSHA256,
+		Route: route, Bytes: target.Bytes, SHA256: target.SHA256,
+	}
 	if err := writeSessionControlFile(directory, retirementRequestFilename, request); err != nil {
 		return retirementControl{}, err
 	}
@@ -1333,17 +1450,24 @@ func readRetirementRequest(store string, sessionID string) (retirementControl, b
 	if err := json.Unmarshal(data, &request); err != nil {
 		return retirementControl{}, false, fmt.Errorf("decode retirement request: %w", err)
 	}
-	if len(request.Token) != 32 || request.Generation == 0 || request.Route == "" || request.Bytes < 0 || len(request.SHA256) != 64 || request.Error != "" {
+	if len(request.Token) != 32 || request.Generation == 0 || !validRetirementSHA256(request.StateSHA256) || request.CheckpointSequence == 0 || !validRetirementSHA256(request.CheckpointSHA256) || request.Route == "" || request.Bytes < 0 || len(request.SHA256) != 64 || request.Error != "" {
 		return retirementControl{}, false, errors.New("invalid retirement request")
 	}
 	return request, true, nil
 }
 
 func writeRetirementAcknowledgement(store string, sessionID string, acknowledgement retirementControl) error {
-	if len(acknowledgement.Token) != 32 || acknowledgement.Generation == 0 || acknowledgement.Route == "" || acknowledgement.Bytes < 0 || len(acknowledgement.SHA256) != 64 {
+	if len(acknowledgement.Token) != 32 || acknowledgement.Generation == 0 || !validRetirementSHA256(acknowledgement.StateSHA256) || acknowledgement.CheckpointSequence == 0 || !validRetirementSHA256(acknowledgement.CheckpointSHA256) || acknowledgement.Route == "" || acknowledgement.Bytes < 0 || len(acknowledgement.SHA256) != 64 {
 		return errors.New("complete retirement acknowledgement metadata is required")
 	}
 	directory := filepath.Join(filepath.Clean(store), "fs", "sessions", sessionID)
+	return writeRetirementAcknowledgementAt(directory, acknowledgement)
+}
+
+func writeRetirementAcknowledgementAt(directory string, acknowledgement retirementControl) error {
+	if len(acknowledgement.Token) != 32 || acknowledgement.Generation == 0 || !validRetirementSHA256(acknowledgement.StateSHA256) || acknowledgement.CheckpointSequence == 0 || !validRetirementSHA256(acknowledgement.CheckpointSHA256) || acknowledgement.Route == "" || acknowledgement.Bytes < 0 || len(acknowledgement.SHA256) != 64 {
+		return errors.New("complete retirement acknowledgement metadata is required")
+	}
 	return writeSessionControlFile(directory, retirementAcknowledgementFilename, acknowledgement)
 }
 
@@ -1352,6 +1476,7 @@ func waitForRetirementAcknowledgement(ctx context.Context, store string, session
 		timeout = 15 * time.Second
 	}
 	path := filepath.Join(filepath.Clean(store), "fs", "sessions", sessionID, retirementAcknowledgementFilename)
+	requestPath := filepath.Join(filepath.Clean(store), "fs", "sessions", sessionID, retirementRequestFilename)
 	deadline := time.Now().Add(timeout)
 	for {
 		data, err := os.ReadFile(path)
@@ -1359,13 +1484,41 @@ func waitForRetirementAcknowledgement(ctx context.Context, store string, session
 			var acknowledgement retirementControl
 			if json.Unmarshal(data, &acknowledgement) == nil &&
 				acknowledgement.Token == request.Token && acknowledgement.Generation == request.Generation &&
+				acknowledgement.StateSHA256 == request.StateSHA256 &&
+				acknowledgement.CheckpointSequence == request.CheckpointSequence &&
+				acknowledgement.CheckpointSHA256 == request.CheckpointSHA256 &&
 				acknowledgement.Route == request.Route && acknowledgement.Bytes == request.Bytes && acknowledgement.SHA256 == request.SHA256 {
 				if acknowledgement.Error != "" {
-					return fmt.Errorf("retirement rejected: %s", acknowledgement.Error)
+					return fmt.Errorf("%w: %s", errRetirementRejected, acknowledgement.Error)
 				}
 				return nil
 			}
 		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		if _, err := vfs.LoadSessionDeletion(store, sessionID); err == nil {
+			return errors.New("explicit session deletion superseded canonical retirement")
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		if _, err := os.Lstat(requestPath); errors.Is(err, os.ErrNotExist) {
+			activeDirectory := filepath.Join(filepath.Clean(store), "fs", "sessions", sessionID)
+			if _, activeErr := os.Lstat(activeDirectory); errors.Is(activeErr, os.ErrNotExist) {
+				// The request can disappear only after a durable positive ACK and
+				// managed-state retirement, or after managed compensation. An absent
+				// active directory proves the forward-complete branch.
+				return nil
+			} else if activeErr != nil {
+				return activeErr
+			}
+			state, stateErr := managedState(store, sessionID)
+			switch {
+			case stateErr == nil && state.Generation > request.Generation:
+				return fmt.Errorf("%w: managed authority was restored", errRetirementRejected)
+			case stateErr != nil:
+				return stateErr
+			}
+		} else if err != nil {
 			return err
 		}
 		if time.Now().After(deadline) {
@@ -1380,13 +1533,17 @@ func waitForRetirementAcknowledgement(ctx context.Context, store string, session
 }
 
 func clearRetirementControl(directory string) error {
-	var result error
-	for _, name := range []string{retirementRequestFilename, retirementAcknowledgementFilename} {
-		if err := removeIfExists(filepath.Join(filepath.Clean(directory), name)); err != nil {
-			result = errors.Join(result, err)
-		}
+	directory = filepath.Clean(directory)
+	if err := removeIfExists(filepath.Join(directory, retirementRequestFilename)); err != nil {
+		return err
 	}
-	return result
+	if err := syncRetirementDirectory(directory); err != nil {
+		return err
+	}
+	if err := removeIfExists(filepath.Join(directory, retirementAcknowledgementFilename)); err != nil {
+		return err
+	}
+	return syncRetirementDirectory(directory)
 }
 
 func removeIfExists(path string) error {
@@ -1409,7 +1566,7 @@ func writeSessionControlFile(directory string, name string, value any) error {
 	if err != nil {
 		return err
 	}
-	temporary, err := os.CreateTemp(directory, ".mounted-*.tmp")
+	temporary, err := os.CreateTemp(directory, "."+name+"-*.tmp")
 	if err != nil {
 		return err
 	}
@@ -1430,7 +1587,10 @@ func writeSessionControlFile(directory string, name string, value any) error {
 	if err := temporary.Close(); err != nil {
 		return err
 	}
-	return os.Rename(temporaryPath, filepath.Join(directory, name))
+	if err := os.Rename(temporaryPath, filepath.Join(directory, name)); err != nil {
+		return err
+	}
+	return syncRetirementDirectory(directory)
 }
 
 func waitForMountAcknowledgement(ctx context.Context, store string, sessionID string, generation uint64, route string, timeout time.Duration) error {
@@ -1478,10 +1638,13 @@ func retireCanonicalNativeSnapshot(store string, nativeRoot string, sessionID st
 		return "", errors.New("canonical native snapshot is outside the retained snapshot roots")
 	}
 	target := filepath.Join(filepath.Clean(retiredState), "retained-native", relative)
-	if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
+	if err := ensureRetirementDirectory(filepath.Clean(retiredState), filepath.Dir(target)); err != nil {
 		return "", err
 	}
 	if err := os.Rename(snapshotPath, target); err != nil {
+		return "", err
+	}
+	if err := syncRetirementDirectories(filepath.Dir(snapshotPath), filepath.Dir(target)); err != nil {
 		return "", err
 	}
 	oldSidecar := filepath.Join(filepath.Dir(snapshotPath), "._"+filepath.Base(snapshotPath))
@@ -1489,14 +1652,25 @@ func retireCanonicalNativeSnapshot(store string, nativeRoot string, sessionID st
 	if _, err := os.Lstat(oldSidecar); err == nil {
 		if err := os.Rename(oldSidecar, newSidecar); err != nil {
 			_ = os.Rename(target, snapshotPath)
+			_ = syncRetirementDirectories(filepath.Dir(target), filepath.Dir(snapshotPath))
+			return "", err
+		}
+		if err := syncRetirementDirectories(filepath.Dir(oldSidecar), filepath.Dir(newSidecar)); err != nil {
 			return "", err
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		_ = os.Rename(target, snapshotPath)
+		_ = syncRetirementDirectories(filepath.Dir(target), filepath.Dir(snapshotPath))
 		return "", err
 	}
 	if hiddenErr == nil {
-		_ = os.Remove(hiddenRoot)
+		if err := os.Remove(hiddenRoot); err == nil {
+			if err := syncRetirementDirectory(filepath.Dir(hiddenRoot)); err != nil {
+				return "", err
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return "", err
+		}
 	}
 	return target, nil
 }
@@ -1525,10 +1699,16 @@ func restoreCanonicalNativeSnapshot(snapshotPath string, retiredSnapshot string)
 	if err := os.Rename(retiredSnapshot, snapshotPath); err != nil {
 		return err
 	}
+	if err := syncRetirementDirectories(filepath.Dir(retiredSnapshot), filepath.Dir(snapshotPath)); err != nil {
+		return err
+	}
 	retiredSidecar := filepath.Join(filepath.Dir(retiredSnapshot), "._"+filepath.Base(retiredSnapshot))
 	originalSidecar := filepath.Join(filepath.Dir(snapshotPath), "._"+filepath.Base(snapshotPath))
 	if _, err := os.Lstat(retiredSidecar); err == nil {
-		return os.Rename(retiredSidecar, originalSidecar)
+		if err := os.Rename(retiredSidecar, originalSidecar); err != nil {
+			return err
+		}
+		return syncRetirementDirectories(filepath.Dir(retiredSidecar), filepath.Dir(originalSidecar))
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}

@@ -2,6 +2,8 @@
 
 CodexFold has one storage objective: preserve every rollout byte while storing exact duplicate byte content once. This applies within one long session, across unrelated sessions, and across fork branches. Cross-session or cross-client boundaries are not prerequisites for reuse.
 
+This taxonomy is the storage-layer classification inherited from the founding product discussion. Runtime reliability, UI residency, delete/archive seals, and acceptance packaging are recorded in [product-inheritance.md](product-inheritance.md).
+
 ## Byte-Preserving Content Reuse
 
 | Mechanism | Scope | Maximum saving | Current boundary |
