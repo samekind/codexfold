@@ -7,6 +7,7 @@ import Foundation
 private enum BackendRecoveryTests {
     static func main() throws {
         try testTransportClassification()
+        try testConnectErrorClassification()
         try testWriteRecoveryDecisions()
         try testRecoveryRetriesBeforeSuccess()
         try testRecoveryRereadsDescriptor()
@@ -23,6 +24,31 @@ private enum BackendRecoveryTests {
         try require(isWireTransportError(POSIXError(.EPIPE)), "EPIPE must trigger recovery")
         try require(isWireTransportError(POSIXError(.ECONNRESET)), "ECONNRESET must trigger recovery")
         try require(!isWireTransportError(POSIXError(.EINVAL)), "EINVAL must not trigger recovery")
+    }
+
+    private static func testConnectErrorClassification() throws {
+        // The backend unlinks its socket while restarting, so connect(2) fails
+        // with ENOENT. Reporting that verbatim showed Codex file-not-found
+        // during an ordinary restart; it must enter the recovery wait instead.
+        try require(
+            isWireTransportError(wireConnectError(ENOENT)),
+            "a missing backend socket must trigger recovery, not file-not-found"
+        )
+        try require(
+            wireConnectError(ENOENT).code != .ENOENT,
+            "a missing backend socket must never surface as ENOENT"
+        )
+        // Unrelated connect failures keep their exact code, and a response
+        // status of ENOENT never reaches this classifier, so a genuinely
+        // missing file still fails immediately.
+        try require(
+            wireConnectError(EINVAL).code == .EINVAL,
+            "an unrelated connect failure must keep its code"
+        )
+        try require(
+            !isWireTransportError(wireConnectError(EINVAL)),
+            "an unrelated connect failure must not trigger recovery"
+        )
     }
 
     private static func testWriteRecoveryDecisions() throws {

@@ -87,11 +87,36 @@ t=1.56  open=ENOENT   daemon=stopped  managedSessions=11
 t=2.24  open=ok       daemon=healthy  managedSessions=11   (new pid)
 ```
 
-The fix belongs in the frontend's error classification: a transport failure,
-including a socket path that does not exist yet, must enter the existing recovery
-wait rather than become a filesystem errno. It requires an Xcode rebuild and
-re-sign of the candidate extension, so it is recorded here rather than attempted
-at the end of this validation.
+Four causes are eliminated with evidence, so the next attempt need not retest them:
+
+1. **Not route publication.** `managed` stayed `healthy` with 11 sessions for the
+   whole window.
+2. **Not a lost descriptor.** `descriptor.bin` is published by atomic rename and
+   never removed; it was present throughout.
+3. **Not `connect(2)` on a missing socket.** The frontend did report that errno
+   verbatim, so this looked like the cause. It was fixed and shipped:
+   `wireConnectError` maps that case to `ECONNREFUSED`, which the existing
+   classifier already treats as recoverable, with a unit test asserting the
+   mapping and that unrelated codes keep their exact value. The module was
+   rebuilt and its live executable hash confirmed to change from `1c0f53fb` to
+   `13bc6ac2` before retesting. The symptom did not change, so this was a real
+   misclassification worth keeping but not the cause of this defect.
+4. **Not module replacement.** Module process identities are unchanged before,
+   during and after the window, so the frontend that owns the recovery wait is
+   never restarted.
+
+The first deployment attempt updated the wrong bundle. The app under
+`~/Library/Application Support/CodexFold/acceptance-a193842z/` holds the
+`pluginkit` registration, while the module actually serving runs from the
+candidate `DerivedData` build products. Any future extension change must confirm
+the **live executable hash** before drawing a conclusion; a registration match is
+not sufficient.
+
+The strongest remaining hypothesis is ordering inside the backend's shutdown: the
+daemon appears to still answer while it is already tearing down, so a path whose
+route has been released is reported missing instead of the connection being
+refused. That would explain why the frontend recovery wait never engages. It is
+untested.
 
 ## What this matrix says
 

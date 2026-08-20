@@ -54,6 +54,23 @@ func isWireTransportError(_ error: any Error) -> Bool {
     }
 }
 
+// wireConnectError classifies a failure of connect(2) on the backend socket. A
+// socket path that does not exist yet means the backend has not bound its
+// listener, and the backend unlinks its socket while restarting. ENOENT here is
+// therefore a transport condition, never a statement about a session file:
+// reporting it verbatim would show Codex file-not-found during an ordinary
+// restart, which the product contract forbids. ECONNREFUSED carries the same
+// meaning and is already classified as recoverable, so the caller waits for the
+// backend instead of failing the operation. Every other code is preserved, and
+// a response status of ENOENT keeps its exact meaning because it never reaches
+// this function.
+func wireConnectError(_ code: Int32) -> POSIXError {
+    if code == ENOENT {
+        return POSIXError(.ECONNREFUSED)
+    }
+    return POSIXError(POSIXErrorCode(rawValue: code) ?? .EIO)
+}
+
 private func transportErrorSummary(_ error: any Error) -> String {
     if let posix = error as? POSIXError {
         return "POSIX \(posix.code.rawValue): \(posix.localizedDescription)"
@@ -1036,7 +1053,7 @@ final class WireConnection {
         guard result == 0 else {
             let code = errno
             Darwin.close(descriptor)
-            throw POSIXError(POSIXErrorCode(rawValue: code) ?? .EIO)
+            throw wireConnectError(code)
         }
         socket = descriptor
     }
