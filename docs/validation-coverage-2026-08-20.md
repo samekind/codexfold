@@ -29,9 +29,9 @@ Status values are exact:
 | Req | Requirement | Status | Evidence on the current candidate |
 | --- | --- | --- | --- |
 | `TF-001` | No manual materialization to open or resume | `verified-current` | Real `codex exec` wrote and read sessions as ordinary paths; no materialize step in any flow |
-| `TF-002` | Unmodified Desktop and CLI both work | CLI `verified-current`, Desktop `historical` | Two real CLI sessions created and read through the mount; no Desktop task has traversed this candidate |
+| `TF-002` | Unmodified Desktop and CLI both work | CLI `verified-current`, Desktop `historical` | Five real CLI sessions created, resumed and forked through the mount, including with a third-party model provider, so the client path is exercised independently of any one model. No Desktop task has traversed this candidate |
 | `TF-003` | Every byte and every operation Codex uses behaves natively | bytes `verified-current`, operation set `none` | Byte identity held across every phase; the operation set used by the current Desktop/CLI builds has not been re-derived from a trace for this candidate |
-| `TF-004` | Identical content stored once; forks independently writable | dedup `verified-current`, fork independence `blocked-on-operator` | Physical/logical ratio 1.14x on 11 real sessions. The CLI offers only `resume`, so a real fork requires Desktop's `Continue in new task from here`; this row cannot leave `historical` without an operator |
+| `TF-004` | Identical content stored once; forks independently writable | `verified-current` | A real `codex fork` of a managed session was driven under a pty. Independence holds in both directions: the child carries its own marker twice and the parent zero times, and a later real turn on the parent grew it by 3904 bytes while the child's SHA-256 stayed identical. Reuse measured across that real fork pair: the record layer finds 0 duplicate bytes and CDC 0, because every record differs from its counterpart starting with `session_meta`, while the field layer finds 81.07 KiB duplicate, 50.20% of the pair. This is the founding correction in practice: prefix and whole-record reuse yield nothing on a real fork, and field-level reuse is what makes fork dedup work |
 | `TF-005` | Append goes to a durable delta without full materialization | `verified-current` | Real `codex exec` appended through the mount; managed rollouts grew without a writable base |
 | `TF-006` | Truncate and random write transition to copy-on-write | `verified-current` | Through the live mount on a managed session: a 16-byte write at mid-file offset 38140 left every other byte unchanged, a truncate left the surviving content an exact prefix, and a following append was exact. This is the path that corrupted a rollout in July, where the prefix stayed exact while a trailing record was partially overwritten. Writes stayed isolated: the nine baseline rollouts were unchanged |
 | `TF-007` | Packed reads avoid per-part loose opens | `verified-current` (indirect) | The store is pack-only; 11390 consecutive reads served with no loose objects present |
@@ -128,6 +128,23 @@ another black-box measurement, so it is recorded rather than guessed at.
 
 Codex opens rollout files repeatedly, so this is a real cost rather than a
 benchmark artifact.
+
+## Measured reuse on a real fork
+
+The founding intent was corrected early: the shared-prefix example was never a
+storage lock-in, and reuse had to apply to repeated content at any position. That
+correction is now measured on a real `codex fork` pair rather than argued:
+
+| Layer | Duplicate bytes | Share of the pair |
+| --- | --- | --- |
+| Record | 0 B | 0.00% |
+| CDC | 0 B | 0.00% |
+| Field | 81.07 KiB | 50.20% |
+
+Every record differs from its counterpart, starting with `session_meta`, because
+the child carries its own session id and timestamps. A design that keyed reuse on
+shared prefixes or whole records would save nothing here. Field-level reuse
+recovers half the pair, which is why Fold V1 stores field objects.
 
 ## What this matrix says
 
