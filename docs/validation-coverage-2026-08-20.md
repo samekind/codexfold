@@ -31,11 +31,11 @@ Status values are exact:
 | `TF-001` | No manual materialization to open or resume | `verified-current` | Real `codex exec` wrote and read sessions as ordinary paths; no materialize step in any flow |
 | `TF-002` | Unmodified Desktop and CLI both work | CLI `verified-current`, Desktop `historical` | Two real CLI sessions created and read through the mount; no Desktop task has traversed this candidate |
 | `TF-003` | Every byte and every operation Codex uses behaves natively | bytes `verified-current`, operation set `none` | Byte identity held across every phase; the operation set used by the current Desktop/CLI builds has not been re-derived from a trace for this candidate |
-| `TF-004` | Identical content stored once; forks independently writable | dedup `verified-current`, fork independence `historical` | Physical/logical ratio 1.14x on 11 real sessions; no fork created on this candidate |
+| `TF-004` | Identical content stored once; forks independently writable | dedup `verified-current`, fork independence `blocked-on-operator` | Physical/logical ratio 1.14x on 11 real sessions. The CLI offers only `resume`, so a real fork requires Desktop's `Continue in new task from here`; this row cannot leave `historical` without an operator |
 | `TF-005` | Append goes to a durable delta without full materialization | `verified-current` | Real `codex exec` appended through the mount; managed rollouts grew without a writable base |
-| `TF-006` | Truncate and random write transition to copy-on-write | `code-only` | Unit coverage in `internal/mountfs`; not exercised through the live mount |
+| `TF-006` | Truncate and random write transition to copy-on-write | `verified-current` | Through the live mount on a managed session: a 16-byte write at mid-file offset 38140 left every other byte unchanged, a truncate left the surviving content an exact prefix, and a following append was exact. This is the path that corrupted a rollout in July, where the prefix stayed exact while a trailing record was partially overwritten. Writes stayed isolated: the nine baseline rollouts were unchanged |
 | `TF-007` | Packed reads avoid per-part loose opens | `verified-current` (indirect) | The store is pack-only; 11390 consecutive reads served with no loose objects present |
-| `TF-008` | Performance and memory gates | `none` | No measurement taken during this validation |
+| `TF-008` | Performance and memory gates | **`verified-current: FAILING`** | Warm sequential read 4215 MiB/s against a 500 MB/s target, 4 KiB random read p95 0.002 ms, `stat` p95 0.099 ms and daemon RSS 167 MiB all pass. `open` p95 fails: 10.925 ms managed against 1.009 ms for a native passthrough file on the same mount, `+9.9 ms` against a `+2 ms` gate. Medians are 7.816 ms and 0.298 ms. A per-open reader lease was ruled out: the lease directory mtime is unchanged across 200 opens |
 | `TF-009` | Daemon termination, host restart, interrupted commit/migration/compaction recover without byte loss | daemon restart `verified-current`, host restart `historical`, interrupted phases `code-only` | Six service restarts and four binary replacements left all nine baseline rollouts byte-identical |
 | `TF-010` | Routing unchanged until shadow verification; native snapshot reclaimable after exact proof | `verified-current` | Enrollment cycle reported `native_retired=1` after its proof, with byte identity preserved |
 | `TF-011` | No per-session setup; automatic discovery and bulk enrollment | `verified-current` | Two real sessions were enrolled by the service with no manual `enroll apply` |
@@ -44,9 +44,9 @@ Status values are exact:
 | `TF-014` | Native reclamation requires durable exact reconstruction proof | `verified-current` (partial) | `native_retired=1` implies the proof path ran; the receipt itself was not inspected |
 | `TF-015` | Client version is diagnostic, never write permission | `code-only` | Unit coverage; no version-change event during this validation |
 | `TF-016` | Elevated prerequisites only after explicit authorization | `blocked-on-operator` | The FSKit extension install path was not exercised |
-| `TF-017` | A canonical mount never degrades into a writable directory | `none` | Not exercised |
-| `TF-018` | Fork-family classification is conservative and dry-run-first | `none` | No fork-family operation run on this candidate |
-| `TF-019` | Archive and deletion are distinct; rename never authorizes deletion | `none` | No archive or delete run on this candidate |
+| `TF-017` | A canonical mount never degrades into a writable directory | `verified-current` | With both jobs booted out the mount stayed present, the directory listed zero entries, and a write was refused with `ECONNREFUSED` rather than creating a file. No probe residue remained after the service returned |
+| `TF-018` | Fork-family classification is conservative and dry-run-first | `verified-current` | `fork-family show` reported evidence only with no mutation, and `compare` on two unrelated sessions reported `relation=unknown exact=false shared=0` rather than guessing |
+| `TF-019` | Archive and deletion are distinct; rename never authorizes deletion | `verified-current` | `archive` defaulted to dry-run and moved nothing. On `--apply` the rollout moved to `archived_sessions` with SHA-256 and size identical before and after, and doctor stayed at 11 of 11 with no issues. `remove-contained` then refused the archived session both with and without `--apply`, because it is not an exact contiguous record sequence of the container, and the file survived |
 | `TF-020` | Byte-preserving storage never changes rollout bytes | `verified-current` | Nine baseline rollouts byte-identical across every phase, including a reclaim that removed four generations |
 | `TF-021` | Hard preflight and reserve budgets govern all retained artifacts | `verified-current` | The free-space reserve blocked enrollment and blocked fold twice during this validation, exactly as designed |
 | `TF-022` | Standalone product, no private control-plane dependency | `code-only` | Reviewed at source level only |
@@ -55,7 +55,7 @@ Status values are exact:
 
 | Lock | Behaviour | Status | Evidence |
 | --- | --- | --- | --- |
-| §5.1 | One bad session must not kill the service | `code-only` | Unit test proves a stalled session load does not block a healthy one; not observed live |
+| §5.1 | One bad session must not kill the service | `verified-current` | One managed session's `state.json` was replaced with invalid JSON. The other ten sessions stayed readable, the service stayed healthy, and the damaged session itself continued serving its last known good content |
 | §5.2 | Path always present; read/write pauses at most ten seconds | **`verified-current: FAILING`** | Reproduced 4 of 5 restarts with reads in flight: 12-21 `ENOENT` and an occasional `EPROTO` reach the reader during the roughly 0.7 s window where `daemon.state` is `stopped`. Byte integrity held (0 mismatches) and the longest read gap was 0.58 s, so the ten-second pause budget passes; the lock's other half, never letting Codex see file-not-found, does not. Managed routes stayed published (`managed=healthy`, 11 sessions) throughout, so this is not a route-publication gap |
 | §5.3 | Under ten seconds silent, at ten seconds a popup, recovery announced | `code-only` | No real failure has produced a window |
 | §5.4 | Resident after login; UI exit does not stop service | `code-only` | Not exercised |
@@ -63,7 +63,7 @@ Status values are exact:
 | §5.6 | Background compaction is preemptible and skips sessions in use | `verified-current` (partial) | An enrollment cycle ran while 11390 reads were in flight and neither disturbed the other |
 | §5.7 | Release native source only after independent full proof | `verified-current` | `native_retired=1` after proof |
 | §5.8 | Auto-repair only within the stated bounds | `verified-current` (partial) | A real transient at enrollment was retained, deferred, and recovered in one second without operator action |
-| §5.9 | Archive never deletes; explicit delete is permanent | `none` | Not exercised |
+| §5.9 | Archive never deletes; explicit delete is permanent | `verified-current` | Archive preserved every byte and deleted nothing; see `TF-019` |
 | §5.10 | Acceptance uses real work in an isolated instance with external observation | `blocked-on-operator` | Requires a Cockpit **Start** and real operator work |
 | §5.11 | Production stays disabled until separately authorized | `verified-current` | Production PIDs unchanged; `~/.codex/sessions` never routed |
 
@@ -117,6 +117,17 @@ daemon appears to still answer while it is already tearing down, so a path whose
 route has been released is reported missing instead of the connection being
 refused. That would explain why the frontend recovery wait never engages. It is
 untested.
+
+## Open defect: TF-008 open latency
+
+Opening a managed session costs about ten milliseconds more than opening a native
+passthrough file on the same mount, against a two-millisecond gate. Reads are
+fast, so the cost is in the open path itself. A reader lease per open was ruled
+out. Locating the remaining cost needs a profile of the daemon rather than
+another black-box measurement, so it is recorded rather than guessed at.
+
+Codex opens rollout files repeatedly, so this is a real cost rather than a
+benchmark artifact.
 
 ## What this matrix says
 
