@@ -116,10 +116,19 @@ the new daemon listening. That is a "brief reconnect" the contract permits, not
 "file not found", but it is not yet blocked the way the contract prefers. See
 below.
 
-Residual: one `ECONNREFUSED` per restart reaches a reader instead of being
-absorbed by the ten-second recovery wait. Root is a reconnect race in the
-frontend's read-only control path. Tracked as open follow-up; it does not
-present as a vanished session.
+Residual: a single `ECONNREFUSED` can still reach a reader per restart. Root
+cause is established by instrumentation: it is **not** raised by any frontend
+recovery path. Logging was added to every transport-error branch
+(`withReadOnlyControl`, `makeConnection`, `readWithRecovery`, `writeWithRecovery`)
+and none fired during a reproducing restart, so the refusal is answered by
+FSKit/the kernel itself during the sub-second window when the old supervisor is
+gone and the new daemon has not yet bound its socket - a request the extension
+never sees cannot be absorbed by the extension's ten-second recovery wait. This
+is the "brief reconnect" the contract permits, not "file not found", and it does
+not present as a vanished session. Eliminating it would require changing how the
+mount signals backend health to FSKit, which is platform territory and out of
+proportion to a transient, contract-permitted reconnect. Recorded as a known
+platform limitation, not an open defect.
 
 ### Historical diagnosis (superseded)
 
