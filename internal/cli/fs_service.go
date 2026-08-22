@@ -158,6 +158,17 @@ func newFSServiceUpdateBinaryCommand() *cobra.Command {
 				CandidateSHA256: candidateSHA256, Changed: currentSHA256 != candidateSHA256, DryRun: !apply,
 			}
 			if apply && result.Changed {
+				// The product is never updated underneath a running Codex, so this
+				// is refused before the service is stopped rather than after.
+				// Failing to observe is refused with the same force as observing
+				// a running process.
+				activity := codexActivityForUpdates(command.Context())
+				if activity.Running {
+					return fmt.Errorf("refusing binary update while Codex is running (%s); updates wait until Codex is completely closed", strings.Join(activity.Observed, ", "))
+				}
+				if activity.Unknown {
+					return errors.New("refusing binary update without proof that Codex is completely closed")
+				}
 				home, err := codex.ResolveHome(codexHome)
 				if err != nil {
 					return err
@@ -1141,7 +1152,12 @@ func newFSServiceUpdatePreflightCommand() *cobra.Command {
 			if compatibilityErr != nil {
 				compatibilityResult.DetectionErrors = append(compatibilityResult.DetectionErrors, compatibilityErr.Error())
 			}
-			decision := service.EvaluateUpdate(service.UpdateInput{Capability: verifiedCapability(), DoctorHealthy: doctorErr == nil, Automatic: automatic, ExplicitPromotion: promote})
+			activity := codexActivityForUpdates(command.Context())
+			decision := service.EvaluateUpdate(service.UpdateInput{
+				Capability: verifiedCapability(), DoctorHealthy: doctorErr == nil,
+				Automatic: automatic, ExplicitPromotion: promote,
+				CodexRunning: activity.Running, CodexActivityUnknown: activity.Unknown,
+			})
 			result := FSUpdatePreflightResult{DoctorHealthy: doctorErr == nil, Compatibility: compatibilityResult, Decision: decision}
 			if jsonOutput {
 				return writeJSON(command, result)

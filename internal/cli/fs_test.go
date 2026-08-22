@@ -833,6 +833,7 @@ func TestFSServiceRestartIsExposedAsDryRun(t *testing.T) {
 
 func TestFSUpdatePreflightReportsUnknownClientWithoutChangingManagedRoute(t *testing.T) {
 	allowFixtureMount(t)
+	withCodexClosed(t)
 	home, storeDir, nativePath := fsFixture(t, true)
 	approvedCLI := approvedCLIContract(t, storeDir, "1.2.3")
 	mount := filepath.Join(home, "mount")
@@ -3539,6 +3540,7 @@ func TestFSRollbackCanonicalRetiresHiddenSnapshot(t *testing.T) {
 
 func TestFSUpdatePreflightReportsUnknownClientWithoutChangingNativeFallback(t *testing.T) {
 	allowFixtureMount(t)
+	withCodexClosed(t)
 	home, storeDir, nativePath := fsFixture(t, true)
 	cliPath := approvedCLIContract(t, storeDir, "1.2.3")
 	mount := filepath.Join(home, "mount")

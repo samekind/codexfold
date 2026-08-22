@@ -77,6 +77,13 @@ type UpdateInput struct {
 	DoctorHealthy     bool
 	Automatic         bool
 	ExplicitPromotion bool
+	// CodexRunning reports that a Codex Desktop, CLI or app-server process was
+	// observed. CodexActivityUnknown reports that the observation itself could
+	// not be completed. Either one refuses the update: the product may only be
+	// updated once Codex is completely closed, and failing to look is not the
+	// same as having looked and found nothing.
+	CodexRunning         bool
+	CodexActivityUnknown bool
 }
 
 type UpdateDecision struct {
@@ -380,6 +387,16 @@ func ProbeMount(path string) error { return defaultMountProbe(path) }
 func EvaluateUpdate(input UpdateInput) UpdateDecision {
 	if !input.DoctorHealthy {
 		return UpdateDecision{Reason: "filesystem doctor is not healthy"}
+	}
+	// Updating underneath a running Codex is what the product forbids outright:
+	// preparation, checking and installation all wait until Desktop, CLI and
+	// app-server are gone. This is checked before the readiness rules so an
+	// approved promotion can never carry an update past it.
+	if input.CodexRunning {
+		return UpdateDecision{Reason: "Codex is running; updates wait until Codex is completely closed"}
+	}
+	if input.CodexActivityUnknown {
+		return UpdateDecision{Reason: "Codex activity could not be determined; updates require proof that Codex is completely closed"}
 	}
 	if input.Automatic && (input.Capability == fsctl.FSEnginePreview || input.Capability == fsctl.PlatformCanary) {
 		return UpdateDecision{Reason: "automatic updates are disabled before platform production readiness"}
