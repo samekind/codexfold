@@ -2,15 +2,11 @@ package service
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
-	"os"
-	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/samekind/codexfold/internal/fskitstatus"
 	"github.com/samekind/codexfold/internal/launcher"
 )
 
@@ -43,7 +39,7 @@ func TestNativeFSKitSupervisorStatusTrackerPreservesOutageAcrossPublisherReplace
 	}
 }
 
-func TestNativeFSKitSupervisorMountsAndUnmountsOnShutdown(t *testing.T) {
+func TestNativeFSKitSupervisorMountsAndPreservesMountOnShutdown(t *testing.T) {
 	operations := &fakeNativeFSKitOperations{
 		daemonHealthy: true,
 		mounted:       make(chan struct{}), forceUnmounted: make(chan struct{}),
@@ -69,7 +65,9 @@ func TestNativeFSKitSupervisorMountsAndUnmountsOnShutdown(t *testing.T) {
 	}
 	operations.mu.Lock()
 	defer operations.mu.Unlock()
-	if operations.mountCalls != 1 || operations.unmountCalls != 1 || operations.forceUnmountCalls != 0 {
+	// Shutdown must never unmount: the path stays present across a restart
+	// (grill lock 5.2). The explicit `stop` command reclaims the mount instead.
+	if operations.mountCalls != 1 || operations.unmountCalls != 0 || operations.forceUnmountCalls != 0 {
 		t.Fatalf("mount calls=%d unmount=%d force=%d", operations.mountCalls, operations.unmountCalls, operations.forceUnmountCalls)
 	}
 }
@@ -150,7 +148,7 @@ func TestNativeFSKitSupervisorKeepsOwnedMountDuringBackendFailure(t *testing.T) 
 	}
 	operations.mu.Lock()
 	defer operations.mu.Unlock()
-	if operations.forceUnmountCalls != 0 || operations.unmountCalls != 1 || operations.probeCalls < 3 {
+	if operations.forceUnmountCalls != 0 || operations.unmountCalls != 0 || operations.probeCalls < 3 {
 		t.Fatalf("force unmount=%d normal unmount=%d probes=%d", operations.forceUnmountCalls, operations.unmountCalls, operations.probeCalls)
 	}
 }
@@ -253,64 +251,6 @@ func TestWaitForNativeFSKitMountDoesNotAcceptHealthyStateWithProbeError(t *testi
 	}
 	if !errors.Is(err, probeErr) {
 		t.Fatalf("wait error = %v, want probe error", err)
-	}
-}
-
-func TestShutdownNativeFSKitReturnsMountStateErrorWithoutUnmounting(t *testing.T) {
-	probeErr := errors.New("temporary statfs failure")
-	operations := &fakeNativeFSKitOperations{
-		mountErr: probeErr,
-		state:    NativeFSKitMountState{Mounted: true, Owned: true, Healthy: true},
-	}
-	err := shutdownNativeFSKit(NativeFSKitSupervisorOptions{
-		ResourcePath: "/tmp/resource", MountPoint: "/tmp/mount",
-		RecoveryTimeout: time.Second, Operations: operations,
-	}, operations)
-	if err != probeErr {
-		t.Fatalf("shutdown error = %v, want probe error", err)
-	}
-	operations.mu.Lock()
-	defer operations.mu.Unlock()
-	if operations.unmountCalls != 0 || operations.forceUnmountCalls != 0 {
-		t.Fatalf("shutdown mutated mount after failed probe: unmount=%d force=%d", operations.unmountCalls, operations.forceUnmountCalls)
-	}
-}
-
-func TestNativeFSKitSupervisorDoesNotReportStoppedWhenShutdownProbeFails(t *testing.T) {
-	probeErr := errors.New("temporary statfs failure")
-	operations := &fakeNativeFSKitOperations{
-		mountErr: probeErr,
-		state:    NativeFSKitMountState{Mounted: true, Owned: true, Healthy: true},
-	}
-	statusPath := filepath.Join(t.TempDir(), "supervisor.json")
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	err := RunNativeFSKitSupervisor(ctx, NativeFSKitSupervisorOptions{
-		ResourcePath: "/tmp/resource", MountPoint: "/tmp/mount",
-		Interval: time.Millisecond, RecoveryTimeout: time.Second,
-		StatusPath: statusPath, Operations: operations,
-	})
-	if err != probeErr {
-		t.Fatalf("supervisor error = %v, want shutdown probe error", err)
-	}
-	payload, readErr := os.ReadFile(statusPath)
-	if readErr != nil {
-		t.Fatalf("read supervisor status: %v", readErr)
-	}
-	var snapshot fskitstatus.Snapshot
-	if decodeErr := json.Unmarshal(payload, &snapshot); decodeErr != nil {
-		t.Fatalf("decode supervisor status: %v", decodeErr)
-	}
-	if snapshot.State != "unavailable" {
-		t.Fatalf("supervisor status = %q, want unavailable", snapshot.State)
-	}
-	if snapshot.PublisherInstanceID == "" || snapshot.BackendID == "" || snapshot.ObservationSequence == 0 {
-		t.Fatalf("supervisor status lacks causal identity: %#v", snapshot)
-	}
-	operations.mu.Lock()
-	defer operations.mu.Unlock()
-	if operations.unmountCalls != 0 || operations.forceUnmountCalls != 0 {
-		t.Fatalf("supervisor mutated mount after failed shutdown probe: unmount=%d force=%d", operations.unmountCalls, operations.forceUnmountCalls)
 	}
 }
 

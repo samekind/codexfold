@@ -169,6 +169,36 @@ func DefinitionFSKitResource(platform Platform, definitionPath string) (string, 
 	return "", errors.New("native-fskit launchd definition has no --fskit-resource argument")
 }
 
+// DefinitionMountPoint reports the --mount argument of a native-fskit launchd
+// definition. It returns an empty string for non-native-fskit definitions.
+func DefinitionMountPoint(platform Platform, definitionPath string) (string, error) {
+	frontend, err := DefinitionFrontend(platform, definitionPath)
+	if err != nil {
+		return "", err
+	}
+	if frontend != "native-fskit" {
+		return "", nil
+	}
+	definition, err := os.ReadFile(filepath.Clean(definitionPath))
+	if err != nil {
+		return "", err
+	}
+	arguments, err := launchdDefinitionArguments(definition)
+	if err != nil {
+		return "", err
+	}
+	for index := 0; index < len(arguments); index++ {
+		if arguments[index] != "--mount" {
+			continue
+		}
+		if index+1 >= len(arguments) || !filepath.IsAbs(arguments[index+1]) {
+			return "", errors.New("launchd definition has an invalid --mount argument")
+		}
+		return filepath.Clean(arguments[index+1]), nil
+	}
+	return "", errors.New("native-fskit launchd definition has no --mount argument")
+}
+
 func DefinitionStore(platform Platform, definitionPath string) (string, error) {
 	if !filepath.IsAbs(definitionPath) {
 		return "", errors.New("absolute service definition path is required")

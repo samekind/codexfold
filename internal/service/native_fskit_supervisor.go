@@ -193,19 +193,20 @@ func RunNativeFSKitSupervisor(ctx context.Context, options NativeFSKitSupervisor
 		}
 		select {
 		case <-ctx.Done():
+			// Never unmount on shutdown. A daemon/supervisor restart must keep
+			// the path present (grill lock 5.2); unmounting here is what made a
+			// routine restart show Codex "file not found". The mount stays owned
+			// by this resource and the next supervisor adopts it, or the `stop`
+			// command reclaims it with an explicit unmount.
 			if launcher.ParentUnavailable(ctx) {
 				if options.Event != nil {
 					options.Event("FSKit launcher parent exited; preserving the owned mount for launchd recovery")
 				}
-				return nil
+			} else if options.Event != nil {
+				options.Event("FSKit supervisor stopped; preserving the owned mount (explicit stop unmounts it)")
 			}
-			err := shutdownNativeFSKit(options, operations)
-			if err != nil {
-				writeNativeFSKitSupervisorStatus(options, statusPublisher, statusTracker, "unavailable", "File service supervision could not stop cleanly", err)
-			} else {
-				writeNativeFSKitSupervisorStatus(options, statusPublisher, statusTracker, "stopped", "File service supervision is stopped", nil)
-			}
-			return err
+			writeNativeFSKitSupervisorStatus(options, statusPublisher, statusTracker, "stopped", "File service supervision is stopped; mount preserved", nil)
+			return nil
 		case <-ticker.C:
 		}
 	}
@@ -285,18 +286,3 @@ func waitForNativeFSKitMount(ctx context.Context, options NativeFSKitSupervisorO
 	}
 }
 
-func shutdownNativeFSKit(options NativeFSKitSupervisorOptions, operations NativeFSKitOperations) error {
-	ctx, cancel := context.WithTimeout(context.Background(), options.RecoveryTimeout)
-	defer cancel()
-	mountState, err := operations.MountState(ctx, options.MountPoint, options.ProbeTimeout)
-	if err != nil {
-		return err
-	}
-	if !mountState.Owned {
-		return nil
-	}
-	if unmountErr := operations.Unmount(ctx, options.MountPoint, false); unmountErr == nil {
-		return nil
-	}
-	return operations.Unmount(ctx, options.MountPoint, true)
-}

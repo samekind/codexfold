@@ -143,3 +143,16 @@ func (*nativeFSKitOperations) Unmount(ctx context.Context, mountPoint string, fo
 	}
 	return nil
 }
+
+// UnmountNativeFSKit detaches an owned native FSKit mount that a stopped
+// supervisor deliberately left behind. The supervisor no longer unmounts on
+// shutdown (a restart must keep the session path present), so an explicit
+// `stop` reclaims the mount here. A mount that is not owned by CodexFold, or
+// one still serving a healthy daemon, is left untouched by the caller.
+func UnmountNativeFSKit(ctx context.Context, mountPoint string, force bool) error {
+	operations, err := defaultNativeFSKitOperations()
+	if err != nil {
+		return err
+	}
+	return operations.Unmount(ctx, mountPoint, force)
+}

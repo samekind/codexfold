@@ -56,7 +56,7 @@ Status values are exact:
 | Lock | Behaviour | Status | Evidence |
 | --- | --- | --- | --- |
 | §5.1 | One bad session must not kill the service | `verified-current` | One managed session's `state.json` was replaced with invalid JSON. The other ten sessions stayed readable, the service stayed healthy, and the damaged session itself continued serving its last known good content |
-| §5.2 | Path always present; read/write pauses at most ten seconds | **`verified-current: FAILING`** | Reproduced 4 of 5 restarts with reads in flight: 12-21 `ENOENT` and an occasional `EPROTO` reach the reader during the roughly 0.7 s window where `daemon.state` is `stopped`. Byte integrity held (0 mismatches) and the longest read gap was 0.58 s, so the ten-second pause budget passes; the lock's other half, never letting Codex see file-not-found, does not. Managed routes stayed published (`managed=healthy`, 11 sessions) throughout, so this is not a route-publication gap |
+| §5.2 | Path always present; read/write pauses at most ten seconds | `verified-current` after a fix | Root cause was the mount being unmounted on restart, not the daemon or the frontend recovery path: the supervisor's shutdown ran `umount`, and every `ENOENT` row was a `mounted=0` row. Fixed by preserving the owned mount across supervisor shutdown (explicit `stop` reclaims it), draining daemon UDS connections before route teardown, and mapping frontend lookup/getattr transport failure to `EAGAIN`. Verified on the isolated candidate across three restart rounds with 15 managed sessions read in flight: zero `ENOENT`, `mounted=1` throughout, byte integrity held. One residual: exactly one `ECONNREFUSED` per restart round from a frontend reconnect race in the old-supervisor/new-daemon gap — a brief reconnect the contract tolerates, not a vanished file; tracked below |
 | §5.3 | Under ten seconds silent, at ten seconds a popup, recovery announced | threshold `verified-current`, window `blocked-on-operator` | A real fifteen-second backend outage was injected twice with a guaranteed restore. The frontend stayed silent for the first ten seconds, escalated to `unavailable` at 10.3 s and 10.5 s, and returned to healthy after recovery, so the threshold, the silence before it, and the recovery announcement all hold. No window appeared, but that is not evidence against the product: the incident helper presents through an `NSApplication`, and a helper started by hand from a shell has no GUI session to present in. The sanctioned path registers it as a LaunchAgent through `fs service install --apply`, which is an explicit authorization boundary. Note also that the daemon status file keeps its last written value while the process is stopped, so `daemon` reads `healthy` throughout such an outage and only the frontend detects it |
 | §5.4 | Resident after login; UI exit does not stop service | `code-only` | Not exercised |
 | §5.5 | Never update while Codex runs | `verified-current` after a fix | The guard did not exist. `update-preflight --promote` returned `allowed=true` with an empty reason while 2 real Codex CLI processes and 18 production Desktop processes were running, and returned the same result with none running; without `--promote` the readiness gate blocked everything and masked the gap. `update-binary` also produced a dry-run plan with Codex running. A running-Codex check now precedes the readiness rules in `service.EvaluateUpdate` and refuses `update-binary --apply` before the service is stopped. Verified on the same host: allowed=false with reason "Codex is running; updates wait until Codex is completely closed". Detection matches exact executable names and the Desktop bundle path so CodexFold's own processes, which all contain `codex`, can never satisfy it, and a failed observation is refused as firmly as an observed process |
@@ -67,27 +67,67 @@ Status values are exact:
 | §5.10 | Acceptance uses real work in an isolated instance with external observation | `blocked-on-operator` | Requires a Cockpit **Start** and real operator work |
 | §5.11 | Production stays disabled until separately authorized | `verified-current` | Production PIDs unchanged; `~/.codex/sessions` never routed |
 
-## Open defect: §5.2
+## Resolved defect: §5.2
 
-During a backend restart a reader receives `ENOENT`. The Swift frontend does
-implement the keep-alive contract for transport failures - it blocks, retries for
-ten seconds, and publishes a recovering status while holding the mount present -
-so this is not a missing feature but a misclassification: connecting to a socket
-that does not exist yet fails with "no such file or directory", and that errno
-reaches the client as though the session file were gone. `descriptor.bin` is
-published by atomic rename and never removed, so the descriptor is not the
-source, and the route table stays populated, so the route table is not either.
+**Resolved 2026-08-22.** A backend restart no longer shows a reader `ENOENT`.
 
-This is the exact symptom the 2026-07-25 accident presented as sessions
-disappearing, and it reproduces in about twenty-five seconds:
+Root cause, established by direct observation: the ENOENT was never produced by
+the daemon's route table or by the frontend's recovery logic. It came from the
+mount being **unmounted** during a restart. `fs service restart` booted out the
+supervisor, and the supervisor's shutdown path ran `umount`
+(`shutdownNativeFSKit`), dropping the mount for the whole window; every path
+under it then resolved to nothing. Confirmed by probe: with the mount present
+(`mounted=1`) reads stayed `ok`; the ENOENT rows were exactly the rows where
+`mounted=0`. A single `kill -TERM` of the daemon alone (mount preserved by
+launchd) produced zero ENOENT.
 
-```text
-t=0.00  open=ok       daemon=healthy  managedSessions=11
-t=1.56  open=ENOENT   daemon=stopped  managedSessions=11
-t=2.24  open=ok       daemon=healthy  managedSessions=11   (new pid)
-```
+Three fixes, each verified on the isolated acceptance candidate:
 
-Four causes are eliminated with evidence, so the next attempt need not retest them:
+1. **Supervisor no longer unmounts on shutdown**
+   (`internal/service/native_fskit_supervisor.go`). The owned mount is preserved
+   across both launcher-parent loss and ordinary stop/restart; the next
+   supervisor adopts it by resource identity. An explicit `fs service stop`
+   reclaims the mount with a deliberate `umount` (`stopPlatformService` in
+   `internal/cli/fs_service.go` via `service.UnmountNativeFSKit`). This is the
+   fix that removes the ENOENT: after it, `mounted=1` holds through a restart.
+2. **Daemon drains live UDS connections before the route table is torn down**
+   (`internal/mountfs/native_fskit_server.go`). Previously a connection
+   established before shutdown could still be answered after `CloseSessions`
+   cleared the routes, returning a phantom ENOENT. Now shutdown closes tracked
+   connections and waits (bounded) for handlers before returning. Reproduction
+   test: `TestNativeFSKitServerShutdownNeverServesNotFoundFromTornDownRoutes`.
+3. **Frontend lookup/getAttributes treat transport failure as busy, never as
+   file-not-found** (`platform/darwin/fskit/Extension/ProfileModule.swift`). A
+   lookup that hits a restarting backend now replies `EAGAIN` so FSKit retries
+   instead of minting a negative entry.
+
+SDK note: the running macOS dispatches `activateWithOptions:` /
+`deactivateWithOptions:` (FSVolume.Operations selectors) while the current
+Xcode 27 SDK names the same requirements `activateVolume(options:)` /
+`deactivateVolume(options:)` (FSVolume.Handler). Both are now implemented, with
+`@objc` legacy aliases, so the module builds on the current SDK and still runs
+on the installed OS.
+
+Evidence (isolated candidate, three restart rounds, 15 managed sessions read in
+flight): zero `ENOENT`; `mounted=1` throughout. One residual remains and is
+recorded honestly: exactly one `ECONNREFUSED` per restart round, a frontend
+recovery race during the sub-second gap between the old supervisor stopping and
+the new daemon listening. That is a "brief reconnect" the contract permits, not
+"file not found", but it is not yet blocked the way the contract prefers. See
+below.
+
+Residual: one `ECONNREFUSED` per restart reaches a reader instead of being
+absorbed by the ten-second recovery wait. Root is a reconnect race in the
+frontend's read-only control path. Tracked as open follow-up; it does not
+present as a vanished session.
+
+### Historical diagnosis (superseded)
+
+The 2026-08-20 analysis below eliminated four causes correctly but missed the
+actual one (unmount-on-restart), because its repro used `fs service restart`
+while attributing the ENOENT to the daemon. Retained for the record.
+
+Four causes were eliminated with evidence:
 
 1. **Not route publication.** `managed` stayed `healthy` with 11 sessions for the
    whole window.

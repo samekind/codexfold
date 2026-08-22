@@ -956,6 +956,17 @@ func stopPlatformService(ctx context.Context, platform service.Platform, definit
 			manager := service.Manager{}
 			supervisorErr := manager.Bootout(ctx, nativeFSKitSupervisorDefinitionPath(definitionPath))
 			daemonErr := manager.Bootout(ctx, definitionPath)
+			// The supervisor preserves the owned mount on shutdown so a restart
+			// keeps the session path present. An explicit stop reclaims that
+			// mount here, otherwise the path would stay occupied by a dead
+			// backend. Only unmount when CodexFold still owns it.
+			if mountPoint, mountErr := service.DefinitionMountPoint(platform, definitionPath); mountErr == nil && mountPoint != "" {
+				unmountCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+				if unmountErr := service.UnmountNativeFSKit(unmountCtx, mountPoint, false); unmountErr != nil {
+					_ = service.UnmountNativeFSKit(unmountCtx, mountPoint, true)
+				}
+				cancel()
+			}
 			return errors.Join(supervisorErr, daemonErr)
 		}
 		return (service.Manager{}).Bootout(ctx, definitionPath)

@@ -197,6 +197,63 @@ type nativeFSKitServer struct {
 	nodes               nativeFSKitNodes
 	sharedMemoryWindows nativeSharedFileWindowPool
 	sharedFileWindows   nativeSharedFileWindowPool
+	connectionsMu       sync.Mutex
+	connections         map[net.Conn]struct{}
+	draining            bool
+	handlers            sync.WaitGroup
+}
+
+// trackConnection registers an accepted connection until shutdown begins. A
+// false result means the server is draining and the connection must be closed
+// without being served.
+func (s *nativeFSKitServer) trackConnection(connection net.Conn) bool {
+	s.connectionsMu.Lock()
+	defer s.connectionsMu.Unlock()
+	if s.draining {
+		return false
+	}
+	if s.connections == nil {
+		s.connections = make(map[net.Conn]struct{})
+	}
+	s.handlers.Add(1)
+	s.connections[connection] = struct{}{}
+	return true
+}
+
+func (s *nativeFSKitServer) untrackConnection(connection net.Conn) {
+	s.connectionsMu.Lock()
+	delete(s.connections, connection)
+	s.connectionsMu.Unlock()
+	s.handlers.Done()
+}
+
+// closeConnections drops every live connection so in-flight and future requests
+// meet a closed transport instead of a torn-down route table. The frontend
+// classifies a closed transport as recoverable and waits for the next backend,
+// while a route miss would surface as ENOENT - a vanished session - to Codex.
+func (s *nativeFSKitServer) closeConnections() {
+	s.connectionsMu.Lock()
+	s.draining = true
+	for connection := range s.connections {
+		_ = connection.Close()
+	}
+	s.connectionsMu.Unlock()
+}
+
+// waitForConnections bounds the drain so a stuck handler cannot hold shutdown
+// open forever; the timeout stays inside the ten-second incident budget that
+// the frontend already grants a restarting backend.
+func (s *nativeFSKitServer) waitForConnections(timeout time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		s.handlers.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(timeout):
+		s.record("shutdown_connection_drain_timeout")
+	}
 }
 
 type nativeSharedFileWindowPool struct {
@@ -419,11 +476,13 @@ func ServeNativeFSKit(ctx context.Context, filesystem *Filesystem, options Nativ
 	go func() {
 		<-ctx.Done()
 		_ = listener.Close()
+		server.closeConnections()
 	}()
 	for {
 		connection, err := listener.Accept()
 		if err != nil {
 			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
+				server.waitForConnections(5 * time.Second)
 				return ctx.Err()
 			}
 			return fmt.Errorf("accept FSKit connection: %w", err)
@@ -431,7 +490,14 @@ func ServeNativeFSKit(ctx context.Context, filesystem *Filesystem, options Nativ
 		if err := configureNativeFSKitSocket(connection); err != nil {
 			server.record(fmt.Sprintf("connection_buffer_error error=%q", err.Error()))
 		}
-		go (&nativeFSKitConnection{server: server, conn: connection, handles: make(map[uint64]*nativeFSKitHandle), nextHandle: 1}).serve()
+		if !server.trackConnection(connection) {
+			_ = connection.Close()
+			continue
+		}
+		go func() {
+			defer server.untrackConnection(connection)
+			(&nativeFSKitConnection{server: server, conn: connection, handles: make(map[uint64]*nativeFSKitHandle), nextHandle: 1}).serve()
+		}()
 	}
 }
 

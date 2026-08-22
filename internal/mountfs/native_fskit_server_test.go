@@ -233,6 +233,78 @@ func TestNativeFSKitServerPreservesJSONLWritesAndNamespaceMutations(t *testing.T
 	}
 }
 
+func TestNativeFSKitServerShutdownNeverServesNotFoundFromTornDownRoutes(t *testing.T) {
+	root := t.TempDir()
+	filesystem := NewCanonical()
+	filesystem.SetNativeRoot(filepath.Join(root, "native"))
+	// A managed session whose native source is retired: the pack is the only
+	// copy, exactly like a production session after native retirement.
+	managedPath := "/sessions/2026/08/22/managed.jsonl"
+	managedBytes := []byte("{\"record\":1}\n")
+	if err := filesystem.AddSessionAt("managed", managedPath, mountSessionFixture(t, "managed", managedBytes)); err != nil {
+		t.Fatal(err)
+	}
+
+	socketRoot := shortNativeFSKitTestDir(t, "cfs-")
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	options := NativeFSKitServerOptions{
+		SocketPath: filepath.Join(socketRoot, "daemon.sock"), ResourcePath: filepath.Join(root, "resource.bin"),
+		Token: bytes.Repeat([]byte{0x42}, 32), Generation: 77, BuildSHA256: strings.Repeat("a", 64),
+	}
+	go func() { done <- ServeNativeFSKit(ctx, filesystem, options) }()
+	deadline := time.Now().Add(5 * time.Second)
+	var client *fskitproto.Client
+	var dialErr error
+	for time.Now().Before(deadline) {
+		client, dialErr = fskitproto.DialResource(options.ResourcePath, 100*time.Millisecond)
+		if dialErr == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if dialErr != nil {
+		cancel()
+		t.Fatalf("start FSKit test server: %v", dialErr)
+	}
+	defer client.Close()
+
+	getattr := func() error {
+		encoder := fskitproto.NewEncoder(128)
+		encoder.String(managedPath)
+		_, err := client.Call(fskitproto.OpGetattr, encoder.Data())
+		return err
+	}
+	if err := getattr(); err != nil {
+		t.Fatalf("getattr before shutdown: %v", err)
+	}
+
+	// Mirror the daemon restart ordering in fs.go: the server context is
+	// cancelled, ServeNativeFSKit returns, and only then CloseSessions tears
+	// down the route table.
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("FSKit server shutdown: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("FSKit server did not stop")
+	}
+	if err := filesystem.CloseSessions(); err != nil {
+		t.Fatalf("close sessions: %v", err)
+	}
+
+	// A request that arrives on the old connection after the route table is
+	// gone must meet a closed transport, never a "file not found" verdict:
+	// ENOENT here is what Codex sees as a vanished session during a backend
+	// restart.
+	err := getattr()
+	if errno := fskitproto.ErrorNumber(err); errno == syscall.ENOENT {
+		t.Fatalf("getattr after route teardown returned ENOENT: %v", err)
+	}
+}
+
 func TestNativeFSKitServerNamespaceRefreshGuardCannotCreateMissingPaths(t *testing.T) {
 	root := t.TempDir()
 	nativeRoot := filepath.Join(root, "native")

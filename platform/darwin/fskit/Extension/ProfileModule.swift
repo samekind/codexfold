@@ -1030,9 +1030,29 @@ private final class CodexFoldVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWr
     var truncatesLongNames: Bool { false }
     var enableOpenUnlinkEmulation: Bool { true }
 
-    func activate(
+    // FSKit on the running macOS dispatches activateWithOptions:replyHandler:
+    // (FSVolume.Operations), while the current SDK's FSVolume.Handler names the
+    // requirement activateVolume(options:replyHandler:). Satisfy the SDK here
+    // and keep the runtime entry point on the legacy alias below.
+    func activateVolume(
         options: FSTaskOptions,
-        replyHandler: @escaping (FSActivateResult?, (any Error)?) -> Void
+        replyHandler: @escaping @Sendable (FSActivateResult?, (any Error)?) -> Void
+    ) {
+        activateVolumeImpl(options: options, replyHandler: replyHandler)
+    }
+
+    // Legacy runtime alias: FSKit on the installed OS calls this selector.
+    @objc(activateWithOptions:replyHandler:)
+    func activateLegacy(
+        options: FSTaskOptions,
+        replyHandler: @escaping @Sendable (FSActivateResult?, (any Error)?) -> Void
+    ) {
+        activateVolumeImpl(options: options, replyHandler: replyHandler)
+    }
+
+    private func activateVolumeImpl(
+        options: FSTaskOptions,
+        replyHandler: @escaping @Sendable (FSActivateResult?, (any Error)?) -> Void
     ) {
         do {
             let entry = try client.getattr("/")
@@ -1048,7 +1068,17 @@ private final class CodexFoldVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWr
         }
     }
 
-    func deactivate(options: FSDeactivateOptions, replyHandler: @escaping ((any Error)?) -> Void) {
+    func deactivateVolume(options: FSDeactivateOptions, replyHandler: @escaping @Sendable ((any Error)?) -> Void) {
+        deactivateVolumeImpl(options: options, replyHandler: replyHandler)
+    }
+
+    // Legacy runtime alias: FSKit on the installed OS calls this selector.
+    @objc(deactivateWithOptions:replyHandler:)
+    func deactivateLegacy(options: FSDeactivateOptions, replyHandler: @escaping @Sendable ((any Error)?) -> Void) {
+        deactivateVolumeImpl(options: options, replyHandler: replyHandler)
+    }
+
+    private func deactivateVolumeImpl(options: FSDeactivateOptions, replyHandler: @escaping @Sendable ((any Error)?) -> Void) {
         stopNamespaceMonitor()
         closeAllItems()
         replyHandler(nil)
@@ -1105,6 +1135,19 @@ private final class CodexFoldVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWr
                 nil
             )
         } catch {
+            // Diagnostic: record every lookup failure so the restart window
+            // shows exactly which errno reaches the kernel.
+            logger.notice("lookup failed path=\(self.join(directory.entry.path, nameString), privacy: .public) error=\(String(describing: error), privacy: .public)")
+            // A vanished backend is a transport condition, not a statement
+            // about the name: the daemon restarts under ordinary operation and
+            // the contract forbids showing Codex "file not found" for a path
+            // that exists. Report the backend as busy so FSKit retries the
+            // lookup instead of minting a negative cache entry; recovery
+            // reconnects within the ten-second budget.
+            if isWireTransportError(error) {
+                replyHandler(nil, POSIXError(.EAGAIN))
+                return
+            }
             replyHandler(nil, error)
         }
     }
@@ -1307,6 +1350,14 @@ private final class CodexFoldVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWr
             item.update(entry)
             replyHandler(FSGetAttributesResult(attributes: attributes(for: entry)), nil)
         } catch {
+            // Same contract as lookupItem: a transport failure means the
+            // backend is restarting, not that the item is gone. EAGAIN asks
+            // FSKit to retry rather than surface a phantom ENOENT.
+            if isWireTransportError(error) {
+                logger.notice("getAttributes during backend recovery path=\(item.entry.path, privacy: .public) error=\(String(describing: error), privacy: .public)")
+                replyHandler(nil, POSIXError(.EAGAIN))
+                return
+            }
             replyHandler(nil, error)
         }
     }
