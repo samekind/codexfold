@@ -2044,6 +2044,16 @@ func newFSRollbackCommand() *cobra.Command {
 					}
 					restoreManagedRoute := func(cause error, retiredState string, retiredSnapshot string) error {
 						var restoreErrors []error
+						// Only a real failure may be recorded. `len(restoreErrors) == 0`
+						// is what decides whether this compensation goes on to wait for
+						// the restored route, and appending a nil still grows the slice:
+						// closing the lock cleanly used to make that check false every
+						// time, so the wait and the verification below never ran.
+						recordRestoreError := func(errs ...error) {
+							if joined := errors.Join(errs...); joined != nil {
+								restoreErrors = append(restoreErrors, joined)
+							}
+						}
 						deletionLock, lockErr := storage.AcquireOperationLock(store, "session-deletions")
 						if lockErr != nil {
 							return errors.Join(cause, fmt.Errorf("serialize retirement compensation with explicit deletion: %w", lockErr))
@@ -2051,7 +2061,7 @@ func newFSRollbackCommand() *cobra.Command {
 						lockOpen := true
 						closeDeletionLock := func() {
 							if lockOpen {
-								restoreErrors = append(restoreErrors, deletionLock.Close())
+								recordRestoreError(deletionLock.Close())
 								lockOpen = false
 							}
 						}
@@ -2105,7 +2115,7 @@ func newFSRollbackCommand() *cobra.Command {
 							} else {
 								restored = restoredManaged.State()
 								restoredVisible, openErr = hashManagedSessionVisible(command.Context(), restoredManaged)
-								restoreErrors = append(restoreErrors, errors.Join(openErr, restoredResolver.Close()))
+								recordRestoreError(openErr, restoredResolver.Close())
 								if err := upsertManagedSessionRegistryEntryIfPresent(store, restored.SessionID, restored.Generation); err != nil {
 									restoreErrors = append(restoreErrors, err)
 								}

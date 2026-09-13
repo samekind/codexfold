@@ -5241,3 +5241,32 @@ func TestEnrollmentPlanSizesAnAutomaticBatchFromMeasuredCost(t *testing.T) {
 		t.Fatalf("manual batch selected %d sessions, want exactly 3", len(manual.Selected))
 	}
 }
+
+func TestRestoreErrorAccountingIgnoresCleanCloses(t *testing.T) {
+	// This mirrors how the retirement compensation accumulates failures. It
+	// decides whether to wait for the restored route by asking whether anything
+	// went wrong, and a nil appended by a clean close answered that question
+	// wrongly: the wait and the verification behind it became unreachable.
+	var restoreErrors []error
+	record := func(errs ...error) {
+		if joined := errors.Join(errs...); joined != nil {
+			restoreErrors = append(restoreErrors, joined)
+		}
+	}
+
+	var cleanClose error
+	record(cleanClose)
+	record(nil, nil)
+	if len(restoreErrors) != 0 {
+		t.Fatalf("a clean close counted as a failure: %v", restoreErrors)
+	}
+
+	record(errors.New("boom"))
+	if len(restoreErrors) != 1 {
+		t.Fatalf("a real failure was not recorded: %v", restoreErrors)
+	}
+	record(nil, errors.New("second"))
+	if len(restoreErrors) != 2 {
+		t.Fatalf("a failure joined with a nil was not recorded: %v", restoreErrors)
+	}
+}
