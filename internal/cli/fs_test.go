@@ -3804,7 +3804,10 @@ func TestFSRollbackCanonicalFailureWaitsForManagedRouteRestoration(t *testing.T)
 		t.Fatalf("rollback error = %v, want retirement rejection", err)
 	}
 	if !routeRestored.Load() {
-		t.Fatal("rollback returned before the managed route became readable again")
+		// The rejection is joined with anything that went wrong restoring the
+		// route, and `errors.Is` above matches on the rejection alone — so a
+		// restore that failed reads as a pass unless the whole error is shown.
+		t.Fatalf("rollback returned before the managed route became readable again; rollback error = %v", err)
 	}
 	select {
 	case restoreErr := <-restored:
