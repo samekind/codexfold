@@ -12,7 +12,7 @@ It finds exact duplicate raw JSON string tokens, complete JSONL records, and con
 
 ## Current Status
 
-`v0.3.0-beta.2` is the current `fs-engine-preview`. It adds bounded Pack V3 storage, verified loose-object and native-snapshot retirement, Pack-only recovery, and current-client regression evidence to the transparent filesystem introduced in `v0.3.0-beta.1`.
+`v0.4.0-beta.1` is the current `fs-engine-preview`. It makes periodic enrollment survive a real corpus: batches size themselves from measured cycle cost, a refused pack build or an unroutable session no longer leaves the store permanently unable to fold, and a slow mount probe is no longer reported as an outage. It builds on the bounded Pack V3 storage, verified loose-object and native-snapshot retirement, and Pack-only recovery introduced in `v0.3.0-beta.2`.
 
 Client version and build identity are diagnostic metadata only. Unknown or newly updated Codex clients do not pause enrollment, change session routes, or force native materialization; runtime safety is enforced by writer probes, exact-byte verification, mount health, storage budgets, journal recovery, and filesystem semantics.
 
@@ -43,11 +43,11 @@ See [the Linux FUSE3 validation](docs/validation-linux-fuse3.md) and [the macOS 
 Install the versioned preview with Go:
 
 ```bash
-go install github.com/samekind/codexfold/cmd/codexfold@v0.3.0-beta.2
+go install github.com/samekind/codexfold/cmd/codexfold@v0.4.0-beta.1
 codexfold --version
 ```
 
-The [GitHub Release](https://github.com/samekind/codexfold/releases/tag/v0.3.0-beta.2) provides checksum-covered default CLI archives for macOS, Linux, and Windows on `amd64` and `arm64`. These archives expose the local storage and recovery command surface; they do not contain a generally signed macOS FSKit App.
+The [GitHub Release](https://github.com/samekind/codexfold/releases/tag/v0.4.0-beta.1) provides checksum-covered default CLI archives for macOS, Linux, and Windows on `amd64` and `arm64`. These archives expose the local storage and recovery command surface; they do not contain a generally signed macOS FSKit App.
 
 The FSKit App under `platform/darwin/fskit` currently requires Xcode 27, XcodeGen, an eligible Apple development team, and source signing. The validated App uses a maintainer Apple Development identity and is neither Developer ID distributed nor notarized for general installation. Follow the [maintainer guide](docs/maintainer-guide.md) and use only an isolated Codex home until the product contract permits production promotion.
 
@@ -174,4 +174,4 @@ codexfold gc --apply
 git diff --check
 ```
 
-See the [changelog](CHANGELOG.md), [v0.3.0-beta.2 release notes](docs/releases/v0.3.0-beta.2.md), [architecture](docs/design.md), [Fold V1 format](docs/fold-v1.md), [v0.2 validation](docs/validation-v0.2.md), [transparent filesystem product contract](docs/superpowers/specs/2026-07-11-transparent-session-filesystem-design.md), and [maintainer guide](docs/maintainer-guide.md).
+See the [changelog](CHANGELOG.md), [v0.4.0-beta.1 release notes](docs/releases/v0.4.0-beta.1.md), [architecture](docs/design.md), [Fold V1 format](docs/fold-v1.md), [v0.2 validation](docs/validation-v0.2.md), [transparent filesystem product contract](docs/superpowers/specs/2026-07-11-transparent-session-filesystem-design.md), and [maintainer guide](docs/maintainer-guide.md).

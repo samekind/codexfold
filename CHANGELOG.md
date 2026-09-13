@@ -6,15 +6,55 @@ pre-1.0, so a minor version may contain compatibility changes.
 
 ## [Unreleased]
 
+## [0.4.0-beta.1] - 2026-09-13
+
 ### Added
 
+- Automatic batch sizing for periodic enrollment. A cycle rebuilds the whole
+  pack whether it folds one session or two hundred, so the batch is derived
+  from the rebuild and per-session costs the last cycles measured, keeping that
+  fixed toll to about a quarter of the work. The Auto fold pane gains a
+  "How many per pass" control for choosing a size directly; `batch_size: 0` in
+  `<store>/enrollment/policy.json` is the automatic setting.
 - A Darwin-only controlled host-interruption canary for the native append
   journal. It arms only with explicit environment variables, persists a
   journal and partial JSONL tail on an isolated internal-volume fixture, and
   requires a changed boot identity before product startup recovery can pass.
 
+### Fixed
+
+- A staged canonical snapshot that already existed is reused when it is
+  byte-identical to its source. Refusing it made a migration that failed after
+  staging permanently unretryable, stranding folded sessions next to the
+  originals they should have replaced.
+- A failed migration no longer skips reclamation. The pack build earlier in the
+  same cycle has already written a new generation, so returning early left the
+  store larger every cycle for as long as one session stayed stuck. Deleting a
+  user's original still waits for a clean cycle.
+- Enrollment planning consults the batch limit before pricing a candidate
+  against the storage budget. Each price is a full store scan, so pricing every
+  candidate turned a sub-second plan into one that timed out, which the Host
+  reported as nothing left to fold.
+- A cycle repacks once before the storage-health gate blocks it. A pack build
+  refused for free space leaves manifests pointing at unpacked objects, and the
+  gate then blocked every candidate without anything ever repacking.
+- The Host preserves policy fields it does not model. Writing a fixed batch size
+  back reset a tuned batch whenever any switch in the pane was flipped.
+- A mount-table probe that exceeds its deadline is treated as inconclusive
+  rather than as recovery, gated on the backend still answering. Status
+  publication no longer waits on reconciliation, the steady-state probe runs
+  once every five intervals, and mount-recovery polling backs off.
+- A status channel that stops advancing degrades the indicator instead of
+  raising an incident, and escalates only once sustained. A component reporting
+  failure still alerts at ten seconds.
+- Read-ahead extends its horizon only after a read advances into the adjacent
+  block, so a lookup no longer pays for a scan it is not performing.
+
 ### Validation
 
+- 205 sessions whose native originals had been retired were read back through
+  the mount and compared against the SHA-256 recorded at retirement: 666 MB,
+  byte-identical, every JSONL record parseable.
 - A real `reboot -q` interruption ran at the durable-journal / partial-tail
   checkpoint. On the next boot, automatic recovery restored the exact base
   SHA-256, rejected partial data, cleared the journal, and the independent
@@ -105,7 +145,8 @@ pre-1.0, so a minor version may contain compatibility changes.
 
 - Initial local-first scan, fold, exact restore, and object-store release.
 
-[Unreleased]: https://github.com/samekind/codexfold/compare/v0.3.0-beta.2...HEAD
+[Unreleased]: https://github.com/samekind/codexfold/compare/v0.4.0-beta.1...HEAD
+[0.4.0-beta.1]: https://github.com/samekind/codexfold/compare/v0.3.0-beta.2...v0.4.0-beta.1
 [0.3.0-beta.2]: https://github.com/samekind/codexfold/compare/v0.3.0-beta.1...v0.3.0-beta.2
 [0.3.0-beta.1]: https://github.com/samekind/codexfold/compare/v0.2.1...v0.3.0-beta.1
 [0.2.1]: https://github.com/samekind/codexfold/releases/tag/v0.2.1
