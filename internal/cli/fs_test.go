@@ -13,6 +13,7 @@ import (
 	"reflect"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -3729,6 +3730,7 @@ func TestFSRollbackCanonicalFailureWaitsForManagedRouteRestoration(t *testing.T)
 	retirementRequest := filepath.Join(stateDirectory, "retire.request.json")
 	canonicalRoute := "/sessions/2026/07/12/" + filename
 	restored := make(chan error, 1)
+	var routeRestored atomic.Bool
 	go func() {
 		deadline := time.Now().Add(5 * time.Second)
 		for time.Now().Before(deadline) {
@@ -3775,6 +3777,12 @@ func TestFSRollbackCanonicalFailureWaitsForManagedRouteRestoration(t *testing.T)
 					restored <- err
 					return
 				}
+				// Mark the route restored before publishing the acknowledgement
+				// that rollback is waiting on. Rollback cannot observe that
+				// acknowledgement, and so cannot return, until after this flag is
+				// set — which is what makes reading it below a real ordering check
+				// rather than a race against this goroutine's next statement.
+				routeRestored.Store(true)
 				restored <- writeMountAcknowledgement(storeDir, "session", state.Generation, canonicalRoute)
 				return
 			}
@@ -3795,13 +3803,16 @@ func TestFSRollbackCanonicalFailureWaitsForManagedRouteRestoration(t *testing.T)
 	if !errors.Is(err, errRetirementRejected) {
 		t.Fatalf("rollback error = %v, want retirement rejection", err)
 	}
+	if !routeRestored.Load() {
+		t.Fatal("rollback returned before the managed route became readable again")
+	}
 	select {
 	case restoreErr := <-restored:
 		if restoreErr != nil {
 			t.Fatal(restoreErr)
 		}
-	default:
-		t.Fatal("rollback returned before the managed route became readable again")
+	case <-time.After(10 * time.Second):
+		t.Fatal("the restoring goroutine never reported its outcome")
 	}
 	state, err := managedState(storeDir, "session")
 	if err != nil {

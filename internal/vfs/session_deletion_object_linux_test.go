@@ -145,11 +145,11 @@ func TestReadSessionDeletionGenerationLinux(t *testing.T) {
 	t.Cleanup(func() { sessionDeletionIoctlLinux = oldIoctl })
 
 	t.Run("unsigned generation", func(t *testing.T) {
-		sessionDeletionIoctlLinux = func(fd uintptr, request uintptr, argument uintptr) unix.Errno {
+		sessionDeletionIoctlLinux = func(fd uintptr, request uintptr, argument unsafe.Pointer) unix.Errno {
 			if fd != file.Fd() || request != sessionDeletionFSIOCGetVersionRequestLinux() {
 				t.Fatalf("unexpected ioctl request: fd=%d request=%#x", fd, request)
 			}
-			*(*int32)(unsafe.Pointer(argument)) = -1
+			*(*int32)(argument) = -1
 			return 0
 		}
 		generation, err := readSessionDeletionGenerationLinux(file)
@@ -159,15 +159,15 @@ func TestReadSessionDeletionGenerationLinux(t *testing.T) {
 	})
 
 	t.Run("unsupported", func(t *testing.T) {
-		sessionDeletionIoctlLinux = func(uintptr, uintptr, uintptr) unix.Errno { return unix.ENOTTY }
+		sessionDeletionIoctlLinux = func(uintptr, uintptr, unsafe.Pointer) unix.Errno { return unix.ENOTTY }
 		if _, err := readSessionDeletionGenerationLinux(file); err == nil || !errors.Is(err, unix.ENOTTY) {
 			t.Fatalf("readSessionDeletionGenerationLinux() error=%v, want ENOTTY", err)
 		}
 	})
 
 	t.Run("zero", func(t *testing.T) {
-		sessionDeletionIoctlLinux = func(_ uintptr, _ uintptr, argument uintptr) unix.Errno {
-			*(*int32)(unsafe.Pointer(argument)) = 0
+		sessionDeletionIoctlLinux = func(_ uintptr, _ uintptr, argument unsafe.Pointer) unix.Errno {
+			*(*int32)(argument) = 0
 			return 0
 		}
 		if _, err := readSessionDeletionGenerationLinux(file); err == nil {

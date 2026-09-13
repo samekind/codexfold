@@ -121,7 +121,7 @@ func readSessionDeletionGenerationLinux(file *os.File) (uint64, error) {
 	errno := sessionDeletionIoctlLinux(
 		file.Fd(),
 		sessionDeletionFSIOCGetVersionRequestLinux(),
-		uintptr(unsafe.Pointer(&version)),
+		unsafe.Pointer(&version),
 	)
 	runtime.KeepAlive(file)
 	if errno != 0 {
@@ -134,8 +134,14 @@ func readSessionDeletionGenerationLinux(file *os.File) (uint64, error) {
 	return generation, nil
 }
 
-func invokeSessionDeletionIoctlLinux(fileDescriptor uintptr, request uintptr, argument uintptr) unix.Errno {
-	_, _, errno := unix.Syscall(unix.SYS_IOCTL, fileDescriptor, request, argument)
+// invokeSessionDeletionIoctlLinux takes the argument as a pointer rather than a
+// uintptr so no caller has to round-trip one back into a pointer. Only the
+// syscall itself may hold the address as an integer, and only inside the call
+// expression, where the compiler keeps the object alive; a uintptr that crosses
+// a function boundary is not a valid pointer and `checkptr` rejects converting
+// it back.
+func invokeSessionDeletionIoctlLinux(fileDescriptor uintptr, request uintptr, argument unsafe.Pointer) unix.Errno {
+	_, _, errno := unix.Syscall(unix.SYS_IOCTL, fileDescriptor, request, uintptr(argument))
 	return errno
 }
 
