@@ -699,6 +699,35 @@ func TestBuildMigratesLegacyCurrentWithoutPublicationHead(t *testing.T) {
 	}
 }
 
+func TestBuildMigratesLegacyCurrentAfterLaterFold(t *testing.T) {
+	root := t.TempDir()
+	refs := putObjects(t, root, []byte("legacy-packed-source"))
+	writeManifest(t, root, "packed-session", refs)
+	legacy, err := Build(context.Background(), root, BuildOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyDir := filepath.Join(root, "packs", legacy.Generation)
+	for _, path := range []string{
+		filepath.Join(root, "packs", publicationHeadFilename),
+		filepath.Join(legacyDir, publishedMarkerFilename),
+		filepath.Join(legacyDir, recoveryArchiveFilename),
+	} {
+		if err := os.Remove(path); err != nil {
+			t.Fatal(err)
+		}
+	}
+	later := putObjects(t, root, []byte("loose-object-after-legacy-pack"))
+	writeManifest(t, root, "packed-session", later)
+	next, err := Build(context.Background(), root, BuildOptions{})
+	if err != nil {
+		t.Fatalf("build after folding a live manifest the legacy pack does not contain: %v", err)
+	}
+	if next.Generation == legacy.Generation {
+		t.Fatal("later fold reused the legacy pack generation")
+	}
+}
+
 func TestBuildResolvesLegacyPublicationChainBeforePublishingHead(t *testing.T) {
 	t.Run("unique complete chain", func(t *testing.T) {
 		root := t.TempDir()
@@ -1814,6 +1843,40 @@ func TestBuildInterruptionKeepsPreviousGenerationCurrent(t *testing.T) {
 	buffer := make([]byte, refs[0].RawBytes)
 	if _, err := resolver.ReadAt(context.Background(), refs[0], buffer, 0); err != nil && !errors.Is(err, io.EOF) {
 		t.Fatalf("read previous generation: %v", err)
+	}
+}
+
+func TestBuildCancellationBeforePublicationRecoversWithoutMismatch(t *testing.T) {
+	root := t.TempDir()
+	refs := putObjects(t, root, []byte("canceled-publication"))
+	writeManifest(t, root, "session", refs)
+	first, err := Build(context.Background(), root, BuildOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	_, err = Build(ctx, root, BuildOptions{BeforePublish: func() error {
+		cancel()
+		return ctx.Err()
+	}})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled Build error = %v, want context.Canceled", err)
+	}
+	recovered, err := RecoverCurrentGeneration(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered != first.Generation {
+		t.Fatalf("recovered generation = %q, want %q", recovered, first.Generation)
+	}
+	if report, doctorErr := Doctor(context.Background(), root); doctorErr != nil || report.IssueCount != 0 || report.VerifiedManifestCount != 1 {
+		t.Fatalf("doctor after canceled build recovery: report=%#v err=%v", report, doctorErr)
+	}
+	if _, err := Build(context.Background(), root, BuildOptions{}); err != nil {
+		t.Fatalf("build after recovery: %v", err)
+	}
+	if report, doctorErr := Doctor(context.Background(), root); doctorErr != nil || report.IssueCount != 0 || report.VerifiedManifestCount != 1 {
+		t.Fatalf("doctor after build retry: report=%#v err=%v", report, doctorErr)
 	}
 }
 

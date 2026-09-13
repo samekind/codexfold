@@ -111,6 +111,10 @@ struct ComponentStatus: Identifiable, Equatable {
     let physicalBytes: Int64?
     let readBytesTotal: UInt64?
     let writtenBytesTotal: UInt64?
+    // A status channel that merely stopped advancing is a monitoring read gap,
+    // not an outage the user can act on. Incident escalation treats it apart
+    // from a channel that is missing, invalid, or reporting a real failure.
+    var isStaleHeartbeat: Bool = false
 }
 
 struct StorageMetrics: Equatable {
@@ -263,6 +267,18 @@ struct StatusHistoryArchive: Codable, Equatable {
         return true
     }
 
+    // A presenter may have been closed when recovery occurred. Preserve the
+    // history and record when recovery was next actually observed, not an
+    // invented earlier recovery time or an indefinitely open incident.
+    mutating func closeOpenIncidentsAfterHealthyObservation(at now: Date) -> Bool {
+        var changed = false
+        for index in incidents.indices where incidents[index].recoveredAt == nil && incidents[index].since <= now {
+            incidents[index].recoveredAt = now
+            changed = true
+        }
+        return changed
+    }
+
     private mutating func compact(referenceDate: Date) {
         let cutoff = referenceDate.addingTimeInterval(-Self.retention)
         let ordered = storageSamples
@@ -355,8 +371,15 @@ private struct StatusContinuityAuthority: Equatable {
             return false
         }
         guard requireExactHealthyPublication else { return true }
-        return status.publisherEvidence == publisherEvidence
-            && status.updatedAt == recoveryEpochEstablishedAt
+        guard let statusUpdatedAt = status.updatedAt,
+              statusUpdatedAt >= recoveryEpochEstablishedAt,
+              let evidence = status.publisherEvidence else {
+            return false
+        }
+        if evidence.publisherInstanceID == publisherEvidence.publisherInstanceID {
+            return evidence.sequence >= publisherEvidence.sequence
+        }
+        return true
     }
 }
 
@@ -406,13 +429,13 @@ private func statusChannelOccurrenceSince(
     continuity: StatusContinuityReadResult,
     at now: Date
 ) -> Date {
-    min(
-        status?.incidentSince
-            ?? continuity.authority?.recoveryEpochEstablishedAt
-            ?? status?.updatedAt
-            ?? now,
-        now
-    )
+    // A healthy epoch proves recovery authority, not when a later read failed.
+    // Only an explicit runtime failure can supply an earlier outage start.
+    if let status, status.health == .recovering || status.health == .failed,
+       let since = status.incidentSince {
+        return min(since, now)
+    }
+    return now
 }
 
 private func statusChannelHasTrustedHealthyPublication(
@@ -529,6 +552,11 @@ struct IncidentTracker {
 
     let timeout: TimeInterval
     let supervisorFreshness: TimeInterval
+    // How long a status channel may go unread before the read gap itself is
+    // worth interrupting the user. A channel that stops advancing for a few
+    // seconds under load recovers on its own and has no action attached to it;
+    // only a sustained silence means the publisher is really gone.
+    let staleHeartbeatTimeout: TimeInterval
 
     private var incidents: [Source: ActiveState] = [:]
     private var selectedSource: Source?
@@ -537,9 +565,14 @@ struct IncidentTracker {
     private var supervisorObservedIncidentID: String?
     private var supervisorLastReliableAt: Date?
 
-    init(timeout: TimeInterval = 10, supervisorFreshness: TimeInterval = 8) {
+    init(
+        timeout: TimeInterval = 10,
+        supervisorFreshness: TimeInterval = 8,
+        staleHeartbeatTimeout: TimeInterval = 120
+    ) {
         self.timeout = max(0, timeout)
         self.supervisorFreshness = max(1, supervisorFreshness)
+        self.staleHeartbeatTimeout = max(self.timeout, staleHeartbeatTimeout)
     }
 
     var currentIncident: FrontendIncident? {
@@ -659,8 +692,9 @@ struct IncidentTracker {
         }
 
         let observation = observeCriticalFailure(source: source, status: status, at: now)
+        let escalationTimeout = status.isStaleHeartbeat ? staleHeartbeatTimeout : timeout
         guard incidents[source] != nil
-                || now.timeIntervalSince(observation.since) >= timeout else {
+                || now.timeIntervalSince(observation.since) >= escalationTimeout else {
             return
         }
 
@@ -758,6 +792,10 @@ struct IncidentTracker {
         guard let supervisor else { return }
         if supervisor.health == .healthy, isReliableSupervisor(supervisor, at: now) {
             resetSupervisorObservation()
+            // Supervisor healthy is the recovery proof for this incident. The
+            // FSKit module only republishes frontend.json on state change, so a
+            // stale healthy frontend file must not keep the window open.
+            incidents[.supervisor] = nil
             return
         }
         guard supervisor.health == .recovering,
@@ -1183,6 +1221,7 @@ private struct DaemonStatusChannelMonitor {
         var minimumUpdatedAt: Date?
         var backendIdentity: BackendIdentity?
         var detail: String
+        var staleHeartbeat = false
     }
 
     private let freshness: TimeInterval
@@ -1222,7 +1261,7 @@ private struct DaemonStatusChannelMonitor {
                         status: nil,
                         continuity: continuity
                     ),
-                since: authority.map { min($0.recoveryEpochEstablishedAt, now) } ?? now,
+                since: now,
                 evidence: nil,
                 minimumUpdatedAt: nil,
                 backendIdentity: lastBackendIdentity,
@@ -1243,7 +1282,8 @@ private struct DaemonStatusChannelMonitor {
                 evidence: status.publisherEvidence,
                 minimumUpdatedAt: status.updatedAt,
                 backendIdentity: status.backendIdentity,
-                detail: L10n.text(.daemonStatusChannelStaleDetail)
+                detail: L10n.text(.daemonStatusChannelStaleDetail),
+                staleHeartbeat: true
             )
             return failureStatus(for: current, at: now)
         }
@@ -1304,7 +1344,8 @@ private struct DaemonStatusChannelMonitor {
                 evidence: lastProgressEvidence,
                 minimumUpdatedAt: lastProgressUpdatedAt,
                 backendIdentity: lastBackendIdentity,
-                detail: L10n.text(.daemonStatusChannelStaleDetail)
+                detail: L10n.text(.daemonStatusChannelStaleDetail),
+                staleHeartbeat: true
             )
             return failureStatus(for: current, at: now)
         }
@@ -1330,10 +1371,12 @@ private struct DaemonStatusChannelMonitor {
         evidence: PublisherEvidence?,
         minimumUpdatedAt: Date?,
         backendIdentity: BackendIdentity?,
-        detail: String
+        detail: String,
+        staleHeartbeat: Bool = false
     ) -> Outage {
         if var current = outage {
             current.detail = detail
+            current.staleHeartbeat = staleHeartbeat
             self.outage = current
             return current
         }
@@ -1344,7 +1387,8 @@ private struct DaemonStatusChannelMonitor {
             minimumSequence: evidence?.sequence ?? lastProgressSequence,
             minimumUpdatedAt: minimumUpdatedAt ?? lastProgressUpdatedAt,
             backendIdentity: backendIdentity ?? lastBackendIdentity,
-            detail: detail
+            detail: detail,
+            staleHeartbeat: staleHeartbeat
         )
         outage = current
         return current
@@ -1451,7 +1495,8 @@ private struct DaemonStatusChannelMonitor {
             logicalBytes: nil,
             physicalBytes: nil,
             readBytesTotal: nil,
-            writtenBytesTotal: nil
+            writtenBytesTotal: nil,
+            isStaleHeartbeat: outage.staleHeartbeat
         )
     }
 
@@ -1493,6 +1538,7 @@ private struct ManagedStatusChannelMonitor {
         let minimumSequence: UInt64?
         let minimumUpdatedAt: Date?
         var detail: String
+        var staleHeartbeat = false
     }
 
     private let freshness: TimeInterval
@@ -1526,7 +1572,7 @@ private struct ManagedStatusChannelMonitor {
                         status: nil,
                         continuity: continuity
                     ),
-                since: authority.map { min($0.recoveryEpochEstablishedAt, now) } ?? now,
+                since: now,
                 detail: authority == nil
                     ? "\(baseDetail)\n\(L10n.text(.managedStatusChannelContinuityInvalidDetail))"
                     : baseDetail
@@ -1580,7 +1626,8 @@ private struct ManagedStatusChannelMonitor {
                             continuity: continuity
                         ),
                         since: now,
-                        detail: L10n.text(.managedStatusChannelStaleDetail)
+                        detail: L10n.text(.managedStatusChannelStaleDetail),
+                        staleHeartbeat: true
                     )
                     return failureStatus(for: outage, at: now)
                 }
@@ -1599,15 +1646,22 @@ private struct ManagedStatusChannelMonitor {
                     continuity: continuity
                 ),
                 since: lastProgressObservedAt ?? now,
-                detail: L10n.text(.managedStatusChannelStaleDetail)
+                detail: L10n.text(.managedStatusChannelStaleDetail),
+                staleHeartbeat: true
             )
             return failureStatus(for: outage, at: now)
         }
     }
 
-    private mutating func ensureOutage(id: String, since: Date, detail: String) -> Outage {
+    private mutating func ensureOutage(
+        id: String,
+        since: Date,
+        detail: String,
+        staleHeartbeat: Bool = false
+    ) -> Outage {
         if var outage {
             outage.detail = detail
+            outage.staleHeartbeat = staleHeartbeat
             self.outage = outage
             return outage
         }
@@ -1617,7 +1671,8 @@ private struct ManagedStatusChannelMonitor {
             minimumPublisherInstanceID: lastProgressPublisherInstanceID,
             minimumSequence: lastProgressSequence,
             minimumUpdatedAt: lastProgressUpdatedAt,
-            detail: detail
+            detail: detail,
+            staleHeartbeat: staleHeartbeat
         )
         self.outage = outage
         return outage
@@ -1712,7 +1767,8 @@ private struct ManagedStatusChannelMonitor {
             logicalBytes: nil,
             physicalBytes: nil,
             readBytesTotal: nil,
-            writtenBytesTotal: nil
+            writtenBytesTotal: nil,
+            isStaleHeartbeat: outage.staleHeartbeat
         )
     }
 
@@ -1759,6 +1815,7 @@ private struct SupervisorStatusChannelMonitor {
         var impact: String
         var recommendations: [String]
         var severe: Bool
+        var staleHeartbeat = false
     }
 
     private let freshness: TimeInterval
@@ -1798,7 +1855,7 @@ private struct SupervisorStatusChannelMonitor {
                         status: nil,
                         continuity: continuity
                     ),
-                since: authority.map { min($0.recoveryEpochEstablishedAt, now) } ?? now,
+                since: now,
                 evidence: nil,
                 minimumUpdatedAt: nil,
                 backendIdentity: nil,
@@ -1834,7 +1891,8 @@ private struct SupervisorStatusChannelMonitor {
                     L10n.text(.supervisorStatusChannelWaitRecommendation),
                     L10n.text(.openDashboardRecommendation),
                 ],
-                severe: false
+                severe: false,
+                staleHeartbeat: true
             )
             return failureStatus(for: current, at: now)
         }
@@ -1916,7 +1974,8 @@ private struct SupervisorStatusChannelMonitor {
                     L10n.text(.supervisorStatusChannelWaitRecommendation),
                     L10n.text(.openDashboardRecommendation),
                 ],
-                severe: false
+                severe: false,
+                staleHeartbeat: true
             )
             return failureStatus(for: current, at: now)
         }
@@ -1950,10 +2009,12 @@ private struct SupervisorStatusChannelMonitor {
         reason: String,
         impact: String,
         recommendations: [String],
-        severe: Bool
+        severe: Bool,
+        staleHeartbeat: Bool = false
     ) -> Outage {
         if var current = outage {
             current.detail = detail
+            current.staleHeartbeat = staleHeartbeat
             current.reason = reason
             current.impact = impact
             current.recommendations = recommendations
@@ -1972,7 +2033,8 @@ private struct SupervisorStatusChannelMonitor {
             reason: reason,
             impact: impact,
             recommendations: recommendations,
-            severe: severe
+            severe: severe,
+            staleHeartbeat: staleHeartbeat
         )
         outage = current
         return current
@@ -2077,7 +2139,8 @@ private struct SupervisorStatusChannelMonitor {
             logicalBytes: nil,
             physicalBytes: nil,
             readBytesTotal: nil,
-            writtenBytesTotal: nil
+            writtenBytesTotal: nil,
+            isStaleHeartbeat: outage.staleHeartbeat
         )
     }
 
@@ -2121,6 +2184,8 @@ private struct StatusLoadResult {
     let daemonContinuity: StatusContinuityReadResult
     let supervisorContinuity: StatusContinuityReadResult
     let hasRuntimeEvidence: Bool
+    let enrollmentProgress: EnrollmentProgress
+    let enrollmentSettings: EnrollmentSettings
 }
 
 @MainActor
@@ -2131,6 +2196,8 @@ final class StatusStore: ObservableObject {
     @Published private(set) var storageHistory: [StorageHistorySample]
     @Published private(set) var incidentHistory: [IncidentHistoryEntry]
     @Published private(set) var currentActivity: IOActivity?
+    @Published private(set) var enrollmentSettings: EnrollmentSettings = .default
+    @Published private(set) var enrollmentProgress: EnrollmentProgress = .empty
 
     let localAuthorizationCapability: LocalAuthorizationCapability
 
@@ -2142,6 +2209,9 @@ final class StatusStore: ObservableObject {
     private let monitorDaemonStatus: Bool
     private let alertsBeforeRuntimeObserved: Bool
     private let recordsHistory: Bool
+    private let runtimeFreshness: TimeInterval
+    private(set) var hasTrustedHealthyBaseline = false
+    private let enrollmentStoreOverride: URL?
     private var timer: Timer?
     private var historyArchive: StatusHistoryArchive
     private var previousActivityObservation: IOActivityObservation?
@@ -2154,10 +2224,12 @@ final class StatusStore: ObservableObject {
     init(
         appGroupURL: URL?,
         incidentTimeout: TimeInterval = 10,
+        staleHeartbeatIncidentTimeout: TimeInterval = 120,
         managedStatusFreshness: TimeInterval = 10,
         monitorDaemonStatus: Bool = false,
         alertsBeforeRuntimeObserved: Bool = true,
         recordsHistory: Bool = true,
+        enrollmentStoreURL: URL? = nil,
         now: @escaping () -> Date = Date.init
     ) {
         self.appGroupURL = appGroupURL
@@ -2165,13 +2237,18 @@ final class StatusStore: ObservableObject {
         self.monitorDaemonStatus = monitorDaemonStatus
         self.alertsBeforeRuntimeObserved = alertsBeforeRuntimeObserved
         self.recordsHistory = recordsHistory
+        self.runtimeFreshness = managedStatusFreshness
+        self.enrollmentStoreOverride = enrollmentStoreURL
         let historyArchive = StatusHistoryPersistence.load(appGroupURL: appGroupURL)
         self.historyArchive = historyArchive
         storageHistory = historyArchive.storageSamples
         incidentHistory = historyArchive.incidents
         currentActivity = nil
         localAuthorizationCapability = .current()
-        incidentTracker = IncidentTracker(timeout: incidentTimeout)
+        incidentTracker = IncidentTracker(
+            timeout: incidentTimeout,
+            staleHeartbeatTimeout: staleHeartbeatIncidentTimeout
+        )
         daemonStatusChannel = DaemonStatusChannelMonitor(freshness: managedStatusFreshness)
         managedStatusChannel = ManagedStatusChannelMonitor(freshness: managedStatusFreshness)
         supervisorStatusChannel = SupervisorStatusChannelMonitor(freshness: managedStatusFreshness)
@@ -2228,12 +2305,7 @@ final class StatusStore: ObservableObject {
 
     var statusDirectoryURL: URL? {
         guard let appGroupURL else { return nil }
-        let statusDirectory = appGroupURL.appendingPathComponent("status", isDirectory: true)
-        var isDirectory: ObjCBool = false
-        if FileManager.default.fileExists(atPath: statusDirectory.path, isDirectory: &isDirectory), isDirectory.boolValue {
-            return statusDirectory
-        }
-        return appGroupURL
+        return statusDirectories(appGroupURL: appGroupURL).first
     }
 
     func start() {
@@ -2259,6 +2331,8 @@ final class StatusStore: ObservableObject {
         components = loaded.components
         lastReadAt = observedAt
         currentActivity = updateIOActivity()
+        enrollmentProgress = loaded.enrollmentProgress
+        enrollmentSettings = loaded.enrollmentSettings
         let frontend = componentStatus(aliases: ["frontend", "native-fskit", "fskit-frontend"])
         let daemonChannel = monitorDaemonStatus && monitorsRuntime
             ? daemonStatusChannel.evaluate(
@@ -2292,6 +2366,15 @@ final class StatusStore: ObservableObject {
             supervisor: supervisor,
             at: observedAt
         )
+        let requiredStatuses = [frontend, loaded.daemonStatus.status, managed, supervisor]
+        let channels = [daemonChannel, managedChannel, supervisorChannel]
+        hasTrustedHealthyBaseline = monitorsRuntime && incidentTracker.currentIncident == nil
+            && requiredStatuses.allSatisfy { status in
+                guard let status, status.health == .healthy, let updatedAt = status.updatedAt else { return false }
+                let age = observedAt.timeIntervalSince(updatedAt)
+                return age >= 0 && age <= runtimeFreshness
+            }
+            && channels.allSatisfy { $0 == nil || $0?.health == .healthy }
         if recordsHistory {
             let insertedMinute = historyArchive.recordStorage(
                 storageMetrics,
@@ -2302,6 +2385,9 @@ final class StatusStore: ObservableObject {
             var shouldPersist = insertedMinute
             if let incidentUpdate {
                 shouldPersist = historyArchive.recordIncident(incidentUpdate, at: observedAt) || shouldPersist
+            }
+            if hasTrustedHealthyBaseline {
+                shouldPersist = historyArchive.closeOpenIncidentsAfterHealthyObservation(at: observedAt) || shouldPersist
             }
             storageHistory = historyArchive.storageSamples
             incidentHistory = historyArchive.incidents
@@ -2316,6 +2402,65 @@ final class StatusStore: ObservableObject {
     func reportHostNotice(_ message: String?) {
         hostNotice = message
         onChange?()
+    }
+
+    func setEnrollmentEnabled(_ enabled: Bool) {
+        updateEnrollmentSettings { $0.enabled = enabled }
+    }
+
+    func setEnrollmentInterval(_ interval: EnrollmentCheckInterval) {
+        updateEnrollmentSettings { $0.interval = interval }
+    }
+
+    func setEnrollmentIdleFor(_ idleFor: EnrollmentIdleDuration) {
+        updateEnrollmentSettings { $0.idleFor = idleFor }
+    }
+
+    func setEnrollmentArchivedOnly(_ archivedOnly: Bool) {
+        updateEnrollmentSettings { $0.archivedOnly = archivedOnly }
+    }
+
+    func setEnrollmentBatchSize(_ batchSize: EnrollmentBatchSize) {
+        updateEnrollmentSettings { $0.batchSize = batchSize }
+    }
+
+    private func updateEnrollmentSettings(_ mutate: (inout EnrollmentSettings) -> Void) {
+        var settings = enrollmentSettings
+        mutate(&settings)
+        enrollmentSettings = settings
+        var progress = enrollmentProgress
+        progress.enabled = settings.enabled
+        progress.archivedOnly = settings.archivedOnly
+        if !settings.enabled {
+            progress.phase = "disabled"
+            progress.nextCheckAt = nil
+        } else if progress.phase == "disabled" || progress.phase.isEmpty {
+            progress.phase = "idle"
+        }
+        enrollmentProgress = progress
+        do {
+            let storeURL = enrollmentStoreURL()
+            let existing = EnrollmentPolicyFile.load(from: storeURL)
+            try EnrollmentPolicyFile.from(settings, preserving: existing).write(to: storeURL)
+            if hostNotice == L10n.text(.autoFoldSaveFailed) {
+                hostNotice = nil
+            }
+        } catch {
+            hostNotice = L10n.text(.autoFoldSaveFailed)
+        }
+        onChange?()
+    }
+
+    func enrollmentStoreURL() -> URL {
+        if let enrollmentStoreOverride {
+            return enrollmentStoreOverride
+        }
+        if !enrollmentProgress.storePath.isEmpty {
+            return URL(fileURLWithPath: enrollmentProgress.storePath, isDirectory: true)
+        }
+        return FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".codex", isDirectory: true)
+            .appendingPathComponent("fold-store", isDirectory: true)
     }
 
     private func persistHistory() {
@@ -2383,6 +2528,10 @@ final class StatusStore: ObservableObject {
                 incidentPayload["recovered_at"] = formatter.string(from: recoveredAt)
             }
             payload["incident"] = incidentPayload
+            // Keep the continuity marker available at the export root for
+            // redacted consumers that validate the diagnostic envelope before
+            // inspecting the incident payload.
+            payload["occurrence_continuity"] = incidentPayload["occurrence_continuity"]
         }
         return try? JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
     }
@@ -2438,27 +2587,47 @@ final class StatusStore: ObservableObject {
                 managedContinuity: .unavailable,
                 daemonContinuity: .unavailable,
                 supervisorContinuity: .unavailable,
-                hasRuntimeEvidence: false
+                hasRuntimeEvidence: false,
+                enrollmentProgress: .empty,
+                enrollmentSettings: .default
             )
         }
-        let statusDirectory = appGroupURL.appendingPathComponent("status", isDirectory: true)
-        let files = (try? FileManager.default.contentsOfDirectory(
-                at: statusDirectory,
+        let statusDirectories = statusDirectories(appGroupURL: appGroupURL)
+        let files = statusDirectories.flatMap {
+            (try? FileManager.default.contentsOfDirectory(
+                at: $0,
                 includingPropertiesForKeys: nil,
                 options: [.skipsHiddenFiles]
             )) ?? []
+        }
 
-        let managedURL = statusDirectory.appendingPathComponent("managed.json", isDirectory: false)
-        let daemonURL = statusDirectory.appendingPathComponent("daemon.json", isDirectory: false)
-        let supervisorURL = statusDirectory.appendingPathComponent("supervisor.json", isDirectory: false)
-        let managedStatus = loadManagedStatus(at: managedURL, now: now)
-        let daemonStatus = loadStatusChannel(at: daemonURL, component: "daemon", now: now)
-        let supervisorStatus = loadStatusChannel(at: supervisorURL, component: "supervisor", now: now)
-        let excludedStatusFiles = Set([
-            managedURL.lastPathComponent,
-            daemonURL.lastPathComponent,
-            supervisorURL.lastPathComponent,
-        ])
+        let managedStatus = firstValidStatus(
+            statusDirectories.map {
+                loadManagedStatus(
+                    at: $0.appendingPathComponent("managed.json", isDirectory: false),
+                    now: now
+                )
+            }
+        )
+        let daemonStatus = firstValidStatus(
+            statusDirectories.map {
+                loadStatusChannel(
+                    at: $0.appendingPathComponent("daemon.json", isDirectory: false),
+                    component: "daemon",
+                    now: now
+                )
+            }
+        )
+        let supervisorStatus = firstValidStatus(
+            statusDirectories.map {
+                loadStatusChannel(
+                    at: $0.appendingPathComponent("supervisor.json", isDirectory: false),
+                    component: "supervisor",
+                    now: now
+                )
+            }
+        )
+        let excludedStatusFiles = Set(["managed.json", "daemon.json", "supervisor.json", "enrollment.json"])
         var statuses = files
             .filter {
                 $0.pathExtension.lowercased() == "json"
@@ -2481,6 +2650,7 @@ final class StatusStore: ObservableObject {
         let managedContinuity = loadStatusContinuity(component: "managed", appGroupURL: appGroupURL)
         let daemonContinuity = loadStatusContinuity(component: "daemon", appGroupURL: appGroupURL)
         let supervisorContinuity = loadStatusContinuity(component: "supervisor", appGroupURL: appGroupURL)
+        let enrollment = loadEnrollmentSnapshot(statusDirectories: statusDirectories)
         return StatusLoadResult(
             components: statuses.values.sorted { lhs, rhs in
                 if lhs.health != rhs.health { return lhs.health > rhs.health }
@@ -2495,8 +2665,91 @@ final class StatusStore: ObservableObject {
             hasRuntimeEvidence: !files.isEmpty
                 || managedContinuity.authority != nil
                 || daemonContinuity.authority != nil
-                || supervisorContinuity.authority != nil
+                || supervisorContinuity.authority != nil,
+            enrollmentProgress: enrollment.progress,
+            enrollmentSettings: enrollment.settings
         )
+    }
+
+    private func statusDirectories(appGroupURL: URL) -> [URL] {
+        let primary = appGroupURL.appendingPathComponent("status", isDirectory: true)
+        var directories: [URL] = []
+        var isDirectory: ObjCBool = false
+        if FileManager.default.fileExists(atPath: primary.path, isDirectory: &isDirectory), isDirectory.boolValue {
+            directories.append(primary)
+        }
+
+        // A non-default FSKit resource owns its status channel beneath the
+        // resource directory. Keep this fallback scoped to the app group and
+        // only accept a real directory; file reads still use O_NOFOLLOW.
+        let resourceStatus = appGroupURL
+            .appendingPathComponent("native-fskit", isDirectory: true)
+            .appendingPathComponent("status", isDirectory: true)
+        isDirectory = false
+        if resourceStatus != primary,
+           FileManager.default.fileExists(atPath: resourceStatus.path, isDirectory: &isDirectory),
+           isDirectory.boolValue {
+            directories.append(resourceStatus)
+        }
+        if directories.isEmpty {
+            // Preserve the legacy layout where status JSON lived directly in
+            // the scoped app-group root.
+            directories.append(appGroupURL)
+        }
+        return directories
+    }
+
+    private func firstValidStatus(_ results: [StatusChannelReadResult]) -> StatusChannelReadResult {
+        let valid = results.compactMap { result -> (StatusChannelReadResult, Date)? in
+            guard let status = result.status, let updatedAt = status.updatedAt else { return nil }
+            return (result, updatedAt)
+        }
+        if let newest = valid.max(by: { $0.1 < $1.1 }) {
+            return newest.0
+        }
+        return results.first ?? .unavailable(StatusChannelReadFailure(kind: .missing))
+    }
+
+    private func loadEnrollmentSnapshot(statusDirectories: [URL]) -> (progress: EnrollmentProgress, settings: EnrollmentSettings) {
+        var candidates: [EnrollmentProgress] = []
+        for directory in statusDirectories {
+            if let progress = EnrollmentProgress.load(
+                from: directory.appendingPathComponent("enrollment.json", isDirectory: false)
+            ) {
+                candidates.append(progress)
+            }
+        }
+        var storeURL = enrollmentStoreOverride
+        if storeURL == nil, let path = candidates.first(where: { !$0.storePath.isEmpty })?.storePath {
+            storeURL = URL(fileURLWithPath: path, isDirectory: true)
+        }
+        if let storeURL,
+           let progress = EnrollmentProgress.load(
+            from: storeURL.appendingPathComponent("enrollment/status.json", isDirectory: false)
+           ) {
+            candidates.append(progress)
+        }
+        let progress = candidates.max { lhs, rhs in
+            (lhs.updatedAt ?? .distantPast) < (rhs.updatedAt ?? .distantPast)
+        } ?? .empty
+        if storeURL == nil, !progress.storePath.isEmpty {
+            storeURL = URL(fileURLWithPath: progress.storePath, isDirectory: true)
+        }
+        if let storeURL, let policy = EnrollmentPolicyFile.load(from: storeURL) {
+            return (progress, policy.settings)
+        }
+        if progress.updatedAt != nil {
+            return (progress, EnrollmentSettings(
+                enabled: progress.enabled,
+                interval: EnrollmentCheckInterval.matching(progress.interval) ?? .thirtyMinutes,
+                idleFor: EnrollmentIdleDuration.matching(progress.stableFor) ?? .oneHour,
+                archivedOnly: progress.archivedOnly,
+                // Status carries no batch; without a policy to read, automatic is
+                // the honest answer rather than an invented number.
+                batchSize: .automatic
+            ))
+        }
+        return (progress, .default)
     }
 
     private func loadManagedStatus(at url: URL, now: Date) -> StatusChannelReadResult {
@@ -2564,9 +2817,22 @@ final class StatusStore: ObservableObject {
         component: String,
         appGroupURL: URL
     ) -> StatusContinuityReadResult {
-        let url = appGroupURL
-            .appendingPathComponent("status-continuity", isDirectory: true)
-            .appendingPathComponent("\(component).json", isDirectory: false)
+        let authorities = statusDirectories(appGroupURL: appGroupURL).compactMap { statusDirectory -> StatusContinuityAuthority? in
+            let continuityRoot = statusDirectory.deletingLastPathComponent()
+                .appendingPathComponent("status-continuity", isDirectory: true)
+            let url = continuityRoot.appendingPathComponent("\(component).json", isDirectory: false)
+            return loadStatusContinuity(at: url, component: component)?.authority
+        }
+        if let newest = authorities.max(by: { $0.recoveryEpochEstablishedAt < $1.recoveryEpochEstablishedAt }) {
+            return .verified(newest)
+        }
+        return .unavailable
+    }
+
+    private func loadStatusContinuity(
+        at url: URL,
+        component: String
+    ) -> StatusContinuityReadResult? {
         guard let data = try? readBoundedRegularFile(at: url),
               let root = decodeStatusRoot(data),
               integer(root, keys: ["schemaVersion", "schema_version"]) == 2,

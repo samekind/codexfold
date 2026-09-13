@@ -3,6 +3,7 @@ import Dispatch
 import ExtensionFoundation
 import Foundation
 import FSKit
+import CryptoKit
 import OSLog
 
 @main
@@ -17,7 +18,6 @@ final class CodexFoldFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations 
         subsystem: "vip.jstar.codexfold.fskitprofileprobe.module",
         category: "resource"
     )
-    private let volumeID = FSVolume.Identifier(uuid: UUID(uuidString: "5D0CF927-75A7-48B0-BDAE-621D8F2E695B")!)
     private let lock = NSLock()
     private var activeResourceURL: URL?
     private weak var activeVolume: CodexFoldVolume?
@@ -26,7 +26,11 @@ final class CodexFoldFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations 
         resource: FSResource,
         replyHandler: @escaping (FSProbeResult?, (any Error)?) -> Void
     ) {
-        let containerID = FSContainerIdentifier(uuid: volumeID.uuid)
+        guard let pathResource = resource as? FSPathURLResource else {
+            replyHandler(nil, POSIXError(.EINVAL))
+            return
+        }
+        let containerID = FSContainerIdentifier(uuid: volumeIdentifier(for: pathResource.url).uuid)
         replyHandler(.usable(name: "CodexFold", containerID: containerID), nil)
     }
 
@@ -40,6 +44,7 @@ final class CodexFoldFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations 
             return
         }
         let url = pathResource.url
+        let volumeID = volumeIdentifier(for: url)
         let scoped = url.startAccessingSecurityScopedResource()
         logger.notice("loadResource started scoped=\(scoped, privacy: .public)")
         do {
@@ -82,6 +87,24 @@ final class CodexFoldFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations 
             }
             replyHandler(nil, error)
         }
+    }
+
+    // FSKit can host production and isolated resources at the same time. A
+    // shared hard-coded volume UUID makes the second final mount look like a
+    // duplicate volume to macOS. Derive a stable UUID from the resource path
+    // so reconnects retain identity while distinct resources stay separate.
+    private func volumeIdentifier(for url: URL) -> FSVolume.Identifier {
+        let digest = SHA256.hash(data: Data(url.standardizedFileURL.path.utf8))
+        var bytes = Array(digest.prefix(16))
+        bytes[6] = (bytes[6] & 0x0f) | 0x50
+        bytes[8] = (bytes[8] & 0x3f) | 0x80
+        let uuid = UUID(uuid: (
+            bytes[0], bytes[1], bytes[2], bytes[3],
+            bytes[4], bytes[5], bytes[6], bytes[7],
+            bytes[8], bytes[9], bytes[10], bytes[11],
+            bytes[12], bytes[13], bytes[14], bytes[15]
+        ))
+        return FSVolume.Identifier(uuid: uuid)
     }
 
     func unloadResource(resource: FSResource, options: FSTaskOptions) async throws {
@@ -748,7 +771,18 @@ private final class CodexFoldIO {
             // already fetched blocks that may still satisfy another open reader.
             prefetchFrontier = blockOffset + blockSize
         }
+        let previousHintBlockOffset = sequentialHintBlockOffset
         sequentialHintBlockOffset = blockOffset
+        guard CodexFoldReadAheadDecision.extendsHorizon(
+            previousBlockOffset: previousHintBlockOffset,
+            blockOffset: blockOffset,
+            blockSize: blockSize
+        ) else {
+            // Not a scan yet. Serve what was asked for and wait for the reader to
+            // prove it is going somewhere before fetching ahead of it.
+            cacheLock.unlock()
+            return
+        }
         let span = Int64(scheduledPrefetchCount) * blockSize
         let requestedHorizon = blockOffset > Int64.max - span ? Int64.max : blockOffset + span
         let horizon = min(lastBlockOffset, requestedHorizon)
@@ -965,6 +999,7 @@ private final class CodexFoldVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWr
     )
     private let client: DaemonClient
     private let itemLock = NSLock()
+    private let directoryEnumerations = DirectoryEnumerationCache<WireEntry>()
     private var items: [UInt64: CodexFoldItem] = [:]
     private var rootItem: CodexFoldItem
     private var namespaceVersion: UInt64
@@ -1398,10 +1433,19 @@ private final class CodexFoldVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWr
         }
         do {
             let before = try client.getattr(directory.entry.path)
-            let entries = try client.readDir(directory.entry.path)
+            if verifier != .initial, verifier.rawValue != before.contentGeneration {
+                throw POSIXError(.ESTALE)
+            }
+            let cached = directoryEnumerations.continuation(
+                node: before.nodeID, generation: before.contentGeneration, start: cookie.rawValue
+            )
+            let entries = try cached ?? client.readDir(directory.entry.path)
             let after = try client.getattr(directory.entry.path)
             guard before.contentGeneration == after.contentGeneration else {
                 throw POSIXError(.ESTALE)
+            }
+            if cached == nil {
+                directoryEnumerations.store(node: after.nodeID, generation: after.contentGeneration, entries: entries)
             }
             directory.update(after)
             let currentVersion = after.contentGeneration
@@ -1911,8 +1955,23 @@ private final class CodexFoldVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWr
         for candidate in candidates {
             let item = candidate.item
             let previous = item.entry
-            guard let refreshed = try? client.getattr(previous.path),
-                  previous.hasSameObjectIdentity(as: refreshed) else {
+            // A transient getattr failure (backend restarting, EAGAIN, a closed
+            // socket) must not mark the item stale: revocation makes the kernel
+            // cache a negative entry and every later stat reports ENOENT for a
+            // file that still exists. Only a definite ENOENT from the backend -
+            // or an identity mismatch on a successful refresh - retires the item.
+            let refreshed: WireEntry
+            do {
+                refreshed = try client.getattr(previous.path)
+            } catch {
+                if (error as? POSIXError)?.code == .ENOENT {
+                    staleItems.append((candidate.nodeID, item))
+                } else {
+                    logger.notice("namespace refresh skipped path=\(previous.path, privacy: .public) reason=\(String(describing: error), privacy: .public)")
+                }
+                continue
+            }
+            guard previous.hasSameObjectIdentity(as: refreshed) else {
                 staleItems.append((candidate.nodeID, item))
                 continue
             }

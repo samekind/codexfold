@@ -30,14 +30,7 @@ struct StatusPopoverView: View {
                         samples: store.storageHistory
                     )
                     .padding(13)
-                    .background(
-                        Color.primary.opacity(0.035),
-                        in: RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    )
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 14, style: .continuous)
-                            .stroke(Color.primary.opacity(0.065), lineWidth: 1)
-                    }
+                    .codexFoldGlassPanel(cornerRadius: 16)
                 } else if store.isRuntimeUnconnected {
                     UnconnectedStateCard()
                 }
@@ -63,10 +56,7 @@ struct StatusPopoverView: View {
                                     }
                                 }
                             }
-                            .background(
-                                Color.primary.opacity(0.025),
-                                in: RoundedRectangle(cornerRadius: 12, style: .continuous)
-                            )
+                            .codexFoldGlassPanel(cornerRadius: 14)
                         }
                     }
                 }
@@ -77,10 +67,7 @@ struct StatusPopoverView: View {
                         .foregroundStyle(.secondary)
                         .padding(11)
                         .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(
-                            Color.accentColor.opacity(0.07),
-                            in: RoundedRectangle(cornerRadius: 11, style: .continuous)
-                        )
+                        .codexFoldGlassPanel(cornerRadius: 13, tint: .accentColor)
                 }
             }
             .padding(16)
@@ -93,12 +80,12 @@ struct StatusPopoverView: View {
                     Label(L10n.text(.openDashboard), systemImage: "macwindow")
                         .frame(maxWidth: .infinity)
                 }
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(.glassProminent)
 
                 Button(action: store.refresh) {
                     Image(systemName: "arrow.clockwise")
                 }
-                .buttonStyle(.bordered)
+                .buttonStyle(.glass)
                 .help(L10n.text(.checkStatus))
                 .accessibilityLabel(L10n.text(.checkStatus))
 
@@ -129,6 +116,7 @@ struct StatusPopoverView: View {
         }
         .frame(width: 360)
         .frame(maxHeight: .infinity, alignment: .top)
+        .codexFoldWindowSurface()
     }
 }
 
@@ -146,16 +134,18 @@ struct DashboardView: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
+        VStack(alignment: .center, spacing: 0) {
             HStack(alignment: .center, spacing: 16) {
                 StatusHeader(health: store.overallHealth, summary: store.summary)
                 Spacer()
                 Button(action: store.refresh) {
                     Label(L10n.text(.checkStatus), systemImage: "arrow.clockwise")
                 }
+                .buttonStyle(.glass)
                 Button(action: exportDiagnostics) {
                     Label(L10n.text(.exportDiagnostics), systemImage: "square.and.arrow.up")
                 }
+                .buttonStyle(.glassProminent)
                 Menu {
                     Button(action: copyDiagnostics) {
                         Label(L10n.text(.copyDiagnostics), systemImage: "doc.on.doc")
@@ -170,6 +160,7 @@ struct DashboardView: View {
                 .help(L10n.text(.technicalDetails))
             }
             .padding(20)
+            .frame(maxWidth: 1120, alignment: .leading)
 
             Divider()
 
@@ -178,6 +169,8 @@ struct DashboardView: View {
                     if let metrics = store.storageMetrics {
                         StorageOverview(metrics: metrics)
                     }
+
+                    AutoFoldSection(store: store)
 
                     StorageHistorySection(
                         samples: store.storageHistory,
@@ -215,11 +208,7 @@ struct DashboardView: View {
                         }
                     }
                     .padding(18)
-                    .background(Color.primary.opacity(0.018), in: RoundedRectangle(cornerRadius: 14))
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 14)
-                            .stroke(Color.primary.opacity(0.06), lineWidth: 1)
-                    }
+                    .codexFoldGlassPanel(cornerRadius: 18)
 
                     if let notice = store.hostNotice {
                         Label(notice, systemImage: "info.circle")
@@ -236,10 +225,13 @@ struct DashboardView: View {
                         }
                     }
                 }
+                .frame(maxWidth: 1120, alignment: .leading)
+                .frame(maxWidth: .infinity)
                 .padding(20)
             }
         }
         .frame(minWidth: 720, minHeight: 620)
+        .codexFoldWindowSurface()
     }
 }
 
@@ -285,14 +277,7 @@ struct IncidentView: View {
                     }
                     .padding(12)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(
-                        Color.primary.opacity(0.035),
-                        in: RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    )
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 12, style: .continuous)
-                            .stroke(incidentTint.opacity(0.18), lineWidth: 1)
-                    }
+                    .codexFoldGlassPanel(cornerRadius: 14, tint: incidentTint)
 
                     IncidentSection(title: L10n.text(.reason), message: incident.reason)
 
@@ -335,17 +320,18 @@ struct IncidentView: View {
                 Button(action: exportDiagnostics) {
                     Label(L10n.text(.exportDiagnostics), systemImage: "square.and.arrow.up")
                 }
-                .buttonStyle(.borderless)
+                .buttonStyle(.glass)
                 Spacer()
                 Button(L10n.text(.close), action: close)
-                    .buttonStyle(.borderedProminent)
+                    .buttonStyle(.glassProminent)
                     .keyboardShortcut(.defaultAction)
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 12)
-            .background(Color.primary.opacity(0.025))
+            .background(.thinMaterial)
         }
         .frame(width: 500, height: 390)
+        .codexFoldWindowSurface()
     }
 
     private var incidentTint: Color {
@@ -404,14 +390,7 @@ private struct UnconnectedStateCard: View {
         }
         .padding(13)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(
-            Color.primary.opacity(0.025),
-            in: RoundedRectangle(cornerRadius: 13, style: .continuous)
-        )
-        .overlay {
-            RoundedRectangle(cornerRadius: 13, style: .continuous)
-                .stroke(Color.primary.opacity(0.06), lineWidth: 1)
-        }
+        .codexFoldGlassPanel(cornerRadius: 14)
     }
 }
 
@@ -444,7 +423,7 @@ private struct CompactStorageOverview: View {
                 Spacer()
                 Text("\(Int((metrics.savingsFraction * 100).rounded()))%")
                     .font(.title3.weight(.semibold).monospacedDigit())
-                    .foregroundStyle(.green)
+                    .foregroundStyle(Color.accentColor)
             }
 
             if !recentSamples.isEmpty {
@@ -455,13 +434,13 @@ private struct CompactStorageOverview: View {
                         yStart: .value("Baseline", savedYDomain.lowerBound),
                         yEnd: .value("Space saved", saved)
                     )
-                    .foregroundStyle(Color.green.opacity(0.09))
+                    .foregroundStyle(Color.accentColor.opacity(0.10))
                     .interpolationMethod(.monotone)
                     LineMark(
                         x: .value("Time", sample.capturedAt),
                         y: .value("Space saved", saved)
                     )
-                    .foregroundStyle(Color.green)
+                    .foregroundStyle(Color.accentColor)
                     .lineStyle(StrokeStyle(lineWidth: 2))
                     .interpolationMethod(.monotone)
                     if recentSamples.count == 1 {
@@ -469,7 +448,7 @@ private struct CompactStorageOverview: View {
                             x: .value("Time", sample.capturedAt),
                             y: .value("Space saved", saved)
                         )
-                        .foregroundStyle(Color.green)
+                        .foregroundStyle(Color.accentColor)
                     }
                 }
                 .chartYScale(domain: savedYDomain)
@@ -535,34 +514,36 @@ private struct StorageOverview: View {
     let metrics: StorageMetrics
 
     var body: some View {
-        LazyVGrid(
-            columns: Array(repeating: GridItem(.flexible(), spacing: 12), count: 4),
-            spacing: 12
-        ) {
-            StorageMetricTile(
-                title: L10n.text(.spaceSaved),
-                value: formattedBytes(metrics.savedBytes),
-                systemImage: "arrow.down.right.circle.fill",
-                tint: .green
-            )
-            StorageMetricTile(
-                title: L10n.text(.savingsRate),
-                value: "\(Int((metrics.savingsFraction * 100).rounded()))%",
-                systemImage: "percent",
-                tint: .green
-            )
-            StorageMetricTile(
-                title: L10n.text(.sessionDataSize),
-                value: formattedBytes(metrics.logicalBytes),
-                systemImage: "doc.on.doc",
-                footnote: metrics.managedSessions.map { "\(L10n.text(.managedSessions)): \($0)" },
-                tint: .primary
-            )
-            StorageMetricTile(
-                title: L10n.text(.diskUsage),
-                value: formattedBytes(metrics.physicalBytes),
-                systemImage: "internaldrive"
-            )
+        GlassEffectContainer(spacing: 12) {
+            LazyVGrid(
+                columns: Array(repeating: GridItem(.flexible(), spacing: 12), count: 4),
+                spacing: 12
+            ) {
+                StorageMetricTile(
+                    title: L10n.text(.spaceSaved),
+                    value: formattedBytes(metrics.savedBytes),
+                    systemImage: "arrow.down.right.circle.fill",
+                    tint: .accentColor
+                )
+                StorageMetricTile(
+                    title: L10n.text(.savingsRate),
+                    value: "\(Int((metrics.savingsFraction * 100).rounded()))%",
+                    systemImage: "percent",
+                    tint: .accentColor
+                )
+                StorageMetricTile(
+                    title: L10n.text(.sessionDataSize),
+                    value: formattedBytes(metrics.logicalBytes),
+                    systemImage: "doc.on.doc",
+                    footnote: metrics.managedSessions.map { "\(L10n.text(.managedSessions)): \($0)" },
+                    tint: .primary
+                )
+                StorageMetricTile(
+                    title: L10n.text(.diskUsage),
+                    value: formattedBytes(metrics.physicalBytes),
+                    systemImage: "internaldrive"
+                )
+            }
         }
     }
 }
@@ -593,11 +574,7 @@ private struct StorageMetricTile: View {
         }
         .frame(maxWidth: .infinity, minHeight: 70, alignment: .leading)
         .padding(12)
-        .background(Color.primary.opacity(0.025), in: RoundedRectangle(cornerRadius: 12))
-        .overlay {
-            RoundedRectangle(cornerRadius: 12)
-                .stroke(Color.primary.opacity(0.06), lineWidth: 1)
-        }
+        .codexFoldGlassPanel(cornerRadius: 14)
     }
 }
 
@@ -642,7 +619,7 @@ private struct StorageHistorySection: View {
                 HStack(spacing: 18) {
                     StorageLegend(color: .secondary, title: L10n.text(.originalSize))
                     StorageLegend(color: .accentColor, title: L10n.text(.currentUsage))
-                    StorageLegend(color: .green.opacity(0.6), title: L10n.text(.spaceSaved))
+                    StorageLegend(color: .accentColor.opacity(0.7), title: L10n.text(.spaceSaved))
                 }
                 .font(.caption)
 
@@ -653,7 +630,7 @@ private struct StorageHistorySection: View {
                             yStart: .value("Disk usage", Double(sample.physicalBytes)),
                             yEnd: .value("Original size", Double(sample.logicalBytes))
                         )
-                        .foregroundStyle(Color.green.opacity(0.08))
+                        .foregroundStyle(Color.accentColor.opacity(0.10))
                         .interpolationMethod(.monotone)
                     }
                     LineMark(
@@ -699,11 +676,7 @@ private struct StorageHistorySection: View {
             }
         }
         .padding(16)
-        .background(Color.primary.opacity(0.018), in: RoundedRectangle(cornerRadius: 14))
-        .overlay {
-            RoundedRectangle(cornerRadius: 14)
-                .stroke(Color.primary.opacity(0.06), lineWidth: 1)
-        }
+        .codexFoldGlassPanel(cornerRadius: 18)
     }
 }
 
@@ -806,11 +779,7 @@ private struct ActivityHistorySection: View {
             }
         }
         .padding(16)
-        .background(Color.primary.opacity(0.018), in: RoundedRectangle(cornerRadius: 14))
-        .overlay {
-            RoundedRectangle(cornerRadius: 14)
-                .stroke(Color.primary.opacity(0.06), lineWidth: 1)
-        }
+        .codexFoldGlassPanel(cornerRadius: 18)
     }
 }
 
@@ -856,11 +825,7 @@ private struct IncidentHistorySection: View {
             }
         }
         .padding(16)
-        .background(Color.primary.opacity(0.018), in: RoundedRectangle(cornerRadius: 14))
-        .overlay {
-            RoundedRectangle(cornerRadius: 14)
-                .stroke(Color.primary.opacity(0.06), lineWidth: 1)
-        }
+        .codexFoldGlassPanel(cornerRadius: 18)
     }
 }
 
@@ -936,6 +901,9 @@ private struct StatusHeader: View {
                 }
             }
         }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .codexFoldGlassPanel(cornerRadius: 18)
     }
 
     private var symbol: String {
@@ -1040,6 +1008,185 @@ private struct IncidentSection: View {
                 .fixedSize(horizontal: false, vertical: true)
                 .textSelection(.enabled)
         }
+    }
+}
+
+private struct AutoFoldSection: View {
+    @ObservedObject var store: StatusStore
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .center, spacing: 12) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(L10n.text(.autoFold))
+                        .font(.title3.weight(.semibold))
+                    Text(L10n.text(.autoFoldDetail))
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: 12)
+                Toggle("", isOn: enabledBinding)
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+                    .accessibilityLabel(L10n.text(.autoFold))
+            }
+
+            VStack(alignment: .leading, spacing: 7) {
+                if let fraction = progressFraction {
+                    ProgressView(value: fraction)
+                        .progressViewStyle(.linear)
+                } else {
+                    ProgressView()
+                        .progressViewStyle(.linear)
+                }
+                Text(progressCaption)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            autoFoldSetting(title: L10n.text(.autoFoldCheckInterval)) {
+                Picker("", selection: intervalBinding) {
+                    ForEach(EnrollmentCheckInterval.allCases) { interval in
+                        Text(interval.title).tag(interval)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .fixedSize()
+            }
+
+            autoFoldSetting(title: L10n.text(.autoFoldIdleFor)) {
+                Picker("", selection: idleBinding) {
+                    ForEach(EnrollmentIdleDuration.allCases) { duration in
+                        Text(duration.title).tag(duration)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .fixedSize()
+            }
+
+            autoFoldSetting(title: L10n.text(.autoFoldScope)) {
+                Picker("", selection: scopeBinding) {
+                    Text(L10n.text(.autoFoldScopeArchived)).tag(true)
+                    Text(L10n.text(.autoFoldScopeArchivedAndIdle)).tag(false)
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .fixedSize()
+            }
+
+            autoFoldSetting(title: L10n.text(.autoFoldBatch)) {
+                Picker("", selection: batchBinding) {
+                    ForEach(EnrollmentBatchSize.allCases) { size in
+                        Text(size.title).tag(size)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .fixedSize()
+            }
+        }
+        .padding(18)
+        .codexFoldGlassPanel(cornerRadius: 18)
+    }
+
+    private var progressCaption: String {
+        if !store.enrollmentSettings.enabled {
+            return L10n.text(.autoFoldOff)
+        }
+        if !store.enrollmentProgress.enabled && !store.enrollmentProgress.isWorking {
+            return L10n.text(.autoFoldWaitingForCheck)
+        }
+        return store.enrollmentProgress.caption(now: Date())
+    }
+
+    private var progressFraction: Double? {
+        if store.enrollmentSettings.enabled && !store.enrollmentProgress.enabled {
+            return nil
+        }
+        return store.enrollmentProgress.fraction
+    }
+
+    private var enabledBinding: Binding<Bool> {
+        Binding(
+            get: { store.enrollmentSettings.enabled },
+            set: { store.setEnrollmentEnabled($0) }
+        )
+    }
+
+    private var intervalBinding: Binding<EnrollmentCheckInterval> {
+        Binding(
+            get: { store.enrollmentSettings.interval },
+            set: { store.setEnrollmentInterval($0) }
+        )
+    }
+
+    private var idleBinding: Binding<EnrollmentIdleDuration> {
+        Binding(
+            get: { store.enrollmentSettings.idleFor },
+            set: { store.setEnrollmentIdleFor($0) }
+        )
+    }
+
+    private var scopeBinding: Binding<Bool> {
+        Binding(
+            get: { store.enrollmentSettings.archivedOnly },
+            set: { store.setEnrollmentArchivedOnly($0) }
+        )
+    }
+
+    private var batchBinding: Binding<EnrollmentBatchSize> {
+        Binding(
+            get: { store.enrollmentSettings.batchSize },
+            set: { store.setEnrollmentBatchSize($0) }
+        )
+    }
+
+    private func autoFoldSetting<Content: View>(title: String, @ViewBuilder content: () -> Content) -> some View {
+        HStack(alignment: .center, spacing: 12) {
+            Text(title)
+                .font(.callout)
+            Spacer(minLength: 12)
+            content()
+        }
+    }
+}
+
+private struct CodexFoldGlassPanelModifier: ViewModifier {
+    let cornerRadius: CGFloat
+    let tint: Color?
+
+    func body(content: Content) -> some View {
+        let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+        let glass = tint.map { Glass.regular.tint($0.opacity(0.12)) } ?? Glass.regular.tint(Color.primary.opacity(0.045))
+        content
+            .glassEffect(glass, in: shape)
+            .overlay {
+                shape.stroke(Color.white.opacity(0.14), lineWidth: 0.5)
+            }
+    }
+}
+
+private struct CodexFoldWindowSurfaceModifier: ViewModifier {
+    func body(content: Content) -> some View {
+        content
+            // Use a readable window surface first; the cards and controls
+            // above it provide the Liquid Glass depth.
+            .background(Color(nsColor: .windowBackgroundColor))
+            .containerBackground(.thickMaterial, for: .window)
+    }
+}
+
+private extension View {
+    func codexFoldGlassPanel(cornerRadius: CGFloat = 18, tint: Color? = nil) -> some View {
+        modifier(CodexFoldGlassPanelModifier(cornerRadius: cornerRadius, tint: tint))
+    }
+
+    func codexFoldWindowSurface() -> some View {
+        modifier(CodexFoldWindowSurfaceModifier())
     }
 }
 

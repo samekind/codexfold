@@ -101,16 +101,17 @@ func (w *continuityStatusWriter) Write(_ string, snapshot Snapshot) error {
 
 	record := w.continuity
 	compatible := w.hasRecord && continuityMatchesSnapshot(record, snapshot)
-	writeContinuity := false
 	if !compatible {
 		record = newContinuityRecord(snapshot, now, nextContinuitySequence(record.Generation))
-		writeContinuity = true
 	}
-	if snapshot.State == "healthy" {
-		record = newContinuityRecord(snapshot, now, nextContinuitySequence(record.Generation))
+	establishedHealthyEpoch := snapshot.State == "healthy" && record.State != "healthy"
+	if establishedHealthyEpoch {
+		if compatible && w.hasRecord {
+			record = newContinuityRecord(snapshot, now, nextContinuitySequence(record.Generation))
+		}
 		record.State = "healthy"
-		writeContinuity = true
 	}
+	writeContinuity := !compatible || establishedHealthyEpoch
 
 	snapshot.RecoveryEpochID = record.RecoveryEpochID
 	snapshot.RecoveryEpochAt = record.RecoveryEpochAt

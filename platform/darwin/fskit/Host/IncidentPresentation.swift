@@ -118,16 +118,19 @@ final class IncidentWindowPresenter: NSObject, NSWindowDelegate {
 
     private let acknowledgementStore: IncidentAcknowledgementStore
     private let diagnosticPayload: (FrontendIncident) -> Data?
+    private let presentWindow: ((NSWindowController) -> Void)?
     private let localAuthorizationCapability = LocalAuthorizationCapability.current()
     private var incidentController: NSWindowController?
     private var presentedIncident: FrontendIncident?
 
     init(
         appGroupURL: URL,
-        diagnosticPayload: @escaping (FrontendIncident) -> Data?
+        diagnosticPayload: @escaping (FrontendIncident) -> Data?,
+        presentWindow: ((NSWindowController) -> Void)? = nil
     ) {
         acknowledgementStore = IncidentAcknowledgementStore(appGroupURL: appGroupURL)
         self.diagnosticPayload = diagnosticPayload
+        self.presentWindow = presentWindow
     }
 
     func handle(_ update: IncidentUpdate) {
@@ -137,9 +140,8 @@ final class IncidentWindowPresenter: NSObject, NSWindowDelegate {
         case .recovered(let incident):
             let presented = incidentForPresentation(incident)
             acknowledgementStore.clear(matching: presented)
-            guard let controller = incidentController else { return }
             presentedIncident = presented
-            updateWindow(controller, incident: presented)
+            incidentController?.close()
         }
     }
 
@@ -197,6 +199,10 @@ final class IncidentWindowPresenter: NSObject, NSWindowDelegate {
     }
 
     private func show(_ controller: NSWindowController) {
+        if let presentWindow {
+            presentWindow(controller)
+            return
+        }
         controller.showWindow(nil)
         controller.window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
@@ -303,7 +309,7 @@ final class IncidentPresentationCoordinator {
     }
 
     private func attemptLease() {
-        if statusStore.currentIncident == nil, statusStore.overallHealth == .healthy {
+        if statusStore.hasTrustedHealthyBaseline {
             presenter.clearAcknowledgementAfterHealthyBaseline()
         }
         let alreadyHeld = lease.isHeld

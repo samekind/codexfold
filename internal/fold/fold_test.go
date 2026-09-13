@@ -480,6 +480,38 @@ func TestFoldHonorsCanceledContextWithoutManifest(t *testing.T) {
 	}
 }
 
+func TestFoldCancellationAtCommitBoundaryRecoversOnRetry(t *testing.T) {
+	root := t.TempDir()
+	sourcePath := filepath.Join(root, "source.jsonl")
+	storeDir := filepath.Join(root, "store")
+	if err := os.WriteFile(sourcePath, []byte("{\"value\":\"cancel-at-commit\"}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	_, err := Fold(ctx, Session{ID: "session", RolloutPath: sourcePath, Archived: true}, FoldOptions{
+		StoreDir: storeDir, Apply: true,
+		beforeCommit: func() error {
+			cancel()
+			return ctx.Err()
+		},
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Fold error = %v, want context.Canceled", err)
+	}
+	if _, statErr := os.Stat(ManifestPath(storeDir, "session")); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("manifest committed after cancellation: %v", statErr)
+	}
+	if report, doctorErr := Doctor(context.Background(), storeDir); doctorErr != nil || report.IssueCount != 0 {
+		t.Fatalf("doctor after canceled fold: report=%#v err=%v", report, doctorErr)
+	}
+	if _, err := Fold(context.Background(), Session{ID: "session", RolloutPath: sourcePath, Archived: true}, FoldOptions{StoreDir: storeDir, Apply: true}); err != nil {
+		t.Fatalf("retry fold: %v", err)
+	}
+	if report, doctorErr := Doctor(context.Background(), storeDir); doctorErr != nil || report.IssueCount != 0 || report.VerifiedManifestCount != 1 {
+		t.Fatalf("doctor after fold retry: report=%#v err=%v", report, doctorErr)
+	}
+}
+
 type foldRejectingChecker struct {
 	Calls      int
 	Projection storage.Projection

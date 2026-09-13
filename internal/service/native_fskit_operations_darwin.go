@@ -13,16 +13,26 @@ import (
 	"time"
 
 	"github.com/samekind/codexfold/internal/fskitproto"
-	"github.com/samekind/codexfold/internal/mountid"
 	"golang.org/x/sys/unix"
 )
 
 type nativeFSKitOperations struct {
 	mountStateProbe chan struct{}
+	filesystemType  string
 }
 
 func defaultNativeFSKitOperations() (NativeFSKitOperations, error) {
-	return &nativeFSKitOperations{mountStateProbe: make(chan struct{}, 1)}, nil
+	return nativeFSKitOperationsForType(NativeFSKitMountType)
+}
+
+func nativeFSKitOperationsForType(filesystemType string) (NativeFSKitOperations, error) {
+	if !ValidNativeFSKitMountType(filesystemType) {
+		return nil, errors.New("invalid native FSKit mount type")
+	}
+	return &nativeFSKitOperations{
+		mountStateProbe: make(chan struct{}, 1),
+		filesystemType:  filesystemType,
+	}, nil
 }
 
 func (*nativeFSKitOperations) DaemonHealthy(ctx context.Context, resourcePath string) error {
@@ -62,8 +72,8 @@ func boundedNativeFSKitMountState(
 	defer cancel()
 	select {
 	case probeSlot <- struct{}{}:
-	case <-probeCtx.Done():
-		return NativeFSKitMountState{}, fmt.Errorf("native FSKit mount health probe did not start within %s: %w", timeout, probeCtx.Err())
+	default:
+		return NativeFSKitMountState{}, ErrNativeFSKitMountProbeInProgress
 	}
 	result := make(chan nativeFSKitMountStateResult, 1)
 	go func() {
@@ -79,54 +89,86 @@ func boundedNativeFSKitMountState(
 	}
 }
 
-func probeNativeFSKitMountState(ctx context.Context, mountPoint string) (NativeFSKitMountState, error) {
-	var stat unix.Statfs_t
-	if err := unix.Statfs(mountPoint, &stat); err != nil {
-		if errors.Is(err, unix.ENOENT) {
-			return NativeFSKitMountState{}, nil
-		}
-		return NativeFSKitMountState{}, err
-	}
-	requested := canonicalMountPath(mountPoint)
-	actual := canonicalMountPath(unix.ByteSliceToString(stat.Mntonname[:]))
-	if requested != actual {
-		return NativeFSKitMountState{}, nil
-	}
-	filesystem := strings.ToLower(unix.ByteSliceToString(stat.Fstypename[:]))
-	state := NativeFSKitMountState{Mounted: true, Owned: filesystem == "codexfold"}
-	if !state.Owned {
-		return state, nil
-	}
-	for _, directory := range []string{"sessions", "archived_sessions"} {
-		command := exec.CommandContext(ctx, "/usr/bin/stat", "-f", "%HT", filepath.Join(mountPoint, directory))
-		if output, err := command.CombinedOutput(); err != nil {
-			return state, fmt.Errorf("probe native FSKit directory %s: %w: %s", directory, err, strings.TrimSpace(string(output)))
-		}
-	}
-	identity, err := os.ReadFile(filepath.Join(mountPoint, mountid.Path))
-	if err != nil {
-		return state, fmt.Errorf("read native FSKit mount identity: %w", err)
-	}
-	if err := mountid.Validate(identity); err != nil {
-		return state, fmt.Errorf("validate native FSKit mount identity: %w", err)
-	}
-	state.Healthy = true
-	return state, nil
+func probeNativeFSKitMountState(_ context.Context, mountPoint string) (NativeFSKitMountState, error) {
+	return lookupNativeFSKitMountState(mountPoint)
 }
 
-func (*nativeFSKitOperations) Mount(ctx context.Context, resourcePath string, mountPoint string) error {
+// lookupNativeFSKitMountState reads the kernel mount table with MNT_NOWAIT.
+// Exact mount paths must be matched without filesystem access, including
+// EvalSymlinks (which performs Lstat). Probing the live FSKit mount competes
+// with Codex I/O and can turn a healthy but busy mount into a recovery incident.
+// Only an unmatched caller-supplied alias may require path resolution.
+func lookupNativeFSKitMountState(mountPoint string) (NativeFSKitMountState, error) {
+	count, err := unix.Getfsstat(nil, unix.MNT_NOWAIT)
+	if err != nil {
+		return NativeFSKitMountState{}, err
+	}
+	stats := make([]unix.Statfs_t, count+8)
+	count, err = unix.Getfsstat(stats, unix.MNT_NOWAIT)
+	if err != nil {
+		return NativeFSKitMountState{}, err
+	}
+	return nativeFSKitMountStateFromTable(mountPoint, stats[:count], canonicalMountPath), nil
+}
+
+func nativeFSKitMountStateFromTable(
+	mountPoint string,
+	stats []unix.Statfs_t,
+	resolvePath func(string) string,
+) NativeFSKitMountState {
+	lookup := func(wanted string) NativeFSKitMountState {
+		for _, stat := range stats {
+			// Kernel mount names are already authoritative. Resolving them can
+			// block on unrelated network/removable volumes, not just our mount.
+			if filepath.Clean(unix.ByteSliceToString(stat.Mntonname[:])) != wanted {
+				continue
+			}
+			filesystem := strings.ToLower(unix.ByteSliceToString(stat.Fstypename[:]))
+			owned := filesystem == "codexfold"
+			return NativeFSKitMountState{Mounted: true, Owned: owned, Healthy: owned}
+		}
+		return NativeFSKitMountState{}
+	}
+
+	wanted := filepath.Clean(mountPoint)
+	if state := lookup(wanted); state.Mounted {
+		return state
+	}
+	if len(stats) == 0 {
+		return NativeFSKitMountState{}
+	}
+	// Preserve aliases such as /tmp -> /private/tmp without resolving any
+	// entry in the mount table or touching an already matched mount root.
+	if resolved := filepath.Clean(resolvePath(mountPoint)); resolved != wanted {
+		return lookup(resolved)
+	}
+	return NativeFSKitMountState{}
+}
+
+func (operations *nativeFSKitOperations) Mount(ctx context.Context, resourcePath string, mountPoint string) error {
 	if err := os.MkdirAll(mountPoint, 0o700); err != nil {
 		return err
 	}
-	output, err := exec.CommandContext(ctx, "/sbin/mount", nativeFSKitMountArguments(resourcePath, mountPoint)...).CombinedOutput()
+	output, err := exec.CommandContext(ctx, "/sbin/mount", nativeFSKitMountArguments(operations.filesystemType, resourcePath, mountPoint)...).CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(output)))
+		return nativeFSKitMountError(err, output)
 	}
 	return nil
 }
 
-func nativeFSKitMountArguments(resourcePath string, mountPoint string) []string {
-	return []string{"-F", "-t", "codexfoldnative", resourcePath, mountPoint}
+func nativeFSKitMountError(commandErr error, output []byte) error {
+	detail := strings.TrimSpace(string(output))
+	if strings.Contains(detail, "Module ") && strings.Contains(detail, " is disabled") {
+		return fmt.Errorf("%w: FSKit module is disabled by macOS: %s; enable CodexFoldFSKit FSKit Modules in System Settings > General > Login Items & Extensions, then retry", commandErr, detail)
+	}
+	return fmt.Errorf("%w: %s", commandErr, detail)
+}
+
+func nativeFSKitMountArguments(filesystemType string, resourcePath string, mountPoint string) []string {
+	// The mount type is part of the signed FSKit module's Info.plist. An
+	// environment-only suffix does not register a second personality and makes
+	// fskitd reject the module as disabled.
+	return []string{"-F", "-t", filesystemType, resourcePath, mountPoint}
 }
 
 func (*nativeFSKitOperations) Unmount(ctx context.Context, mountPoint string, force bool) error {

@@ -34,6 +34,9 @@ final class CodexFoldAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         if let button = statusItem.button {
             button.image = statusSymbol(for: .unknown)
             button.imagePosition = .imageOnly
+            button.imageScaling = .scaleProportionallyDown
+            button.imageHugsTitle = false
+            button.contentTintColor = .secondaryLabelColor
             button.toolTip = L10n.text(.productName)
             button.target = self
             button.action = #selector(togglePopover(_:))
@@ -127,12 +130,13 @@ final class CodexFoldAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
             popover?.contentSize = NSSize(width: 360, height: popoverHeight)
         }
         button.image = statusSymbol(for: store.overallHealth)
-        button.title = store.menuBarTitle
-        button.imagePosition = store.menuBarTitle.isEmpty ? .imageOnly : .imageLeading
+        let menuBarTitle = store.menuBarTitle
+        button.attributedTitle = Self.menuBarAttributedTitle(menuBarTitle)
+        button.imagePosition = menuBarTitle.isEmpty ? .imageOnly : .imageLeading
         button.toolTip = store.storageMetrics.map {
             "\(store.summary) · \(L10n.text(.spaceSaved)) \(ByteCountFormatter.string(fromByteCount: $0.savedBytes, countStyle: .file))"
         } ?? store.summary
-        button.contentTintColor = statusColor(for: store.overallHealth)
+        button.contentTintColor = statusIconColor(for: store.overallHealth)
         button.setAccessibilityLabel(L10n.text(.productName))
         button.setAccessibilityValue(button.toolTip ?? store.summary)
     }
@@ -148,11 +152,19 @@ final class CodexFoldAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         guard let store = statusStore else { return }
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 900, height: 760),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
             backing: .buffered,
             defer: false
         )
         window.title = L10n.text(.productName)
+        window.titleVisibility = .hidden
+        window.titlebarAppearsTransparent = true
+        window.isMovableByWindowBackground = true
+        // The window itself is a stable system surface. Liquid Glass belongs
+        // to the cards and controls inside it, not to an arbitrary desktop
+        // document showing through the entire dashboard.
+        window.backgroundColor = .windowBackgroundColor
+        window.isOpaque = true
         window.minSize = NSSize(width: 780, height: 650)
         window.center()
         window.isReleasedWhenClosed = false
@@ -203,16 +215,49 @@ final class CodexFoldAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
     }
 
     private func statusSymbol(for health: ComponentHealth) -> NSImage? {
-        let name: String
+        let names: [String]
         switch health {
-        case .healthy: name = "checkmark.circle.fill"
-        case .recovering: name = "arrow.triangle.2.circlepath.circle.fill"
-        case .failed: name = "exclamationmark.triangle.fill"
-        case .unknown: name = "questionmark.circle"
+        case .healthy:
+            names = ["externaldrive.fill.badge.checkmark", "externaldrive.fill", "checkmark.circle.fill"]
+        case .recovering:
+            names = ["externaldrive.fill.badge.exclamationmark", "arrow.triangle.2.circlepath.circle.fill"]
+        case .failed:
+            names = ["externaldrive.fill.badge.xmark", "exclamationmark.circle.fill", "exclamationmark.triangle.fill"]
+        case .unknown:
+            names = ["externaldrive.fill.badge.questionmark", "externaldrive.fill", "questionmark.circle"]
         }
-        let image = NSImage(systemSymbolName: name, accessibilityDescription: L10n.text(.productName))
-        image?.isTemplate = false
-        return image
+        let sizeConfiguration = NSImage.SymbolConfiguration(pointSize: 14, weight: .semibold)
+        let iconColor = statusIconColor(for: health)
+        let colorConfiguration = NSImage.SymbolConfiguration(
+            paletteColors: [iconColor, iconColor]
+        )
+        for name in names {
+            if let image = NSImage(
+                systemSymbolName: name,
+                accessibilityDescription: L10n.text(.productName)
+            )?.withSymbolConfiguration(sizeConfiguration)?.withSymbolConfiguration(colorConfiguration) {
+                // Status-bar buttons on this macOS path ignore
+                // contentTintColor for template symbols. Keep the image
+                // non-template so the health tint remains visible.
+                image.isTemplate = false
+                return image
+            }
+        }
+        return nil
+    }
+
+    private static func menuBarAttributedTitle(_ title: String) -> NSAttributedString {
+        NSAttributedString(
+            string: title,
+            attributes: [
+                // Menu-bar vibrancy can be darker than the app's own Aqua
+                // appearance. Keep the compact metric readable in both the
+                // normal and highlighted status-item states.
+                .foregroundColor: NSColor.white,
+                .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .semibold),
+                .kern: 0,
+            ]
+        )
     }
 
     private func statusColor(for health: ComponentHealth) -> NSColor {
@@ -221,6 +266,13 @@ final class CodexFoldAppDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         case .recovering: return .systemOrange
         case .failed: return .systemRed
         case .unknown: return .secondaryLabelColor
+        }
+    }
+
+    private func statusIconColor(for health: ComponentHealth) -> NSColor {
+        switch health {
+        case .healthy: return .labelColor
+        default: return statusColor(for: health)
         }
     }
 

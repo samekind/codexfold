@@ -31,6 +31,9 @@ type ManagedSessionDeletionGuard struct {
 	files      []*os.File
 }
 
+// ErrManagedSessionBusy is ordinary live I/O contention, not corrupt storage.
+var ErrManagedSessionBusy = errors.New("managed session is busy")
+
 func ManagedSessionReferences(ctx context.Context, storeDir string) ([]ManagedSessionReference, error) {
 	s, exists, err := prepareScanner(ctx, Options{StoreDir: storeDir})
 	if err != nil {
@@ -197,9 +200,13 @@ func AcquireManagedSessionDeletionGuard(ctx context.Context, storeDir string) (*
 			_ = guard.Close()
 			return nil, fmt.Errorf("inspect managed session %s journal: %w", sessionID, err)
 		}
-		if readerActive || pending {
+		if readerActive {
 			_ = guard.Close()
-			return nil, fmt.Errorf("managed session %s has an active reader or unfinished recovery", sessionID)
+			return nil, fmt.Errorf("%w: managed session %s has an active reader", ErrManagedSessionBusy, sessionID)
+		}
+		if pending {
+			_ = guard.Close()
+			return nil, fmt.Errorf("managed session %s has unfinished recovery", sessionID)
 		}
 	}
 	if _, err := guard.Refresh(ctx, storeDir); err != nil {
@@ -250,7 +257,7 @@ func acquireExclusiveFileLock(path string) (*os.File, error) {
 	}
 	if !locked {
 		_ = file.Close()
-		return nil, errors.New("writer is active")
+		return nil, fmt.Errorf("%w: writer is active", ErrManagedSessionBusy)
 	}
 	return file, nil
 }

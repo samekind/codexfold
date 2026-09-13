@@ -86,6 +86,9 @@ func TestRenderLaunchdNativeFSKitSeparatesDaemonAndSupervisor(t *testing.T) {
 			t.Fatalf("native daemon definition missing %q:\n%s", required, daemon)
 		}
 	}
+	if strings.Contains(string(daemon), "CODEXFOLD_FSKIT_SCHEME") {
+		t.Fatalf("native daemon definition must not inject an unsupported FSKit scheme:\n%s", daemon)
+	}
 
 	supervisor, err := RenderLaunchdSupervisor(options)
 	if err != nil {

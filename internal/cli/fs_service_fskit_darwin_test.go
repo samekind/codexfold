@@ -94,7 +94,23 @@ func TestCompleteFSKitResidencyRequiresCurrentMenuBar(t *testing.T) {
 	}
 }
 
+func stubNoFSKitHostProcesses(t *testing.T) {
+	t.Helper()
+	originalList := listFSKitUserProcessIDs
+	originalSignal := signalFSKitProcess
+	t.Cleanup(func() {
+		listFSKitUserProcessIDs = originalList
+		signalFSKitProcess = originalSignal
+	})
+	listFSKitUserProcessIDs = func(context.Context, string) ([]int, error) { return nil, nil }
+	signalFSKitProcess = func(pid int, sig unix.Signal) error {
+		t.Fatalf("unexpected signal %s to pid %d", sig, pid)
+		return nil
+	}
+}
+
 func TestEnsureFSKitMenuBarResidencyDoesNotRelaunchRunningApp(t *testing.T) {
+	stubNoFSKitHostProcesses(t)
 	originalInspect := inspectFSKitMenuBarProcess
 	originalOpen := runFSKitMenuBarOpenCommand
 	t.Cleanup(func() {
@@ -115,6 +131,7 @@ func TestEnsureFSKitMenuBarResidencyDoesNotRelaunchRunningApp(t *testing.T) {
 }
 
 func TestEnsureFSKitMenuBarResidencyLaunchesOnlyCodexFoldApp(t *testing.T) {
+	stubNoFSKitHostProcesses(t)
 	originalInspect := inspectFSKitMenuBarProcess
 	originalOpen := runFSKitMenuBarOpenCommand
 	t.Cleanup(func() {
@@ -142,6 +159,7 @@ func TestEnsureFSKitMenuBarResidencyLaunchesOnlyCodexFoldApp(t *testing.T) {
 }
 
 func TestEnsureFSKitMenuBarResidencyReportsLaunchFailureWithoutFallback(t *testing.T) {
+	stubNoFSKitHostProcesses(t)
 	originalInspect := inspectFSKitMenuBarProcess
 	originalOpen := runFSKitMenuBarOpenCommand
 	t.Cleanup(func() {
@@ -156,6 +174,151 @@ func TestEnsureFSKitMenuBarResidencyReportsLaunchFailureWithoutFallback(t *testi
 	outcome := ensureFSKitMenuBarResidency(context.Background(), "/tmp/CodexFoldFSKit.app")
 	if outcome.State != "unavailable" || outcome.Detail == "" {
 		t.Fatalf("failed menu bar launch outcome = %#v", outcome)
+	}
+}
+
+func TestStopCodexFoldFSKitHostProcessesStopsStagedLeftoverMenuBar(t *testing.T) {
+	originalList := listFSKitUserProcessIDs
+	originalExecutable := inspectFSKitProcessExecutable
+	originalCommand := inspectFSKitProcessCommand
+	originalSignal := signalFSKitProcess
+	t.Cleanup(func() {
+		listFSKitUserProcessIDs = originalList
+		inspectFSKitProcessExecutable = originalExecutable
+		inspectFSKitProcessCommand = originalCommand
+		signalFSKitProcess = originalSignal
+	})
+
+	current := "/tmp/CodexFoldFSKit.app/Contents/MacOS/CodexFoldFSKit"
+	staged := "/tmp/.codexfold-fskit-stage-1/CodexFoldFSKit.app/Contents/MacOS/CodexFoldFSKit"
+	alive := map[int]string{101: staged, 202: current + " --run-helper helper fs serve"}
+	listFSKitUserProcessIDs = func(context.Context, string) ([]int, error) {
+		var pids []int
+		for _, pid := range []int{101, 202} {
+			if _, ok := alive[pid]; ok {
+				pids = append(pids, pid)
+			}
+		}
+		return pids, nil
+	}
+	inspectFSKitProcessExecutable = func(_ context.Context, pid int) (string, error) {
+		if pid == 101 {
+			return staged, nil
+		}
+		return current, nil
+	}
+	inspectFSKitProcessCommand = func(_ context.Context, pid int) (string, error) {
+		return alive[pid], nil
+	}
+	signaled := make([]int, 0, 1)
+	signalFSKitProcess = func(pid int, sig unix.Signal) error {
+		if sig == unix.SIGTERM {
+			signaled = append(signaled, pid)
+			delete(alive, pid)
+		}
+		if _, ok := alive[pid]; !ok {
+			return unix.ESRCH
+		}
+		return nil
+	}
+
+	if err := stopCodexFoldFSKitHostProcesses(context.Background(), "/tmp/CodexFoldFSKit.app"); err != nil {
+		t.Fatal(err)
+	}
+	if len(signaled) != 1 || signaled[0] != 101 {
+		t.Fatalf("signaled=%v, want only staged leftover 101", signaled)
+	}
+	if _, ok := alive[202]; !ok {
+		t.Fatal("helper process was stopped")
+	}
+}
+
+func TestEnsureFSKitMenuBarResidencyStopsStaleStageHostBeforeLaunch(t *testing.T) {
+	originalList := listFSKitUserProcessIDs
+	originalExecutable := inspectFSKitProcessExecutable
+	originalCommand := inspectFSKitProcessCommand
+	originalSignal := signalFSKitProcess
+	originalInspect := inspectFSKitMenuBarProcess
+	originalOpen := runFSKitMenuBarOpenCommand
+	t.Cleanup(func() {
+		listFSKitUserProcessIDs = originalList
+		inspectFSKitProcessExecutable = originalExecutable
+		inspectFSKitProcessCommand = originalCommand
+		signalFSKitProcess = originalSignal
+		inspectFSKitMenuBarProcess = originalInspect
+		runFSKitMenuBarOpenCommand = originalOpen
+	})
+
+	staged := "/tmp/.codexfold-fskit-stage-9/CodexFoldFSKit.app/Contents/MacOS/CodexFoldFSKit"
+	alive := map[int]bool{77: true}
+	listFSKitUserProcessIDs = func(context.Context, string) ([]int, error) {
+		if alive[77] {
+			return []int{77}, nil
+		}
+		return nil, nil
+	}
+	inspectFSKitProcessExecutable = func(context.Context, int) (string, error) { return staged, nil }
+	inspectFSKitProcessCommand = func(context.Context, int) (string, error) { return "CodexFoldFSKit", nil }
+	signalFSKitProcess = func(pid int, sig unix.Signal) error {
+		if pid == 77 && sig == unix.SIGTERM {
+			delete(alive, 77)
+			return nil
+		}
+		return unix.ESRCH
+	}
+	inspectFSKitMenuBarProcess = func(context.Context, string) (bool, error) { return false, nil }
+	opened := 0
+	runFSKitMenuBarOpenCommand = func(context.Context, string) ([]byte, error) {
+		opened++
+		inspectFSKitMenuBarProcess = func(context.Context, string) (bool, error) { return true, nil }
+		return nil, nil
+	}
+
+	outcome := ensureFSKitMenuBarResidency(context.Background(), "/tmp/CodexFoldFSKit.app")
+	if outcome.State != "enabled" || opened != 1 || alive[77] {
+		t.Fatalf("outcome=%#v opened=%d stale_alive=%t", outcome, opened, alive[77])
+	}
+}
+
+func TestStaleFSKitMenuBarProcessIDsOnlyReturnsArgumentFreeStageHosts(t *testing.T) {
+	originalList := listFSKitUserProcessIDs
+	originalExecutable := inspectFSKitProcessExecutable
+	originalCommand := inspectFSKitProcessCommand
+	t.Cleanup(func() {
+		listFSKitUserProcessIDs = originalList
+		inspectFSKitProcessExecutable = originalExecutable
+		inspectFSKitProcessCommand = originalCommand
+	})
+
+	current := "/Users/test/Applications/CodexFoldFSKit.app/Contents/MacOS/CodexFoldFSKit"
+	stage := "/Users/test/Applications/.codexfold-fskit-stage-1/CodexFoldFSKit.app/Contents/MacOS/CodexFoldFSKit"
+	otherInstalled := "/tmp/Other/CodexFoldFSKit.app/Contents/MacOS/CodexFoldFSKit"
+	listFSKitUserProcessIDs = func(context.Context, string) ([]int, error) {
+		return []int{101, 202, 303, 404}, nil
+	}
+	inspectFSKitProcessExecutable = func(_ context.Context, pid int) (string, error) {
+		switch pid {
+		case 101, 404:
+			return stage, nil
+		case 202:
+			return otherInstalled, nil
+		default:
+			return "", nil
+		}
+	}
+	inspectFSKitProcessCommand = func(_ context.Context, pid int) (string, error) {
+		if pid == 404 {
+			return stage + " --run-helper /tmp/helper fs serve", nil
+		}
+		return stage, nil
+	}
+
+	got, err := staleFSKitMenuBarProcessIDs(context.Background(), current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, []int{101}) {
+		t.Fatalf("stale stage host pids = %#v, want [101]", got)
 	}
 }
 
@@ -206,6 +369,65 @@ func TestFSKitMenuBarProcessRunningRequiresArgumentFreeHostProcess(t *testing.T)
 	}
 }
 
+func TestCollapseFSKitMenuBarProcessesStopsOlderDuplicates(t *testing.T) {
+	originalList := listFSKitUserProcessIDs
+	originalExecutable := inspectFSKitProcessExecutable
+	originalCommand := inspectFSKitProcessCommand
+	originalSignal := signalFSKitProcess
+	t.Cleanup(func() {
+		listFSKitUserProcessIDs = originalList
+		inspectFSKitProcessExecutable = originalExecutable
+		inspectFSKitProcessCommand = originalCommand
+		signalFSKitProcess = originalSignal
+	})
+
+	launcher := "/tmp/CodexFoldFSKit.app/Contents/MacOS/CodexFoldFSKit"
+	alive := map[int]bool{101: true, 202: true, 303: true}
+	listFSKitUserProcessIDs = func(context.Context, string) ([]int, error) {
+		var pids []int
+		for _, pid := range []int{101, 202, 303} {
+			if alive[pid] {
+				pids = append(pids, pid)
+			}
+		}
+		return pids, nil
+	}
+	inspectFSKitProcessExecutable = func(context.Context, int) (string, error) {
+		return launcher, nil
+	}
+	inspectFSKitProcessCommand = func(_ context.Context, pid int) (string, error) {
+		if pid == 202 {
+			return launcher + " --run-helper /tmp/helper fs serve", nil
+		}
+		return launcher, nil
+	}
+	var signals []int
+	signalFSKitProcess = func(pid int, signal syscall.Signal) error {
+		if pid == 303 {
+			t.Fatal("newest menu-bar process was signalled")
+		}
+		if pid == 202 {
+			t.Fatal("helper process was signalled as a menu-bar duplicate")
+		}
+		if signal != unix.SIGTERM {
+			t.Fatalf("signal = %v, want SIGTERM", signal)
+		}
+		signals = append(signals, pid)
+		delete(alive, pid)
+		return nil
+	}
+
+	if err := collapseFSKitMenuBarProcesses(context.Background(), launcher); err != nil {
+		t.Fatal(err)
+	}
+	if len(signals) != 1 || signals[0] != 101 {
+		t.Fatalf("signals = %#v, want only older menu-bar pid 101", signals)
+	}
+	if !alive[202] || !alive[303] {
+		t.Fatal("helper or newest menu-bar process did not remain alive")
+	}
+}
+
 func TestFSKitMenuBarCommandHasNoArgumentsAcceptsLaunchdArgvZeroOnly(t *testing.T) {
 	launcher := "/tmp/CodexFoldFSKit.app/Contents/MacOS/CodexFoldFSKit"
 	for _, command := range []string{launcher, filepath.Base(launcher)} {
@@ -214,6 +436,7 @@ func TestFSKitMenuBarCommandHasNoArgumentsAcceptsLaunchdArgvZeroOnly(t *testing.
 		}
 	}
 	for _, command := range []string{
+		"",
 		launcher + " --run-helper /tmp/helper fs serve",
 		launcher + " --run-helper /tmp/helper fs supervise",
 		launcher + " --configure-residency",
@@ -282,6 +505,158 @@ func TestStopFSKitModuleProcessesSignalsOnlyTheExactTargetApp(t *testing.T) {
 	}
 
 	if err := stopCodexFoldFSKitModuleProcesses(context.Background(), targetApp); err != nil {
+		t.Fatal(err)
+	}
+	if len(signals) != 1 || signals[0].pid != 101 || signals[0].signal != unix.SIGTERM {
+		t.Fatalf("signals = %#v, want one SIGTERM for target pid 101", signals)
+	}
+	if !alive[202] {
+		t.Fatal("production FSKit module did not remain alive")
+	}
+}
+
+func TestReapIdleFSKitModuleProcessesKillsOnlySocketlessDuplicates(t *testing.T) {
+	originalList := listFSKitUserProcessIDs
+	originalInspect := inspectFSKitProcessExecutable
+	originalSocket := inspectFSKitModuleUnixSocket
+	originalSignal := signalFSKitProcess
+	t.Cleanup(func() {
+		listFSKitUserProcessIDs = originalList
+		inspectFSKitProcessExecutable = originalInspect
+		inspectFSKitModuleUnixSocket = originalSocket
+		signalFSKitProcess = originalSignal
+	})
+
+	app := "/tmp/CodexFoldFSKit.app"
+	executable, err := fsKitModuleExecutablePath(app)
+	if err != nil {
+		t.Fatal(err)
+	}
+	alive := map[int]bool{101: true, 202: true}
+	listFSKitUserProcessIDs = func(context.Context, string) ([]int, error) {
+		var pids []int
+		for _, pid := range []int{101, 202} {
+			if alive[pid] {
+				pids = append(pids, pid)
+			}
+		}
+		return pids, nil
+	}
+	inspectFSKitProcessExecutable = func(context.Context, int) (string, error) {
+		return executable, nil
+	}
+	inspectFSKitModuleUnixSocket = func(_ context.Context, pid int) (bool, error) {
+		return pid == 202, nil
+	}
+	var signals []struct {
+		pid    int
+		signal syscall.Signal
+	}
+	signalFSKitProcess = func(pid int, signal syscall.Signal) error {
+		signals = append(signals, struct {
+			pid    int
+			signal syscall.Signal
+		}{pid: pid, signal: signal})
+		if pid == 202 {
+			t.Fatal("live FSKit module was signalled")
+		}
+		if signal != unix.SIGKILL {
+			t.Fatalf("signal = %v, want SIGKILL", signal)
+		}
+		delete(alive, pid)
+		return nil
+	}
+
+	if err := reapIdleCodexFoldFSKitModuleProcesses(context.Background(), app); err != nil {
+		t.Fatal(err)
+	}
+	if len(signals) != 1 || signals[0].pid != 101 {
+		t.Fatalf("signals = %#v, want SIGKILL for idle pid 101", signals)
+	}
+	if !alive[202] {
+		t.Fatal("live FSKit module did not remain alive")
+	}
+}
+
+func TestQuiesceNativeFSKitDefinitionSignalsOnlyTheDefinitionApp(t *testing.T) {
+	originalList := listFSKitUserProcessIDs
+	originalInspect := inspectFSKitProcessExecutable
+	originalSignal := signalFSKitProcess
+	t.Cleanup(func() {
+		listFSKitUserProcessIDs = originalList
+		inspectFSKitProcessExecutable = originalInspect
+		signalFSKitProcess = originalSignal
+	})
+
+	root := t.TempDir()
+	targetApp := filepath.Join(root, "isolated", "CodexFoldFSKit.app")
+	productionApp := filepath.Join(root, "Applications", "CodexFoldFSKit.app")
+	launcher, err := service.FSKitHostLauncherPath(targetApp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetExecutable, err := fsKitModuleExecutablePath(targetApp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	productionExecutable, err := fsKitModuleExecutablePath(productionApp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	definition, err := service.RenderLaunchd(service.Options{
+		Label: "com.codexfold.fs", BinaryPath: filepath.Join(root, "bin", "codexfold"),
+		LauncherPath: launcher, CodexHome: filepath.Join(root, "codex"),
+		StoreDir: filepath.Join(root, "store"), MountPoint: filepath.Join(root, "mount"),
+		StdoutPath: filepath.Join(root, "logs", "stdout.log"),
+		StderrPath: filepath.Join(root, "logs", "stderr.log"), CanonicalNamespace: true,
+		NativeRoot: filepath.Join(root, "native"), Frontend: "native-fskit",
+		FSKitResource: filepath.Join(root, "store", "fs", "native-fskit.resource"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	definitionPath := filepath.Join(root, "com.codexfold.fs.plist")
+	if err := os.WriteFile(definitionPath, definition, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	alive := map[int]bool{101: true, 202: true}
+	listFSKitUserProcessIDs = func(context.Context, string) ([]int, error) {
+		var pids []int
+		for _, pid := range []int{101, 202} {
+			if alive[pid] {
+				pids = append(pids, pid)
+			}
+		}
+		return pids, nil
+	}
+	inspectFSKitProcessExecutable = func(_ context.Context, pid int) (string, error) {
+		switch pid {
+		case 101:
+			return targetExecutable, nil
+		case 202:
+			return productionExecutable, nil
+		default:
+			return "", nil
+		}
+	}
+	var signals []struct {
+		pid    int
+		signal syscall.Signal
+	}
+	signalFSKitProcess = func(pid int, signal syscall.Signal) error {
+		signals = append(signals, struct {
+			pid    int
+			signal syscall.Signal
+		}{pid: pid, signal: signal})
+		if pid == 202 {
+			t.Fatal("production FSKit module was signalled")
+		}
+		delete(alive, pid)
+		return nil
+	}
+
+	if err := quiesceNativeFSKitDefinition(context.Background(), definitionPath); err != nil {
 		t.Fatal(err)
 	}
 	if len(signals) != 1 || signals[0].pid != 101 || signals[0].signal != unix.SIGTERM {

@@ -156,6 +156,14 @@ func (f *Filesystem) WatchNativeNamespace(ctx context.Context) error {
 					changedSet[filepath.ToSlash(filepath.Dir(route))] = struct{}{}
 				}
 				if event.Fflags&(unix.NOTE_DELETE|unix.NOTE_RENAME|unix.NOTE_REVOKE) != 0 {
+					// EVFILT_VNODE follows the opened inode, not its pathname. A
+					// replacement at the same path needs a newly opened descriptor.
+					// Otherwise rescan reuses the old watch forever and misses later
+					// content-only writes to the replacement file/directory.
+					descriptor := int(event.Ident)
+					_ = unix.Close(descriptor)
+					delete(watchers, descriptor)
+					delete(watchersByPath, watcher.path)
 					fullRescan = true
 				}
 			}

@@ -263,28 +263,29 @@ final class IncidentTrackerTests: XCTestCase {
         }
         XCTAssertTrue(isNew)
 
-        XCTAssertNil(tracker.evaluate(
-            frontend: nil,
+        guard case .recovered? = tracker.evaluate(
+            frontend: oldFrontendHealthy,
             supervisor: status(
                 id: "supervisor",
                 health: .healthy,
                 updatedAt: start.addingTimeInterval(12)
             ),
             at: start.addingTimeInterval(12)
-        ))
-        XCTAssertNotNil(tracker.currentIncident, "supervisor healthy alone is not frontend recovery evidence")
+        ) else {
+            return XCTFail("expected a fresh healthy supervisor to recover even if frontend.json is stale")
+        }
+        XCTAssertNil(tracker.currentIncident)
 
-        guard case .recovered? = tracker.evaluate(
-            frontend: status(health: .healthy, updatedAt: start.addingTimeInterval(10.5)),
+        XCTAssertNil(tracker.evaluate(
+            frontend: oldFrontendHealthy,
             supervisor: status(
                 id: "supervisor",
                 health: .healthy,
                 updatedAt: start.addingTimeInterval(13)
             ),
             at: start.addingTimeInterval(13)
-        ) else {
-            return XCTFail("expected fresh frontend and supervisor healthy evidence to recover")
-        }
+        ))
+        XCTAssertNil(tracker.currentIncident)
     }
 
     func testStaleSupervisorSnapshotDoesNotStartLivenessTimer() {
@@ -1031,6 +1032,47 @@ final class DiagnosticRedactionTests: XCTestCase {
     }
 }
 
+final class StatusDirectorySelectionTests: XCTestCase {
+    func testNewestScopedStatusWinsOverOlderPrimaryStatus() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("codexfold-status-selection-\(UUID().uuidString)", isDirectory: true)
+        let primary = root.appendingPathComponent("status", isDirectory: true)
+        let nested = root
+            .appendingPathComponent("native-fskit", isDirectory: true)
+            .appendingPathComponent("status", isDirectory: true)
+        try FileManager.default.createDirectory(at: primary, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let old = Date(timeIntervalSince1970: 10_000)
+        let new = old.addingTimeInterval(20)
+        try writeManagedStatus(
+            to: primary.appendingPathComponent("managed.json"),
+            state: "failed",
+            updatedAt: old,
+            sequence: 1,
+            incidentID: "old-incident",
+            recoveryStartedAt: old,
+            recoveryEpochID: "old-epoch",
+            recoveryEpochEstablishedAt: old
+        )
+        try writeManagedStatus(
+            to: nested.appendingPathComponent("managed.json"),
+            state: "healthy",
+            updatedAt: new,
+            sequence: 2,
+            publisherInstanceID: "new-publisher",
+            backendID: "new-backend"
+        )
+
+        MainActor.assumeIsolated {
+            let store = StatusStore(appGroupURL: root, recordsHistory: false, now: { new })
+            store.refresh()
+            XCTAssertEqual(store.components.first(where: { $0.id == "managed" })?.health, .healthy)
+        }
+    }
+}
+
 final class StatusHistoryTests: XCTestCase {
     func testStorageMetricsPreferTheStoragePublisherAndCalculateSavings() {
         let metrics = StorageMetrics.current(from: [
@@ -1100,6 +1142,44 @@ final class StatusHistoryTests: XCTestCase {
         XCTAssertEqual(archive.incidents.count, 1)
         XCTAssertEqual(archive.incidents.first?.recoveredAt, recoveredAt)
         XCTAssertEqual(archive.incidents.first?.duration(relativeTo: recoveredAt), 18)
+    }
+
+    func testHealthyObservationClosesHistoryAfterPresenterWasAbsent() {
+        let since = Date(timeIntervalSince1970: 5_000)
+        let observed = since.addingTimeInterval(600)
+        var archive = StatusHistoryArchive()
+        let incident = FrontendIncident(id: "prior-presenter", since: since, reason: "reason", impact: "impact", recommendations: [], technicalDetails: "", recoveredAt: nil)
+        _ = archive.recordIncident(.active(incident, isNew: true), at: since)
+        XCTAssertTrue(archive.closeOpenIncidentsAfterHealthyObservation(at: observed))
+        XCTAssertEqual(archive.incidents.count, 1)
+        XCTAssertEqual(archive.incidents[0].since, since)
+        XCTAssertEqual(archive.incidents[0].recoveredAt, observed)
+        XCTAssertFalse(archive.closeOpenIncidentsAfterHealthyObservation(at: observed.addingTimeInterval(1)))
+        XCTAssertEqual(archive.incidents[0].recoveredAt, observed)
+    }
+
+    @MainActor
+    func testHealthyBaselineRequiresEveryFreshRuntimeChannel() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let directory = root.appendingPathComponent("status")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        var now = Date(timeIntervalSince1970: 10_000)
+        let formatter = ISO8601DateFormatter()
+        for name in ["frontend", "daemon", "managed", "supervisor"] {
+            let payload: [String: Any] = [
+                "schemaVersion": 2, "component": name, "state": "healthy", "updatedAt": formatter.string(from: now),
+                "publisherInstanceID": "\(name)-publisher", "observationSequence": 1,
+                "backendID": "test-backend", "mountPoint": "/test/mount", "resourcePath": "/test/resource",
+            ]
+            try JSONSerialization.data(withJSONObject: payload).write(to: directory.appendingPathComponent("\(name).json"))
+        }
+        let store = StatusStore(appGroupURL: root, monitorDaemonStatus: true, now: { now })
+        store.refresh()
+        XCTAssertTrue(store.hasTrustedHealthyBaseline)
+        now = now.addingTimeInterval(11)
+        store.refresh()
+        XCTAssertFalse(store.hasTrustedHealthyBaseline, "stale healthy files must not clear acknowledgements or close old history")
     }
 
     func testStatusStoreReadsPublishedStorageAndPersistsAHistoryPoint() async throws {
@@ -1185,6 +1265,58 @@ final class StatusHistoryTests: XCTestCase {
 }
 
 final class StatusStoreIntegrationTests: XCTestCase {
+    func testOldHealthyEpochDoesNotBackdateMissingChannelAlert() async throws {
+        for component in ["daemon", "managed", "supervisor"] {
+            let root = try managedStatusFixtureRoot()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let start = Date(timeIntervalSince1970: 100_000)
+            try writeStatusContinuity(
+                root: root, component: component, epochID: "old-healthy",
+                establishedAt: start.addingTimeInterval(-86_400), sequence: 10
+            )
+            try await MainActor.run {
+                var current = start
+                let managedURL = root.appendingPathComponent("status/managed.json")
+                if component != "managed" {
+                    try writeManagedStatus(to: managedURL, state: "healthy", updatedAt: current, sequence: 1)
+                }
+                let store = StatusStore(appGroupURL: root, monitorDaemonStatus: true, now: { current })
+                if component != "daemon" {
+                    try writeDaemonStatus(to: root.appendingPathComponent("status/daemon.json"), state: "healthy", updatedAt: current, sequence: 1)
+                }
+                if component == "supervisor" {
+                    try FileManager.default.removeItem(at: root.appendingPathComponent("status/supervisor.json"))
+                }
+                store.refresh()
+                XCTAssertNil(store.currentIncident, component)
+                current = start.addingTimeInterval(9)
+                if component != "daemon" {
+                    try writeDaemonStatus(to: root.appendingPathComponent("status/daemon.json"), state: "healthy", updatedAt: current, sequence: 2)
+                }
+                if component != "managed" {
+                    try writeManagedStatus(to: managedURL, state: "healthy", updatedAt: current, sequence: 2)
+                }
+                if component == "supervisor" {
+                    try FileManager.default.removeItem(at: root.appendingPathComponent("status/supervisor.json"))
+                }
+                store.refresh()
+                XCTAssertNil(store.currentIncident, component)
+                current = start.addingTimeInterval(10)
+                if component != "daemon" {
+                    try writeDaemonStatus(to: root.appendingPathComponent("status/daemon.json"), state: "healthy", updatedAt: current, sequence: 3)
+                }
+                if component != "managed" {
+                    try writeManagedStatus(to: managedURL, state: "healthy", updatedAt: current, sequence: 3)
+                }
+                if component == "supervisor" {
+                    try FileManager.default.removeItem(at: root.appendingPathComponent("status/supervisor.json"))
+                }
+                store.refresh()
+                XCTAssertEqual(store.currentIncident?.since, start, component)
+            }
+        }
+    }
+
     func testStandaloneMenuBarLaunchDoesNotReportMissingRuntimeAsAnIncident() async throws {
         let root = try managedStatusFixtureRoot()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -1558,7 +1690,9 @@ final class StatusStoreIntegrationTests: XCTestCase {
 
         try await MainActor.run {
             var current = start
-            let store = StatusStore(appGroupURL: root, now: { current })
+            // Pinned to the old escalation window: this case covers recovery causality,
+            // not how long a read gap must last before it reaches the user.
+            let store = StatusStore(appGroupURL: root, staleHeartbeatIncidentTimeout: 10, now: { current })
             var updates: [IncidentUpdate] = []
             store.onIncident = { updates.append($0) }
             store.refresh()
@@ -1595,6 +1729,73 @@ final class StatusStoreIntegrationTests: XCTestCase {
             store.refresh()
             guard case let .recovered(recovered)? = updates.last else {
                 return XCTFail("expected a fresh advancing sequence to recover status monitoring")
+            }
+            XCTAssertEqual(recovered.id, incident.id)
+        }
+    }
+
+    func testStatusChannelGapThatResumesNeverReachesTheUser() async throws {
+        let root = try managedStatusFixtureRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let managedURL = root.appendingPathComponent("status/managed.json")
+        let start = Date(timeIntervalSince1970: 6_520)
+        try writeManagedStatus(to: managedURL, state: "healthy", updatedAt: start, sequence: 2_000)
+
+        try await MainActor.run {
+            var current = start
+            let store = StatusStore(appGroupURL: root, now: { current })
+            var updates: [IncidentUpdate] = []
+            store.onIncident = { updates.append($0) }
+            store.refresh()
+
+            // A publisher starved by system load stops advancing for far longer
+            // than the freshness window. Nothing is waiting on it and it comes
+            // back on its own, so interrupting the user here is noise.
+            for elapsed in stride(from: 10.0, through: 40.0, by: 5.0) {
+                current = start.addingTimeInterval(elapsed)
+                store.refresh()
+            }
+            XCTAssertTrue(updates.isEmpty, "a status channel gap that resolves itself is not an incident")
+
+            current = start.addingTimeInterval(45)
+            try writeManagedStatus(to: managedURL, state: "healthy", updatedAt: current, sequence: 2_001)
+            store.refresh()
+            XCTAssertTrue(updates.isEmpty, "a resumed status channel must not report a recovery it never raised")
+        }
+    }
+
+    func testStatusChannelSilenceStillAlertsOnceSustained() async throws {
+        let root = try managedStatusFixtureRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let managedURL = root.appendingPathComponent("status/managed.json")
+        let start = Date(timeIntervalSince1970: 6_560)
+        try writeManagedStatus(to: managedURL, state: "healthy", updatedAt: start, sequence: 3_000)
+
+        try await MainActor.run {
+            var current = start
+            let store = StatusStore(appGroupURL: root, now: { current })
+            var updates: [IncidentUpdate] = []
+            store.onIncident = { updates.append($0) }
+            store.refresh()
+
+            current = start.addingTimeInterval(119)
+            store.refresh()
+            XCTAssertTrue(updates.isEmpty)
+
+            // A publisher this quiet is gone rather than busy, and that is worth
+            // telling the user about.
+            current = start.addingTimeInterval(120)
+            store.refresh()
+            guard case let .active(incident, _)? = updates.last else {
+                return XCTFail("expected sustained status channel silence to alert")
+            }
+            XCTAssertEqual(incident.since, start)
+
+            current = start.addingTimeInterval(121)
+            try writeManagedStatus(to: managedURL, state: "healthy", updatedAt: current, sequence: 3_001)
+            store.refresh()
+            guard case let .recovered(recovered)? = updates.last else {
+                return XCTFail("expected an advancing sequence to recover status monitoring")
             }
             XCTAssertEqual(recovered.id, incident.id)
         }
@@ -1790,7 +1991,9 @@ final class StatusStoreIntegrationTests: XCTestCase {
 
         try await MainActor.run {
             var current = start
-            let store = StatusStore(appGroupURL: root, now: { current })
+            // Pinned to the old escalation window: this case covers recovery causality,
+            // not how long a read gap must last before it reaches the user.
+            let store = StatusStore(appGroupURL: root, staleHeartbeatIncidentTimeout: 10, now: { current })
             var updates: [IncidentUpdate] = []
             store.onIncident = { updates.append($0) }
             store.refresh()
@@ -1973,8 +2176,12 @@ final class StatusStoreIntegrationTests: XCTestCase {
 
         try await MainActor.run {
             var current = start
+            // Pinned to the old escalation window: this case covers recovery
+            // causality, not how long a read gap must last before it reaches
+            // the user.
             let store = StatusStore(
                 appGroupURL: root,
+                staleHeartbeatIncidentTimeout: 10,
                 monitorDaemonStatus: true,
                 now: { current }
             )
@@ -2096,6 +2303,9 @@ final class StatusStoreIntegrationTests: XCTestCase {
             )
             var firstUpdates: [IncidentUpdate] = []
             firstStore.onIncident = { firstUpdates.append($0) }
+            current = start
+            firstStore.refresh()
+            current = start.addingTimeInterval(10)
             firstStore.refresh()
             guard case let .active(firstIncident, _)? = firstUpdates.last else {
                 return XCTFail("expected the first durable missing-channel occurrence")
@@ -2114,11 +2324,15 @@ final class StatusStoreIntegrationTests: XCTestCase {
             var restartedUpdates: [IncidentUpdate] = []
             restartedStore.onIncident = { restartedUpdates.append($0) }
             restartedStore.refresh()
+            XCTAssertNil(restartedStore.currentIncident, "restart must not date a read failure from an old healthy epoch")
+            current = start.addingTimeInterval(21)
+            try writeManagedStatus(to: managedURL, state: "healthy", updatedAt: current, sequence: 3)
+            restartedStore.refresh()
             guard case let .active(sameIncident, _)? = restartedUpdates.last else {
                 return XCTFail("expected the same outage after presenter restart")
             }
             XCTAssertEqual(sameIncident.id, firstIncident.id)
-            XCTAssertTrue(acknowledgement.contains(sameIncident))
+            XCTAssertTrue(acknowledgement.contains(sameIncident), "the same durable occurrence remains acknowledged after restart")
 
             let recoveredAt = start.addingTimeInterval(20)
             try writeDaemonStatus(
@@ -2147,6 +2361,10 @@ final class StatusStoreIntegrationTests: XCTestCase {
             )
             var newUpdates: [IncidentUpdate] = []
             newStore.onIncident = { newUpdates.append($0) }
+            newStore.refresh()
+            XCTAssertNil(newStore.currentIncident)
+            current = start.addingTimeInterval(41)
+            try writeManagedStatus(to: managedURL, state: "healthy", updatedAt: current, sequence: 4)
             newStore.refresh()
             guard case let .active(newIncident, _)? = newUpdates.last else {
                 return XCTFail("expected a new outage derived from the newer healthy baseline")
@@ -2184,6 +2402,9 @@ final class StatusStoreIntegrationTests: XCTestCase {
             )
             var updates: [IncidentUpdate] = []
             store.onIncident = { updates.append($0) }
+            current = start
+            store.refresh()
+            current = start.addingTimeInterval(10)
             store.refresh()
             guard case .active? = updates.last else {
                 return XCTFail("expected the original missing-channel occurrence")
@@ -2217,6 +2438,88 @@ final class StatusStoreIntegrationTests: XCTestCase {
         }
     }
 
+    func testHealthySupervisorHeartbeatAfterContinuityBaselineRecoversAndStaysQuiet() async throws {
+        let root = try managedStatusFixtureRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let statusDirectory = root.appendingPathComponent("status", isDirectory: true)
+        let managedURL = statusDirectory.appendingPathComponent("managed.json")
+        let supervisorURL = statusDirectory.appendingPathComponent("supervisor.json")
+        let start = Date(timeIntervalSince1970: 7_550)
+        let epoch = "supervisor-epoch-stable"
+        try writeManagedStatus(to: managedURL, state: "healthy", updatedAt: start, sequence: 1)
+        try writeSupervisorStatus(
+            to: supervisorURL,
+            state: "healthy",
+            updatedAt: start,
+            sequence: 10,
+            recoveryEpochID: epoch,
+            recoveryEpochEstablishedAt: start
+        )
+        try writeStatusContinuity(
+            root: root,
+            component: "supervisor",
+            epochID: epoch,
+            establishedAt: start,
+            sequence: 10
+        )
+
+        try await MainActor.run {
+            var current = start
+            // Pinned to the old escalation window: this case covers recovery causality,
+            // not how long a read gap must last before it reaches the user.
+            let store = StatusStore(appGroupURL: root, staleHeartbeatIncidentTimeout: 10, now: { current })
+            var updates: [IncidentUpdate] = []
+            store.onIncident = { updates.append($0) }
+            store.refresh()
+            XCTAssertTrue(updates.isEmpty)
+
+            current = start.addingTimeInterval(10)
+            try writeManagedStatus(to: managedURL, state: "healthy", updatedAt: current, sequence: 2)
+            try writeSupervisorStatus(
+                to: supervisorURL,
+                state: "healthy",
+                updatedAt: start,
+                sequence: 10,
+                recoveryEpochID: epoch,
+                recoveryEpochEstablishedAt: start
+            )
+            store.refresh()
+            guard case let .active(active, _)? = updates.last else {
+                return XCTFail("expected a stale supervisor heartbeat to alert")
+            }
+
+            current = start.addingTimeInterval(11)
+            try writeManagedStatus(to: managedURL, state: "healthy", updatedAt: current, sequence: 3)
+            try writeSupervisorStatus(
+                to: supervisorURL,
+                state: "healthy",
+                updatedAt: current,
+                sequence: 11,
+                recoveryEpochID: epoch,
+                recoveryEpochEstablishedAt: start
+            )
+            store.refresh()
+            guard case let .recovered(recovered)? = updates.last else {
+                return XCTFail("a later healthy heartbeat on the same continuity epoch must recover")
+            }
+            XCTAssertEqual(recovered.id, active.id)
+
+            current = start.addingTimeInterval(12)
+            try writeManagedStatus(to: managedURL, state: "healthy", updatedAt: current, sequence: 4)
+            try writeSupervisorStatus(
+                to: supervisorURL,
+                state: "healthy",
+                updatedAt: current,
+                sequence: 12,
+                recoveryEpochID: epoch,
+                recoveryEpochEstablishedAt: start
+            )
+            store.refresh()
+            XCTAssertEqual(updates.count, 2, "later healthy heartbeats on the same epoch must not reopen the window")
+            XCTAssertNil(store.currentIncident)
+        }
+    }
+
     func testChannelRecoveryHandsOffToTheSameManagedOccurrenceWithoutANewWindow() async throws {
         let root = try managedStatusFixtureRoot()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -2236,6 +2539,9 @@ final class StatusStoreIntegrationTests: XCTestCase {
             let store = StatusStore(appGroupURL: root, now: { current })
             var updates: [IncidentUpdate] = []
             store.onIncident = { updates.append($0) }
+            current = start
+            store.refresh()
+            current = start.addingTimeInterval(10)
             store.refresh()
             guard case let .active(channelIncident, firstIsNew)? = updates.last else {
                 return XCTFail("expected the missing managed channel occurrence")
@@ -2392,11 +2698,13 @@ private func writeSupervisorStatus(
     backendID: String = "supervisor-backend-a",
     mountPoint: String = "/managed/sessions",
     resourcePath: String = "/group/native-fskit",
+    recoveryEpochID: String? = nil,
+    recoveryEpochEstablishedAt: Date? = nil,
     detail: String = ""
 ) throws {
     let formatter = ISO8601DateFormatter()
     formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-    let payload: [String: Any] = [
+    var payload: [String: Any] = [
         "schemaVersion": 2,
         "component": "supervisor",
         "state": state,
@@ -2409,6 +2717,12 @@ private func writeSupervisorStatus(
         "mountPoint": mountPoint,
         "resourcePath": resourcePath,
     ]
+    if let recoveryEpochID {
+        payload["recoveryEpochID"] = recoveryEpochID
+    }
+    if let recoveryEpochEstablishedAt {
+        payload["recoveryEpochEstablishedAt"] = formatter.string(from: recoveryEpochEstablishedAt)
+    }
     let data = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
     try data.write(to: url, options: .atomic)
 }

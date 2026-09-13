@@ -54,6 +54,14 @@ func AuthorizeGenerationRemoval(ctx context.Context, storeDir string, candidate 
 	if filepath.Dir(filepath.Clean(candidate.Path)) != expectedRoot || !safeGeneration(filepath.Base(candidate.Path)) {
 		return nil, errors.New("pack-generation candidate is outside the pack store")
 	}
+	// Older generations may predate durable publication identities. They
+	// cannot be deleted automatically, but must not block unrelated cleanup.
+	// Malformed or mismatched identities still fail the full checks below.
+	if _, err := os.Lstat(filepath.Join(candidate.Path, "published.json")); errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	} else if err != nil {
+		return nil, err
+	}
 
 	managed, err := storage.AcquireManagedSessionDeletionGuard(ctx, storeDir)
 	if err != nil {

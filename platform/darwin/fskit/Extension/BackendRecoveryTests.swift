@@ -6,6 +6,7 @@ import Foundation
 @main
 private enum BackendRecoveryTests {
     static func main() throws {
+        try testDirectoryEnumerationContinuation()
         try testTransportClassification()
         try testConnectErrorClassification()
         try testWriteRecoveryDecisions()
@@ -14,10 +15,23 @@ private enum BackendRecoveryTests {
         try testConcurrentCallersShareRecovery()
         try testRecoveryDeadlineIsBounded()
         try testCoordinatorPublishesUnavailable()
+        try testFrontendRuntimeScopeIsValidatedAndApplied()
         try testFrontendStatusIsAtomicallyPublished()
         try testFrontendStatusUsesProvidedRuntimeRoot()
         try testFrontendStatusPublicationReportsUnsafeDestination()
         print("BackendRecoveryTests: PASS")
+    }
+
+    private static func testDirectoryEnumerationContinuation() throws {
+        let cache = DirectoryEnumerationCache<Int>()
+        cache.store(node: 10, generation: 1, entries: [1, 2, 3])
+        try require(cache.continuation(node: 10, generation: 1, start: 2) == [1, 2, 3], "continuation must reuse listing")
+        try require(cache.continuation(node: 10, generation: 2, start: 2) == nil, "changed directory must not reuse listing")
+        cache.store(node: 10, generation: 2, entries: [4])
+        try require(cache.continuation(node: 10, generation: 2, start: 0) == nil, "new enumeration must reread even unchanged directory")
+        try require(cache.continuation(node: 10, generation: 2, start: 1) == nil, "new enumeration invalidates previous snapshot")
+        cache.store(node: 10, generation: 2, entries: Array(0...16_384))
+        try require(cache.continuation(node: 10, generation: 2, start: 1) == nil, "oversized snapshots must not remain resident")
     }
 
     private static func testTransportClassification() throws {
@@ -207,6 +221,27 @@ private enum BackendRecoveryTests {
             let elapsed = Date().timeIntervalSince(startedAt)
             try require(elapsed >= 0.04, "recovery stopped before its retry window")
             try require(elapsed < 0.2, "recovery exceeded its configured deadline")
+        }
+    }
+
+    private static func testFrontendRuntimeScopeIsValidatedAndApplied() throws {
+        let root = URL(fileURLWithPath: "/tmp/group.vip.jstar.codexfold", isDirectory: true)
+        let scoped = FrontendRuntimeLocation.containerURL(
+            appGroupURL: root,
+            environment: ["CODEXFOLD_RUNTIME_SCOPE": "acceptance-a193842z"]
+        )
+        try require(
+            scoped == root.appendingPathComponent("acceptance-a193842z", isDirectory: true),
+            "frontend runtime scope must stay beneath the app-group root"
+        )
+        for invalid in ["", ".", "..", "nested/scope", "../outside", " scope"] {
+            try require(
+                FrontendRuntimeLocation.containerURL(
+                    appGroupURL: root,
+                    environment: ["CODEXFOLD_RUNTIME_SCOPE": invalid]
+                ) == nil,
+                "invalid frontend runtime scope must fail closed: \(invalid)"
+            )
         }
     }
 

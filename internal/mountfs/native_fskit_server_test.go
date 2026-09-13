@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -608,6 +609,68 @@ func TestNativeFSKitServerPublishesDirectoryResourceWithScopedSocket(t *testing.
 	}
 	if _, err := os.Lstat(options.SocketPath); err != nil {
 		t.Fatalf("scoped socket: %v", err)
+	}
+}
+
+func TestNativeFSKitServerReplacesStaleUnixSocketAndRestoresPing(t *testing.T) {
+	root := shortNativeFSKitTestDir(t, "cfs-stale-")
+	resource := filepath.Join(root, "native-fskit")
+	socketPath := filepath.Join(resource, "daemon.sock")
+	if err := os.MkdirAll(resource, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: socketPath, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener.SetUnlinkOnClose(false)
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(socketPath)
+	if err != nil {
+		t.Fatalf("stale socket fixture: %v", err)
+	}
+	if info.Mode()&os.ModeSocket == 0 {
+		t.Fatalf("stale socket fixture mode = %v", info.Mode())
+	}
+
+	filesystem := NewCanonical()
+	filesystem.SetNativeRoot(filepath.Join(root, "native"))
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- ServeNativeFSKit(ctx, filesystem, NativeFSKitServerOptions{
+			SocketPath: socketPath, ResourcePath: resource,
+			Token: bytes.Repeat([]byte{0x42}, 32), Generation: 92, BuildSHA256: strings.Repeat("c", 64),
+		})
+	}()
+	defer func() {
+		cancel()
+		select {
+		case err := <-done:
+			if err != nil && !errors.Is(err, context.Canceled) {
+				t.Errorf("server shutdown: %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Error("server did not stop")
+		}
+	}()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		client, dialErr := fskitproto.DialResource(resource, 100*time.Millisecond)
+		if dialErr == nil {
+			_, pingErr := client.Call(fskitproto.OpPing, nil)
+			_ = client.Close()
+			if pingErr == nil {
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("backend did not replace stale socket and restore ping: %v", dialErr)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

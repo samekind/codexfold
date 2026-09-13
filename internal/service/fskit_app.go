@@ -31,6 +31,24 @@ func FSKitHostLauncherPath(appPath string) (string, error) {
 	return filepath.Join(appPath, "Contents", "MacOS", FSKitHostExecutableName), nil
 }
 
+func FSKitAppPathFromLauncher(launcher string) (string, error) {
+	if !filepath.IsAbs(launcher) {
+		return "", errors.New("FSKit launcher path must be absolute")
+	}
+	launcher = filepath.Clean(launcher)
+	if filepath.Base(launcher) != FSKitHostExecutableName {
+		return "", errors.New("FSKit launcher path must identify the host executable")
+	}
+	macosDir := filepath.Dir(launcher)
+	contentsDir := filepath.Dir(macosDir)
+	appPath := filepath.Dir(contentsDir)
+	expected, err := FSKitHostLauncherPath(appPath)
+	if err != nil || expected != launcher {
+		return "", errors.New("FSKit launcher path is not inside a CodexFold app bundle")
+	}
+	return appPath, nil
+}
+
 func FSKitModulePath(appPath string) (string, error) {
 	launcher, err := FSKitHostLauncherPath(appPath)
 	if err != nil {

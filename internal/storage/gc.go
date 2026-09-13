@@ -51,7 +51,7 @@ type GCOptions struct {
 	BeforePackStage func(GCCandidate) error
 	// AuthorizePackGenerationRemoval must return a guard that keeps every
 	// surviving reconstruction source stable until the candidate is removed.
-	// A nil authorizer disables destructive pack-generation cleanup.
+	// A nil authorizer or nil guard retains the unproved candidate.
 	AuthorizePackGenerationRemoval func(context.Context, GCCandidate) (PackGenerationRemovalGuard, error)
 	// AuthorizeExactRemoval must verify a durable operation record and hold
 	// every lock needed to keep the returned exact byte proof stable until
@@ -228,6 +228,10 @@ func Collect(ctx context.Context, options GCOptions) (StorageGCResult, error) {
 			packGuard, err = options.AuthorizePackGenerationRemoval(ctx, candidate)
 			if packGuard != nil {
 				unlock = packGuard.Close
+			} else if err == nil {
+				result.RetainedUnprovedCount++
+				result.RetainedUnprovedApparentBytes += candidate.ApparentBytes
+				continue
 			}
 		} else {
 			if options.AuthorizeExactRemoval == nil {

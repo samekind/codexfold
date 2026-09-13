@@ -225,6 +225,75 @@ func TestPublisherContinuityChangesOnlyAfterDurableHealthyPublication(t *testing
 	}
 }
 
+func TestPublisherReusesHealthyContinuityEpochForLaterHeartbeats(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "status", "supervisor.json")
+	base := Snapshot{
+		Component: "supervisor", State: "healthy",
+		MountPoint: "/mount", ResourcePath: "/resource",
+		PublisherInstanceID: "publisher-a", BackendID: "backend-a",
+		ObservationSequence: 10,
+	}
+
+	first := NewPublisher(path, nil)
+	first.Publish(base)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := first.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	firstStatus, err := Read(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstContinuity, err := Read(ContinuityPath(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstContinuity.State != "healthy" || firstStatus.RecoveryEpochID == "" || firstStatus.RecoveryEpochID != firstContinuity.RecoveryEpochID {
+		t.Fatalf("first healthy continuity mismatch: status=%#v continuity=%#v", firstStatus, firstContinuity)
+	}
+
+	second := NewPublisher(path, nil)
+	base.ObservationSequence = 11
+	second.Publish(base)
+	if err := second.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	secondStatus, err := Read(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondContinuity, err := Read(ContinuityPath(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secondStatus.RecoveryEpochID != firstStatus.RecoveryEpochID ||
+		secondStatus.RecoveryEpochAt != firstStatus.RecoveryEpochAt ||
+		secondContinuity.RecoveryEpochID != firstContinuity.RecoveryEpochID ||
+		secondContinuity.Generation != firstContinuity.Generation {
+		t.Fatalf("healthy heartbeat reminted recovery epoch: first=%#v second=%#v firstContinuity=%#v secondContinuity=%#v", firstStatus, secondStatus, firstContinuity, secondContinuity)
+	}
+	if secondStatus.ObservationSequence != 11 {
+		t.Fatalf("status observation sequence = %d", secondStatus.ObservationSequence)
+	}
+
+	third := NewPublisher(path, nil)
+	base.BackendID = "backend-b"
+	base.ObservationSequence = 1
+	third.Publish(base)
+	if err := third.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	thirdStatus, err := Read(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if thirdStatus.RecoveryEpochID == secondStatus.RecoveryEpochID {
+		t.Fatal("backend identity change must establish a new healthy continuity epoch")
+	}
+}
+
 func TestContinuityPublicationFollowsSuccessfulMainStatusPublication(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "status", "daemon.json")
 	snapshot := Snapshot{

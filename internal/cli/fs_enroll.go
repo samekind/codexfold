@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -31,10 +32,25 @@ type enrollmentFlags struct {
 	nativeRoot         string
 	stableFor          time.Duration
 	batchSize          int
+	archivedOnly       bool
 	canonicalNamespace bool
 	canary             bool
 	jsonOutput         bool
+	statusPaths        []string
 }
+
+type enrollmentApplyHooks struct {
+	onPhase         func(string)
+	onProgress      func(done, total int)
+	stop            func() bool
+	skipMaintenance bool
+}
+
+var errEnrollmentStopped = errors.New("automatic folding stopped")
+
+var enrollmentPolicyPollInterval = 2 * time.Second
+
+var enrollmentPolicyMinInterval = 30 * time.Second
 
 type FSEnrollmentApplyResult struct {
 	Plan        enroll.Plan                   `json:"plan"`
@@ -43,6 +59,7 @@ type FSEnrollmentApplyResult struct {
 }
 
 type FSEnrollmentMaintenanceResult struct {
+	ReclaimDeferred    bool                            `json:"reclaim_deferred,omitempty"`
 	NativeRetention    storage.NativeSnapshotRetention `json:"native_retention"`
 	NativeCandidates   int                             `json:"native_candidates"`
 	NativeRetired      int                             `json:"native_retired"`
@@ -80,13 +97,24 @@ func enrollmentChildEnvironment(environment []string) []string {
 	return result
 }
 
-var runServiceEnrollmentCycle = runEnrollmentCycle
+var runServiceEnrollmentCycle = applyEnrollmentCycle
 
 var discoverEnrollmentSessionStates = vfs.DiscoverSessionStates
+
+var verifyEnrollmentPack = func(ctx context.Context, home, store string) error {
+	return runEnrollmentCommand(ctx, []string{"pack", "doctor", "--codex-home", home, "--store", store})
+}
+
+var verifyEnrollmentFold = func(ctx context.Context, home, store string) error {
+	return runEnrollmentCommand(ctx, []string{"doctor", "--codex-home", home, "--store", store})
+}
 
 var runEnrollmentStorageGC = func(ctx context.Context, store string) (storage.StorageGCResult, error) {
 	return storage.Collect(ctx, storage.GCOptions{
 		StoreDir: store, Apply: true,
+		// Old packs are retained only by live leases or failed recovery proof,
+		// not an unconditional second full copy of the compressed store.
+		KeepPackGenerations: 1,
 		AuthorizePackGenerationRemoval: func(ctx context.Context, candidate storage.GCCandidate) (storage.PackGenerationRemovalGuard, error) {
 			return pack.AuthorizeGenerationRemoval(ctx, store, candidate)
 		},
@@ -166,6 +194,29 @@ func newFSEnrollApplyCommand() *cobra.Command {
 }
 
 func runEnrollmentCycle(ctx context.Context, flags enrollmentFlags) (FSEnrollmentApplyResult, error) {
+	return applyEnrollmentCycle(ctx, flags, enrollmentApplyHooks{})
+}
+
+func (hooks enrollmentApplyHooks) stopIfRequested() error {
+	if hooks.stop != nil && hooks.stop() {
+		return errEnrollmentStopped
+	}
+	return nil
+}
+
+func (hooks enrollmentApplyHooks) reportPhase(phase string) {
+	if hooks.onPhase != nil {
+		hooks.onPhase(phase)
+	}
+}
+
+func (hooks enrollmentApplyHooks) reportProgress(done, total int) {
+	if hooks.onProgress != nil {
+		hooks.onProgress(done, total)
+	}
+}
+
+func applyEnrollmentCycle(ctx context.Context, flags enrollmentFlags, hooks enrollmentApplyHooks) (FSEnrollmentApplyResult, error) {
 	home, err := codex.ResolveHome(flags.codexHome)
 	if err != nil {
 		return FSEnrollmentApplyResult{}, err
@@ -205,22 +256,84 @@ func runEnrollmentCycle(ctx context.Context, flags enrollmentFlags) (FSEnrollmen
 	if err != nil {
 		return result, err
 	}
+	if len(selected) != 0 {
+		if err := hooks.stopIfRequested(); err != nil {
+			return result, err
+		}
+	}
+	operationTotal := 0
+	if len(selected) != 0 {
+		// Each child command is a separately completed operation. The final
+		// doctor remains outstanding until it succeeds, so progress cannot show
+		// 100% while verification is still running.
+		operationTotal = len(selected)*2 + 3
+		if !hooks.skipMaintenance {
+			operationTotal++ // Pack-only recovery verification and space reclamation.
+		}
+	}
+	operationDone := 0
+	hooks.reportProgress(operationDone, operationTotal)
+	// Time the two halves of a cycle separately. Folding is what each extra
+	// session costs; the pack rebuild is the toll the whole batch shares. The
+	// next cycle sizes itself so the second stays small against the first.
+	foldStarted := time.Now()
+	var foldSeconds, packSeconds float64
 	for _, decision := range selected {
+		if err := hooks.stopIfRequested(); err != nil {
+			return result, err
+		}
+		hooks.reportPhase(enroll.PhaseFolding)
 		if err := revalidateEnrollmentDecision(ctx, home, decision, true); err != nil {
 			return result, fmt.Errorf("prepare enrollment for %s: %w", decision.SessionID, err)
 		}
 		if err := runEnrollmentCommand(ctx, []string{"fold", decision.SessionID, "--codex-home", home, "--store", store, "--apply", "--overwrite"}); err != nil {
 			return result, fmt.Errorf("fold enrollment for %s: %w", decision.SessionID, err)
 		}
+		operationDone++
+		hooks.reportProgress(operationDone, operationTotal)
 	}
 	if len(selected) != 0 {
+		foldSeconds = time.Since(foldStarted).Seconds()
+		if err := hooks.stopIfRequested(); err != nil {
+			return result, err
+		}
+		hooks.reportPhase(enroll.PhasePacking)
+		packStarted := time.Now()
 		if err := runEnrollmentCommand(ctx, []string{"pack", "build", "--codex-home", home, "--store", store}); err != nil {
 			return result, fmt.Errorf("build enrollment pack for %d sessions: %w", len(selected), err)
 		}
+		operationDone++
+		hooks.reportProgress(operationDone, operationTotal)
+		if err := verifyEnrollmentPack(ctx, home, store); err != nil {
+			return result, fmt.Errorf("verify enrollment pack for %d sessions: %w", len(selected), err)
+		}
+		packSeconds = time.Since(packStarted).Seconds()
+		// Record before migration: what was measured is already true, and a
+		// migration that fails should still teach the next cycle its own cost.
+		// A tuning record that cannot be written costs the next cycle a good batch
+		// size, not correctness, so it does not fail the cycle.
+		_ = enroll.SaveTuning(
+			enrollmentTuningPath(store),
+			enroll.LoadTuning(enrollmentTuningPath(store)).Observe(packSeconds, foldSeconds, len(selected)),
+		)
+		operationDone++
+		hooks.reportProgress(operationDone, operationTotal)
 	}
+	// A session that cannot be routed is this session's problem, not the batch's.
+	// Returning here skips reclamation, and reclamation is the half of the cycle
+	// that shrinks the store: the pack build above has already written a new
+	// generation, so aborting leaves the store larger than it started and does it
+	// again every cycle for as long as one session stays stuck. Collect the
+	// failures, keep going, and report them after the space has been reclaimed.
+	var migrationErrors []error
 	for _, decision := range selected {
+		if err := hooks.stopIfRequested(); err != nil {
+			return result, err
+		}
+		hooks.reportPhase(enroll.PhaseMigrating)
 		if err := revalidateEnrollmentDecision(ctx, home, decision, false); err != nil {
-			return result, fmt.Errorf("commit enrollment for %s: %w", decision.SessionID, err)
+			migrationErrors = append(migrationErrors, fmt.Errorf("commit enrollment for %s: %w", decision.SessionID, err))
+			continue
 		}
 		arguments := []string{
 			"fs", "migrate", decision.SessionID, "--codex-home", home, "--store", store,
@@ -230,16 +343,40 @@ func runEnrollmentCycle(ctx context.Context, flags enrollmentFlags) (FSEnrollmen
 			arguments = append(arguments, "--compatibility-canary", "--cli", "none", "--desktop-app", "none")
 		}
 		if err := runEnrollmentCommand(ctx, arguments); err != nil {
-			return result, fmt.Errorf("migrate enrollment for %s: %w", decision.SessionID, err)
+			if ctx.Err() != nil {
+				return result, err
+			}
+			migrationErrors = append(migrationErrors, fmt.Errorf("migrate enrollment for %s: %w", decision.SessionID, err))
+			continue
 		}
 		result.Apply.Applied++
+		operationDone++
+		hooks.reportProgress(operationDone, operationTotal)
 	}
 	if ctx.Err() != nil {
 		return result, ctx.Err()
 	}
-	maintenance, maintenanceErr := runEnrollmentMaintenance(ctx, home, store, result.Apply.Applied)
+	if err := hooks.stopIfRequested(); err != nil {
+		return result, err
+	}
+	if len(selected) != 0 {
+		if err := verifyEnrollmentFold(ctx, home, store); err != nil {
+			return result, fmt.Errorf("verify enrollment after migration: %w", err)
+		}
+		operationDone++
+		hooks.reportProgress(operationDone, operationTotal)
+	}
+	if hooks.skipMaintenance {
+		return result, errors.Join(migrationErrors...)
+	}
+	hooks.reportPhase(enroll.PhaseReclaiming)
+	maintenance, maintenanceErr := runEnrollmentMaintenance(ctx, home, store, result.Apply.Applied, len(migrationErrors) == 0)
 	result.Maintenance = maintenance
-	return result, maintenanceErr
+	if maintenanceErr == nil && !maintenance.ReclaimDeferred && operationTotal > 0 {
+		operationDone++
+		hooks.reportProgress(operationDone, operationTotal)
+	}
+	return result, errors.Join(append(migrationErrors, maintenanceErr)...)
 }
 
 func revalidateEnrollmentDecision(ctx context.Context, home string, decision enroll.Decision, validateRollout bool) error {
@@ -270,24 +407,342 @@ func revalidateEnrollmentDecision(ctx context.Context, home string, decision enr
 }
 
 func runPeriodicEnrollment(ctx context.Context, flags enrollmentFlags, interval time.Duration, report enrollmentCycleReporter) {
-	if interval <= 0 {
-		return
+	control := resolveEnrollmentControl(flags, interval)
+	nextApply := time.Time{}
+	if control.Enabled {
+		nextApply = time.Now()
 	}
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+	progress := applyEnrollmentControl(newEnrollmentProgress(flags, control, enroll.PhaseDisabled), flags, control)
+	if control.Enabled {
+		progress.Phase = enroll.PhaseIdle
+		progress.NextCheckAt = nextApply
+	}
+	publishEnrollmentProgress(flags, progress)
+
 	for {
-		select {
-		case <-ctx.Done():
+		if err := ctx.Err(); err != nil {
 			return
-		case <-ticker.C:
-			result, err := runServiceEnrollmentCycle(ctx, flags)
-			if report != nil {
-				report(result, err)
-			}
-			if ctx.Err() != nil {
-				return
+		}
+		wait := enrollmentPolicyPollInterval
+		if control.Enabled && !nextApply.IsZero() {
+			if remaining := time.Until(nextApply); remaining < wait {
+				wait = remaining
 			}
 		}
+		if wait < 0 {
+			wait = 0
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+
+		previous := control
+		control = resolveEnrollmentControl(flags, interval)
+		now := time.Now()
+		if enrollmentControlChanged(previous, control) {
+			if control.Enabled && !previous.Enabled {
+				nextApply = now
+			} else if control.Enabled && previous.Interval != control.Interval {
+				nextApply = now.Add(effectiveEnrollmentInterval(control, interval))
+			}
+			if !control.Enabled {
+				nextApply = time.Time{}
+			}
+			progress = applyEnrollmentControl(progress, flags, control)
+			if control.Enabled {
+				progress.Phase = enroll.PhaseIdle
+				progress.NextCheckAt = nextApply
+			} else {
+				progress.Phase = enroll.PhaseDisabled
+				progress.NextCheckAt = time.Time{}
+			}
+			publishEnrollmentProgress(flags, progress)
+			continue
+		}
+		if !control.Enabled || nextApply.IsZero() || now.Before(nextApply) {
+			progress = applyEnrollmentControl(progress, flags, control)
+			if control.Enabled {
+				progress.Phase = enroll.PhaseIdle
+				progress.NextCheckAt = nextApply
+			} else {
+				progress.Phase = enroll.PhaseDisabled
+				progress.NextCheckAt = time.Time{}
+			}
+			publishEnrollmentProgress(flags, progress)
+			continue
+		}
+
+		cycleFlags := flagsWithEnrollmentControl(flags, control)
+		progress = applyEnrollmentControl(progress, flags, control)
+		progress.Phase = enroll.PhaseChecking
+		progress.CycleTotal = 0
+		progress.CycleDone = 0
+		progress.NextCheckAt = time.Time{}
+		progress.LastError = ""
+		publishEnrollmentProgress(flags, progress)
+
+		cycleCtx, cycleCancel := context.WithCancel(ctx)
+		watchDone := make(chan struct{})
+		go func() {
+			defer close(watchDone)
+			poll := enrollmentPolicyPollInterval
+			if poll <= 0 {
+				poll = 100 * time.Millisecond
+			}
+			ticker := time.NewTicker(poll)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-cycleCtx.Done():
+					return
+				case <-ticker.C:
+					if next := resolveEnrollmentControl(flags, interval); !next.Enabled {
+						cycleCancel()
+						return
+					}
+				}
+			}
+		}()
+		result, err := runServiceEnrollmentCycle(cycleCtx, cycleFlags, enrollmentApplyHooks{
+			onPhase: func(phase string) {
+				progress.Phase = phase
+				publishEnrollmentProgress(flags, progress)
+			},
+			onProgress: func(done, total int) {
+				progress.CycleDone = done
+				progress.CycleTotal = total
+				publishEnrollmentProgress(flags, progress)
+			},
+			stop: func() bool {
+				return !resolveEnrollmentControl(flags, interval).Enabled
+			},
+		})
+		cycleCancel()
+		<-watchDone
+		if report != nil {
+			report(result, err)
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		progress = applyEnrollmentControl(progress, flags, control)
+		progress.WaitingCount = enrollmentRemainingWaiting(result)
+		progress.WaitingKnown = true
+		progress.ManagedCount = enrollmentManagedCount(cycleFlags, result)
+		if progress.CycleTotal > 0 && err == nil && !result.Maintenance.ReclaimDeferred {
+			progress.CycleDone = progress.CycleTotal
+		}
+		if err != nil && !errors.Is(err, errEnrollmentStopped) && !errors.Is(err, context.Canceled) {
+			progress.LastError = "retry"
+			progress.ErrorKind = "operation"
+		} else {
+			progress.LastError = ""
+			progress.ErrorKind = ""
+		}
+		control = resolveEnrollmentControl(flags, interval)
+		if control.Enabled {
+			nextApply = time.Now().Add(effectiveEnrollmentInterval(control, interval))
+			progress.Phase = enroll.PhaseIdle
+			if err == nil && result.Maintenance.ReclaimDeferred {
+				progress.Phase = enroll.PhaseWaitingReclaim
+			}
+			progress.NextCheckAt = nextApply
+		} else {
+			nextApply = time.Time{}
+			progress.Phase = enroll.PhaseDisabled
+			progress.NextCheckAt = time.Time{}
+		}
+		progress = applyEnrollmentControl(progress, flags, control)
+		publishEnrollmentProgress(flags, progress)
+	}
+}
+
+// The plan describes the start of the cycle; successfully migrated sessions
+// must not remain in the displayed queue until the next scheduled scan.
+func enrollmentRemainingWaiting(result FSEnrollmentApplyResult) int {
+	return max(0, enroll.WaitingCount(result.Plan)-result.Apply.Applied)
+}
+
+func resolveEnrollmentControl(flags enrollmentFlags, flagInterval time.Duration) enroll.Control {
+	path := enrollmentControlPath(flags)
+	if path == "" {
+		return flagEnrollmentControl(flags, flagInterval)
+	}
+	control, err := enroll.LoadControl(path)
+	if err != nil {
+		return enroll.Control{
+			Present:     true,
+			ConfigError: fmt.Sprintf("enrollment policy is invalid: %v", err),
+		}
+	}
+	if !control.Present {
+		return flagEnrollmentControl(flags, flagInterval)
+	}
+	if control.Enabled && control.Interval > 0 && control.Interval < enrollmentPolicyMinInterval {
+		control.Interval = enrollmentPolicyMinInterval
+	}
+	return control
+}
+
+func flagEnrollmentControl(flags enrollmentFlags, flagInterval time.Duration) enroll.Control {
+	return enroll.Control{
+		Enabled:      flagInterval > 0,
+		Interval:     flagInterval,
+		StableFor:    flags.stableFor,
+		ArchivedOnly: flags.archivedOnly,
+		BatchSize:    flags.batchSize,
+	}
+}
+
+func enrollmentControlPath(flags enrollmentFlags) string {
+	if flags.storeDir != "" {
+		if !filepath.IsAbs(flags.storeDir) {
+			return ""
+		}
+		return enroll.ControlPath(flags.storeDir)
+	}
+	if flags.codexHome == "" {
+		return ""
+	}
+	home, err := codex.ResolveHome(flags.codexHome)
+	if err != nil {
+		return ""
+	}
+	return enroll.ControlPath(resolveFoldStore(home, flags.storeDir))
+}
+
+func effectiveEnrollmentInterval(control enroll.Control, flagInterval time.Duration) time.Duration {
+	if control.Present {
+		if control.Interval < enrollmentPolicyMinInterval {
+			return enrollmentPolicyMinInterval
+		}
+		return control.Interval
+	}
+	if control.Interval > 0 {
+		return control.Interval
+	}
+	return flagInterval
+}
+
+func enrollmentControlChanged(previous enroll.Control, next enroll.Control) bool {
+	return previous.Present != next.Present ||
+		previous.ConfigError != next.ConfigError ||
+		previous.Enabled != next.Enabled ||
+		previous.Interval != next.Interval ||
+		previous.StableFor != next.StableFor ||
+		previous.ArchivedOnly != next.ArchivedOnly ||
+		previous.BatchSize != next.BatchSize
+}
+
+func flagsWithEnrollmentControl(flags enrollmentFlags, control enroll.Control) enrollmentFlags {
+	if control.StableFor > 0 {
+		flags.stableFor = control.StableFor
+	}
+	// Zero is the automatic setting and has to reach the planner as zero; only a
+	// number the user actually chose overrides it.
+	if control.Present {
+		flags.batchSize = control.BatchSize
+	}
+	flags.archivedOnly = control.ArchivedOnly
+	return flags
+}
+
+func newEnrollmentProgress(flags enrollmentFlags, control enroll.Control, phase string) enroll.Progress {
+	progress := enroll.Progress{
+		Enabled:      control.Enabled,
+		Interval:     control.Interval,
+		StableFor:    control.StableFor,
+		ArchivedOnly: control.ArchivedOnly,
+		Phase:        phase,
+		ManagedCount: enrollmentManagedCount(flags, FSEnrollmentApplyResult{}),
+	}
+	if store := enrollmentStorePath(flags); store != "" {
+		progress.StorePath = store
+	}
+	return progress
+}
+
+func applyEnrollmentControl(progress enroll.Progress, flags enrollmentFlags, control enroll.Control) enroll.Progress {
+	progress.Enabled = control.Enabled
+	progress.Interval = control.Interval
+	progress.StableFor = control.StableFor
+	progress.ArchivedOnly = control.ArchivedOnly
+	if control.ConfigError != "" {
+		progress.LastError = control.ConfigError
+		progress.ErrorKind = "configuration"
+	} else if progress.ErrorKind == "configuration" {
+		progress.LastError = ""
+		progress.ErrorKind = ""
+	}
+	if store := enrollmentStorePath(flags); store != "" {
+		progress.StorePath = store
+	}
+	progress.ManagedCount = enrollmentManagedCount(flags, FSEnrollmentApplyResult{})
+	return progress
+}
+
+func enrollmentStorePath(flags enrollmentFlags) string {
+	if flags.storeDir != "" {
+		return filepath.Clean(flags.storeDir)
+	}
+	if flags.codexHome == "" {
+		return ""
+	}
+	home, err := codex.ResolveHome(flags.codexHome)
+	if err != nil {
+		return ""
+	}
+	return resolveFoldStore(home, flags.storeDir)
+}
+
+func enrollmentManagedCount(flags enrollmentFlags, result FSEnrollmentApplyResult) int {
+	if result.Apply.Applied > 0 || len(result.Plan.Decisions) > 0 {
+		count := 0
+		for _, decision := range result.Plan.Decisions {
+			for _, reason := range decision.Reasons {
+				if reason == enroll.ReasonAlreadyManaged {
+					count++
+					break
+				}
+			}
+		}
+		if result.Apply.Applied > 0 {
+			return count + result.Apply.Applied
+		}
+		if count > 0 {
+			return count
+		}
+	}
+	store := enrollmentStorePath(flags)
+	if store == "" {
+		return 0
+	}
+	states, err := vfs.DiscoverSessionStates(store)
+	if err != nil {
+		return 0
+	}
+	return len(states)
+}
+
+func publishEnrollmentProgress(flags enrollmentFlags, progress enroll.Progress) {
+	paths := append([]string(nil), flags.statusPaths...)
+	if store := enrollmentStorePath(flags); store != "" {
+		paths = append(paths, enroll.ProgressPath(store))
+	}
+	seen := make(map[string]struct{}, len(paths))
+	for _, path := range paths {
+		if path == "" || !filepath.IsAbs(path) {
+			continue
+		}
+		if _, ok := seen[path]; ok {
+			continue
+		}
+		seen[path] = struct{}{}
+		_ = enroll.SaveProgress(path, progress)
 	}
 }
 
@@ -392,9 +847,15 @@ func buildEnrollmentPlan(ctx context.Context, flags enrollmentFlags) (enroll.Pla
 		return enroll.Plan{}, "", err
 	}
 	now := time.Now()
+	// A batch the user did not choose is sized from what the last cycle measured,
+	// so the pack rebuild it has to amortize stays a small share of the work.
+	batchSize := flags.batchSize
+	if batchSize <= 0 {
+		batchSize = enroll.AutoBatchSize(enroll.LoadTuning(enrollmentTuningPath(store)), enroll.DefaultAutoBatchLimits)
+	}
 	input := enroll.Input{
 		Sessions: sessions, Managed: managed, Previous: observations, Now: now,
-		Policy: enroll.Policy{StableFor: flags.stableFor, BatchSize: flags.batchSize, ArchivedOnly: false},
+		Policy: enroll.Policy{StableFor: flags.stableFor, BatchSize: batchSize, ArchivedOnly: flags.archivedOnly},
 		Gates: enroll.Gates{
 			DoctorHealthy: true, MountHealthy: mountHealthy,
 			CanonicalNamespace: flags.canonicalNamespace, NamespaceActive: readiness.Active, NamespaceReady: readiness.Ready,
@@ -413,6 +874,20 @@ func buildEnrollmentPlan(ctx context.Context, flags enrollmentFlags) (enroll.Pla
 	// it off the no-op polling path, but require it before any batch mutation.
 	if enrollmentStorageHealthProbe(ctx, store) == nil {
 		return plan, store, nil
+	}
+	// A pack build that was refused — most often because the disk was briefly
+	// too full — leaves the objects it should have packed still referenced by
+	// manifests the pack cannot read. The doctor reports exactly that, and
+	// reporting it is all the cycle used to do: the gate then blocked every
+	// candidate, so the store stayed unhealthy and nothing folded again, on
+	// every cycle, until a person noticed. Packing what is already on disk is
+	// the same step the batch would have run anyway and it removes nothing, so
+	// attempt it once before giving the cycle up. If it is still refused, the
+	// gate closes exactly as before.
+	if healErr := runEnrollmentCommand(ctx, []string{"pack", "build", "--codex-home", home, "--store", store}); healErr == nil {
+		if enrollmentStorageHealthProbe(ctx, store) == nil {
+			return plan, store, nil
+		}
 	}
 	input.Gates.DoctorHealthy = false
 	plan, err = enroll.Build(ctx, input)
@@ -450,11 +925,20 @@ func automaticEnrollmentAllowed(capability fsctl.Capability) bool {
 	return capability != fsctl.StorageEngine
 }
 
+func enrollmentTuningPath(store string) string {
+	return filepath.Join(filepath.Clean(store), "enrollment", "tuning.json")
+}
+
 func enrollmentObservationPath(store string) string {
 	return filepath.Join(filepath.Clean(store), "enrollment", "observations.json")
 }
 
-func runEnrollmentMaintenance(ctx context.Context, home string, store string, newlyApplied int) (FSEnrollmentMaintenanceResult, error) {
+// runEnrollmentMaintenance reclaims space after a cycle. retireNative is false
+// when some session in the batch could not be routed: reclaiming data the pack
+// already holds is always safe, but deleting a user's original file is not
+// something to start doing while part of the cycle is failing. Those sessions
+// defer to the next clean cycle.
+func runEnrollmentMaintenance(ctx context.Context, home string, store string, newlyApplied int, retireNative bool) (FSEnrollmentMaintenanceResult, error) {
 	retention, err := storage.LoadRetentionPolicy(store)
 	if err != nil {
 		return FSEnrollmentMaintenanceResult{}, fmt.Errorf("load storage retention policy: %w", err)
@@ -466,11 +950,14 @@ func runEnrollmentMaintenance(ctx context.Context, home string, store string, ne
 	}
 	var maintenanceErrors []error
 	for _, state := range states {
+		if err := ctx.Err(); err != nil {
+			return result, errors.Join(append(maintenanceErrors, err)...)
+		}
 		if state.NativeSnapshot.Path == "" {
 			continue
 		}
 		result.NativeCandidates++
-		if retention.NativeSnapshots == storage.NativeSnapshotRetentionManual {
+		if !retireNative || retention.NativeSnapshots == storage.NativeSnapshotRetentionManual {
 			result.NativeDeferred++
 			result.DeferredSessionIDs = append(result.DeferredSessionIDs, state.SessionID)
 			continue
@@ -482,23 +969,63 @@ func runEnrollmentMaintenance(ctx context.Context, home string, store string, ne
 		}
 		result.NativeDeferred++
 		result.DeferredSessionIDs = append(result.DeferredSessionIDs, state.SessionID)
-		if !strings.Contains(err.Error(), "active writer") {
+		if strings.Contains(err.Error(), "active writer") {
+			result.ReclaimDeferred = true
+		} else {
 			maintenanceErrors = append(maintenanceErrors, fmt.Errorf("retire native snapshot for %s: %w", state.SessionID, err))
 		}
 	}
-	if newlyApplied > 0 || result.NativeCandidates > 0 {
+	loosePresent, looseErr := enrollmentHasLooseObjects(store)
+	if looseErr != nil {
+		maintenanceErrors = append(maintenanceErrors, looseErr)
+	}
+	if newlyApplied > 0 || result.NativeCandidates > 0 || len(states) > 0 && loosePresent {
+		if err := ctx.Err(); err != nil {
+			return result, errors.Join(append(maintenanceErrors, err)...)
+		}
 		if err := runEnrollmentCommand(ctx, []string{"pack", "retire-loose", "--codex-home", home, "--store", store, "--apply"}); err != nil {
-			maintenanceErrors = append(maintenanceErrors, fmt.Errorf("retire loose objects: %w", err))
+			if strings.Contains(err.Error(), storage.ErrManagedSessionBusy.Error()) {
+				result.ReclaimDeferred = true
+			} else {
+				maintenanceErrors = append(maintenanceErrors, fmt.Errorf("retire loose objects: %w", err))
+			}
 		} else {
 			result.LooseRetirementRan = true
 		}
 	}
-	if result.LooseRetirementRan || result.NativeRetired > 0 {
+	// Retry collection on later enabled cycles after a reader has released an
+	// old generation, even when every native snapshot was already retired.
+	if result.LooseRetirementRan || result.NativeRetired > 0 || len(states) > 0 {
+		if err := ctx.Err(); err != nil {
+			return result, errors.Join(append(maintenanceErrors, err)...)
+		}
 		gc, err := runEnrollmentStorageGC(ctx, store)
 		result.StorageGC = gc
-		if err != nil {
+		if errors.Is(err, storage.ErrManagedSessionBusy) {
+			result.ReclaimDeferred = true
+		} else if err != nil {
 			maintenanceErrors = append(maintenanceErrors, fmt.Errorf("collect old storage generations: %w", err))
 		}
 	}
 	return result, errors.Join(maintenanceErrors...)
+}
+
+// A previous cycle may have retired the native snapshot but deferred loose
+// cleanup behind a live writer. Retry that work without requiring a new fold.
+func enrollmentHasLooseObjects(store string) (bool, error) {
+	found := false
+	err := filepath.WalkDir(filepath.Join(store, "objects"), func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".zst") {
+			found = true
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	if errors.Is(err, os.ErrNotExist) {
+		err = nil
+	}
+	return found, err
 }

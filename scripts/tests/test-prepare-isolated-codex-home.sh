@@ -146,7 +146,9 @@ slice_home="$TEST_ROOT/target slice's"
 [[ "$(sqlite3 "$slice_home/state_5.sqlite" 'SELECT count(*) FROM thread_dynamic_tools;')" == 1 ]]
 [[ "$(sqlite3 "$slice_home/state_5.sqlite" 'SELECT count(*) FROM thread_spawn_edges;')" == 0 ]]
 [[ "$(sqlite3 "$slice_home/state_5.sqlite" 'PRAGMA integrity_check;')" == ok ]]
-[[ "$(sqlite3 "$slice_home/state_5.sqlite" "SELECT rollout_path FROM threads WHERE id='$active_new';")" == "$slice_home/sessions/2026/07/26/rollout-2026-07-26T01-00-00-$active_new.jsonl" ]]
+expected_active_new_path="$slice_home/sessions/2026/07/26/rollout-2026-07-26T01-00-00-$active_new.jsonl"
+expected_active_new_path="$(cd "$(dirname "$expected_active_new_path")" && pwd -P)/$(basename "$expected_active_new_path")"
+[[ "$(sqlite3 "$slice_home/state_5.sqlite" "SELECT rollout_path FROM threads WHERE id='$active_new';")" == "$expected_active_new_path" ]]
 [[ "$(wc -l < "$slice_home/selected-sessions.tsv" | tr -d ' ')" == 2 ]]
 awk -F '\t' 'NF == 6 && $4 ~ /^[0-9]+$/ && $5 ~ /^[0-9a-f]{64}$/ && $6 ~ /^[0-9a-f]{64}$/ { ok++ } END { exit(ok == 2 ? 0 : 1) }' \
   "$slice_home/selected-sessions.tsv"
@@ -267,6 +269,49 @@ if "$PREPARE" "$source_home" "$symlink_home" --session "$symlink_id" >/dev/null 
   exit 1
 fi
 [[ ! -e "$symlink_home" ]]
+
+# A production canonical namespace makes the two top-level session directories
+# symlinks to a mounted tree. The namespace link is valid, while rollout files
+# and nested paths must still resolve inside that exact mounted namespace.
+mounted_id=88888888-8888-7888-8888-888888888888
+mounted_source="$TEST_ROOT/mounted-source"
+mounted_root="$TEST_ROOT/mounted-root"
+mounted_rollout="$mounted_source/archived_sessions/rollout-2026-07-26T07-00-00-$mounted_id.jsonl"
+mkdir -p "$mounted_source" "$mounted_root/sessions" "$mounted_root/archived_sessions"
+printf 'model_provider = "main"\n' > "$mounted_source/config.toml"
+printf '{}\n' > "$mounted_source/auth.json"
+printf '{"session":"mounted-real"}\n' > "$mounted_root/archived_sessions/$(basename "$mounted_rollout")"
+ln -s "$mounted_root/sessions" "$mounted_source/sessions"
+ln -s "$mounted_root/archived_sessions" "$mounted_source/archived_sessions"
+sqlite3 "$mounted_source/state_5.sqlite" <<SQL
+CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, updated_at INTEGER NOT NULL, archived INTEGER NOT NULL DEFAULT 0);
+INSERT INTO threads VALUES('$mounted_id', '$mounted_rollout', 1, 1);
+SQL
+printf '{"id":"%s","thread_name":"mounted","updated_at":"1"}\n' "$mounted_id" > "$mounted_source/session_index.jsonl"
+mounted_home="$TEST_ROOT/mounted-target"
+"$PREPARE" "$mounted_source" "$mounted_home" --session "$mounted_id" >/dev/null
+cmp -s "$mounted_root/archived_sessions/$(basename "$mounted_rollout")" \
+  "$mounted_home/archived_sessions/$(basename "$mounted_rollout")"
+expected_mounted_path="$mounted_home/archived_sessions/$(basename "$mounted_rollout")"
+expected_mounted_path="$(cd "$(dirname "$expected_mounted_path")" && pwd -P)/$(basename "$expected_mounted_path")"
+[[ "$(sqlite3 "$mounted_home/state_5.sqlite" "SELECT rollout_path FROM threads WHERE id='$mounted_id';")" == \
+   "$expected_mounted_path" ]]
+
+escaped_id=99999999-9999-7999-8999-999999999998
+escaped_root="$TEST_ROOT/escaped-root"
+escaped_rollout="$mounted_source/sessions/escaped/rollout-2026-07-26T08-00-00-$escaped_id.jsonl"
+mkdir -p "$escaped_root"
+printf '{"session":"escaped"}\n' > "$escaped_root/$(basename "$escaped_rollout")"
+ln -s "$escaped_root" "$mounted_root/sessions/escaped"
+sqlite3 "$mounted_source/state_5.sqlite" \
+  "INSERT INTO threads VALUES('$escaped_id', '$escaped_rollout', 2, 0);"
+printf '{"id":"%s","thread_name":"escaped","updated_at":"2"}\n' "$escaped_id" >> "$mounted_source/session_index.jsonl"
+escaped_home="$TEST_ROOT/nested-symlink-escape"
+if "$PREPARE" "$mounted_source" "$escaped_home" --session "$escaped_id" >/dev/null 2>&1; then
+  echo "explicit session accepted a nested namespace symlink escape" >&2
+  exit 1
+fi
+[[ ! -e "$escaped_home" ]]
 
 special_id=77777777-7777-7777-8777-777777777777
 special_rollout="$source_home/sessions/2026/07/26/rollout-2026-07-26T06-00-00-$special_id.jsonl"

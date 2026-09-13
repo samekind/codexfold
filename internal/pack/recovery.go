@@ -169,6 +169,21 @@ func writeRecoveryArchive(storeDir string, generationDir string, meta indexV3Met
 	return syncDirectory(generationDir)
 }
 
+func writeLegacyGenerationRecoveryArchive(storeDir string, directory string) error {
+	index, err := openIndexV3(directory)
+	if err != nil {
+		return fmt.Errorf("open legacy current pack index: %w", err)
+	}
+	meta := index.meta
+	if err := index.close(); err != nil {
+		return err
+	}
+	if err := writeRecoveryArchive(storeDir, directory, meta); err != nil {
+		return fmt.Errorf("create legacy current recovery archive: %w", err)
+	}
+	return nil
+}
+
 func collectRecoverySources(storeDir string, generationDir string, meta indexV3Meta) ([]recoverySource, []RecoveryFile, error) {
 	var sources []recoverySource
 	for _, name := range []string{indexV3MetaFilename, indexV3ObjectsFile, indexV3BlocksFile} {
@@ -179,8 +194,13 @@ func collectRecoverySources(storeDir string, generationDir string, meta indexV3M
 		}
 		sources = append(sources, recoverySource{archivePath: name, diskPath: path, identity: identity})
 	}
+	resolver, err := openGeneration(generationDir, 0, false)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer resolver.Close()
 	manifestRoot := filepath.Join(filepath.Clean(storeDir), "manifests")
-	err := filepath.WalkDir(manifestRoot, func(path string, entry os.DirEntry, walkErr error) error {
+	err = filepath.WalkDir(manifestRoot, func(path string, entry os.DirEntry, walkErr error) error {
 		if errors.Is(walkErr, os.ErrNotExist) {
 			return filepath.SkipDir
 		}
@@ -195,6 +215,16 @@ func collectRecoverySources(storeDir string, generationDir string, meta indexV3M
 			return fmt.Errorf("unsafe recovery manifest path %q", path)
 		}
 		archivePath := filepath.ToSlash(relative)
+		manifest, loadErr := fold.LoadManifestPath(path)
+		if loadErr != nil {
+			return loadErr
+		}
+		if verifyErr := fold.VerifyManifest(context.Background(), resolver, manifest); verifyErr != nil {
+			if errors.Is(verifyErr, ErrObjectNotPacked) {
+				return nil
+			}
+			return verifyErr
+		}
 		identity, err := recoveryFileIdentity(archivePath, path)
 		if err != nil {
 			return err
@@ -1545,17 +1575,8 @@ func migrateLegacyCurrentPublication(ctx context.Context, storeDir string, gener
 	}
 	catalog, err := VerifyRecovery(ctx, storeDir, generation)
 	if errors.Is(err, os.ErrNotExist) {
-		index, indexErr := openIndexV3(directory)
-		if indexErr != nil {
-			return "", 0, fmt.Errorf("open legacy current pack index: %w", indexErr)
-		}
-		meta := index.meta
-		closeErr := index.close()
-		if closeErr != nil {
-			return "", 0, closeErr
-		}
-		if err := writeRecoveryArchive(storeDir, directory, meta); err != nil {
-			return "", 0, fmt.Errorf("create legacy current recovery archive: %w", err)
+		if writeErr := writeLegacyGenerationRecoveryArchive(storeDir, directory); writeErr != nil {
+			return "", 0, writeErr
 		}
 		catalog, err = VerifyRecovery(ctx, storeDir, generation)
 	}
@@ -1566,10 +1587,25 @@ func migrateLegacyCurrentPublication(ctx context.Context, storeDir string, gener
 	if err != nil {
 		return "", 0, err
 	}
-	verifyErr := verifyRecoveryAndLiveManifests(ctx, storeDir, directory, catalog, resolver)
+	_, verifyErr := verifyRecoveryManifestArchive(ctx, directory, catalog, resolver)
 	closeErr := resolver.Close()
+	if errors.Is(verifyErr, ErrObjectNotPacked) {
+		if writeErr := writeLegacyGenerationRecoveryArchive(storeDir, directory); writeErr != nil {
+			return "", 0, errors.Join(closeErr, writeErr)
+		}
+		catalog, err = VerifyRecovery(ctx, storeDir, generation)
+		if err != nil {
+			return "", 0, errors.Join(closeErr, fmt.Errorf("verify rewritten legacy current recovery archive: %w", err))
+		}
+		resolver, err = openGeneration(directory, 0, false)
+		if err != nil {
+			return "", 0, errors.Join(closeErr, err)
+		}
+		_, verifyErr = verifyRecoveryManifestArchive(ctx, directory, catalog, resolver)
+		closeErr = errors.Join(closeErr, resolver.Close())
+	}
 	if err := errors.Join(verifyErr, closeErr); err != nil {
-		return "", 0, fmt.Errorf("verify legacy current live manifests: %w", err)
+		return "", 0, fmt.Errorf("verify legacy current recovery archive: %w", err)
 	}
 	current, err := CurrentGeneration(storeDir)
 	if err != nil || current != generation {

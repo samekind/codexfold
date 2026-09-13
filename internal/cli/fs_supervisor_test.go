@@ -17,6 +17,7 @@ func TestFSNativeSupervisorDryRunReportsAbsoluteRuntimePaths(t *testing.T) {
 		"fs", "supervise",
 		"--resource", filepath.Join(root, "resource.bin"),
 		"--mount", filepath.Join(root, "mount"),
+		"--fskit-type", "codexfolda108",
 		"--json",
 	})
 	if err := command.Execute(); err != nil {
@@ -26,7 +27,21 @@ func TestFSNativeSupervisorDryRunReportsAbsoluteRuntimePaths(t *testing.T) {
 	if err := json.Unmarshal(output.Bytes(), &result); err != nil {
 		t.Fatalf("decode supervisor dry-run: %v\n%s", err, output.String())
 	}
-	if !result.DryRun || result.ResourcePath == "" || result.MountPoint == "" {
+	if !result.DryRun || result.ResourcePath == "" || result.MountPoint == "" || result.FSKitType != "codexfolda108" {
 		t.Fatalf("unexpected supervisor dry-run: %#v", result)
+	}
+}
+
+func TestFSNativeSupervisorRejectsUnsafeMountType(t *testing.T) {
+	root := t.TempDir()
+	command := NewRootCommand()
+	command.SetArgs([]string{
+		"fs", "supervise",
+		"--resource", filepath.Join(root, "resource.bin"),
+		"--mount", filepath.Join(root, "mount"),
+		"--fskit-type", "codexfold;bad",
+	})
+	if err := command.Execute(); err == nil {
+		t.Fatal("unsafe FSKit mount type was accepted")
 	}
 }

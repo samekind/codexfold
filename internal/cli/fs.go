@@ -21,6 +21,7 @@ import (
 	"github.com/samekind/codexfold/internal/cdc"
 	"github.com/samekind/codexfold/internal/codex"
 	"github.com/samekind/codexfold/internal/compat"
+	"github.com/samekind/codexfold/internal/enroll"
 	"github.com/samekind/codexfold/internal/fold"
 	"github.com/samekind/codexfold/internal/fsctl"
 	"github.com/samekind/codexfold/internal/fskitproto"
@@ -726,30 +727,32 @@ func newFSServeCommand() *cobra.Command {
 					}
 				}()
 			}
-			var enrollmentDone chan struct{}
-			if enrollmentInterval > 0 {
-				enrollmentDone = make(chan struct{})
-				flags := enrollmentFlags{
-					codexHome: home, storeDir: store, mountPoint: mount, nativeRoot: nativeRoot,
-					stableFor: enrollmentStableFor, batchSize: enrollmentBatchSize,
-					canonicalNamespace: canonicalNamespace, canary: enrollmentCanary,
-				}
-				go func() {
-					defer close(enrollmentDone)
-					runPeriodicEnrollment(ctx, flags, enrollmentInterval, func(result FSEnrollmentApplyResult, cycleErr error) {
-						if cycleErr != nil {
-							if !errors.Is(cycleErr, context.Canceled) {
-								_, _ = fmt.Fprintf(command.ErrOrStderr(), "enrollment cycle failed: %v\n", cycleErr)
-							}
-							return
-						}
-						if len(result.Plan.Selected) == 0 && result.Apply.Applied == 0 && result.Maintenance.NativeCandidates == 0 {
-							return
-						}
-						_, _ = fmt.Fprintf(command.ErrOrStderr(), "enrollment cycle sessions=%d selected=%d applied=%d native_retired=%d native_deferred=%d gc_removed=%d\n", len(result.Plan.Decisions), len(result.Plan.Selected), result.Apply.Applied, result.Maintenance.NativeRetired, result.Maintenance.NativeDeferred, result.Maintenance.StorageGC.RemovedCount)
-					})
-				}()
+			enrollmentDone := make(chan struct{})
+			enrollmentStatusPaths := []string{enroll.ProgressPath(store)}
+			if frontend == "native-fskit" {
+				enrollmentStatusPaths = append(enrollmentStatusPaths, service.FSKitStatusPath(nativeFSKitResource, "enrollment"))
 			}
+			flags := enrollmentFlags{
+				codexHome: home, storeDir: store, mountPoint: mount, nativeRoot: nativeRoot,
+				stableFor: enrollmentStableFor, batchSize: enrollmentBatchSize,
+				canonicalNamespace: canonicalNamespace, canary: enrollmentCanary,
+				statusPaths: enrollmentStatusPaths,
+			}
+			go func() {
+				defer close(enrollmentDone)
+				runPeriodicEnrollment(ctx, flags, enrollmentInterval, func(result FSEnrollmentApplyResult, cycleErr error) {
+					if cycleErr != nil {
+						if !errors.Is(cycleErr, context.Canceled) && !errors.Is(cycleErr, errEnrollmentStopped) {
+							_, _ = fmt.Fprintf(command.ErrOrStderr(), "enrollment cycle failed: %v\n", cycleErr)
+						}
+						return
+					}
+					if len(result.Plan.Selected) == 0 && result.Apply.Applied == 0 && result.Maintenance.NativeCandidates == 0 {
+						return
+					}
+					_, _ = fmt.Fprintf(command.ErrOrStderr(), "enrollment cycle sessions=%d selected=%d applied=%d native_retired=%d native_deferred=%d gc_removed=%d\n", len(result.Plan.Decisions), len(result.Plan.Selected), result.Apply.Applied, result.Maintenance.NativeRetired, result.Maintenance.NativeDeferred, result.Maintenance.StorageGC.RemovedCount)
+				})
+			}()
 			known := make(map[string]uint64)
 			knownRoutes := make(map[string]string)
 			knownPacks := make(map[string]string)
@@ -1033,7 +1036,11 @@ func newFSServeCommand() *cobra.Command {
 					// Recovery and repair can outlive a SQLite route change. Refresh at
 					// the final publication boundary so stale metadata never authorizes a
 					// Move, Upsert, retirement acknowledgement, or owner switch.
-					codexSessions, err = codex.LoadSessions(home)
+					ids := make([]string, 0, len(states))
+					for _, state := range states {
+						ids = append(ids, state.SessionID)
+					}
+					codexSessions, err = codex.LoadSessionsByID(home, ids)
 					if err != nil {
 						observation.Fatal = errors.Join(observation.Fatal, fmt.Errorf("refresh Codex metadata before managed route publication: %w", err))
 						return observation
@@ -1182,9 +1189,7 @@ func newFSServeCommand() *cobra.Command {
 				<-storageStatusDone
 			}
 			<-runtimeMemoryMaintenanceDone
-			if enrollmentDone != nil {
-				<-enrollmentDone
-			}
+			<-enrollmentDone
 			var nativeWatcherErr error
 			if nativeWatcherDone != nil {
 				nativeWatcherErr = <-nativeWatcherDone
@@ -2507,6 +2512,15 @@ func recoverInterruptedCanonicalMigrationWithOptionsLocked(
 	if err != nil {
 		return false, err
 	}
+	// A session with writes cannot be an untouched interrupted migration.
+	// Avoid hashing its potentially large native source on every reload.
+	if state.BackingPath != "" {
+		return false, nil
+	}
+	delta, deltaErr := os.Stat(state.DeltaPath)
+	if deltaErr == nil && delta.Size() != 0 {
+		return false, nil
+	}
 	source, err := hashStableCanonicalNativeFile(nativeRoot, sourcePath)
 	if errors.Is(err, os.ErrNotExist) {
 		return false, nil
@@ -2514,15 +2528,8 @@ func recoverInterruptedCanonicalMigrationWithOptionsLocked(
 	if err != nil {
 		return false, err
 	}
-	if state.BackingPath != "" {
-		return false, nil
-	}
-	delta, err := os.Stat(state.DeltaPath)
-	if err != nil {
-		return false, err
-	}
-	if delta.Size() != 0 {
-		return false, nil
+	if deltaErr != nil {
+		return false, deltaErr
 	}
 	if source.Bytes != state.BaseBytes || source.SHA256 != state.BaseSHA256 || source.Bytes != state.NativeSnapshot.Bytes || source.SHA256 != state.NativeSnapshot.SHA256 {
 		return false, errors.New("interrupted canonical migration source no longer matches the managed base")

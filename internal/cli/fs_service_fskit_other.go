@@ -14,3 +14,11 @@ func prepareFSKitAppPlatform(context.Context, string, string, bool) (fsKitAppTra
 func ensureFSKitMenuBarResidency(context.Context, string) FSKitResidencyServiceOutcome {
 	return FSKitResidencyServiceOutcome{State: "unavailable", Detail: "CodexFold menu-bar residency is available only on macOS"}
 }
+
+func reclaimNativeFSKitMount(context.Context, string, string) error {
+	return nil
+}
+
+func reapIdleCodexFoldFSKitModuleProcesses(context.Context, string) error {
+	return nil
+}

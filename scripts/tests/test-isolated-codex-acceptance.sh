@@ -17,15 +17,15 @@ trap cleanup EXIT
 # Pure parsers are sourceable without dispatching the runner. An old registered
 # module path must not satisfy the exact current-candidate path check.
 (
-  # shellcheck source=../run-isolated-codex-acceptance.sh
+  # shellcheck disable=SC1090,SC1091
   source "$RUNNER"
-  candidate_module='/private/tmp/current candidate/CodexFoldFSKit.app/Contents/Extensions/CodexFoldFSKitModule.appex'
-  old_output=$'+    vip.jstar.codexfold.fskitprofileprobe.module(0.3.0)\tOLD\t2026-07-24 18:23:02 +0000\t/Users/test/Applications/CodexFoldFSKit.app/Contents/Extensions/CodexFoldFSKitModule.appex'
+  candidate_module='/private/tmp/current candidate/CodexFoldVerification.app/Contents/Extensions/CodexFoldFSKitModule.appex'
+  old_output=$'+    vip.jstar.codexfold.verification.module(0.3.0)\tOLD\t2026-07-24 18:23:02 +0000\t/Users/test/Applications/CodexFoldVerification.app/Contents/Extensions/CodexFoldFSKitModule.appex'
   if registered_fskit_module_output_contains "$old_output" "$candidate_module"; then
     echo "old registered FSKit module path matched the current candidate" >&2
     exit 1
   fi
-  exact_output="$old_output"$'\n'"+    vip.jstar.codexfold.fskitprofileprobe.module(0.3.0)"$'\tCURRENT\t2026-07-26 10:00:45 +0000\t'"$candidate_module"
+  exact_output="$old_output"$'\n'"+    vip.jstar.codexfold.verification.module(0.3.0)"$'\tCURRENT\t2026-07-26 10:00:45 +0000\t'"$candidate_module"
   registered_fskit_module_output_contains "$exact_output" "$candidate_module"
   while IFS= read -r module_pid; do
     [[ "$module_pid" =~ ^[0-9]+$ ]] || {
@@ -60,8 +60,9 @@ trap cleanup EXIT
   snapshot_repo="$TEST_ROOT/source-snapshot-repo"
   mkdir "$snapshot_repo"
   git -C "$snapshot_repo" init -q
+  printf '/.tmp/\n' > "$snapshot_repo/.gitignore"
   printf 'tracked-v1\n' > "$snapshot_repo/tracked.txt"
-  git -C "$snapshot_repo" add tracked.txt
+  git -C "$snapshot_repo" add .gitignore tracked.txt
   snapshot_v1=$(source_snapshot_sha "$snapshot_repo")
   printf 'tracked-v2\n' > "$snapshot_repo/tracked.txt"
   snapshot_v2=$(source_snapshot_sha "$snapshot_repo")
@@ -69,14 +70,115 @@ trap cleanup EXIT
   printf 'untracked\n' > "$snapshot_repo/untracked.txt"
   snapshot_with_untracked=$(source_snapshot_sha "$snapshot_repo")
   [[ "$snapshot_v2" != "$snapshot_with_untracked" ]]
+  mkdir -p "$snapshot_repo/.tmp/nested-repository"
+  git -C "$snapshot_repo/.tmp/nested-repository" init -q
+  [[ "$(source_snapshot_sha "$snapshot_repo")" == "$snapshot_with_untracked" ]]
   if source_snapshot_sha "$TEST_ROOT" >/dev/null 2>&1; then
     echo "source snapshot accepted a non-repository directory" >&2
     exit 1
   fi
 
+  # A mounted-path hash must fail within its bound when the target never
+  # produces EOF; otherwise a broken FSKit endpoint can wedge the verifier.
+  hung_fifo="$TEST_ROOT/hung-rollout.fifo"
+  mkfifo "$hung_fifo"
+  started_at=$(date +%s)
+  if bounded_file_sha 1 "$hung_fifo" >/dev/null 2>&1; then
+    echo "bounded_file_sha unexpectedly read a non-terminating FIFO" >&2
+    exit 1
+  fi
+  elapsed=$(( $(date +%s) - started_at ))
+  (( elapsed <= 3 )) || {
+    echo "bounded_file_sha exceeded its timeout: ${elapsed}s" >&2
+    exit 1
+  }
+
+  api_home="$TEST_ROOT/api-home"
+  mkdir -p "$api_home"
+  printf '%s\n' \
+    'preferred_auth_method = "apikey"' \
+    'cli_auth_credentials_store = "file"' \
+    '[model_providers.main]' \
+    'requires_openai_auth = true' \
+    'base_url = "https://provider.invalid/v1"' > "$api_home/config.toml"
+  printf '{}\n' > "$api_home/auth.json"
+  sanitize_acceptance_credentials "$api_home"
+  [[ "$(grep -E '^[[:space:]]*requires_openai_auth[[:space:]]*=' "$api_home/config.toml" | tr -d '[:space:]')" == 'requires_openai_auth=false' ]]
+  [[ "$(grep -E '^[[:space:]]*env_key[[:space:]]*=' "$api_home/config.toml" | tr -d '[:space:]')" == 'env_key="OPENAI_API_KEY"' ]]
+  [[ "$(grep -E '^[[:space:]]*forced_login_method[[:space:]]*=' "$api_home/config.toml" | tr -d '[:space:]')" == 'forced_login_method="api"' ]]
+  if grep -Eq '^[[:space:]]*notify[[:space:]]*=' "$api_home/config.toml"; then
+    echo "isolated API-key config retained notify" >&2
+    exit 1
+  fi
+  if grep -Eq '^\[(plugins|mcp_servers)\.' "$api_home/config.toml"; then
+    echo "isolated API-key config retained plugin or MCP configuration" >&2
+    exit 1
+  fi
+  if grep -Eq '^\[marketplaces\.' "$api_home/config.toml"; then
+    echo "isolated API-key config retained marketplace configuration" >&2
+    exit 1
+  fi
+  if grep -Eq '^[[:space:]]*requires_openai_auth[[:space:]]*=[[:space:]]*true' "$api_home/config.toml"; then
+    echo "isolated API-key config still requests OpenAI OAuth" >&2
+    exit 1
+  fi
+  printf '{}\n' > "$api_home/auth.json"
+  fake_login="$TEST_ROOT/fake-codex-login"
+  # shellcheck disable=SC2016
+  printf '#!/usr/bin/env bash\nset -euo pipefail\n[[ "$1" == login && "$2" == --with-api-key ]]\nIFS= read -r _key\nprintf seen > "$HOME/.api-key-seen"\nprintf '\''{"auth_mode":"apikey","OPENAI_API_KEY":"fixture-key"}\n'\'' > "$CODEX_HOME/auth.json"\n' > "$fake_login"
+  chmod 700 "$fake_login"
+  HOME="$api_home" install_acceptance_api_key "$api_home" fixture-key "$fake_login"
+  [[ -f "$api_home/.codexfold-acceptance-api-key" ]]
+  [[ -f "$api_home/.api-key-seen" ]]
+  [[ "$(jq -c 'keys | sort' "$api_home/auth.json")" == '["OPENAI_API_KEY","auth_mode"]' ]]
+  [[ "$(stat -f '%p' "$api_home/auth.json")" == 100600 ]]
+
   runtime_epoch_advanced 100 'Sun Jul 26 00:00:00 2026' 101 'Sun Jul 26 00:00:01 2026'
   if runtime_epoch_advanced 100 'Sun Jul 26 00:00:00 2026' 100 'Sun Jul 26 00:00:01 2026'; then
     echo "same-PID STOP/CONT transition was accepted as a crash runtime epoch" >&2
+    exit 1
+  fi
+
+  # Native fault targets are allowed only below the exact resource root
+  # parsed from the candidate service definition, while the task observer may
+  # legitimately bind to the crash-before identity.
+  CANDIDATE_ROOT="$TEST_ROOT/candidate-root"
+  mkdir -p "$CANDIDATE_ROOT"
+  VALIDATED_CANDIDATE_RESOURCE_ROOT="$TEST_ROOT/candidate-resource"
+  mkdir -p "$VALIDATED_CANDIDATE_RESOURCE_ROOT"
+  printf 'descriptor\n' > "$VALIDATED_CANDIDATE_RESOURCE_ROOT/descriptor.bin"
+  expected_descriptor="$(cd "$VALIDATED_CANDIDATE_RESOURCE_ROOT" && pwd -P)/descriptor.bin"
+  [[ "$(canonical_candidate_resource_file "$VALIDATED_CANDIDATE_RESOURCE_ROOT/descriptor.bin")" == "$expected_descriptor" ]]
+  printf 'outside\n' > "$TEST_ROOT/outside-descriptor"
+  if canonical_candidate_resource_file "$TEST_ROOT/outside-descriptor" >/dev/null 2>&1; then
+    echo "outside native descriptor target passed resource-root validation" >&2
+    exit 1
+  fi
+  EVIDENCE_ROOT="$TEST_ROOT/runtime-evidence"
+  mkdir -p "$EVIDENCE_ROOT"
+  jq -n '{before:{pid:101,processStart:"before",commandSHA256:"before-sha"},after:{pid:202,processStart:"after",commandSHA256:"after-sha"}}' > "$EVIDENCE_ROOT/candidate-backend-crash-respawn.json"
+  # These globals are consumed indirectly by the sourced runtime validator.
+  # shellcheck disable=SC2034
+  BACKEND_CRASH_RESPAWN_EVIDENCE_VALID=true
+  # shellcheck disable=SC2034
+  VALIDATED_CANDIDATE_PID=202
+  # shellcheck disable=SC2034
+  VALIDATED_CANDIDATE_PROCESS_START=after
+  # shellcheck disable=SC2034
+  VALIDATED_CANDIDATE_COMMAND_SHA=after-sha
+  candidate_task_runtime_matches 101 before before-sha
+  if candidate_task_runtime_matches 303 unrelated unrelated-sha; then
+    echo "unrelated task runtime passed crash-before/after binding" >&2
+    exit 1
+  fi
+
+  backend_pid_fixture="$TEST_ROOT/backend.pid"
+  printf '1111\n' > "$backend_pid_fixture"
+  write_verified_backend_pid_file "$backend_pid_fixture" 2222
+  [[ "$(tr -d '[:space:]' < "$backend_pid_fixture")" == 2222 ]]
+  ln -s "$backend_pid_fixture" "$TEST_ROOT/backend.pid.symlink"
+  if write_verified_backend_pid_file "$TEST_ROOT/backend.pid.symlink" 3333; then
+    echo "backend PID refresh followed a symlink" >&2
     exit 1
   fi
 
@@ -131,8 +233,8 @@ workspace="$TEST_ROOT/workspace"
 fake_app="$TEST_ROOT/Fake Codex.app"
 run_root="$TEST_ROOT/run's path"
 session_id=44444444-4444-7444-8444-444444444444
-mkdir -p "$source_home/sessions/2026/07/26" "$workspace" "$fake_app/Contents/MacOS" "$fake_app/Contents/Resources"
-printf 'model_provider = "test"\n' > "$source_home/config.toml"
+mkdir -p "$source_home/sessions/2026/07/26" "$source_home/archived_sessions" "$workspace" "$fake_app/Contents/MacOS" "$fake_app/Contents/Resources"
+printf 'model_provider = "test"\npreferred_auth_method = "chatgpt"\nexperimental_bearer_token = "fixture-secret"\n' > "$source_home/config.toml"
 printf '{"access_token":"secret-that-must-not-appear-in-evidence"}\n' > "$source_home/auth.json"
 printf '{"session":"copied without being printed"}\n' > "$source_home/sessions/2026/07/26/rollout-2026-07-26T03-00-00-$session_id.jsonl"
 sqlite3 "$source_home/state_5.sqlite" <<SQL
@@ -148,6 +250,7 @@ plutil -insert CFBundleIdentifier -string com.example.CockpitToolsIsolated "$fak
 plutil -insert CFBundleShortVersionString -string 1.2.3 "$fake_app/Contents/Info.plist"
 plutil -insert CFBundleVersion -string 123 "$fake_app/Contents/Info.plist"
 printf 'workspace\n' > "$workspace/README"
+git -C "$workspace" init -q
 
 "$RUNNER" prepare \
   --source-home "$source_home" \
@@ -157,6 +260,8 @@ printf 'workspace\n' > "$workspace/README"
   --protected-app "$fake_app" \
   --cockpit-app "$fake_app" \
   --workspace "$workspace" >/dev/null
+
+run_root=$(cd "$run_root" && pwd -P)
 
 [[ "$(jq -r '.autoSyncThreads' "$run_root/run.json")" == false ]]
 [[ "$(jq -r '.candidateAttached' "$run_root/run.json")" == false ]]
@@ -182,14 +287,27 @@ grep -Fq 'COCKPIT_TOOLS_TEST_DATA_DIR=' "$run_root/open-isolated-cockpit.sh"
 [[ -x "$run_root/record-native-incident-evidence.sh" ]]
 [[ -x "$run_root/record-native-incident-review.sh" ]]
 grep -Fq '/usr/bin/open -n' "$RUNNER"
-grep -Fq 'open_help=$(/usr/bin/open -h 2>&1 || true)' "$RUNNER"
+open_help_probe="open_help=\$(/usr/bin/open -h 2>&1 || true)"
+grep -Fq "$open_help_probe" "$RUNNER"
+grep -Fq 'unset CODEXFOLD_FSKIT_SCHEME' "$RUNNER"
 if grep -Fq "open -h 2>&1 | grep -q -- '--env'" "$RUNNER"; then
   echo 'launch capability detection must not use grep -q under pipefail' >&2
   exit 1
 fi
 grep -Fq 'CODEX_HOME=' "$run_root/open-isolated-cockpit.sh"
+grep -Fq '/usr/bin/env -i' "$run_root/open-isolated-cockpit.sh"
+grep -Fq '/usr/bin/env -i' "$run_root/launch-isolated-desktop.sh"
+grep -Fq 'ZDOTDIR=' "$run_root/launch-isolated-desktop.sh"
+if grep -Fq '/usr/bin/open -n' "$run_root/launch-isolated-desktop.sh"; then
+  echo "direct Desktop launcher unexpectedly uses LaunchServices" >&2
+  exit 1
+fi
 [[ "$(jq -r '.schema' "$run_root/run.json")" == codexfold.isolated-acceptance.v3 ]]
 [[ "$(jq -r '.cockpitCodexHome' "$run_root/run.json")" == "$(jq -r '.codexHome' "$run_root/run.json")" ]]
+[[ "$(jq -r '.acceptanceAuthMode' "$run_root/run.json")" == isolated-file-api-key ]]
+[[ "$(plutil -extract Label raw -o - "$ROOT_DIR/platform/darwin/fskit/Host/CodexFoldMenuBar.plist")" == vip.jstar.codexfold.fskitprofileprobe.menu-bar ]]
+[[ "$(plutil -extract BundleProgram raw -o - "$ROOT_DIR/platform/darwin/fskit/Host/CodexFoldMenuBar.plist")" == Contents/MacOS/CodexFoldFSKit ]]
+[[ "$(plutil -extract Label raw -o - "$ROOT_DIR/platform/darwin/fskit/Host/CodexFoldIncidentMonitor.plist")" == vip.jstar.codexfold.fskitprofileprobe.incident-monitor ]]
 [[ -n "$(jq -r '.pathFences.runRoot.identity' "$run_root/run.json")" ]]
 module_baseline=$(jq -r '.fskitModuleProcessBaselinePath' "$run_root/run.json")
 [[ "$module_baseline" == "$run_root/evidence/fskit-module-processes.before.tsv" ]]
@@ -227,6 +345,25 @@ if rg -q 'mark-launched|"\$APP_PATH" --args' "$RUNNER" "$ROOT_DIR/scripts/cockpi
   exit 1
 fi
 [[ "$(sqlite3 "$run_root/codex-home/state_5.sqlite" 'SELECT count(*) FROM threads;')" == 1 ]]
+[[ "$(jq -c 'keys | sort' "$run_root/codex-home/auth.json")" == '["OPENAI_API_KEY","auth_mode"]' ]]
+[[ "$(jq -r '.auth_mode' "$run_root/codex-home/auth.json")" == apikey ]]
+[[ "$(jq -r '.OPENAI_API_KEY | type' "$run_root/codex-home/auth.json")" == string ]]
+[[ "$(jq -r '.OPENAI_API_KEY | length' "$run_root/codex-home/auth.json")" -gt 0 ]]
+for isolated_dir in "$run_root/codex-home/.tmp/plugins" "$run_root/codex-home/skills" "$run_root/codex-home/plugins"; do
+  [[ -d "$isolated_dir" && ! -L "$isolated_dir" ]]
+  [[ "$(stat -f '%p' "$isolated_dir")" == 40700 ]]
+done
+if rg -q '^\[(plugins|marketplaces|mcp_servers)\.' "$run_root/codex-home/config.toml"; then
+  echo "isolated CODEX_HOME retained plugin, marketplace, or MCP configuration" >&2
+  exit 1
+fi
+grep -Fq 'preferred_auth_method = "apikey"' "$run_root/codex-home/config.toml"
+grep -Fq 'forced_login_method = "api"' "$run_root/codex-home/config.toml"
+grep -Fq 'cli_auth_credentials_store = "file"' "$run_root/codex-home/config.toml"
+if grep -Fq 'experimental_bearer_token' "$run_root/codex-home/config.toml"; then
+  echo "source provider bearer value leaked into isolated acceptance config" >&2
+  exit 1
+fi
 
 # Historical v2 runs cannot be upgraded in place because they did not capture
 # the loaded Swift module or source/build provenance.
@@ -440,8 +577,8 @@ jq \
   '.schema=$schema |
    .faultTargets.backendPidFile=$candidatePIDFile |
    .faultTargets.backendStatus=$candidateBackendStatus |
-   .candidateApp={path:$candidateApp,directoryIdentity:$candidateAppIdentity,bundleIdentifier:"vip.jstar.codexfold.fskitprofileprobe",shortVersion:"0.3.0",bundleVersion:"104",executablePath:($candidateApp+"/Contents/MacOS/CodexFoldFSKit"),executableSHA256:$zeroSHA,codeDirectoryHash:$zeroCDHash,teamIdentifier:"ABCDEFGHIJ"} |
-   .fskitModule={bundlePath:$oldModule,directoryIdentity:$oldModuleIdentity,bundleIdentifier:"vip.jstar.codexfold.fskitprofileprobe.module",shortVersion:"0.3.0",bundleVersion:"104",fsShortName:"codexfoldnative",executablePath:($oldModule+"/Contents/MacOS/CodexFoldFSKitModule"),executableSHA256:$zeroSHA,codeDirectoryHash:$zeroCDHash,teamIdentifier:"ABCDEFGHIJ",process:{pid:4242,ppid:1,processStart:"Sun Jul 26 00:00:00 2026",executablePath:($oldModule+"/Contents/MacOS/CodexFoldFSKitModule"),executableSHA256:$zeroSHA,commandSHA256:$zeroSHA,baselineSHA256:$baselineSHA}}' \
+   .candidateApp={path:$candidateApp,directoryIdentity:$candidateAppIdentity,bundleIdentifier:"vip.jstar.codexfold.verification",shortVersion:"0.3.0",bundleVersion:"104",executablePath:($candidateApp+"/Contents/MacOS/CodexFoldVerification"),executableSHA256:$zeroSHA,codeDirectoryHash:$zeroCDHash,teamIdentifier:"ABCDEFGHIJ"} |
+   .fskitModule={bundlePath:$oldModule,directoryIdentity:$oldModuleIdentity,bundleIdentifier:"vip.jstar.codexfold.verification.module",shortVersion:"0.3.0",bundleVersion:"104",fsShortName:"codexfoldverification",executablePath:($oldModule+"/Contents/MacOS/CodexFoldFSKitModule"),executableSHA256:$zeroSHA,codeDirectoryHash:$zeroCDHash,teamIdentifier:"ABCDEFGHIJ",process:{pid:4242,ppid:1,processStart:"Sun Jul 26 00:00:00 2026",executablePath:($oldModule+"/Contents/MacOS/CodexFoldFSKitModule"),executableSHA256:$zeroSHA,commandSHA256:$zeroSHA,baselineSHA256:$baselineSHA}}' \
   "$legacy_candidate_input" > "$candidate_input"
 if module_mismatch_error=$("$RUNNER" candidate-evidence --run-root "$run_root" --input "$candidate_input" --dry-run 2>&1); then
   echo "module from another App build fabricated candidate evidence" >&2

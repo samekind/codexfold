@@ -1,5 +1,60 @@
 import Foundation
+import AppKit
 import XCTest
+
+@MainActor
+final class IncidentWindowLifecycleTests: XCTestCase {
+    func testOneWindowUpdatesWithoutRePresentingAndRecoveryClosesIt() throws {
+        _ = NSApplication.shared
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        var shown: [NSWindowController] = []
+        let presenter = IncidentWindowPresenter(appGroupURL: root, diagnosticPayload: { _ in nil }, presentWindow: { shown.append($0) })
+        let incident = makeIncident("first")
+        presenter.handle(.active(incident, isNew: true))
+        XCTAssertEqual(shown.count, 1)
+        let window = try XCTUnwrap(shown.first?.window)
+        XCTAssertNotNil(window.contentViewController)
+        XCTAssertFalse(window.isVisible, "test must never expose or activate a window")
+        presenter.handle(.active(incident, isNew: false))
+        XCTAssertEqual(shown.count, 1)
+        var recovered = incident
+        recovered.recoveredAt = Date()
+        presenter.handle(.recovered(recovered))
+        XCTAssertFalse(IncidentAcknowledgementStore(appGroupURL: root).contains(incident))
+        presenter.handle(.active(makeIncident("second"), isNew: true))
+        XCTAssertEqual(shown.count, 2)
+        XCTAssertFalse(shown.last?.window === window)
+        shown.last?.close()
+    }
+
+    func testDismissedOccurrenceStaysSuppressedAcrossPresenterRestart() throws {
+        _ = NSApplication.shared
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        var shown: [NSWindowController] = []
+        let presenter = IncidentWindowPresenter(appGroupURL: root, diagnosticPayload: { _ in nil }, presentWindow: { shown.append($0) })
+        let incident = makeIncident("dismissed")
+        presenter.presentCurrent(incident)
+        shown.first?.close()
+        XCTAssertTrue(IncidentAcknowledgementStore(appGroupURL: root).contains(incident))
+        presenter.handle(.active(incident, isNew: false))
+        presenter.presentCurrent(incident)
+        let replacement = IncidentWindowPresenter(appGroupURL: root, diagnosticPayload: { _ in nil }, presentWindow: { shown.append($0) })
+        replacement.presentCurrent(incident)
+        XCTAssertEqual(shown.count, 1)
+        replacement.clearAcknowledgementAfterHealthyBaseline()
+        replacement.presentCurrent(makeIncident("next"))
+        XCTAssertEqual(shown.count, 2)
+        shown.last?.close()
+    }
+
+    private func makeIncident(_ id: String) -> FrontendIncident {
+        FrontendIncident(id: id, since: Date(timeIntervalSince1970: 100), reason: "backend unavailable", impact: "session access delayed", recommendations: ["Wait for recovery"], technicalDetails: "isolated test", recoveredAt: nil)
+    }
+}
 
 final class IncidentAcknowledgementStoreTests: XCTestCase {
     func testAdministratorCapabilityUsesOnlyReadOnlyGroupEvidence() {

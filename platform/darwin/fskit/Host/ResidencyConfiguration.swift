@@ -151,11 +151,9 @@ struct ResidencyConfigurator {
             return ResidencyServiceOutcome(state: .enabled, detail: nil)
         case .requiresApproval:
             return ResidencyServiceOutcome(state: .requiresApproval, detail: nil)
-        case .notFound:
-            return ResidencyServiceOutcome(state: .notFound, detail: nil)
         case .unavailable:
             return ResidencyServiceOutcome(state: .unavailable, detail: nil)
-        case .notRegistered:
+        case .notRegistered, .notFound:
             do {
                 try service.register()
             } catch {

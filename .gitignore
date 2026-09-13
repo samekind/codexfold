@@ -1,5 +1,6 @@
 /codexfold
 /codexfold.exe
+/.cfbin
 /dist/
 /*.sqlite
 /*.sqlite-shm
@@ -8,5 +9,10 @@
 *.test
 .DS_Store
 .worktrees/
+/.tmp/
+
+# Xcode build products and derived data
+platform/darwin/fskit/build/
+DerivedData/
 xcuserdata/
 *.xcuserstate

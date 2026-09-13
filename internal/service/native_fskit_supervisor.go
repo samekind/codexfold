@@ -15,9 +15,30 @@ import (
 	"github.com/samekind/codexfold/internal/launcher"
 )
 
-var ErrForeignMount = errors.New("mount point is occupied by a foreign filesystem")
+var (
+	ErrForeignMount                    = errors.New("mount point is occupied by a foreign filesystem")
+	ErrNativeFSKitMountProbeInProgress = errors.New("native FSKit mount health probe is already in progress")
+	// ErrNativeFSKitMountProbeInconclusive reports a mount-table lookup that ran
+	// out of time while the backend was still answering. It is an unusable
+	// observation, not evidence of an outage.
+	ErrNativeFSKitMountProbeInconclusive = errors.New("native FSKit mount health probe was inconclusive")
+)
 
 const NativeFSKitSupervisorLockName = "supervisor.lock"
+
+const NativeFSKitMountType = "codexfoldnative"
+
+func ValidNativeFSKitMountType(value string) bool {
+	if len(value) == 0 || len(value) > 32 || value[0] < 'a' || value[0] > 'z' {
+		return false
+	}
+	for _, character := range value[1:] {
+		if (character < 'a' || character > 'z') && (character < '0' || character > '9') {
+			return false
+		}
+	}
+	return true
+}
 
 type NativeFSKitMountState struct {
 	Mounted bool
@@ -33,14 +54,18 @@ type NativeFSKitOperations interface {
 }
 
 type NativeFSKitSupervisorOptions struct {
-	ResourcePath    string
-	MountPoint      string
-	Interval        time.Duration
-	ProbeTimeout    time.Duration
-	RecoveryTimeout time.Duration
-	StatusPath      string
-	Operations      NativeFSKitOperations
-	Event           func(string)
+	ResourcePath string
+	MountPoint   string
+	FSKitType    string
+	Interval     time.Duration
+	// MountObservationInterval is how long a conclusive "this mount is ours and
+	// healthy" reading stays usable. Defaults to five reconciliation intervals.
+	MountObservationInterval time.Duration
+	ProbeTimeout             time.Duration
+	RecoveryTimeout          time.Duration
+	StatusPath               string
+	Operations               NativeFSKitOperations
+	Event                    func(string)
 }
 
 type nativeFSKitSupervisorStatusTracker struct {
@@ -125,6 +150,14 @@ func (t *nativeFSKitSupervisorStatusTracker) snapshot(
 				"Keep Codex running while CodexFold restores file-service health.",
 				"Open CodexFold to inspect the current incident.",
 			}
+			if strings.Contains(detail, "FSKit module is disabled") {
+				snapshot.Reason = "CodexFold FSKit module is disabled by macOS"
+				snapshot.Recommendations = []string{
+					"Open System Settings > General > Login Items & Extensions.",
+					"Open CodexFoldFSKit FSKit Modules and turn it on.",
+					"Retry the CodexFold service after macOS enables the module.",
+				}
+			}
 		}
 	}
 	if state == "healthy" {
@@ -141,11 +174,20 @@ func RunNativeFSKitSupervisor(ctx context.Context, options NativeFSKitSupervisor
 	if options.StatusPath != "" && !filepath.IsAbs(options.StatusPath) {
 		return errors.New("absolute FSKit supervisor status path is required")
 	}
+	if options.FSKitType == "" {
+		options.FSKitType = NativeFSKitMountType
+	}
+	if !ValidNativeFSKitMountType(options.FSKitType) {
+		return errors.New("FSKit mount type must start with a lowercase letter and contain only lowercase letters or digits")
+	}
 	if options.Interval <= 0 {
 		options.Interval = time.Second
 	}
 	if options.ProbeTimeout <= 0 {
 		options.ProbeTimeout = 2 * time.Second
+	}
+	if options.MountObservationInterval <= 0 {
+		options.MountObservationInterval = 5 * options.Interval
 	}
 	if options.RecoveryTimeout <= 0 {
 		options.RecoveryTimeout = 15 * time.Second
@@ -162,35 +204,38 @@ func RunNativeFSKitSupervisor(ctx context.Context, options NativeFSKitSupervisor
 			statusTracker.resume(previous)
 		}
 		defer func() {
-			closeCtx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			closeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			defer cancel()
-			_ = statusPublisher.Close(closeCtx)
+			if err := statusPublisher.Close(closeCtx); err != nil && options.Event != nil {
+				options.Event("close supervisor status: " + err.Error())
+			}
 		}()
 	}
 	operations := options.Operations
 	if operations == nil {
 		var err error
-		operations, err = defaultNativeFSKitOperations()
+		operations, err = nativeFSKitOperationsForType(options.FSKitType)
 		if err != nil {
 			writeNativeFSKitSupervisorStatus(options, statusPublisher, statusTracker, "unavailable", "File service supervision is unavailable", err)
 			return err
 		}
 	}
 	writeNativeFSKitSupervisorStatus(options, statusPublisher, statusTracker, "recovering", "File service supervision is starting", nil)
+	// Publication must not wait on reconciliation. Mount recovery alone can hold
+	// a single pass for RecoveryTimeout, and a kernel mount-table lookup can
+	// outlive its probe deadline; while either ran, the status file stopped
+	// advancing and the UI reported the resulting read gap as an incident even
+	// though supervision was healthy. Reconcile on its own cadence and keep the
+	// heartbeat on the ticker, so a stale channel means the supervisor is
+	// actually gone rather than merely busy.
+	observations := make(chan nativeFSKitSupervisorObservation, 1)
+	reconcileCtx, stopReconciling := context.WithCancel(ctx)
+	defer stopReconciling()
+	go reconcileNativeFSKitContinuously(reconcileCtx, options, operations, observations)
+	current := nativeFSKitSupervisorObservation{state: "recovering", summary: "File service supervision is starting"}
 	ticker := time.NewTicker(options.Interval)
 	defer ticker.Stop()
 	for {
-		err := reconcileNativeFSKit(ctx, options, operations)
-		if err == nil {
-			writeNativeFSKitSupervisorStatus(options, statusPublisher, statusTracker, "healthy", "File service is available", nil)
-		} else if errors.Is(err, ErrForeignMount) {
-			writeNativeFSKitSupervisorStatus(options, statusPublisher, statusTracker, "unavailable", "Another filesystem occupies the session path", err)
-		} else {
-			writeNativeFSKitSupervisorStatus(options, statusPublisher, statusTracker, "recovering", "File service is recovering", err)
-		}
-		if err != nil && options.Event != nil {
-			options.Event(err.Error())
-		}
 		select {
 		case <-ctx.Done():
 			// Never unmount on shutdown. A daemon/supervisor restart must keep
@@ -207,6 +252,67 @@ func RunNativeFSKitSupervisor(ctx context.Context, options NativeFSKitSupervisor
 			}
 			writeNativeFSKitSupervisorStatus(options, statusPublisher, statusTracker, "stopped", "File service supervision is stopped; mount preserved", nil)
 			return nil
+		case observation := <-observations:
+			current = observation
+			writeNativeFSKitSupervisorStatus(options, statusPublisher, statusTracker, current.state, current.summary, current.err)
+			// A fresh observation is this interval's publication; restarting the
+			// ticker keeps the channel at one write per interval instead of
+			// doubling it whenever reconciliation keeps pace.
+			ticker.Reset(options.Interval)
+		case <-ticker.C:
+			writeNativeFSKitSupervisorStatus(options, statusPublisher, statusTracker, current.state, current.summary, current.err)
+		}
+	}
+}
+
+// nativeFSKitSupervisorObservation is the latest reconciliation outcome the
+// heartbeat republishes until reconciliation reports a different one.
+type nativeFSKitSupervisorObservation struct {
+	state   string
+	summary string
+	err     error
+}
+
+func reconcileNativeFSKitContinuously(
+	ctx context.Context,
+	options NativeFSKitSupervisorOptions,
+	operations NativeFSKitOperations,
+	observations chan<- nativeFSKitSupervisorObservation,
+) {
+	ticker := time.NewTicker(options.Interval)
+	defer ticker.Stop()
+	observed := &nativeFSKitMountObservation{validFor: options.MountObservationInterval}
+	for {
+		err := reconcileNativeFSKit(ctx, options, operations, observed)
+		var observation nativeFSKitSupervisorObservation
+		switch {
+		case errors.Is(err, ErrNativeFSKitMountProbeInProgress),
+			errors.Is(err, ErrNativeFSKitMountProbeInconclusive):
+			// A previous non-cancellable kernel mount-table lookup still owns the
+			// single probe slot. Nothing observable about the mount changed, so
+			// leave the last observation in place instead of turning local probe
+			// serialization into a new recovery incident. The heartbeat keeps
+			// republishing it, so the channel still proves the supervisor is live.
+		case err == nil:
+			observation = nativeFSKitSupervisorObservation{state: "healthy", summary: "File service is available"}
+		case errors.Is(err, ErrForeignMount):
+			observation = nativeFSKitSupervisorObservation{state: "unavailable", summary: "Another filesystem occupies the session path", err: err}
+		default:
+			observation = nativeFSKitSupervisorObservation{state: "recovering", summary: "File service is recovering", err: err}
+		}
+		if observation.state != "" {
+			select {
+			case observations <- observation:
+			case <-ctx.Done():
+				return
+			}
+		}
+		if err != nil && observation.state != "" && options.Event != nil {
+			options.Event(err.Error())
+		}
+		select {
+		case <-ctx.Done():
+			return
 		case <-ticker.C:
 		}
 	}
@@ -226,19 +332,91 @@ func writeNativeFSKitSupervisorStatus(
 	publisher.Publish(tracker.snapshot(options, state, summary, statusErr))
 }
 
+// nativeFSKitMountObservation remembers the last mount-table reading that was
+// conclusive and favourable, so steady-state reconciliation does not re-read the
+// whole table every interval.
+type nativeFSKitMountObservation struct {
+	validFor   time.Duration
+	observedAt time.Time
+	valid      bool
+}
+
+func (o *nativeFSKitMountObservation) usable(now time.Time) bool {
+	if o == nil || !o.valid || o.validFor <= 0 {
+		return false
+	}
+	return now.Sub(o.observedAt) < o.validFor
+}
+
+func (o *nativeFSKitMountObservation) record(state NativeFSKitMountState, now time.Time) {
+	if o == nil {
+		return
+	}
+	// Only an owned, healthy mount may be reused. Every other reading describes
+	// something the supervisor has to act on at the next interval.
+	if !state.Owned || !state.Healthy {
+		o.valid = false
+		return
+	}
+	o.observedAt = now
+	o.valid = true
+}
+
+func (o *nativeFSKitMountObservation) invalidate() {
+	if o != nil {
+		o.valid = false
+	}
+}
+
 func reconcileNativeFSKit(
 	ctx context.Context,
 	options NativeFSKitSupervisorOptions,
 	operations NativeFSKitOperations,
+	observed *nativeFSKitMountObservation,
 ) error {
+	now := time.Now()
+	if observed.usable(now) {
+		// The kernel recently confirmed this mount as ours, and a mount does not
+		// stop being ours without the backend noticing. Re-reading the whole
+		// mount table every interval buys nothing and, on a loaded machine, is
+		// mostly an opportunity for the bounded probe to miss its deadline: the
+		// production store logged 1,906 probes that never got scheduled at all.
+		// The backend socket is the cheap liveness signal, so ask it instead and
+		// fall through to a full reading the moment it stops answering.
+		if operations.DaemonHealthy(ctx, options.ResourcePath) == nil {
+			return nil
+		}
+		observed.invalidate()
+	}
 	mountState, mountErr := operations.MountState(ctx, options.MountPoint, options.ProbeTimeout)
+	if mountErr == nil {
+		observed.record(mountState, now)
+	} else {
+		observed.invalidate()
+	}
 	if mountState.Mounted && !mountState.Owned {
 		return fmt.Errorf("%w: %s", ErrForeignMount, options.MountPoint)
 	}
 	if mountErr != nil {
+		// A mount-table lookup that ran out of time proves nothing about the
+		// mount. Even MNT_NOWAIT contends with unrelated volumes and with the
+		// scheduler, so under load this deadline expires while the file service
+		// is perfectly healthy; reporting it as recovery is what turned ordinary
+		// system load into a stream of "needs attention" alerts. A mount that
+		// actually went away is reported by a lookup that completes, not by one
+		// that runs out of time. Ask the backend directly instead: a reachable
+		// daemon means file operations are being served and the probe was merely
+		// slow, so keep the last conclusive observation.
+		if errors.Is(mountErr, context.DeadlineExceeded) &&
+			operations.DaemonHealthy(ctx, options.ResourcePath) == nil {
+			return ErrNativeFSKitMountProbeInconclusive
+		}
 		return fmt.Errorf("probe native FSKit mount before reconciliation: %w", mountErr)
 	}
 	daemonErr := operations.DaemonHealthy(ctx, options.ResourcePath)
+	// An owned mount plus a live daemon is healthy. Do not treat a busy FSKit
+	// getattr path as recovery: Codex I/O and the old through-mount probe
+	// shared one control lock, which is what tripped the 2s/10s incident.
 	if mountState.Owned && mountState.Healthy && daemonErr == nil {
 		return nil
 	}
@@ -263,8 +441,17 @@ func reconcileNativeFSKit(
 func waitForNativeFSKitMount(ctx context.Context, options NativeFSKitSupervisorOptions, operations NativeFSKitOperations) error {
 	deadline := time.NewTimer(options.RecoveryTimeout)
 	defer deadline.Stop()
-	ticker := time.NewTicker(50 * time.Millisecond)
-	defer ticker.Stop()
+	// Poll quickly at first so a mount that lands immediately is noticed
+	// immediately, then back off. A fixed 50ms poll issues twenty mount-table
+	// reads a second for the whole recovery window, which is the pressure that
+	// makes the bounded probe miss its deadline in the first place.
+	const (
+		minimumPoll = 50 * time.Millisecond
+		maximumPoll = 500 * time.Millisecond
+	)
+	poll := minimumPoll
+	timer := time.NewTimer(poll)
+	defer timer.Stop()
 	var lastErr error
 	for {
 		mountState, mountErr := operations.MountState(ctx, options.MountPoint, options.ProbeTimeout)
@@ -281,8 +468,11 @@ func waitForNativeFSKitMount(ctx context.Context, options NativeFSKitSupervisorO
 			return ctx.Err()
 		case <-deadline.C:
 			return fmt.Errorf("native FSKit mount did not become healthy: %w", lastErr)
-		case <-ticker.C:
+		case <-timer.C:
+			if poll < maximumPoll {
+				poll = min(2*poll, maximumPoll)
+			}
+			timer.Reset(poll)
 		}
 	}
 }
-

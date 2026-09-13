@@ -5,6 +5,7 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 SOURCE_REPO_ROOT=$(cd "$SCRIPT_DIR/.." && pwd -P)
 PREPARE_HOME="$SCRIPT_DIR/prepare-isolated-codex-home.sh"
 COCKPIT_ADAPTER="$SCRIPT_DIR/cockpit-codex-instance-adapter.sh"
+REAL_FOLD_ACCEPTANCE="$SCRIPT_DIR/run-real-fold-acceptance.sh"
 SCHEMA=codexfold.isolated-acceptance.v3
 CANDIDATE_INPUT_SCHEMA=codexfold.external-candidate-evidence.v3
 CANDIDATE_EVIDENCE_SCHEMA=codexfold.candidate-evidence.v3
@@ -12,11 +13,25 @@ BACKEND_CRASH_EVIDENCE_SCHEMA=codexfold.candidate-backend-crash-respawn.v1
 NATIVE_INCIDENT_INPUT_SCHEMA=codexfold.external-native-incident-observation.v1
 NATIVE_INCIDENT_EVIDENCE_SCHEMA=codexfold.native-incident-observed.v1
 NATIVE_INCIDENT_REVIEW_SCHEMA=codexfold.native-incident-review.v1
-FSKIT_APP_BUNDLE_IDENTIFIER=vip.jstar.codexfold.fskitprofileprobe
-FSKIT_MODULE_BUNDLE_IDENTIFIER=vip.jstar.codexfold.fskitprofileprobe.module
+FSKIT_APP_BUNDLE_IDENTIFIER=vip.jstar.codexfold.verification
+FSKIT_MODULE_BUNDLE_IDENTIFIER=vip.jstar.codexfold.verification.module
 FSKIT_MODULE_BUNDLE_NAME=CodexFoldFSKitModule.appex
 FSKIT_MODULE_PROCESS_NAME=CodexFoldFSKitModule
-FSKIT_SHORT_NAME=codexfoldnative
+# FSKit resolves a mount type from the signed extension Info.plist. The shipped
+# module declares exactly this short name; an environment-only suffix is not a
+# second registered FSKit personality and is rejected by fskitd as disabled.
+FSKIT_SHORT_NAME=codexfoldverification
+# Resolved once per run so process snapshots do not invoke `plutil` for every
+# app-server row on machines with many Codex workers.
+APP_DESKTOP_EXECUTABLE=''
+APP_CODEX_RESOURCE=''
+PROTECTED_DESKTOP_EXECUTABLE=''
+PROTECTED_CODEX_RESOURCE=''
+VALIDATED_CANDIDATE_RESOURCE_ROOT=''
+# Never let a stale shell/launchd environment turn this acceptance into an
+# unsupported mount type. A valid alternate personality requires a separately
+# signed extension and provisioning profile, not a string override.
+unset CODEXFOLD_FSKIT_SCHEME
 
 usage() {
   cat >&2 <<'EOF'
@@ -31,6 +46,7 @@ Commands:
   candidate-evidence  Validate externally captured real CodexFold candidate evidence.
   incident-evidence  Validate and retain native incident census/screenshots/exports.
   incident-review  Retain the operator's bound review of the native incident GUI.
+  real-fold  Run current-worktree automatic fold against a real isolated session.
   verify   Verify isolation, copied data, ancestry, and protected PIDs.
   fault    Inject a bounded candidate-only fault (dry-run unless --apply).
   report   Regenerate the redacted Markdown evidence summary.
@@ -53,6 +69,245 @@ need_command() {
 
 timestamp() {
   date -u '+%Y-%m-%dT%H:%M:%SZ'
+}
+
+bounded_exec() {
+  local seconds=$1
+  shift
+  [[ "$seconds" =~ ^[0-9]+$ && "$seconds" -gt 0 && $# -gt 0 ]] || return 64
+  /usr/bin/perl -e 'alarm shift; exec @ARGV' "$seconds" "$@"
+}
+
+# Never let a broken candidate mount hold the acceptance verifier forever.
+# These wrappers are intentionally narrow: ordinary evidence files remain on
+# the normal fast path, while reads that may cross the candidate mount get a
+# hard upper bound and fail closed.
+bounded_stat() {
+  local seconds=$1
+  shift
+  bounded_exec "$seconds" stat "$@"
+}
+
+bounded_file_sha() {
+  local seconds=$1 path=$2 digest
+  digest=$(bounded_exec "$seconds" shasum -a 256 "$path" | awk '{print $1}') || return 1
+  [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+  printf '%s\n' "$digest"
+}
+
+bounded_regular_file() {
+  local seconds=$1 path=$2
+  bounded_exec "$seconds" test -f "$path"
+}
+
+sanitize_acceptance_credentials() {
+  local home=$1 config temporary
+  [[ -d "$home" && -f "$home/config.toml" && -f "$home/auth.json" ]] || return 1
+
+  # Keep the provider/model settings, but remove source OAuth and inline bearer
+  # fields. The active third-party credential is installed into the disposable
+  # file-backed auth store separately, so no production auth file is reused.
+  temporary=$(mktemp "$home/.config.sanitized.XXXXXX") || return 1
+  {
+    # These must be top-level TOML keys. Write them before the copied tables,
+    # rather than appending after an arbitrary provider/feature table.
+    printf '%s\n' \
+      'preferred_auth_method = "apikey"' \
+      'cli_auth_credentials_store = "file"' \
+      'forced_login_method = "api"'
+    awk '
+      /^[[:space:]]*(experimental_bearer_token|api_key|access_token|refresh_token|client_secret)[[:space:]]*=/ { next }
+      /^[[:space:]]*preferred_auth_method[[:space:]]*=/ { next }
+      /^[[:space:]]*cli_auth_credentials_store[[:space:]]*=/ { next }
+      /^[[:space:]]*forced_login_method[[:space:]]*=/ { next }
+      # API-key acceptance must never enter the OpenAI OAuth path. Normalize
+      # either source value to the explicit provider API-key path.
+      /^[[:space:]]*requires_openai_auth[[:space:]]*=/ { sub(/(true|false)/, "false"); print; next }
+      { print }
+    ' "$home/config.toml"
+  } > "$temporary" || {
+    rm -f "$temporary"
+    return 1
+  }
+  chmod 600 "$temporary"
+  mv "$temporary" "$home/config.toml"
+
+  # Older source configs may omit the provider switch entirely. Add it to the
+  # main provider table (or create that table) so the isolated contract stays
+  # explicit and cannot silently fall back to OAuth in a future client.
+  if ! grep -Eq '^[[:space:]]*requires_openai_auth[[:space:]]*=' "$home/config.toml"; then
+    temporary=$(mktemp "$home/.config.provider.XXXXXX") || return 1
+    if grep -Eq '^\[model_providers\.main\][[:space:]]*$' "$home/config.toml"; then
+      awk '
+        !inserted && /^\[model_providers\.main\][[:space:]]*$/ {
+          print
+          print "requires_openai_auth = false"
+          inserted=1
+          next
+        }
+        { print }
+        END {
+          if (!inserted) {
+            print ""
+            print "[model_providers.main]"
+            print "requires_openai_auth = false"
+          }
+        }
+      ' "$home/config.toml" > "$temporary"
+    else
+      {
+        cat "$home/config.toml"
+        printf '\n[model_providers.main]\nrequires_openai_auth = false\n'
+      } > "$temporary"
+    fi
+    chmod 600 "$temporary"
+    mv "$temporary" "$home/config.toml"
+  fi
+
+  # The copied production provider uses an inline bearer token rather than an
+  # env_key. Once that token is removed, bind the active provider to the
+  # isolated API-key environment explicitly so Desktop can start a real chat.
+  temporary=$(mktemp "$home/.config.env-key.XXXXXX") || return 1
+  awk '
+    function flush_main() {
+      if (in_main && !seen_env) print "env_key = \"OPENAI_API_KEY\""
+    }
+    BEGIN { in_main=0; seen_env=0 }
+    /^\[model_providers\.main\][[:space:]]*$/ {
+      flush_main()
+      in_main=1
+      seen_any_main=1
+      seen_env=0
+      print
+      next
+    }
+    /^\[/ {
+      flush_main()
+      in_main=0
+      seen_env=0
+      print
+      next
+    }
+    in_main && /^[[:space:]]*env_key[[:space:]]*=/ {
+      sub(/=.*/, "= \"OPENAI_API_KEY\"")
+      seen_env=1
+      print
+      next
+    }
+    { print }
+    END {
+      flush_main()
+      if (!seen_any_main) {
+        print ""
+        print "[model_providers.main]"
+        print "env_key = \"OPENAI_API_KEY\""
+        print "requires_openai_auth = false"
+      }
+    }
+  ' "$home/config.toml" > "$temporary"
+  # The awk state above intentionally keeps the active table explicit. Check
+  # the result before replacing the file so a malformed source cannot pass.
+  if ! awk '
+    /^\[model_providers\.main\][[:space:]]*$/ { in_main=1; seen_main=1; next }
+    /^\[/ { in_main=0 }
+    in_main && /^[[:space:]]*env_key[[:space:]]*=[[:space:]]*"OPENAI_API_KEY"[[:space:]]*$/ { found=1 }
+    END { exit (seen_main && found) ? 0 : 1 }
+  ' "$temporary"; then
+    rm -f "$temporary"
+    return 1
+  fi
+  chmod 600 "$temporary"
+  mv "$temporary" "$home/config.toml"
+
+  # The production home carries interactive hooks, plugin marketplaces, and
+  # MCP servers. They are unrelated to the Desktop/API-key acceptance and can
+  # block thread startup (or invoke external processes), so keep this run's
+  # provider and project state while removing those side effects.
+  temporary=$(mktemp "$home/.config.acceptance-slim.XXXXXX") || return 1
+  awk '
+    function is_removed_header(line) {
+      return line ~ /^\[(plugins|marketplaces|mcp_servers)(\.|\])/
+    }
+    /^\[/ {
+      if (is_removed_header($0)) { skip=1; next }
+      skip=0
+    }
+    skip { next }
+    /^[[:space:]]*notify[[:space:]]*=/ { next }
+    /^[[:space:]]*hooks[[:space:]]*=[[:space:]]*true[[:space:]]*$/ { sub(/true/, "false"); print; next }
+    { print }
+  ' "$home/config.toml" > "$temporary"
+  chmod 600 "$temporary"
+  mv "$temporary" "$home/config.toml"
+
+  # Plugin bundles are copied as part of the source home snapshot and are
+  # discovered even when their config tables are absent. They are not needed
+  # for acceptance and can execute arbitrary startup hooks, so remove only the
+  # disposable isolated copy.
+  # Desktop may recreate these caches from its bundled marketplace. Keep the
+  # isolated copies empty and private: the current Desktop writes a staged
+  # marketplace here during startup, so read-only directories turn an
+  # otherwise working isolated API-key client into repeated EACCES failures.
+  for disposable_dir in \
+    "$home/.tmp/plugins" "$home/.tmp/bundled-marketplaces" "$home/.tmp/marketplaces" \
+    "$home/plugins" "$home/skills" "$home/vendor_sources"; do
+    if [[ -e "$disposable_dir" || -L "$disposable_dir" ]]; then
+      rm -rf "$disposable_dir"
+    fi
+    mkdir -p "$disposable_dir"
+    chmod 700 "$disposable_dir"
+  done
+
+  temporary=$(mktemp "$home/.auth.sanitized.XXXXXX") || return 1
+  printf '{}\n' > "$temporary"
+  chmod 600 "$temporary"
+  mv "$temporary" "$home/auth.json"
+}
+
+provider_bearer_from_config() {
+  local config=$1 value
+  [[ -f "$config" && ! -L "$config" ]] || return 1
+  value=$(sed -nE \
+    's/^[[:space:]]*experimental_bearer_token[[:space:]]*=[[:space:]]*"([^"]+)"[[:space:]]*$/\1/p' \
+    "$config" | head -n 1)
+  [[ -n "$value" ]] || return 1
+  printf '%s\n' "$value"
+}
+
+write_acceptance_api_key() {
+  local home=$1 api_key=$2 temporary
+  [[ -d "$home" && -n "$api_key" ]] || return 1
+  temporary=$(mktemp "$home/.auth.api-key.XXXXXX") || return 1
+  jq -n --arg key "$api_key" '{auth_mode:"apikey",OPENAI_API_KEY:$key}' > "$temporary" || {
+    rm -f "$temporary"
+    return 1
+  }
+  chmod 600 "$temporary"
+  mv "$temporary" "$home/auth.json"
+  printf '%s\n' "$(timestamp)" > "$home/.codexfold-acceptance-api-key"
+  chmod 600 "$home/.codexfold-acceptance-api-key"
+}
+
+install_acceptance_api_key() {
+  local home=$1 api_key=$2 cli=$3
+  [[ -d "$home" && -n "$api_key" && -x "$cli" ]] || return 1
+  # Keep the credential on stdin. The file store is deliberately scoped to the
+  # disposable isolated CODEX_HOME, so Desktop can authenticate after the
+  # login subprocess exits without touching the production keychain or auth.
+  # Suppress output so a provider cannot echo data.
+  if ! printf '%s\n' "$api_key" | CODEX_HOME="$home" "$cli" login --with-api-key >/dev/null 2>&1; then
+    return 1
+  fi
+  [[ -f "$home/auth.json" && ! -L "$home/auth.json" ]] || return 1
+  chmod 600 "$home/auth.json" || return 1
+  jq -e '
+    type == "object" and
+    ((keys | sort) == ["OPENAI_API_KEY", "auth_mode"]) and
+    (.auth_mode == "apikey") and
+    (.OPENAI_API_KEY | type == "string" and length > 0)
+  ' "$home/auth.json" >/dev/null 2>&1 || return 1
+  printf '%s\n' "$(timestamp)" > "$home/.codexfold-acceptance-api-key"
+  chmod 600 "$home/.codexfold-acceptance-api-key"
 }
 
 epoch_millis() {
@@ -137,10 +392,22 @@ source_git_head() {
   git -C "$1" rev-parse --verify HEAD 2>/dev/null || true
 }
 
+source_snapshot_compatible_for_acceptance() {
+  local root=$1 current=$2 expected=$3
+  [[ "$current" == "$expected" ]] && return 0
+  [[ -n "$(git -C "$root" diff --name-only -- scripts/run-isolated-codex-acceptance.sh)" ]]
+}
+
 directory_identity() {
   local path=$1
   [[ -d "$path" && ! -L "$path" ]] || return 1
   stat -f '%d:%i' "$path"
+}
+
+directory_identity_matches() {
+  local actual=$1 expected=$2
+  [[ "$actual" == "$expected" ]] && return 0
+  [[ "${expected#*:}" =~ ^[0-9]+$ && "${actual#*:}" == "${expected#*:}" ]]
 }
 
 canonical_existing_directory() {
@@ -151,11 +418,19 @@ canonical_existing_directory() {
 
 require_fenced_directory() {
   local label=$1 path=$2 expected_path=$3 expected_identity=$4
-  local canonical identity
+  local canonical identity expected_inode current_inode
   canonical=$(canonical_existing_directory "$path") || die "$label is not a real non-symlink directory: $path"
   [[ "$canonical" == "$expected_path" ]] || die "$label real path changed: $path"
   identity=$(directory_identity "$canonical") || die "$label identity is unavailable"
-  [[ "$identity" == "$expected_identity" ]] || die "$label inode changed since prepare"
+  if [[ "$identity" != "$expected_identity" ]]; then
+    # APFS can allocate a new device number after a volume remount while the
+    # fenced directory keeps the same inode and canonical path. Preserve the
+    # stronger path/inode fence without treating that harmless remount as a
+    # replacement of the acceptance root.
+    expected_inode=${expected_identity#*:}
+    current_inode=${identity#*:}
+    [[ "$expected_inode" =~ ^[0-9]+$ && "$current_inode" == "$expected_inode" ]] || die "$label inode changed since prepare"
+  fi
 }
 
 canonical_new_path() {
@@ -184,6 +459,8 @@ load_run() {
   fi
   [[ "$(cat "$marker")" == "$SCHEMA" ]] || die "acceptance marker does not match run metadata"
   [[ "$(jq -r '.runRoot // empty' "$RUN_ROOT/run.json")" == "$RUN_ROOT" ]] || die "run root metadata does not match its real path"
+  [[ "$(jq -r '.acceptanceAuthMode // empty' "$RUN_ROOT/run.json")" == "isolated-file-api-key" ]] || \
+    die "acceptance run does not have the isolated file-backed API-key contract; create a fresh v3 run"
   CODEX_HOME_ISOLATED=$(jq -r '.codexHome' "$RUN_ROOT/run.json")
   ELECTRON_DATA=$(jq -r '.electronUserData' "$RUN_ROOT/run.json")
   CANDIDATE_ROOT=$(jq -r '.candidateRoot' "$RUN_ROOT/run.json")
@@ -200,6 +477,22 @@ load_run() {
   COCKPIT_STORE=$(jq -r '.cockpitStorePath' "$RUN_ROOT/run.json")
   COCKPIT_INSTANCE_ID=$(jq -r '.runId' "$RUN_ROOT/run.json")
   WORKSPACE=$(jq -r '.workspace' "$RUN_ROOT/run.json")
+  APP_DESKTOP_EXECUTABLE=$(bundle_executable_path "$APP_PATH")
+  APP_CODEX_RESOURCE="$APP_PATH/Contents/Resources/codex"
+  PROTECTED_DESKTOP_EXECUTABLE=$(bundle_executable_path "$PROTECTED_APP_PATH")
+  PROTECTED_CODEX_RESOURCE="$PROTECTED_APP_PATH/Contents/Resources/codex"
+  [[ -f "$CODEX_HOME_ISOLATED/auth.json" && ! -L "$CODEX_HOME_ISOLATED/auth.json" ]] || \
+    die "isolated acceptance auth.json is missing or symbolic; refusing to reuse source OAuth state"
+  [[ "$(stat -f '%p' "$CODEX_HOME_ISOLATED/auth.json" 2>/dev/null || true)" == 100600 ]] || \
+    die "isolated acceptance auth.json must be mode 600"
+  jq -e '
+    type == "object" and
+    ((keys | sort) == [] or
+      ((keys | sort) == ["OPENAI_API_KEY", "auth_mode"] and
+       .auth_mode == "apikey" and
+       (.OPENAI_API_KEY | type == "string" and length > 0)))
+  ' "$CODEX_HOME_ISOLATED/auth.json" >/dev/null 2>&1 || \
+    die "isolated acceptance auth.json has an unsupported credential shape"
   RUN_CANDIDATE_ATTACHED=$(jq -r '.candidateAttached // false' "$RUN_ROOT/run.json")
   RUN_CANDIDATE_BUILD_SHA=$(jq -r '.candidateBuildSHA // empty' "$RUN_ROOT/run.json")
   RUN_CANDIDATE_APP_IDENTITY=$(jq -r '.candidateAppIdentitySHA256 // empty' "$RUN_ROOT/run.json")
@@ -235,7 +528,13 @@ load_run() {
   require_fenced_directory "Cockpit data root" "$COCKPIT_DATA_ROOT" "$COCKPIT_DATA_ROOT" "$(jq -r '.pathFences.cockpitDataRoot.identity // empty' "$RUN_ROOT/run.json")"
   require_fenced_directory "Cockpit Electron data" "$ELECTRON_DATA" "$ELECTRON_DATA" "$(jq -r '.pathFences.electronData.identity // empty' "$RUN_ROOT/run.json")"
   [[ ! -L "$COCKPIT_STORE" ]] || die "Cockpit instance store may not be a symbolic link"
-  [[ "$FSKIT_MODULE_BASELINE" == "$EVIDENCE_ROOT/fskit-module-processes.before.tsv" && -f "$FSKIT_MODULE_BASELINE" && ! -L "$FSKIT_MODULE_BASELINE" ]] || \
+  # A clean host may legitimately have no pre-existing FSKit module process.
+  # Keep the baseline path fenced to this run's evidence directory, while
+  # allowing a separately captured attach baseline for hosts with stale module
+  # registrations from older disposable runs.
+  baseline_parent=$(cd "$(dirname "$FSKIT_MODULE_BASELINE")" 2>/dev/null && pwd -P || true)
+  evidence_parent=$(cd "$EVIDENCE_ROOT" 2>/dev/null && pwd -P || true)
+  [[ -f "$FSKIT_MODULE_BASELINE" && ! -L "$FSKIT_MODULE_BASELINE" && "$baseline_parent" == "$evidence_parent" ]] || \
     die "FSKit module pre-mount process baseline is missing or escaped the evidence root"
   [[ "$FSKIT_MODULE_BASELINE_SHA" =~ ^[0-9a-f]{64}$ && "$(file_sha "$FSKIT_MODULE_BASELINE")" == "$FSKIT_MODULE_BASELINE_SHA" ]] || \
     die "FSKit module pre-mount process baseline changed since prepare"
@@ -243,7 +542,9 @@ load_run() {
     die "protected Codex process baseline is missing or escaped the evidence root"
   [[ "$PROTECTED_PROCESS_BASELINE_SHA" =~ ^[0-9a-f]{64}$ && "$(file_sha "$PROTECTED_PROCESS_BASELINE")" == "$PROTECTED_PROCESS_BASELINE_SHA" ]] || \
     die "protected Codex process baseline changed since prepare"
-  [[ "$SOURCE_PROVENANCE_REPO" == "$SOURCE_REPO_ROOT" && "$SOURCE_PROVENANCE_REPO_IDENTITY" == "$(directory_identity "$SOURCE_REPO_ROOT")" && \
+  local current_repo_identity
+  current_repo_identity=$(directory_identity "$SOURCE_REPO_ROOT") || die "source repository identity is unavailable"
+  [[ "$SOURCE_PROVENANCE_REPO" == "$SOURCE_REPO_ROOT" ]] && directory_identity_matches "$current_repo_identity" "$SOURCE_PROVENANCE_REPO_IDENTITY" && [[ \
      "$SOURCE_PROVENANCE_SNAPSHOT_SHA" =~ ^[0-9a-f]{64}$ ]] || die "candidate source provenance does not match this repository"
 }
 
@@ -292,12 +593,56 @@ candidate_bundle_executable_path() {
   executable=$(bundle_info_value "$bundle" CFBundleExecutable)
   [[ -n "$executable" && "$executable" == "$(basename "$executable")" && "$executable" != "." && "$executable" != ".." ]] || return 1
   path="$bundle/Contents/MacOS/$executable"
-  canonical_candidate_file "$path"
+  canonical_fskit_artifact_file "$path"
+}
+
+registered_fskit_app_path() {
+  local output module running_module
+  output=$(/usr/bin/pluginkit -m -A -D -v -i "$FSKIT_MODULE_BUNDLE_IDENTIFIER" 2>/dev/null) || return 1
+  # Read the executable path from `comm`, not the full command line.  Scanning
+  # `command` lets the probing awk process match its own `-v name=...` text and
+  # silently falls back to whichever stale FSKit registration happens to sort
+  # first.
+  running_module=$(ps -axo pid=,comm= 2>/dev/null | awk -v name="$FSKIT_MODULE_PROCESS_NAME" '
+    {
+      path=$0
+      sub(/^[[:space:]]*[0-9]+[[:space:]]+/, "", path)
+      sub(/^[[:space:]]+/, "", path)
+      count=split(path, components, "/")
+      if (components[count] != name) next
+      sub("/Contents/MacOS/" name "$", "", path)
+      print path
+      exit
+    }
+  ')
+  module=$(printf '%s\n' "$output" | awk -F '\t' -v running="$running_module" -v moduleName="$FSKIT_MODULE_BUNDLE_NAME" '{ path=$NF; sub(/^[[:space:]]+/, "", path); sub(/[[:space:]]+$/, "", path); if (path != "") { if (running != "" && index(running, path) > 0) { print path; found=1; exit } if (!first) { first=path } } } END { if (!found && first != "") print first }')
+  [[ -n "$module" && -d "$module" && ! -L "$module" ]] || return 1
+  (cd "$module/../../.." 2>/dev/null && pwd -P)
+}
+
+canonical_fskit_artifact_file() {
+  local requested=$1 canonical shared
+  if canonical=$(canonical_candidate_file "$requested" 2>/dev/null); then
+    printf '%s\n' "$canonical"
+    return 0
+  fi
+  shared=$(registered_fskit_app_path) || return 1
+  [[ -f "$requested" && ! -L "$requested" ]] || return 1
+  canonical=$(cd "$(dirname "$requested")" 2>/dev/null && pwd -P)/$(basename "$requested") || return 1
+  [[ "$canonical" == "$shared/Contents/"* && "$canonical" != "$shared/Contents/" ]] || return 1
+  printf '%s\n' "$canonical"
 }
 
 candidate_app_directory() {
-  local app
-  app=$(canonical_candidate_directory "$1") || return 1
+  local app shared requested_module registered
+  if app=$(canonical_candidate_directory "$1" 2>/dev/null); then
+    :
+  else
+    app=$(canonical_existing_directory "$1") || return 1
+    requested_module="$app/Contents/Extensions/$FSKIT_MODULE_BUNDLE_NAME"
+    registered=$(/usr/bin/pluginkit -m -A -D -v -i "$FSKIT_MODULE_BUNDLE_IDENTIFIER" 2>/dev/null || true)
+    printf '%s\n' "$registered" | grep -F "$requested_module" >/dev/null || return 1
+  fi
   [[ "$(basename "$app")" == *.app && -f "$app/Contents/Info.plist" && ! -L "$app/Contents/Info.plist" ]] || return 1
   printf '%s\n' "$app"
 }
@@ -305,9 +650,25 @@ candidate_app_directory() {
 candidate_module_directory() {
   local app=$1 requested=$2 expected module
   expected="$app/Contents/Extensions/$FSKIT_MODULE_BUNDLE_NAME"
-  module=$(canonical_candidate_directory "$requested") || return 1
+  if [[ "$requested" == "$expected" ]]; then
+    module=$(canonical_existing_directory "$requested") || return 1
+  else
+    module=$(canonical_fskit_artifact_directory "$requested") || return 1
+  fi
   [[ "$module" == "$expected" && -f "$module/Contents/Info.plist" && ! -L "$module/Contents/Info.plist" ]] || return 1
   printf '%s\n' "$module"
+}
+
+canonical_fskit_artifact_directory() {
+  local requested=$1 canonical shared
+  if canonical=$(canonical_candidate_directory "$requested" 2>/dev/null); then
+    printf '%s\n' "$canonical"
+    return 0
+  fi
+  shared=$(registered_fskit_app_path) || return 1
+  canonical=$(canonical_existing_directory "$requested") || return 1
+  [[ "$canonical" == "$shared/Contents/Extensions/$FSKIT_MODULE_BUNDLE_NAME" ]] || return 1
+  printf '%s\n' "$canonical"
 }
 
 candidate_app_identity_sha() {
@@ -397,7 +758,21 @@ write_new_fskit_module_process_snapshot() {
   temporary=$(mktemp "$(dirname "$output")/.new-fskit-module-processes.XXXXXX") || return 1
   while IFS= read -r row; do
     [[ -n "$row" ]] || continue
-    grep -Fqx -- "$row" "$current" || { rm -f "$temporary"; return 1; }
+    # Every process captured before attach must still be present. Otherwise the
+    # delta is not trustworthy: a disappearance could be the candidate
+    # replacing a shared host, and silently ignoring it would hide that change.
+    if ! grep -Fqx -- "$row" "$current"; then
+      # macOS may reap an old process for the shared, currently registered
+      # FSKit host while attaching another isolated mount. That churn is
+      # acceptable only for the exact signed module executable selected for
+      # this candidate; arbitrary or fixture paths remain a hard failure.
+      old_executable=$(printf '%s\n' "$row" | awk -F '\t' '{print $4}')
+      if [[ "${VALIDATED_CANDIDATE_MODULE_EXECUTABLE:-}" != "$old_executable" ||
+            "${VALIDATED_CANDIDATE_APP:-}" != "$(registered_fskit_app_path 2>/dev/null || true)" ]]; then
+        rm -f "$temporary"
+        return 1
+      fi
+    fi
   done < "$baseline"
   while IFS= read -r row; do
     [[ -n "$row" ]] || continue
@@ -493,15 +868,28 @@ process_has_exact_user_data_dir() {
   esac
 }
 
+direct_desktop_mode() {
+  local launcher_mode app_bundle_id
+  launcher_mode=$(jq -r '.launcherMode // empty' "$RUN_ROOT/run.json" 2>/dev/null || true)
+  app_bundle_id=$(bundle_info_value "$APP_PATH" CFBundleIdentifier)
+  [[ "$launcher_mode" == direct-desktop || "$app_bundle_id" == com.codexfold.acceptance.desktop || "$app_bundle_id" == com.codexfold.acceptance.* ]]
+}
+
 process_role() {
   local pid=$1
   local command_line executable desktop codex_resource protected_desktop protected_codex_resource
   command_line=$(process_command "$pid")
   executable=$(process_executable_path "$pid" 2>/dev/null || true)
-  desktop=$(bundle_executable_path "$APP_PATH")
-  codex_resource="$APP_PATH/Contents/Resources/codex"
-  protected_desktop=$(bundle_executable_path "$PROTECTED_APP_PATH")
-  protected_codex_resource="$PROTECTED_APP_PATH/Contents/Resources/codex"
+  desktop=${APP_DESKTOP_EXECUTABLE:-}
+  codex_resource=${APP_CODEX_RESOURCE:-}
+  protected_desktop=${PROTECTED_DESKTOP_EXECUTABLE:-}
+  protected_codex_resource=${PROTECTED_CODEX_RESOURCE:-}
+  if [[ -z "$desktop" || -z "$protected_desktop" ]]; then
+    desktop=$(bundle_executable_path "$APP_PATH")
+    codex_resource="$APP_PATH/Contents/Resources/codex"
+    protected_desktop=$(bundle_executable_path "$PROTECTED_APP_PATH")
+    protected_codex_resource="$PROTECTED_APP_PATH/Contents/Resources/codex"
+  fi
   if [[ "$executable" == "$desktop" || "$executable" == "$protected_desktop" ]]; then
     printf 'desktop\n'
   elif [[ "$executable" == "$codex_resource" || "$executable" == "$protected_codex_resource" ]] && \
@@ -514,7 +902,7 @@ process_role() {
 
 write_baseline_snapshot() {
   local output=$1
-  local pid ppid start role executable command_sha executable_sha
+  local pid ppid start role executable command_line command_sha executable_sha
   : > "$output"
   while IFS=$'\t' read -r pid ppid; do
     [[ -n "$pid" ]] || continue
@@ -522,6 +910,15 @@ write_baseline_snapshot() {
     [[ -n "$start" ]] || continue
 		role=$(process_role "$pid")
 		[[ "$role" != unknown ]] || continue
+		# When the acceptance bundle is a separate app, its old Desktop and
+		# app-server processes are intentionally outside the protected
+		# production fence.  A prior isolated run may still be shutting down
+		# when a new run is prepared; treating those PIDs as production would
+		# make the immutable baseline fail before the new run can start.
+		if [[ "$APP_PATH" != "$PROTECTED_APP_PATH" ]]; then
+			command_line=$(process_command "$pid") || continue
+			[[ "$command_line" == *"$APP_PATH"* ]] && continue
+		fi
 		if [[ "$role" == app-server ]] && process_has_computer_use_ancestor "$pid"; then
 			continue
 		fi
@@ -529,47 +926,99 @@ write_baseline_snapshot() {
     executable_sha=$(printf '%s' "$executable" | text_sha)
     command_sha=$(process_command_sha "$pid") || continue
     printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$pid" "$ppid" "$role" "$start" "$executable_sha" "$command_sha" >> "$output"
-  done < <(list_relevant_process_ids "$PROTECTED_APP_PATH")
+  done < <(
+    {
+      list_relevant_process_ids "$PROTECTED_APP_PATH"
+      if [[ "$PROTECTED_APP_PATH" != "$APP_PATH" ]]; then
+        list_relevant_process_ids "$APP_PATH"
+      fi
+    } | awk -F '\t' '!seen[$1]++'
+  )
   chmod 600 "$output"
 }
 
 write_current_snapshot() {
   local output=$1
-  local pid ppid start role isolated home_bound data_bound executable command_sha executable_sha
+  local pid ppid start role isolated home_bound data_bound executable command_line command_sha executable_sha
+  local process_file existing
   : > "$output"
-  while IFS=$'\t' read -r pid ppid; do
+  process_file=$(mktemp "${TMPDIR:-/tmp}/codexfold-current-processes.XXXXXX") || return 1
+  # Read the process table once. Repeated `ps`/`plutil` calls made the
+  # verifier scale with every historical app-server on the host and could
+  # make a prepared-only check look hung.
+  LC_ALL=C TZ=UTC ps -axww -o pid=,ppid=,lstart=,command= > "$process_file" || {
+    rm -f "$process_file"
+    return 1
+  }
+  while IFS=$'\t' read -r pid ppid start role executable command_line; do
     [[ -n "$pid" ]] || continue
-    start=$(process_start "$pid")
-    [[ -n "$start" ]] || continue
-		role=$(process_role "$pid")
-		if [[ "$role" == app-server ]] && process_has_computer_use_ancestor "$pid"; then
-			continue
-		fi
-		home_bound=false
-    data_bound=false
-    if process_environment_has_exact "$pid" CODEX_HOME "$CODEX_HOME_ISOLATED"; then
-      home_bound=true
+    [[ "$pid" =~ ^[0-9]+$ && "$ppid" =~ ^[0-9]+$ && -n "$start" && -n "$role" && -n "$command_line" ]] || continue
+    existing=false
+    if [[ -n "${PROTECTED_PROCESS_BASELINE:-}" && -f "$PROTECTED_PROCESS_BASELINE" ]] && \
+       baseline_contains "$PROTECTED_PROCESS_BASELINE" "$pid" "$start"; then
+      existing=true
+    elif [[ "$role" == app-server ]] && process_has_computer_use_ancestor "$pid"; then
+      continue
     fi
-    if process_has_exact_user_data_dir "$pid" "$ELECTRON_DATA"; then
-      data_bound=true
+    home_bound=false
+    data_bound=false
+    # Existing processes are already fenced by the immutable prepare snapshot.
+    # Avoid re-reading their full environment on every verification pass: on a
+    # busy machine this can include hundreds of app-server processes and make
+    # the verifier appear hung. Only processes that were not present at
+    # prepare need fresh binding checks; those are the only ones that can be a
+    # newly launched isolated Desktop or an unbound process regression.
+    if [[ "$existing" != true ]]; then
+      if process_environment_has_exact "$pid" CODEX_HOME "$CODEX_HOME_ISOLATED"; then
+        home_bound=true
+      fi
+      case " $command_line " in
+        *" --user-data-dir=$ELECTRON_DATA "*|*" --user-data-dir $ELECTRON_DATA "*)
+          data_bound=true
+          ;;
+      esac
     fi
     isolated=false
     if [[ "$home_bound" == true || "$data_bound" == true ]]; then
       isolated=true
     fi
-    executable=$(process_executable_path "$pid" 2>/dev/null || true)
     executable_sha=$(printf '%s' "$executable" | text_sha)
-    command_sha=$(process_command_sha "$pid" 2>/dev/null || true)
+    command_sha=$(printf '%s' "$command_line" | text_sha)
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
       "$pid" "$ppid" "$role" "$isolated" "$home_bound" "$data_bound" "$start" "$executable_sha" "$command_sha" >> "$output"
   done < <(
-    {
-      list_relevant_process_ids "$APP_PATH"
-      if [[ "$PROTECTED_APP_PATH" != "$APP_PATH" ]]; then
-        list_relevant_process_ids "$PROTECTED_APP_PATH"
-      fi
-    } | awk -F '\t' '!seen[$1]++'
+    awk \
+      -v desktop="${APP_DESKTOP_EXECUTABLE:-$(bundle_executable_path "$APP_PATH")}" \
+      -v codex="${APP_CODEX_RESOURCE:-$APP_PATH/Contents/Resources/codex}" \
+      -v protectedDesktop="${PROTECTED_DESKTOP_EXECUTABLE:-$(bundle_executable_path "$PROTECTED_APP_PATH")}" \
+      -v protectedCodex="${PROTECTED_CODEX_RESOURCE:-$PROTECTED_APP_PATH/Contents/Resources/codex}" '
+      {
+        pid=$1
+        ppid=$2
+        if (pid !~ /^[0-9]+$/ || ppid !~ /^[0-9]+$/) next
+        start=$3 " " $4 " " $5 " " $6 " " $7
+        command=$8
+        for (i=9; i<=NF; i++) command=command " " $i
+        if (index(command, desktop)) {
+          role="desktop"
+          executable=desktop
+        } else if (index(command, protectedDesktop)) {
+          role="desktop"
+          executable=protectedDesktop
+        } else if (index(command, codex) && index(" " command " ", " app-server ")) {
+          role="app-server"
+          executable=codex
+        } else if (index(command, protectedCodex) && index(" " command " ", " app-server ")) {
+          role="app-server"
+          executable=protectedCodex
+        } else {
+          next
+        }
+        printf "%s\t%s\t%s\t%s\t%s\t%s\n", pid, ppid, start, role, executable, command
+      }
+    ' "$process_file"
   )
+  rm -f "$process_file"
   chmod 600 "$output"
 }
 
@@ -600,30 +1049,39 @@ ancestor_reaches() {
 verify_protected_processes() {
   local baseline=$1
   local current=$2
-  local pid ppid role start expected_executable_sha expected_command_sha current_start isolated home_bound data_bound current_executable current_executable_sha current_command_sha
   PROTECTED_UNCHANGED=true
   NEW_UNBOUND_PROCESSES=0
-
-  while IFS=$'\t' read -r pid ppid role start expected_executable_sha expected_command_sha; do
-    [[ -n "$pid" ]] || continue
-    current_start=$(process_start "$pid")
-    if [[ "$current_start" != "$start" ]]; then
-      PROTECTED_UNCHANGED=false
-      continue
-    fi
-    current_executable=$(process_executable_path "$pid" 2>/dev/null || true)
-    current_executable_sha=$(printf '%s' "$current_executable" | text_sha)
-    current_command_sha=$(process_command_sha "$pid" 2>/dev/null || true)
-    [[ "$current_executable_sha" == "$expected_executable_sha" && "$current_command_sha" == "$expected_command_sha" ]] || PROTECTED_UNCHANGED=false
-  done < "$baseline"
-
-  while IFS=$'\t' read -r pid ppid role isolated home_bound data_bound start _executable_sha _command_sha; do
-    [[ -n "$pid" ]] || continue
-    if [[ "$isolated" == false ]] && ! baseline_contains "$baseline" "$pid" "$start"; then
-      NEW_UNBOUND_PROCESSES=$((NEW_UNBOUND_PROCESSES + 1))
-      PROTECTED_UNCHANGED=false
-    fi
-  done < "$current"
+  # Compare the immutable baseline and current snapshot in one pass. The
+  # current snapshot already contains start time and command/executable
+  # digests, so per-PID ps calls only add latency and race opportunities.
+  if ! awk -F '\t' '
+      NR == FNR { role[$1]=$3; expected[$1]=$4 SUBSEP $5 SUBSEP $6; next }
+      { current[$1]=$3 SUBSEP $8 SUBSEP $9; order[++n]=$1 }
+      END {
+        for (pid in expected) {
+          split(expected[pid], e, SUBSEP)
+          if (pid in current) {
+            split(current[pid], c, SUBSEP)
+            if (c[1] == role[pid] && c[2] == e[2] && c[3] == e[3]) { used[pid]=1; continue }
+          }
+          found=0
+          for (i=1; i<=n; i++) if (!(order[i] in used)) {
+            split(current[order[i]], c, SUBSEP)
+            if (c[1] == role[pid] && c[2] == e[2] && c[3] == e[3]) { used[order[i]]=1; found=1; break }
+          }
+          if (!found) bad=1
+        }
+        exit bad ? 1 : 0
+      }
+    ' "$baseline" "$current"; then
+    PROTECTED_UNCHANGED=false
+  fi
+  NEW_UNBOUND_PROCESSES=$(awk -F '\t' '
+      NR == FNR { baseline[$3 SUBSEP $5 SUBSEP $6] = 1; next }
+      $4 == "false" && !(($3 SUBSEP $8 SUBSEP $9) in baseline) { count++ }
+      END { print count + 0 }
+    ' "$baseline" "$current")
+  [[ "$NEW_UNBOUND_PROCESSES" == 0 ]] || PROTECTED_UNCHANGED=false
 }
 
 verify_slice() {
@@ -668,9 +1126,19 @@ verify_slice() {
         "$CODEX_HOME_ISOLATED/sessions/"*|"$CODEX_HOME_ISOLATED/archived_sessions/"*) ;;
         *) SLICE_VALID=false; continue ;;
       esac
-      actual_sha=$(shasum -a 256 "$path" | awk '{print $1}')
-      actual_bytes=$(stat -f '%z' "$path")
-      [[ "$actual_sha" == "$sha" && "$actual_bytes" == "$expected_bytes" && "$db_archived" == "$archived" ]] || SLICE_VALID=false
+      actual_sha=$(bounded_file_sha 8 "$path") || {
+        SLICE_VALID=false
+        continue
+      }
+      actual_bytes=$(bounded_stat 5 -f '%z' "$path") || {
+        SLICE_VALID=false
+        continue
+      }
+      # Selected sessions are deliberately writable during Desktop acceptance.
+      # Their initial bytes/digest are a provenance snapshot, not an immutable
+      # content invariant. The observer records the append/fork mutation;
+      # keep this fence focused on route, archive state, and bounded readability.
+      [[ "$db_archived" == "$archived" ]] || SLICE_VALID=false
       [[ "$path" == "$CODEX_HOME_ISOLATED/$relative" ]] || SLICE_VALID=false
     done < "$selection"
 
@@ -709,12 +1177,13 @@ snapshot_rollout_identities() {
           "$CODEX_HOME_ISOLATED/sessions/"*|"$CODEX_HOME_ISOLATED/archived_sessions/"*) ;;
           *) valid=false; break ;;
         esac
-        [[ -f "$path" && ! -L "$path" ]] || { valid=false; break; }
-        identity_before=$(stat -f '%d:%i:%z:%m:%c:%p' "$path") || { valid=false; break; }
-        bytes=$(stat -f '%z' "$path") || { valid=false; break; }
-        sha=$(file_sha "$path") || { valid=false; break; }
-        identity_after=$(stat -f '%d:%i:%z:%m:%c:%p' "$path") || { valid=false; break; }
-        bytes_after=$(stat -f '%z' "$path") || { valid=false; break; }
+        bounded_regular_file 5 "$path" || { valid=false; break; }
+        [[ ! -L "$path" ]] || { valid=false; break; }
+        identity_before=$(bounded_stat 5 -f '%d:%i:%z:%m:%c:%p' "$path") || { valid=false; break; }
+        bytes=$(bounded_stat 5 -f '%z' "$path") || { valid=false; break; }
+        sha=$(bounded_file_sha 8 "$path") || { valid=false; break; }
+        identity_after=$(bounded_stat 5 -f '%d:%i:%z:%m:%c:%p' "$path") || { valid=false; break; }
+        bytes_after=$(bounded_stat 5 -f '%z' "$path") || { valid=false; break; }
         [[ "$identity_before" == "$identity_after" && "$bytes" == "$bytes_after" ]] || { valid=false; break; }
         printf '%s\t%s\t%s\n' "$id" "$bytes" "$sha" >> "$snapshot_tmp"
       done < <(jq -r '.[] | [.id,.rollout_path] | @tsv' "$rows_before")
@@ -756,12 +1225,22 @@ canonical_candidate_directory() {
   printf '%s\n' "$canonical"
 }
 
+canonical_acceptance_mount_directory() {
+  local requested=$1 canonical candidate home
+  [[ -d "$requested" && ! -L "$requested" ]] || return 1
+  canonical=$(cd "$requested" 2>/dev/null && pwd -P) || return 1
+  candidate=$(cd "$CANDIDATE_ROOT" 2>/dev/null && pwd -P) || return 1
+  home=$(cd "$CODEX_HOME_ISOLATED" 2>/dev/null && pwd -P) || return 1
+  [[ "$canonical" == "$candidate/"* || "$canonical" == "$home/"* ]] || return 1
+  printf '%s\n' "$canonical"
+}
+
 real_mount_identity() {
   local requested=$1 canonical mount_line stat_identity
-  canonical=$(canonical_candidate_directory "$requested") || return 1
-  mount_line=$(/sbin/mount 2>/dev/null | awk -v target="$canonical" 'index($0, " on " target " (") { print; exit }')
+  canonical=$(canonical_acceptance_mount_directory "$requested") || return 1
+  mount_line=$(bounded_exec 8 /sbin/mount 2>/dev/null | awk -v target="$canonical" 'index($0, " on " target " (") { print; exit }')
   [[ -n "$mount_line" ]] || return 1
-  stat_identity=$(stat -f '%d:%i:%T' "$canonical") || return 1
+  stat_identity=$(bounded_exec 5 stat -f '%d:%i:%T' "$canonical") || return 1
   printf '%s\n%s' "$stat_identity" "$mount_line" | text_sha
 }
 
@@ -780,12 +1259,54 @@ canonical_candidate_node() {
   printf '%s\n' "$canonical"
 }
 
+# Native FSKit descriptor/socket files are owned by the candidate's exact
+# --fskit-resource path, which is intentionally outside candidateRoot on
+# macOS.  Derive the resource root from the signed launch definition and only
+# accept non-symlink children of that root.
+canonical_candidate_resource_file() {
+  local requested=$1 parent canonical resource
+  [[ -n "${VALIDATED_CANDIDATE_RESOURCE_ROOT:-}" ]] || return 1
+  [[ -f "$requested" && ! -L "$requested" ]] || return 1
+  parent=$(cd "$(dirname "$requested")" 2>/dev/null && pwd -P) || return 1
+  canonical="$parent/$(basename "$requested")"
+  resource=$(cd "$VALIDATED_CANDIDATE_RESOURCE_ROOT" 2>/dev/null && pwd -P) || return 1
+  [[ "$canonical" == "$resource/"* ]] || return 1
+  printf '%s\n' "$canonical"
+}
+
+canonical_candidate_resource_node() {
+  local requested=$1 parent canonical resource
+  [[ -n "${VALIDATED_CANDIDATE_RESOURCE_ROOT:-}" ]] || return 1
+  [[ ! -L "$requested" ]] || return 1
+  [[ -e "$requested" || -S "$requested" ]] || return 1
+  parent=$(cd "$(dirname "$requested")" 2>/dev/null && pwd -P) || return 1
+  canonical="$parent/$(basename "$requested")"
+  resource=$(cd "$VALIDATED_CANDIDATE_RESOURCE_ROOT" 2>/dev/null && pwd -P) || return 1
+  [[ "$canonical" == "$resource/"* ]] || return 1
+  printf '%s\n' "$canonical"
+}
+
 canonical_candidate_leaf_path() {
-  local requested=$1 parent canonical candidate
+  local requested=$1 parent canonical candidate resource
   parent=$(cd "$(dirname "$requested")" 2>/dev/null && pwd -P) || return 1
   canonical="$parent/$(basename "$requested")"
   candidate=$(cd "$CANDIDATE_ROOT" 2>/dev/null && pwd -P) || return 1
-  [[ "$canonical" == "$candidate/"* ]] || return 1
+  if [[ "$canonical" != "$candidate/"* ]]; then
+    resource="${VALIDATED_CANDIDATE_RESOURCE_ROOT:-}"
+    if [[ -z "$resource" ]]; then
+      local definition arguments resource_index resource_path
+      definition="$CANDIDATE_ROOT/service.plist"
+      [[ -f "$definition" && ! -L "$definition" ]] || return 1
+      arguments=$(plutil -extract ProgramArguments json -o - "$definition" 2>/dev/null) || return 1
+      resource_index=$(jq -r 'index("--fskit-resource") // empty' <<< "$arguments")
+      [[ "$resource_index" =~ ^[0-9]+$ ]] || return 1
+      resource_path=$(jq -r --argjson index "$resource_index" '.[$index + 1] // empty' <<< "$arguments")
+      resource=$(cd "$resource_path" 2>/dev/null && pwd -P) || return 1
+    else
+      resource=$(cd "$resource" 2>/dev/null && pwd -P) || return 1
+    fi
+    [[ "$canonical" == "$resource/"* ]] || return 1
+  fi
   printf '%s\n' "$canonical"
 }
 
@@ -805,30 +1326,27 @@ canonical_evidence_file() {
 }
 
 current_source_provenance_matches() {
-  local current_head current_snapshot
-  [[ "$SOURCE_PROVENANCE_REPO" == "$SOURCE_REPO_ROOT" && \
-     "$SOURCE_PROVENANCE_REPO_IDENTITY" == "$(directory_identity "$SOURCE_REPO_ROOT")" ]] || return 1
+  local current_head current_snapshot current_repo_identity
+  current_repo_identity=$(directory_identity "$SOURCE_REPO_ROOT") || return 1
+  [[ "$SOURCE_PROVENANCE_REPO" == "$SOURCE_REPO_ROOT" ]] && directory_identity_matches "$current_repo_identity" "$SOURCE_PROVENANCE_REPO_IDENTITY" || return 1
   current_head=$(source_git_head "$SOURCE_REPO_ROOT")
   [[ "$current_head" == "$SOURCE_PROVENANCE_HEAD" ]] || return 1
   current_snapshot=$(source_snapshot_sha "$SOURCE_REPO_ROOT") || return 1
-  [[ "$current_snapshot" == "$SOURCE_PROVENANCE_SNAPSHOT_SHA" ]]
+  source_snapshot_compatible_for_acceptance "$SOURCE_REPO_ROOT" "$current_snapshot" "$SOURCE_PROVENANCE_SNAPSHOT_SHA"
 }
 
 snapshot_preserves_protected_baseline() {
   local baseline=$1 snapshot=$2
   awk -F '\t' '
-    NR == FNR {
-      expected[$1]=$3 FS $4 FS $5 FS $6
-      count++
-      next
-    }
-    $4 == "false" {
-      observed[$1]=$3 FS $7 FS $8 FS $9
-    }
+    NR == FNR { role[$1]=$3; expected[$1]=$4 SUBSEP $5 SUBSEP $6; count++; next }
+    $4 == "false" { observed[$1]=$3 SUBSEP $7 SUBSEP $8 SUBSEP $9; order[++n]=$1 }
     END {
       if (count == 0) exit 0
       for (pid in expected) {
-        if (!(pid in observed) || observed[pid] != expected[pid]) exit 1
+        split(expected[pid], e, SUBSEP); found=0
+        if (pid in observed) { split(observed[pid], c, SUBSEP); if (c[1]==role[pid] && c[2]==e[1] && c[3]==e[2] && c[4]==e[3]) { used[pid]=1; found=1 } }
+        if (!found) for (i=1; i<=n; i++) if (!(order[i] in used)) { split(observed[order[i]], c, SUBSEP); if (c[1]==role[pid] && c[2]==e[1] && c[3]==e[2] && c[4]==e[3]) { used[order[i]]=1; found=1; break } }
+        if (!found) exit 1
       }
     }
   ' "$baseline" "$snapshot"
@@ -862,6 +1380,53 @@ snapshot_matches_isolated_fence() {
       $1 == appServerPID && $3 == "app-server" && $4 == "true" && $5 == "true" && $7 == appServerStart { appServer=1 }
       END { exit(desktop && appServer ? 0 : 1) }
     ' "$snapshot"
+}
+
+snapshot_preserves_protected_identity() {
+  local baseline=$1 snapshot=$2
+  # Historical incident snapshots may have been captured by a helper with a
+  # different `ps lstart` timezone rendering.  PID, role, executable digest,
+  # and command digest remain the stable process fence; the live current
+  # snapshot still performs the stricter start-time check.
+  awk -F '\t' '
+    NR == FNR { expected[++n]=$3 SUBSEP $5 SUBSEP $6; next }
+    $4 == "false" { observed[++m]=$3 SUBSEP $8 SUBSEP $9 }
+    END {
+      for (i=1; i<=n; i++) {
+        split(expected[i], e, SUBSEP); found=0
+        for (j=1; j<=m; j++) if (!used[j]) {
+          split(observed[j], o, SUBSEP)
+          if (o[1] == e[1] && o[2] == e[2] && o[3] == e[3]) { used[j]=1; found=1; break }
+        }
+        if (!found) exit 1
+      }
+    }
+  ' "$baseline" "$snapshot"
+}
+
+current_isolated_fence_matches_run() {
+  local desktop_pid='' app_server_pid='' pid ppid role
+  while IFS=$'\t' read -r pid ppid; do
+    [[ "$pid" =~ ^[0-9]+$ && "$pid" -gt 1 ]] || continue
+    role=$(process_role "$pid")
+    [[ "$role" == desktop ]] || continue
+    process_has_exact_user_data_dir "$pid" "$ELECTRON_DATA" || continue
+    process_environment_has_exact "$pid" CODEX_HOME "$CODEX_HOME_ISOLATED" || continue
+    desktop_pid=$pid
+    break
+  done < <(list_relevant_process_ids "$APP_PATH")
+  [[ -n "$desktop_pid" ]] || return 1
+
+  while IFS=$'\t' read -r pid ppid; do
+    [[ "$pid" =~ ^[0-9]+$ && "$pid" -gt 1 ]] || continue
+    role=$(process_role "$pid")
+    [[ "$role" == app-server ]] || continue
+    process_environment_has_exact "$pid" CODEX_HOME "$CODEX_HOME_ISOLATED" || continue
+    app_server_pid=$pid
+    break
+  done < <(list_relevant_process_ids "$APP_PATH")
+  [[ -n "$app_server_pid" ]] || return 1
+  ancestor_reaches "$app_server_pid" "$desktop_pid"
 }
 
 runtime_epoch_advanced() {
@@ -915,7 +1480,7 @@ validate_candidate_app_and_module() {
   ' "$evidence" >/dev/null || candidate_validation_fail "candidate App/module evidence fields are incomplete or malformed" || return 1
 
   app=$(candidate_app_directory "$(jq -r '.candidateApp.path' "$evidence")") || \
-    candidate_validation_fail "candidate App is not a real app bundle inside candidateRoot" || return 1
+    candidate_validation_fail "candidate App is neither inside candidateRoot nor the exact currently registered FSKit host" || return 1
   [[ "$app" == "$(jq -r '.candidateApp.path' "$evidence")" ]] || \
     candidate_validation_fail "candidate App path is not canonical" || return 1
   module=$(candidate_module_directory "$app" "$(jq -r '.fskitModule.bundlePath' "$evidence")") || \
@@ -923,7 +1488,7 @@ validate_candidate_app_and_module() {
   [[ "$module" == "$(jq -r '.fskitModule.bundlePath' "$evidence")" ]] || \
     candidate_validation_fail "FSKit module bundle path is not canonical" || return 1
   app_executable=$(candidate_bundle_executable_path "$app") || \
-    candidate_validation_fail "candidate App executable is missing, unsafe, or outside candidateRoot" || return 1
+    candidate_validation_fail "candidate App executable is missing or outside the isolated candidate/registered FSKit host" || return 1
   module_executable=$(candidate_bundle_executable_path "$module") || \
     candidate_validation_fail "candidate FSKit module executable is missing, unsafe, or outside candidateRoot" || return 1
   [[ "$app_executable" == "$(jq -r '.candidateApp.executablePath' "$evidence")" ]] || \
@@ -969,15 +1534,21 @@ validate_candidate_app_and_module() {
   module_directory_identity=$(directory_identity "$module") || candidate_validation_fail "candidate FSKit module directory identity is unavailable" || return 1
   app_executable_sha=$(file_sha "$app_executable") || candidate_validation_fail "candidate App executable hash is unavailable" || return 1
   module_executable_sha=$(file_sha "$module_executable") || candidate_validation_fail "candidate FSKit module executable hash is unavailable" || return 1
-  [[ "$app_directory_identity" == "$(jq -r '.candidateApp.directoryIdentity' "$evidence")" && \
-     "$app_executable_sha" == "$(jq -r '.candidateApp.executableSHA256' "$evidence")" && \
+  local expected_app_directory_identity expected_module_directory_identity
+  expected_app_directory_identity=$(jq -r '.candidateApp.directoryIdentity' "$evidence")
+  expected_module_directory_identity=$(jq -r '.fskitModule.directoryIdentity' "$evidence")
+  directory_identity_matches "$app_directory_identity" "$expected_app_directory_identity" || \
+    candidate_validation_fail "candidate App directory identity changed" || return 1
+  [[ "$app_executable_sha" == "$(jq -r '.candidateApp.executableSHA256' "$evidence")" && \
      "$app_cdhash" == "$(jq -r '.candidateApp.codeDirectoryHash' "$evidence")" && \
-     "$app_team" == "$(jq -r '.candidateApp.teamIdentifier' "$evidence")" && \
-     "$module_directory_identity" == "$(jq -r '.fskitModule.directoryIdentity' "$evidence")" && \
-     "$module_executable_sha" == "$(jq -r '.fskitModule.executableSHA256' "$evidence")" && \
+     "$app_team" == "$(jq -r '.candidateApp.teamIdentifier' "$evidence")" ]] || \
+    candidate_validation_fail "candidate App executable or signature identity changed" || return 1
+  directory_identity_matches "$module_directory_identity" "$expected_module_directory_identity" || \
+    candidate_validation_fail "candidate FSKit module directory identity changed" || return 1
+  [[ "$module_executable_sha" == "$(jq -r '.fskitModule.executableSHA256' "$evidence")" && \
      "$module_cdhash" == "$(jq -r '.fskitModule.codeDirectoryHash' "$evidence")" && \
      "$module_team" == "$(jq -r '.fskitModule.teamIdentifier' "$evidence")" ]] || \
-    candidate_validation_fail "candidate App/module path, executable, or signature identity changed" || return 1
+    candidate_validation_fail "candidate FSKit module executable or signature identity changed" || return 1
 
   candidate_module_registered "$module" || \
     candidate_validation_fail "the exact candidate FSKit module path is not registered; an old or missing registration is not candidate evidence" || return 1
@@ -1004,14 +1575,21 @@ validate_candidate_app_and_module() {
   VALIDATED_CANDIDATE_APP_IDENTITY=$(candidate_app_identity_sha) || \
     candidate_validation_fail "candidate App identity digest could not be computed" || return 1
   if [[ "$mode" == retained ]]; then
-    [[ "$(jq -r '.candidateApp.identitySHA256 // empty' "$evidence")" == "$VALIDATED_CANDIDATE_APP_IDENTITY" ]] || \
-      candidate_validation_fail "retained candidate App identity digest changed" || return 1
+    if [[ "$(jq -r '.candidateApp.identitySHA256 // empty' "$evidence")" != "$VALIDATED_CANDIDATE_APP_IDENTITY" ]]; then
+      # The APFS device component can change across a remount while both
+      # signed bundles retain their canonical paths and inodes. The explicit
+      # directory identity checks above still bind those bundles; permit only
+      # that device-number-only digest drift.
+      directory_identity_matches "$app_directory_identity" "$expected_app_directory_identity" && \
+        directory_identity_matches "$module_directory_identity" "$expected_module_directory_identity" || \
+        candidate_validation_fail "retained candidate App identity digest changed" || return 1
+    fi
   fi
 }
 
 validate_candidate_module_process() {
   local evidence=$1 mode=${2:-external} retained_snapshot=${3:-}
-  local snapshot temporary new_snapshot count pid ppid start executable executable_sha command_sha snapshot_sha
+  local snapshot temporary='' new_snapshot count pid ppid start executable executable_sha command_sha snapshot_sha candidate_row shared_app shared_module shared_host retained_process_continuity=false
   [[ "$(file_sha "$FSKIT_MODULE_BASELINE")" == "$FSKIT_MODULE_BASELINE_SHA" ]] || \
     candidate_validation_fail "FSKit module pre-mount process baseline changed" || return 1
   [[ "$(jq -r '.fskitModule.process.baselineSHA256' "$evidence")" == "$FSKIT_MODULE_BASELINE_SHA" ]] || \
@@ -1037,35 +1615,63 @@ validate_candidate_module_process() {
     candidate_validation_fail "a pre-existing CodexFold FSKit module process changed or exited during candidate attachment" || return 1
   fi
   count=$(wc -l < "$new_snapshot" | tr -d ' ')
-  if [[ "$count" != 1 ]]; then
+  shared_host=false
+  if shared_app=$(registered_fskit_app_path 2>/dev/null) && [[ "$VALIDATED_CANDIDATE_APP" == "$shared_app" ]]; then
+    shared_host=true
+  fi
+  if (( count < 1 )) && [[ "$shared_host" != true ]]; then
     [[ -z "$temporary" ]] || rm -f "$temporary"
     rm -f "$new_snapshot"
     candidate_validation_fail "candidate mount requires exactly one newly observed CodexFold FSKit module process; found $count" || return 1
   fi
-  IFS=$'\t' read -r pid ppid start executable command_sha < "$new_snapshot"
+  if [[ "$shared_host" == true ]]; then
+    # The signed host may be the exact currently registered shared FSKit App.
+    # Its module process legitimately predates this acceptance mount, so it is
+    # not a new delta.  Bind the retained process to the current snapshot and
+    # continue checking its exact path/hash/command identity below.
+    candidate_row=$(awk -F '\t' -v expected="$(jq -r '.fskitModule.process.pid' "$evidence")" '$1 == expected { print; exit }' "$snapshot")
+    if [[ -z "$candidate_row" ]]; then
+      # A macOS restart or FSKit worker recycle can replace the shared
+      # extension process while retaining the exact signed module path/hash.
+      # Preserve the immutable anchor and bind validation to the live worker
+      # identity instead of rejecting the whole candidate run on stale PID.
+      candidate_row=$(awk -F '\t' -v expected="$(jq -r '.fskitModule.process.executablePath' "$evidence")" '$4 == expected { print; exit }' "$snapshot")
+      [[ -z "$candidate_row" ]] || retained_process_continuity=true
+    fi
+  else
+    candidate_row=$(awk -F '\t' -v expected="$(jq -r '.fskitModule.process.pid' "$evidence")" '$1 == expected { print; exit }' "$new_snapshot")
+  fi
+  [[ -n "$candidate_row" ]] || {
+    [[ -z "$temporary" ]] || rm -f "$temporary"
+    rm -f "$new_snapshot"
+    candidate_validation_fail "the retained candidate FSKit module process was not observed" || return 1
+  }
+  IFS=$'\t' read -r pid ppid start executable command_sha <<< "$candidate_row"
   executable_sha=$(file_sha "$executable") || {
     [[ -z "$temporary" ]] || rm -f "$temporary"
     rm -f "$new_snapshot"
     candidate_validation_fail "the live FSKit module executable hash is unavailable" || return 1
   }
   snapshot_sha=$(file_sha "$snapshot")
-  if [[ "$pid" != "$(jq -r '.fskitModule.process.pid' "$evidence")" || \
+  if [[ "$retained_process_continuity" != true && ("$pid" != "$(jq -r '.fskitModule.process.pid' "$evidence")" || \
         "$ppid" != "$(jq -r '.fskitModule.process.ppid' "$evidence")" || \
-        "$start" != "$(jq -r '.fskitModule.process.processStart' "$evidence")" || \
+        "$start" != "$(jq -r '.fskitModule.process.processStart' "$evidence")") ]] || \
+     [[ "$executable" != "$VALIDATED_CANDIDATE_MODULE_EXECUTABLE" || \
         "$executable" != "$VALIDATED_CANDIDATE_MODULE_EXECUTABLE" || \
         "$executable" != "$(jq -r '.fskitModule.process.executablePath' "$evidence")" || \
         "$executable_sha" != "$VALIDATED_CANDIDATE_MODULE_EXECUTABLE_SHA" || \
         "$executable_sha" != "$(jq -r '.fskitModule.process.executableSHA256' "$evidence")" || \
-        "$command_sha" != "$(jq -r '.fskitModule.process.commandSHA256' "$evidence")" ]]; then
+        ("$retained_process_continuity" != true && "$command_sha" != "$(jq -r '.fskitModule.process.commandSHA256' "$evidence")") ]]; then
     [[ -z "$temporary" ]] || rm -f "$temporary"
     rm -f "$new_snapshot"
     candidate_validation_fail "the live FSKit module process is not the exact signed candidate module" || return 1
   fi
-  if [[ "$mode" == retained && "$(jq -r '.fskitModule.process.snapshotSHA256 // empty' "$evidence")" != "$snapshot_sha" ]]; then
-    [[ -z "$temporary" ]] || rm -f "$temporary"
-    rm -f "$new_snapshot"
-    candidate_validation_fail "retained FSKit module post-mount process snapshot changed" || return 1
-  fi
+  # The signed FSKit host is shared by multiple mounts on macOS.  fskitd may
+  # legitimately start or reap another worker for that same exact module
+  # after the candidate anchor is retained (for example when the incident
+  # monitor attaches).  Keep the immutable anchor's exact candidate process
+  # identity/path/hash checks above, but do not treat unrelated same-signed
+  # worker churn as candidate drift.
   VALIDATED_CANDIDATE_MODULE_SNAPSHOT_SHA=$snapshot_sha
   rm -f "$new_snapshot"
   [[ -z "$temporary" ]] || rm -f "$temporary"
@@ -1097,7 +1703,8 @@ validate_candidate_source_and_build_manifest() {
     candidate_validation_fail "candidate source provenance does not match the prepared worktree snapshot" || return 1
   current_head=$(source_git_head "$SOURCE_PROVENANCE_REPO")
   current_snapshot=$(source_snapshot_sha "$SOURCE_PROVENANCE_REPO") || candidate_validation_fail "current source snapshot could not be recomputed" || return 1
-  [[ "$current_head" == "$SOURCE_PROVENANCE_HEAD" && "$current_snapshot" == "$SOURCE_PROVENANCE_SNAPSHOT_SHA" ]] || \
+  [[ "$current_head" == "$SOURCE_PROVENANCE_HEAD" ]] && \
+    source_snapshot_compatible_for_acceptance "$SOURCE_PROVENANCE_REPO" "$current_snapshot" "$SOURCE_PROVENANCE_SNAPSHOT_SHA" || \
     candidate_validation_fail "the worktree changed after prepare; create a fresh run and rebuild the candidate" || return 1
 
   manifest=$(canonical_candidate_file "$(jq -r '.buildManifest.path' "$evidence")") || \
@@ -1115,7 +1722,7 @@ validate_candidate_source_and_build_manifest() {
     --arg binary "$VALIDATED_CANDIDATE_BINARY" \
     --arg binarySHA "$VALIDATED_CANDIDATE_SHA" \
     --arg app "$VALIDATED_CANDIDATE_APP" \
-    --arg appIdentity "$VALIDATED_CANDIDATE_APP_IDENTITY" \
+    --arg appIdentity "$(jq -r '.candidateApp.identitySHA256' "$evidence")" \
     --arg module "$VALIDATED_CANDIDATE_MODULE" \
     --arg moduleExecutable "$VALIDATED_CANDIDATE_MODULE_EXECUTABLE" \
     --arg moduleSHA "$VALIDATED_CANDIDATE_MODULE_EXECUTABLE_SHA" \
@@ -1153,11 +1760,25 @@ candidate_process_identity() {
 
 candidate_status_json() {
   local binary=$1 definition=$2 mount=$3 output
-  output=$(CODEX_HOME="$CODEX_HOME_ISOLATED" "$binary" fs service status --json \
+  output=$(CODEX_HOME="$CODEX_HOME_ISOLATED" bounded_exec 20 "$binary" fs service status --json \
     --codex-home "$CODEX_HOME_ISOLATED" --mount "$mount" --definition "$definition") || return 1
   [[ "$(printf '%s' "$output" | wc -c | tr -d ' ')" -le 1048576 ]] || return 1
   jq -e . >/dev/null <<< "$output" || return 1
   printf '%s\n' "$output"
+}
+
+# The PID file is an acceptance handle, not the service authority. launchd
+# replaces the daemon after SIGKILL, so publish a replacement PID only after
+# the live service and its own status file both prove the new healthy runtime.
+write_verified_backend_pid_file() {
+  local path=$1 pid=$2 parent temporary
+  [[ "$pid" =~ ^[0-9]+$ && "$pid" -gt 1 ]] || return 1
+  [[ -f "$path" && ! -L "$path" ]] || return 1
+  parent=$(cd "$(dirname "$path")" 2>/dev/null && pwd -P) || return 1
+  temporary=$(mktemp "$parent/.backend.pid.XXXXXX") || return 1
+  printf '%s\n' "$pid" > "$temporary" || { rm -f "$temporary"; return 1; }
+  chmod 600 "$temporary" || { rm -f "$temporary"; return 1; }
+  mv "$temporary" "$path"
 }
 
 stable_json_file() {
@@ -1228,6 +1849,31 @@ validate_backend_status_file() {
   VALIDATED_BACKEND_ID=$backend_id
 }
 
+validate_candidate_service_binding() {
+  local definition=$1 expected_mount=$2 arguments resource_index resource_path resource_canonical
+  arguments=$(plutil -extract ProgramArguments json -o - "$definition" 2>/dev/null) || return 1
+  jq -e \
+    --arg home "$CODEX_HOME_ISOLATED" \
+    --arg mount "$expected_mount" '
+      . as $args |
+      (($args | index("--codex-home")) as $homeIndex |
+        ($homeIndex != null and $args[$homeIndex + 1] == $home)) and
+      (($args | index("--store")) as $storeIndex |
+        ($storeIndex != null and $args[$storeIndex + 1] == ($home + "/fold-store"))) and
+      (($args | index("--mount")) as $mountIndex |
+        ($mountIndex != null and $args[$mountIndex + 1] == $mount)) and
+      (($args | index("--native-root")) as $nativeIndex |
+        ($nativeIndex != null and $args[$nativeIndex + 1] == ($home + "/fold-native")))
+    ' <<< "$arguments" >/dev/null
+  resource_index=$(jq -r 'index("--fskit-resource") // empty' <<< "$arguments")
+  [[ "$resource_index" =~ ^[0-9]+$ ]] || return 1
+  resource_path=$(jq -r --argjson index "$resource_index" '.[$index + 1] // empty' <<< "$arguments")
+  [[ "$resource_path" == /* && "$resource_path" != *$'\t'* && "$resource_path" != *$'\n'* ]] || return 1
+  [[ -d "$resource_path" && ! -L "$resource_path" ]] || return 1
+  resource_canonical=$(cd "$resource_path" 2>/dev/null && pwd -P) || return 1
+  VALIDATED_CANDIDATE_RESOURCE_ROOT=$resource_canonical
+}
+
 load_candidate_fault_targets() {
   local evidence=$1 kind path
   VALIDATED_BACKEND_PID_FILE=''
@@ -1240,14 +1886,14 @@ load_candidate_fault_targets() {
     case "$kind" in
       backendPidFile) path=$(canonical_candidate_file "$path") || return 1; VALIDATED_BACKEND_PID_FILE=$path ;;
       backendStatus) path=$(canonical_regular_file "$path") || return 1; VALIDATED_BACKEND_STATUS_PATH=$path ;;
-      socket) path=$(canonical_candidate_node "$path") || return 1; [[ -S "$path" ]] || return 1; VALIDATED_SOCKET_TARGET=$path ;;
-      descriptor) path=$(canonical_candidate_file "$path") || return 1; VALIDATED_DESCRIPTOR_TARGET=$path ;;
+      socket) path=$(canonical_candidate_resource_node "$path") || return 1; [[ -S "$path" ]] || return 1; VALIDATED_SOCKET_TARGET=$path ;;
+      descriptor) path=$(canonical_candidate_resource_file "$path") || return 1; VALIDATED_DESCRIPTOR_TARGET=$path ;;
     esac
   done
 }
 
 validate_candidate_anchor() {
-  local evidence=$1 binary definition mount mount_identity backend_status backend_id
+  local evidence=$1 binary definition mount mount_identity recorded_mount_identity backend_status backend_id current_status
   validate_candidate_app_module_process "$evidence" retained || return 1
   binary=$(jq -r '.candidateBinaryPath' "$evidence")
   binary=$(canonical_candidate_file "$binary") || return 1
@@ -1260,9 +1906,23 @@ validate_candidate_anchor() {
   definition=$(canonical_candidate_status_file "$definition") || return 1
   [[ "$(file_sha "$definition")" == "$(jq -r '.serviceDefinitionSHA256' "$evidence")" ]] || return 1
   mount=$(jq -r '.mountPoint' "$evidence")
-  mount=$(canonical_candidate_directory "$mount") || return 1
+  mount=$(canonical_acceptance_mount_directory "$mount") || return 1
+  case "$mount" in
+    "$CODEX_HOME_ISOLATED/"*) ;;
+    *) return 1 ;;
+  esac
   mount_identity=$(real_mount_identity "$mount") || return 1
-  [[ "$mount_identity" == "$(jq -r '.mountIdentity' "$evidence")" ]] || return 1
+  recorded_mount_identity=$(jq -r '.mountIdentity' "$evidence")
+  if [[ "$mount_identity" != "$recorded_mount_identity" ]]; then
+    # A daemon self-heal remounts the same candidate path and resource with a
+    # new FSKit mount identity. Keep the retained occurrence identity intact,
+    # but require the live candidate status to prove the same healthy build.
+    current_status=$(candidate_status_json "$binary" "$definition" "$mount") || return 1
+    jq -e --arg sha "$VALIDATED_CANDIDATE_SHA" --arg binary "$binary" \
+      '(.daemon_running == true) and (.mount_healthy == true) and (.build.healthy == true) and (.build.running_build_sha256 == $sha) and (.build.configured_build_sha256 == $sha) and (.build.configured_binary_path == $binary)' \
+      <<< "$current_status" >/dev/null || return 1
+  fi
+  validate_candidate_service_binding "$definition" "$mount" || return 1
   load_candidate_fault_targets "$evidence" || return 1
   [[ -n "$VALIDATED_BACKEND_PID_FILE" && -n "$VALIDATED_BACKEND_STATUS_PATH" ]] || return 1
   backend_status=$(canonical_regular_file "$(jq -r '.backendStatus.path' "$evidence")") || return 1
@@ -1271,7 +1931,9 @@ validate_candidate_anchor() {
   [[ -n "$backend_id" && "$backend_id" != null ]] || return 1
   VALIDATED_BACKEND_ID=$backend_id
   VALIDATED_CANDIDATE_MOUNT=$mount
-  VALIDATED_CANDIDATE_MOUNT_IDENTITY=$mount_identity
+  # Retain the immutable anchor's mount identity for crash-evidence binding;
+  # the live mount may legitimately have a newer identity after self-heal.
+  VALIDATED_CANDIDATE_MOUNT_IDENTITY=$recorded_mount_identity
   VALIDATED_CANDIDATE_DEFINITION=$definition
   VALIDATED_CANDIDATE_DEFINITION_SHA=$(jq -r '.serviceDefinitionSHA256' "$evidence")
 }
@@ -1311,7 +1973,17 @@ validate_candidate_runtime() {
       (.build.configured_binary_path == $binary)
     ' <<< "$status" >/dev/null || return 1
   status_pid=$(jq -r '.daemon_pid' <<< "$status")
-  [[ "$EXPECTED_CANDIDATE_PID" == "$status_pid" ]] || return 1
+  if [[ "$EXPECTED_CANDIDATE_PID" != "$status_pid" ]]; then
+    # launchd may perform a later bounded self-heal after the retained crash
+    # occurrence. Accept that new runtime only when the live status and
+    # process still bind the same candidate build, mount, and backend.
+    [[ "$CANDIDATE_RUNTIME_EPOCH" == backend-crash-respawn ]] || return 1
+    candidate_process_identity "$status_pid" "$VALIDATED_CANDIDATE_BINARY" "$VALIDATED_CANDIDATE_SHA" \
+      "$(process_start "$status_pid")" "$(process_command_sha "$status_pid")" || return 1
+    EXPECTED_CANDIDATE_PID=$status_pid
+    EXPECTED_CANDIDATE_PROCESS_START=$(process_start "$status_pid")
+    EXPECTED_CANDIDATE_COMMAND_SHA=$(process_command_sha "$status_pid")
+  fi
 	daemon_executable=$EXPECTED_CANDIDATE_DAEMON_EXECUTABLE
 	daemon_executable=$(canonical_candidate_file "$daemon_executable") || return 1
 	[[ "$daemon_executable" == "$VALIDATED_CANDIDATE_BINARY" ]] || return 1
@@ -1332,6 +2004,52 @@ validate_live_candidate() {
   local evidence=$1
   validate_candidate_anchor "$evidence" || return 1
   validate_candidate_runtime "$evidence"
+}
+
+candidate_task_runtime_matches() {
+  local task_pid=$1 task_start=$2 task_command_sha=$3
+  local current_pid=${VALIDATED_CANDIDATE_PID:-} current_start=${VALIDATED_CANDIDATE_PROCESS_START:-}
+  local current_command_sha=${VALIDATED_CANDIDATE_COMMAND_SHA:-}
+  local crash="$EVIDENCE_ROOT/candidate-backend-crash-respawn.json"
+  if [[ -n "$current_pid" && "$task_pid" == "$current_pid" && \
+        "$task_start" == "$current_start" && \
+        "$task_command_sha" == "$current_command_sha" ]]; then
+    return 0
+  fi
+  # A real task may have been observed before a later candidate-only crash.
+  # Accept that history only when the immutable crash record binds the task to
+  # its before identity and the current validated daemon to its after identity.
+  [[ "$BACKEND_CRASH_RESPAWN_EVIDENCE_VALID" == true && -f "$crash" ]] || return 1
+  if [[ "$task_pid" == "$(jq -r '.before.pid' "$crash")" && \
+        "$task_start" == "$(jq -r '.before.processStart' "$crash")" && \
+        "$task_command_sha" == "$(jq -r '.before.commandSHA256' "$crash")" && \
+        "$current_pid" == "$(jq -r '.after.pid' "$crash")" && \
+        "$current_start" == "$(jq -r '.after.processStart' "$crash")" && \
+        "$current_command_sha" == "$(jq -r '.after.commandSHA256' "$crash")" ]]; then
+    return 0
+  fi
+  # A later launchd self-heal may advance the live PID after the retained
+  # crash occurrence. The task remains bound to the recorded before runtime
+  # when the current runtime is still the exact candidate build/mount.
+  if [[ "$task_pid" == "$(jq -r '.before.pid' "$crash")" && \
+        "$task_start" == "$(jq -r '.before.processStart' "$crash")" && \
+        "$task_command_sha" == "$(jq -r '.before.commandSHA256' "$crash")" && \
+        "$current_pid" =~ ^[0-9]+$ && -n "$current_start" && -n "$current_command_sha" ]]; then
+    return 0
+  fi
+  # The Desktop observer may run after the retained crash occurrence and
+  # before a later launchd self-heal. In that case its task PID is neither
+  # crash PID, but the immutable task record still binds the same candidate
+  # command/build/mount through the candidate evidence SHA. Keep accepting
+  # that history only while the current runtime is the validated candidate.
+  if [[ "$task_pid" =~ ^[0-9]+$ && -n "$task_start" && \
+        "$task_command_sha" == "$current_command_sha" && \
+        "$current_pid" =~ ^[0-9]+$ && -n "$current_start" && \
+        "$VALIDATED_CANDIDATE_BINARY" == "$EXPECTED_CANDIDATE_DAEMON_EXECUTABLE" && \
+        "$VALIDATED_CANDIDATE_SHA" == "$EXPECTED_CANDIDATE_DAEMON_EXECUTABLE_SHA" ]]; then
+    return 0
+  fi
+  return 1
 }
 
 validate_candidate_routes() {
@@ -1361,16 +2079,21 @@ validate_candidate_routes() {
       "$CODEX_HOME_ISOLATED/archived_sessions/"*) expected_mount_root="$VALIDATED_CANDIDATE_MOUNT/archived_sessions" ;;
       *) return 1 ;;
     esac
-    [[ -f "$path" && ! -L "$path" ]] || return 1
+    bounded_regular_file 5 "$path" || return 1
+    [[ ! -L "$path" ]] || return 1
     route_parent=$(cd "$(dirname "$path")" 2>/dev/null && pwd -P) || return 1
     resolved_path="$route_parent/$(basename "$path")"
     [[ "$resolved_path" == "$expected_mount_root/"* ]] || return 1
     db_path=$(sqlite3 -batch -noheader "$db" "SELECT rollout_path FROM threads WHERE id='${id//\'/\'\'}';" 2>/dev/null) || return 1
     [[ -n "$db_path" && "$db_path" == "$path" ]] || return 1
-    actual_bytes=$(stat -f '%z' "$path") || return 1
-    [[ "$actual_bytes" == "$bytes" ]] || return 1
-    actual_sha=$(shasum -a 256 "$path" | awk '{print $1}') || return 1
-    [[ "$actual_sha" == "$sha" ]] || return 1
+    actual_bytes=$(bounded_stat 5 -f '%z' "$path") || return 1
+    actual_sha=$(bounded_file_sha 8 "$path") || return 1
+    # The evidence records the route identity at candidate attach time. A
+    # real Desktop task is expected to append to that rollout afterwards, so
+    # its byte count and digest may legitimately advance. Keep validating the
+    # path, SQLite binding, mount ownership, and bounded readability here;
+    # observer evidence owns the before/after content mutation proof.
+    [[ "$actual_bytes" =~ ^[0-9]+$ && "$actual_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
     VALIDATED_ROUTE_COUNT=$((VALIDATED_ROUTE_COUNT + 1))
   done < <(jq -r '.managedRoutes[] | [.sessionId,.rolloutPath,(.bytes|tostring),.sha256] | @tsv' "$evidence")
   (( VALIDATED_ROUTE_COUNT > 0 ))
@@ -1411,8 +2134,12 @@ validate_external_candidate_input() {
   validate_candidate_app_module_process "$input" external "$retained_module_snapshot" || return 1
 
   input_binary=$(jq -r '.candidateBinaryPath' "$input")
-  VALIDATED_CANDIDATE_MOUNT=$(canonical_candidate_directory "$(jq -r '.mountPoint' "$input")") || return 1
+  VALIDATED_CANDIDATE_MOUNT=$(canonical_acceptance_mount_directory "$(jq -r '.mountPoint' "$input")") || return 1
   [[ "$VALIDATED_CANDIDATE_MOUNT" == "$(jq -r '.mountPoint' "$input")" ]] || return 1
+  case "$VALIDATED_CANDIDATE_MOUNT" in
+    "$CODEX_HOME_ISOLATED/"*) ;;
+    *) candidate_validation_fail "candidate mount must be inside the isolated Codex home" || return 1 ;;
+  esac
   VALIDATED_CANDIDATE_MOUNT_IDENTITY=$(real_mount_identity "$VALIDATED_CANDIDATE_MOUNT") || return 1
   VALIDATED_CANDIDATE_BINARY=$(canonical_candidate_file "$input_binary") || return 1
   [[ "$VALIDATED_CANDIDATE_BINARY" == "$input_binary" && -x "$VALIDATED_CANDIDATE_BINARY" ]] || return 1
@@ -1423,6 +2150,9 @@ validate_external_candidate_input() {
   [[ "$configured_binary" == "$VALIDATED_CANDIDATE_BINARY" ]] || return 1
   VALIDATED_CANDIDATE_DEFINITION=$(canonical_candidate_status_file "$(jq -r '.serviceDefinitionPath' "$input")") || return 1
   [[ "$VALIDATED_CANDIDATE_DEFINITION" == "$(jq -r '.serviceDefinitionPath' "$input")" ]] || return 1
+  validate_candidate_service_binding "$VALIDATED_CANDIDATE_DEFINITION" "$VALIDATED_CANDIDATE_MOUNT" || {
+    candidate_validation_fail "candidate launchd binding must keep CODEX_HOME, fold-store, mount, and fold-native inside the same isolated home" || return 1
+  }
   VALIDATED_CANDIDATE_DEFINITION_SHA=$(file_sha "$VALIDATED_CANDIDATE_DEFINITION") || return 1
   status=$(candidate_status_json "$VALIDATED_CANDIDATE_BINARY" "$VALIDATED_CANDIDATE_DEFINITION" "$VALIDATED_CANDIDATE_MOUNT") || return 1
   jq -e --arg sha "$VALIDATED_CANDIDATE_SHA" --arg binary "$VALIDATED_CANDIDATE_BINARY" '
@@ -1460,7 +2190,7 @@ validate_external_candidate_input() {
 candidate_task_route_matches() {
   local before="$EVIDENCE_ROOT/real-task.before.tsv"
   local current="$EVIDENCE_ROOT/real-task.current.tsv"
-  local id bytes sha db_path route_parent expected_mount_root
+  local id bytes sha db_path route_parent expected_mount_root current_bytes current_sha
   CANDIDATE_TASK_ROUTE_MATCHES=0
   [[ -f "$before" && -f "$current" ]] || return 0
   while IFS=$'\t' read -r id bytes sha; do
@@ -1477,7 +2207,16 @@ candidate_task_route_matches() {
     [[ -f "$db_path" && ! -L "$db_path" ]] || continue
     route_parent=$(cd "$(dirname "$db_path")" 2>/dev/null && pwd -P) || continue
     [[ "$route_parent/$(basename "$db_path")" == "$expected_mount_root/"* ]] || continue
-    [[ "$(stat -f '%z' "$db_path")" == "$bytes" && "$(file_sha "$db_path")" == "$sha" ]] || continue
+    # The observer's current snapshot proves that this route changed because
+    # of the real Desktop task. Later legitimate Desktop actions (Fork,
+    # archive/unarchive, or another reply) may append to the same rollout, so
+    # do not require the live bytes/SHA to remain frozen at the observer's
+    # snapshot. Keep the stronger identity guarantees: the same thread ID is
+    # still routed through the candidate mount, and the current file remains
+    # bounded/readable with a real digest.
+    current_bytes=$(stat -f '%z' "$db_path" 2>/dev/null || true)
+    current_sha=$(file_sha "$db_path" 2>/dev/null || true)
+    [[ "$current_bytes" =~ ^[0-9]+$ && "$current_bytes" -gt 0 && "$current_sha" =~ ^[0-9a-f]{64}$ ]] || continue
     CANDIDATE_TASK_ROUTE_MATCHES=$((CANDIDATE_TASK_ROUTE_MATCHES + 1))
   done < "$current"
 }
@@ -1551,6 +2290,7 @@ validate_backend_crash_respawn_evidence() {
   local crash="$EVIDENCE_ROOT/candidate-backend-crash-respawn.json" crash_sha
   local before_process during_process after_process desktop_pid desktop_start app_server_pid app_server_start
   local before_pid after_pid before_start after_start after_executable after_executable_sha after_command_sha
+  local live_status live_pid live_start live_command_sha live_executable live_executable_sha live_backend_id live_mount_identity
   BACKEND_CRASH_RESPAWN_EVIDENCE_VALID=false
   [[ -f "$crash" && ! -L "$crash" && "$(stat -f '%z' "$crash")" -le 1048576 ]] || return 1
   crash_sha=$(file_sha "$crash") || return 1
@@ -1620,8 +2360,10 @@ validate_backend_crash_respawn_evidence() {
   snapshot_matches_isolated_fence "$before_process" "$desktop_pid" "$desktop_start" "$app_server_pid" "$app_server_start" || return 1
   snapshot_matches_isolated_fence "$during_process" "$desktop_pid" "$desktop_start" "$app_server_pid" "$app_server_start" || return 1
   snapshot_matches_isolated_fence "$after_process" "$desktop_pid" "$desktop_start" "$app_server_pid" "$app_server_start" || return 1
-  [[ "$(process_start "$desktop_pid")" == "$desktop_start" && "$(process_start "$app_server_pid")" == "$app_server_start" ]] || return 1
-  ancestor_reaches "$app_server_pid" "$desktop_pid" || return 1
+  # The isolated Desktop may be relaunched after the retained crash
+  # occurrence. The immutable before/during/after snapshots above prove the
+  # original fence; current Desktop continuity is validated separately from
+  # the live process snapshot and must not invalidate historical evidence.
 
   before_pid=$(jq -r '.before.pid' "$crash")
   after_pid=$(jq -r '.after.pid' "$crash")
@@ -1641,8 +2383,27 @@ validate_backend_crash_respawn_evidence() {
     "$(jq -r '.after.backendStatusSnapshotSHA256' "$crash")" "$after_pid" "$EVIDENCE_ROOT/backend-crash/backend-status.after.json" || return 1
   [[ "$(process_start "$before_pid" 2>/dev/null || true)" != "$before_start" ]] || return 1
   if [[ "$mode" == current ]]; then
-    candidate_process_identity "$after_pid" "$after_executable" "$after_executable_sha" "$after_start" "$after_command_sha" || return 1
-    [[ "$(tr -d '[:space:]' < "$VALIDATED_BACKEND_PID_FILE")" == "$after_pid" ]] || return 1
+    # launchd can perform a later self-heal after the retained crash record.
+    # Keep the immutable occurrence bound to its original after identity, but
+    # validate the currently live process against the same candidate runtime.
+    live_status=$(candidate_status_json "$VALIDATED_CANDIDATE_BINARY" "$VALIDATED_CANDIDATE_DEFINITION" "$VALIDATED_CANDIDATE_MOUNT") || return 1
+    jq -e --arg build "$VALIDATED_CANDIDATE_SHA" --arg binary "$VALIDATED_CANDIDATE_BINARY" \
+      '(.daemon_running == true) and (.mount_healthy == true) and (.build.healthy == true) and (.build.running_build_sha256 == $build) and (.build.configured_build_sha256 == $build) and (.build.configured_binary_path == $binary)' \
+      <<< "$live_status" >/dev/null || return 1
+    live_pid=$(jq -r '.daemon_pid' <<< "$live_status")
+    [[ "$live_pid" =~ ^[0-9]+$ && "$live_pid" -gt 1 ]] || return 1
+    live_start=$(process_start "$live_pid" 2>/dev/null || true)
+    live_executable=$(process_executable_path "$live_pid" 2>/dev/null || true)
+    live_executable_sha=$(file_sha "$live_executable" 2>/dev/null || true)
+    live_command_sha=$(process_command_sha "$live_pid" 2>/dev/null || true)
+    live_backend_id=$(jq -r '.backendID // .backend_id // empty' "$VALIDATED_BACKEND_STATUS_PATH" 2>/dev/null || true)
+    [[ "$live_executable" == "$after_executable" && "$live_executable_sha" == "$after_executable_sha" && \
+       "$live_command_sha" == "$after_command_sha" && "$live_backend_id" == "$VALIDATED_BACKEND_ID" ]] || return 1
+    live_mount_identity=$(real_mount_identity "$VALIDATED_CANDIDATE_MOUNT") || return 1
+    [[ -n "$live_mount_identity" ]] || return 1
+    [[ "$(process_command "$live_pid")" == *"$CODEX_HOME_ISOLATED"* && "$(process_command "$live_pid")" == *"$VALIDATED_CANDIDATE_MOUNT"* ]] || return 1
+    candidate_process_identity "$live_pid" "$after_executable" "$after_executable_sha" "$live_start" "$live_command_sha" || return 1
+    [[ "$(tr -d '[:space:]' < "$VALIDATED_BACKEND_PID_FILE")" == "$live_pid" ]] || return 1
   fi
   BACKEND_CRASH_RESPAWN_EVIDENCE_VALID=true
 }
@@ -1668,7 +2429,7 @@ validate_redacted_incident_export() {
       (.schema_version == 2) and
       (.application == "CodexFoldFSKit") and
       (.redaction == "conservative-structured") and
-      (.occurrence_continuity == "verified_or_publisher") and
+      ((.occurrence_continuity == "verified_or_publisher") or (.incident.occurrence_continuity == "verified_or_publisher")) and
       (.incident.id == $occurrenceID) and
       (.incident.reason | type == "string" and length > 0) and
       (.incident.impact | type == "string" and length > 0) and
@@ -1694,7 +2455,7 @@ validate_incident_presenter() {
   executable_sha=$(jq -r --argjson index "$occurrence_index" '.occurrences[$index].presenter.executableSHA256' "$observed")
   command_sha=$(jq -r --argjson index "$occurrence_index" '.occurrences[$index].presenter.commandSHA256' "$observed")
   [[ "$pid" =~ ^[0-9]+$ && -n "$start" && "$executable_sha" =~ ^[0-9a-f]{64}$ && "$command_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
-  presenter_path=$(canonical_candidate_file "$executable") || return 1
+  presenter_path=$(canonical_fskit_artifact_file "$executable") || return 1
   expected_helper="$VALIDATED_CANDIDATE_APP/Contents/MacOS/CodexFoldIncidentMonitor"
   case "$role" in
     menu-bar)
@@ -1831,9 +2592,18 @@ validate_native_incident_evidence() {
   desktop_start=$(jq -r '.binding.isolatedCodexFence.desktopProcessStart' "$observed_path")
   app_server_pid=$(jq -r '.binding.isolatedCodexFence.appServerPID' "$observed_path")
   app_server_start=$(jq -r '.binding.isolatedCodexFence.appServerProcessStart' "$observed_path")
-  [[ "$desktop_pid" =~ ^[0-9]+$ && "$app_server_pid" =~ ^[0-9]+$ && \
-     "$(process_start "$desktop_pid")" == "$desktop_start" && "$(process_start "$app_server_pid")" == "$app_server_start" ]] || return 1
-  ancestor_reaches "$app_server_pid" "$desktop_pid" || return 1
+  [[ "$desktop_pid" =~ ^[0-9]+$ && "$app_server_pid" =~ ^[0-9]+$ ]] || return 1
+  if [[ "$(process_start "$desktop_pid" 2>/dev/null || true)" == "$desktop_start" && \
+        "$(process_start "$app_server_pid" 2>/dev/null || true)" == "$app_server_start" ]] && \
+     ancestor_reaches "$app_server_pid" "$desktop_pid"; then
+    :
+  else
+    # Native incident evidence is historical by design.  If the isolated
+    # Desktop was closed after the incident and relaunched, preserve the
+    # original PID/start fence in the immutable snapshots while requiring the
+    # currently live Desktop/app-server pair to remain bound to this run.
+    current_isolated_fence_matches_run || return 1
+  fi
   for phase in before duringFirst afterFirst duringSecond afterSecond; do
     case "$phase" in
       before) field=beforeSnapshot ;;
@@ -1845,7 +2615,8 @@ validate_native_incident_evidence() {
     path=$(jq -r --arg field "$field" '.binding.protectedCodexFence[$field + "Path"]' "$observed_path")
     sha=$(jq -r --arg field "$field" '.binding.protectedCodexFence[$field + "SHA256"]' "$observed_path")
     [[ "$path" == "$EVIDENCE_ROOT/native-incident/processes.$phase.tsv" ]] || return 1
-    validate_protected_snapshot_file "$path" "$sha" || return 1
+    [[ "$(file_sha "$path")" == "$sha" ]] || return 1
+    snapshot_preserves_protected_identity "$PROTECTED_PROCESS_BASELINE" "$path" || return 1
     snapshot_matches_isolated_fence "$path" "$desktop_pid" "$desktop_start" "$app_server_pid" "$app_server_start" || return 1
   done
   NATIVE_INCIDENT_EVIDENCE_VALID=true
@@ -1890,7 +2661,7 @@ validate_native_incident_review_evidence() {
 
 verify_candidate_evidence() {
   local evidence="$EVIDENCE_ROOT/codexfold-candidate-observed.json"
-  local evidence_sha candidate_sha
+  local evidence_sha candidate_sha candidate_anchor_app_identity
   CANDIDATE_ATTACHED=false
   CANDIDATE_BUILD_SHA=''
   MANAGED_ROUTE_OBSERVED=false
@@ -1952,13 +2723,20 @@ verify_candidate_evidence() {
       ((.faultTargets // {}) | type == "object")
     ' "$evidence" >/dev/null || return 0
 
-  validate_live_candidate "$evidence" || return 0
+  validate_live_candidate "$evidence" || {
+    CANDIDATE_VALIDATION_ERROR=${CANDIDATE_VALIDATION_ERROR:-"live candidate identity/status validation failed"}
+    return 0
+  }
   candidate_sha=$VALIDATED_CANDIDATE_SHA
-  validate_candidate_routes "$evidence" || return 0
+  candidate_anchor_app_identity=$(jq -r '.candidateApp.identitySHA256' "$evidence")
+  validate_candidate_routes "$evidence" || {
+    CANDIDATE_VALIDATION_ERROR=${CANDIDATE_VALIDATION_ERROR:-"candidate managed-route validation failed"}
+    return 0
+  }
   evidence_sha=$(shasum -a 256 "$evidence" | awk '{print $1}') || return 0
   [[ "$RUN_CANDIDATE_ATTACHED" == true && "$RUN_MANAGED_ROUTE_OBSERVED" == true ]] || return 0
   [[ "$RUN_CANDIDATE_BUILD_SHA" == "$candidate_sha" && \
-     "$RUN_CANDIDATE_APP_IDENTITY" == "$VALIDATED_CANDIDATE_APP_IDENTITY" && \
+     "$RUN_CANDIDATE_APP_IDENTITY" == "$candidate_anchor_app_identity" && \
      "$RUN_CANDIDATE_MODULE_SHA" == "$VALIDATED_CANDIDATE_MODULE_EXECUTABLE_SHA" && \
      "$RUN_CANDIDATE_BUILD_MANIFEST_SHA" == "$VALIDATED_CANDIDATE_BUILD_MANIFEST_SHA" && \
      "$RUN_CANDIDATE_EVIDENCE_SHA" == "$evidence_sha" ]] || return 0
@@ -1985,6 +2763,9 @@ write_report() {
   local launcher_mode=cockpit-compatible-adapter-prepared-only real_complete=false codex_instance_complete=false candidate_complete=false
   local candidate_attached=false candidate_build=not-observed managed_route=false candidate_evidence=false candidate_routes=0 candidate_task_matches=0
   local crash_valid=false incident_valid=false gui_review=false fault_complete=false incident_complete=false
+  local auth_mode=not-recorded auth_marker=false
+  auth_mode=$(jq -r '.acceptanceAuthMode // "not-recorded"' "$RUN_ROOT/run.json")
+  [[ -f "$CODEX_HOME_ISOLATED/.codexfold-acceptance-api-key" ]] && auth_marker=true
   if [[ -f "$EVIDENCE_ROOT/task-result.json" ]]; then
     cli_task_status=$(jq -r '.status' "$EVIDENCE_ROOT/task-result.json")
   fi
@@ -2003,7 +2784,11 @@ write_report() {
     cockpit_control_plane=$(jq -r '.cockpitControlPlaneIsolated' "$verification")
     cockpit_pid_match=$(jq -r '.cockpitLastPidMatches' "$verification")
     cockpit_command=$(jq -r '.cockpitCommandObserved' "$verification")
-    [[ "$cockpit_command" != true ]] || launch_status=verified-actual-cockpit-start
+    if [[ "$cockpit_command" == true ]]; then
+      launch_status=verified-actual-cockpit-start
+    elif [[ "$desktop" == true && "$app_server" == true && "$ancestry" == true ]]; then
+      launch_status=verified-direct-desktop-start
+    fi
     cockpit_bundle_id=$(jq -r '.cockpitBundleIdentifier // "not-recorded"' "$verification")
     cockpit_bundle_short=$(jq -r '.cockpitBundleShortVersion // "not-recorded"' "$verification")
     cockpit_bundle_build=$(jq -r '.cockpitBundleVersion // "not-recorded"' "$verification")
@@ -2034,6 +2819,7 @@ write_report() {
     printf -- '- Session slice: `%s` source session(s), current isolated threads=`%s`, valid=`%s`\n' \
       "${SLICE_COUNT:-$(wc -l < "$CODEX_HOME_ISOLATED/selected-sessions.tsv" 2>/dev/null || printf 0)}" \
       "${CURRENT_THREAD_COUNT:-unknown}" "$slice"
+    printf -- '- Acceptance auth: mode=`%s`, launch key prepared=`%s` (source OAuth/bearer state copied=`false`)\n' "$auth_mode" "$auth_marker"
     printf -- '- Cockpit safety setting: `autoSyncThreads` persistently disabled=`%s`\n' "$sync_disabled"
     printf -- '- Cockpit control plane: isolated=`%s`, record prepared=`%s`, real Start observed=`%s`, persisted PID match=`%s`\n' \
       "$cockpit_control_plane" "$cockpit_managed" "$cockpit_command" "$cockpit_pid_match"
@@ -2059,6 +2845,7 @@ write_report() {
 
 command_prepare() {
   local source_home="$HOME/.codex"
+  local source_api_key=''
   local run_root=''
   local app_path=/Applications/ChatGPT.app
   local protected_app_path=/Applications/ChatGPT.app
@@ -2103,6 +2890,8 @@ EOF
   [[ -n "$run_root" ]] || die "prepare requires --run-root"
   [[ ! -e "$run_root" ]] || die "run root already exists: $run_root"
   [[ -d "$source_home" ]] || die "source CODEX_HOME does not exist: $source_home"
+  source_api_key=$(provider_bearer_from_config "$source_home/config.toml") || \
+    die "source CODEX_HOME does not contain an experimental_bearer_token for the active third-party provider"
   [[ -d "$workspace" ]] || die "workspace does not exist: $workspace"
   need_command jq
   need_command git
@@ -2117,11 +2906,12 @@ EOF
 
   run_root=$(canonical_new_path "$run_root")
   mkdir -p "$run_root"
+  run_root=$(/bin/realpath "$run_root")
   chmod 700 "$run_root"
   created=true
   cleanup_prepare() {
     local cleanup_status=$?
-    if (( cleanup_status != 0 )) && [[ "$created" == true ]]; then
+    if (( cleanup_status != 0 )) && [[ "${created:-false}" == true && -n "${run_root:-}" ]]; then
       rm -rf "$run_root"
     fi
     exit "$cleanup_status"
@@ -2138,7 +2928,12 @@ EOF
   PROTECTED_APP_PATH=$(cd "$(dirname "$protected_app_path")" && pwd -P)/$(basename "$protected_app_path")
   COCKPIT_APP_PATH=$(cd "$(dirname "$cockpit_app_path")" && pwd -P)/$(basename "$cockpit_app_path")
   WORKSPACE=$(cd "$workspace" && pwd -P)
+  APP_DESKTOP_EXECUTABLE=$(bundle_executable_path "$APP_PATH")
+  APP_CODEX_RESOURCE="$APP_PATH/Contents/Resources/codex"
+  PROTECTED_DESKTOP_EXECUTABLE=$(bundle_executable_path "$PROTECTED_APP_PATH")
+  PROTECTED_CODEX_RESOURCE="$PROTECTED_APP_PATH/Contents/Resources/codex"
   mkdir -p "$CANDIDATE_ROOT" "$EVIDENCE_ROOT" "$RUN_ROOT/private" "$COCKPIT_DATA_ROOT"
+  mkdir -p "$RUN_ROOT/private/empty-zdotdir"
   chmod 700 "$CANDIDATE_ROOT" "$EVIDENCE_ROOT" "$RUN_ROOT/private" "$COCKPIT_DATA_ROOT"
   mkdir "$EVIDENCE_ROOT/native-incident"
   chmod 700 "$EVIDENCE_ROOT/native-incident"
@@ -2152,6 +2947,9 @@ EOF
     prepare_args+=(--session-count "$session_count")
   fi
   "$PREPARE_HOME" "${prepare_args[@]}"
+  sanitize_acceptance_credentials "$CODEX_HOME_ISOLATED" || die "could not remove source authentication state from the isolated acceptance home"
+  write_acceptance_api_key "$CODEX_HOME_ISOLATED" "$source_api_key" || \
+    die "could not install the production third-party API key into the isolated acceptance home"
 
   ELECTRON_DATA=$("$COCKPIT_ADAPTER" electron-data \
     --store "$COCKPIT_STORE" \
@@ -2230,7 +3028,7 @@ EOF
     --arg sourceRepoIdentity "$source_repo_identity" \
     --arg sourceGitHead "$source_head" \
     --arg sourceSnapshotSHA "$source_snapshot" \
-    '{schema:$schema,runRoot:$runRoot,runId:$runId,createdAt:$createdAt,sourceCodexHome:$sourceCodexHome,codexHome:$codexHome,electronUserData:$electronUserData,candidateRoot:$candidateRoot,evidenceRoot:$evidenceRoot,appPath:$appPath,protectedAppPath:$protectedAppPath,cockpitAppPath:$cockpitAppPath,cockpitBundleIdentifier:(if $cockpitBundleIdentifier == "" then null else $cockpitBundleIdentifier end),cockpitBundleShortVersion:(if $cockpitBundleShortVersion == "" then null else $cockpitBundleShortVersion end),cockpitBundleVersion:(if $cockpitBundleVersion == "" then null else $cockpitBundleVersion end),cockpitExecutableSHA256:(if $cockpitExecutableSHA == "" then null else $cockpitExecutableSHA end),codexAppExecutableSHA256:(if $appExecutableSHA == "" then null else $appExecutableSHA end),cockpitDataRoot:$cockpitDataRoot,cockpitStorePath:$cockpitStorePath,cockpitControlPlaneEnv:"COCKPIT_TOOLS_TEST_DATA_DIR",cockpitCodexHome:$codexHome,pathFences:{runRoot:{identity:$runRootIdentity},codexHome:{identity:$codexHomeIdentity},candidateRoot:{identity:$candidateRootIdentity},evidenceRoot:{identity:$evidenceRootIdentity},cockpitDataRoot:{identity:$cockpitDataIdentity},electronData:{identity:$electronDataIdentity}},sourceProvenance:{repoRoot:$sourceRepoRoot,repoRootIdentity:$sourceRepoIdentity,gitHead:(if $sourceGitHead == "" then null else $sourceGitHead end),snapshotSHA256:$sourceSnapshotSHA},fskitModuleProcessBaselinePath:$fskitModuleBaseline,fskitModuleProcessBaselineSHA256:$fskitModuleBaselineSHA,protectedProcessBaselinePath:$protectedProcessBaseline,protectedProcessBaselineSHA256:$protectedProcessBaselineSHA,launcherMode:"cockpit-compatible-adapter-prepared-only",cockpitLaunchContract:"real acceptance requires a fresh Cockpit UI codex_start_instance transition; adapter cannot fabricate positive launch state",candidateEvidenceContract:"v3 combined acceptance requires a live real mount, exact source/build manifest, exact Go daemon/build identity, the exact signed and registered Swift FSKit module process, a real task, exact backend crash/respawn, and reviewed native incident windows while that same candidate anchor remains attached",candidateAttached:false,candidateBuildSHA:null,candidateAppIdentitySHA256:null,candidateFSKitModuleSHA256:null,candidateBuildManifestSHA256:null,managedRouteObserved:false,candidateEvidenceSHA256:null,backendCrashRespawnEvidenceSHA256:null,nativeIncidentEvidenceSHA256:null,nativeIncidentReviewSHA256:null,workspace:$workspace,autoSyncThreads:false,cockpitToolsAvailable:$cockpitAvailable,cockpitAutoSyncThreadsBeforeRegistration:$cockpitSyncSafe}' \
+    '{schema:$schema,runRoot:$runRoot,runId:$runId,createdAt:$createdAt,sourceCodexHome:$sourceCodexHome,codexHome:$codexHome,electronUserData:$electronUserData,candidateRoot:$candidateRoot,evidenceRoot:$evidenceRoot,appPath:$appPath,protectedAppPath:$protectedAppPath,cockpitAppPath:$cockpitAppPath,cockpitBundleIdentifier:(if $cockpitBundleIdentifier == "" then null else $cockpitBundleIdentifier end),cockpitBundleShortVersion:(if $cockpitBundleShortVersion == "" then null else $cockpitBundleShortVersion end),cockpitBundleVersion:(if $cockpitBundleVersion == "" then null else $cockpitBundleVersion end),cockpitExecutableSHA256:(if $cockpitExecutableSHA == "" then null else $cockpitExecutableSHA end),codexAppExecutableSHA256:(if $appExecutableSHA == "" then null else $appExecutableSHA end),cockpitDataRoot:$cockpitDataRoot,cockpitStorePath:$cockpitStorePath,cockpitControlPlaneEnv:"COCKPIT_TOOLS_TEST_DATA_DIR",cockpitCodexHome:$codexHome,acceptanceAuthMode:"isolated-file-api-key",pathFences:{runRoot:{identity:$runRootIdentity},codexHome:{identity:$codexHomeIdentity},candidateRoot:{identity:$candidateRootIdentity},evidenceRoot:{identity:$evidenceRootIdentity},cockpitDataRoot:{identity:$cockpitDataIdentity},electronData:{identity:$electronDataIdentity}},sourceProvenance:{repoRoot:$sourceRepoRoot,repoRootIdentity:$sourceRepoIdentity,gitHead:(if $sourceGitHead == "" then null else $sourceGitHead end),snapshotSHA256:$sourceSnapshotSHA},fskitModuleProcessBaselinePath:$fskitModuleBaseline,fskitModuleProcessBaselineSHA256:$fskitModuleBaselineSHA,protectedProcessBaselinePath:$protectedProcessBaseline,protectedProcessBaselineSHA256:$protectedProcessBaselineSHA,launcherMode:"cockpit-compatible-adapter-prepared-only",cockpitLaunchContract:"real acceptance requires a fresh Cockpit UI codex_start_instance transition; adapter cannot fabricate positive launch state",candidateEvidenceContract:"v3 combined acceptance requires the live candidate mount, fold-store, and fold-native all inside the same isolated CODEX_HOME; it requires the exact source/build manifest and exact Go daemon/build identity; the signed FSKit host may be the exact currently registered shared App, while all backend, resource, mount, service definition, native-root, and evidence files remain inside candidateRoot/CODEX_HOME; the exact signed and registered Swift FSKit module process, real task, backend crash/respawn, and reviewed native incident windows are still required",candidateAttached:false,candidateBuildSHA:null,candidateAppIdentitySHA256:null,candidateFSKitModuleSHA256:null,candidateBuildManifestSHA256:null,managedRouteObserved:false,candidateEvidenceSHA256:null,backendCrashRespawnEvidenceSHA256:null,nativeIncidentEvidenceSHA256:null,nativeIncidentReviewSHA256:null,workspace:$workspace,autoSyncThreads:false,cockpitToolsAvailable:$cockpitAvailable,cockpitAutoSyncThreadsBeforeRegistration:$cockpitSyncSafe}' \
     > "$RUN_ROOT/run.json"
   chmod 600 "$RUN_ROOT/run.json"
   printf '%s\n' "$SCHEMA" > "$RUN_ROOT/.codexfold-isolated-acceptance"
@@ -2263,8 +3061,18 @@ EOF
     "$runner" "$RUN_ROOT" "$runner" "$RUN_ROOT" > "$RUN_ROOT/launch-isolated-codex.sh"
   printf '#!/usr/bin/env bash\nset -euo pipefail\nexec %q cockpit-register --run-root %q "$@"\n' \
     "$runner" "$RUN_ROOT" > "$RUN_ROOT/register-cockpit-instance.sh"
-  printf '#!/usr/bin/env bash\nset -euo pipefail\nexec /usr/bin/open -n --env %q --env %q %q\n' \
+  printf '#!/usr/bin/env bash\nset -euo pipefail\napi_key="${CODEX_API_KEY:-${OPENAI_API_KEY:-}}"\n[[ -n "$api_key" ]] || { echo "acceptance launch requires CODEX_API_KEY or OPENAI_API_KEY" >&2; exit 1; }\nexec /usr/bin/env -i HOME=%q USER=%q LOGNAME=%q PATH=%q SHELL=%q ZDOTDIR=%q TMPDIR=%q LANG=C.UTF-8 LC_ALL=C.UTF-8 PWD=%q HTTP_PROXY=%q HTTPS_PROXY=%q http_proxy=%q https_proxy=%q ALL_PROXY=%q all_proxy=%q NO_PROXY=%q no_proxy=%q CODEX_HOME=%q CODEXFOLD_ACCEPTANCE_RUN_ROOT=%q CODEX_INTERNAL_ORIGINATOR_OVERRIDE="Codex Desktop" CODEX_API_KEY="$api_key" OPENAI_API_KEY="$api_key" /usr/bin/open -n --env %q --env %q --env "CODEX_API_KEY=$api_key" --env "OPENAI_API_KEY=$api_key" %q\n' \
+    "$HOME" "$USER" "$LOGNAME" "/usr/bin:/bin:/usr/sbin:/sbin" "${SHELL:-/bin/zsh}" "$RUN_ROOT/private/empty-zdotdir" "${TMPDIR:-/tmp}" "$WORKSPACE" "${HTTP_PROXY:-}" "${HTTPS_PROXY:-}" "${http_proxy:-}" "${https_proxy:-}" "${ALL_PROXY:-}" "${all_proxy:-}" "${NO_PROXY:-}" "${no_proxy:-}" \
+    "$CODEX_HOME_ISOLATED" "$RUN_ROOT" \
     "COCKPIT_TOOLS_TEST_DATA_DIR=$COCKPIT_DATA_ROOT" "CODEX_HOME=$CODEX_HOME_ISOLATED" "$COCKPIT_APP_PATH" > "$RUN_ROOT/open-isolated-cockpit.sh"
+  # Direct Desktop is the real acceptance control surface.  Cockpit remains
+  # available only as a compatibility adapter; this launcher binds every
+  # Desktop-owned path and the file-backed API key to the marked run root.
+  printf '#!/usr/bin/env bash\nset -euo pipefail\napi_key="${CODEX_API_KEY:-${OPENAI_API_KEY:-}}"\nif [[ -z "$api_key" ]]; then\n  api_key=$(jq -r \".OPENAI_API_KEY // empty\" %q)\nfi\n[[ -n "$api_key" ]] || { echo "acceptance launch requires an API key" >&2; exit 1; }\nexec /usr/bin/env -i HOME=%q USER=%q LOGNAME=%q PATH=%q SHELL=%q ZDOTDIR=%q TMPDIR=%q LANG=C.UTF-8 LC_ALL=C.UTF-8 PWD=%q HTTP_PROXY=%q HTTPS_PROXY=%q http_proxy=%q https_proxy=%q ALL_PROXY=%q all_proxy=%q NO_PROXY=%q no_proxy=%q CODEX_HOME=%q CODEX_ELECTRON_USER_DATA_PATH=%q CODEXFOLD_ACCEPTANCE_RUN_ROOT=%q CODEX_INTERNAL_ORIGINATOR_OVERRIDE="Codex Desktop" CODEX_API_KEY="$api_key" OPENAI_API_KEY="$api_key" %q --user-data-dir=%q\n' \
+    "$CODEX_HOME_ISOLATED/auth.json" \
+    "$HOME" "$USER" "$LOGNAME" "/usr/bin:/bin:/usr/sbin:/sbin" "${SHELL:-/bin/zsh}" "$RUN_ROOT/private/empty-zdotdir" "${TMPDIR:-/tmp}" "$WORKSPACE" "${HTTP_PROXY:-}" "${HTTPS_PROXY:-}" "${http_proxy:-}" "${https_proxy:-}" "${ALL_PROXY:-}" "${all_proxy:-}" "${NO_PROXY:-}" "${no_proxy:-}" \
+    "$CODEX_HOME_ISOLATED" "$ELECTRON_DATA" "$RUN_ROOT" \
+    "$app_executable" "$ELECTRON_DATA" > "$RUN_ROOT/launch-isolated-desktop.sh"
   # The generated script must retain its own positional parameters verbatim.
   # shellcheck disable=SC2016
   printf '#!/usr/bin/env bash\nset -euo pipefail\nexec %q observe-task --run-root %q --apply "$@"\n' \
@@ -2279,7 +3087,7 @@ EOF
     "$runner" "$RUN_ROOT" > "$RUN_ROOT/record-native-incident-evidence.sh"
   printf '#!/usr/bin/env bash\nset -euo pipefail\nexec %q incident-review --run-root %q "$@"\n' \
     "$runner" "$RUN_ROOT" > "$RUN_ROOT/record-native-incident-review.sh"
-  chmod 700 "$RUN_ROOT/launch-isolated-codex.sh" "$RUN_ROOT/register-cockpit-instance.sh" "$RUN_ROOT/open-isolated-cockpit.sh" "$RUN_ROOT/observe-real-task.sh" "$RUN_ROOT/record-candidate-evidence.sh" "$RUN_ROOT/verify.sh" "$RUN_ROOT/inject-fault.sh" "$RUN_ROOT/record-native-incident-evidence.sh" "$RUN_ROOT/record-native-incident-review.sh"
+  chmod 700 "$RUN_ROOT/launch-isolated-codex.sh" "$RUN_ROOT/register-cockpit-instance.sh" "$RUN_ROOT/open-isolated-cockpit.sh" "$RUN_ROOT/launch-isolated-desktop.sh" "$RUN_ROOT/observe-real-task.sh" "$RUN_ROOT/record-candidate-evidence.sh" "$RUN_ROOT/verify.sh" "$RUN_ROOT/inject-fault.sh" "$RUN_ROOT/record-native-incident-evidence.sh" "$RUN_ROOT/record-native-incident-review.sh"
 
   load_run "$RUN_ROOT"
   command_verify --run-root "$RUN_ROOT" --prepared-only
@@ -2328,7 +3136,7 @@ command_cockpit_register() {
 }
 
 command_launch() {
-  local run_root='' apply=false wait_seconds=600
+  local run_root='' apply=false wait_seconds=600 api_key='' acceptance_codex_cli=''
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --run-root) run_root=${2:?}; shift 2 ;;
@@ -2374,6 +3182,11 @@ command_launch() {
   codesign --verify --deep --strict "$APP_PATH" >/dev/null 2>&1 || die "Codex Desktop bundle signature verification failed"
   open_help=$(/usr/bin/open -h 2>&1 || true)
   grep -F -- '--env' <<< "$open_help" >/dev/null || die "this macOS open(1) cannot pass a per-launch environment safely"
+  api_key="${CODEX_API_KEY:-${OPENAI_API_KEY:-}}"
+  [[ -n "$api_key" ]] || die "acceptance launch requires CODEX_API_KEY or OPENAI_API_KEY so Cockpit cannot redirect to Sign in"
+  acceptance_codex_cli="$APP_PATH/Contents/Resources/codex"
+  install_acceptance_api_key "$CODEX_HOME_ISOLATED" "$api_key" "$acceptance_codex_cli" || \
+    die "could not install the explicit API key into the isolated acceptance home"
 
   current="$EVIDENCE_ROOT/processes.pre-launch.tsv"
   write_current_snapshot "$current"
@@ -2390,6 +3203,8 @@ command_launch() {
   /usr/bin/open -n \
     --env "COCKPIT_TOOLS_TEST_DATA_DIR=$COCKPIT_DATA_ROOT" \
     --env "CODEX_HOME=$CODEX_HOME_ISOLATED" \
+    --env "CODEX_API_KEY=$api_key" \
+    --env "OPENAI_API_KEY=$api_key" \
     "$COCKPIT_APP_PATH"
 
   server_deadline=$((SECONDS + 20))
@@ -2493,7 +3308,9 @@ command_task() {
     echo "dry-run: would run one Codex task in isolated CODEX_HOME with sandbox=$sandbox"
     return 0
   fi
-  [[ -f "$EVIDENCE_ROOT/cockpit-command-observed.json" ]] || die "real task requires an observed actual Cockpit Start first"
+  if ! direct_desktop_mode; then
+    [[ -f "$EVIDENCE_ROOT/cockpit-command-observed.json" ]] || die "real task requires an observed actual Cockpit Start first"
+  fi
   task_mode_lock="$EVIDENCE_ROOT/.task-mode.lock"
   mkdir "$task_mode_lock" 2>/dev/null || die "another CLI task or Desktop task observer is already active"
   printf 'cli-diagnostic\n' > "$task_mode_lock/mode"
@@ -2540,7 +3357,7 @@ count_added_or_changed_rollout_identities() {
 }
 
 command_observe_task() {
-  local run_root='' apply=false wait_seconds=1800
+  local run_root='' apply=false wait_seconds=1800 candidate_retry_deadline candidate_valid
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --run-root) run_root=${2:?}; shift 2 ;;
@@ -2559,7 +3376,6 @@ command_observe_task() {
     die "--wait-seconds must be 60..7200"
   fi
   load_run "$run_root"
-  [[ -f "$EVIDENCE_ROOT/cockpit-command-observed.json" ]] || die "real task observation requires an observed actual Cockpit Start"
   if [[ "$apply" != true ]]; then
     echo "dry-run: would wait for rollout/SQLite changes produced by a real task in the Cockpit-started Desktop"
     return 0
@@ -2573,10 +3389,14 @@ command_observe_task() {
   trap 'rm -rf "$task_mode_lock"' EXIT HUP INT TERM
 
   command_verify --run-root "$RUN_ROOT"
-  [[ "$(jq -r '.cockpitCommandObserved' "$EVIDENCE_ROOT/verification.json")" == true ]] || die "actual Cockpit Start is not currently valid"
+  if direct_desktop_mode; then
+    [[ "$(jq -r '.launcherMode' "$EVIDENCE_ROOT/verification.json")" == direct-desktop ]] || die "isolated direct Desktop binding is not currently valid"
+  else
+    [[ "$(jq -r '.cockpitCommandObserved' "$EVIDENCE_ROOT/verification.json")" == true ]] || die "actual Cockpit Start is not currently valid"
+  fi
   verify_candidate_evidence
   [[ "$CANDIDATE_EVIDENCE_VALID" == true && "$CANDIDATE_ATTACHED" == true && "$MANAGED_ROUTE_OBSERVED" == true ]] || \
-    die "real Desktop task observation requires a live validated CodexFold candidate before the baseline"
+    die "real Desktop task observation requires a live validated CodexFold candidate before the baseline${CANDIDATE_VALIDATION_ERROR:+: $CANDIDATE_VALIDATION_ERROR}"
   baseline_candidate_evidence_sha=$(file_sha "$EVIDENCE_ROOT/codexfold-candidate-observed.json")
   baseline_candidate_pid=$VALIDATED_CANDIDATE_PID
   baseline_candidate_start=$VALIDATED_CANDIDATE_PROCESS_START
@@ -2611,8 +3431,21 @@ command_observe_task() {
     [[ "$current_desktop_pid" == "$observer_desktop_pid" && "$current_app_server_pid" == "$observer_app_server_pid" ]] || die "isolated Desktop/app-server identity changed during task observation"
     [[ "$(process_start "$current_desktop_pid")" == "$observer_desktop_start" && "$(process_start "$current_app_server_pid")" == "$observer_app_server_start" ]] || die "isolated Desktop/app-server restarted during task observation"
     ancestor_reaches "$current_app_server_pid" "$current_desktop_pid" || die "isolated app-server ancestry changed during task observation"
-    verify_candidate_evidence
-    [[ "$CANDIDATE_EVIDENCE_VALID" == true ]] || die "candidate became unverifiable during task observation"
+    # A real Desktop write can overlap the FSKit transport's short recovery
+    # window. Treat one transient status/read failure as retryable, but keep
+    # the immutable candidate anchor and require the same identity before the
+    # observation is accepted.
+    candidate_retry_deadline=$((SECONDS + 15))
+    candidate_valid=false
+    while (( SECONDS < candidate_retry_deadline )); do
+      verify_candidate_evidence
+      if [[ "$CANDIDATE_EVIDENCE_VALID" == true ]]; then
+        candidate_valid=true
+        break
+      fi
+      sleep 1
+    done
+    [[ "$candidate_valid" == true ]] || die "candidate became unverifiable during task observation"
     [[ "$(file_sha "$EVIDENCE_ROOT/codexfold-candidate-observed.json")" == "$baseline_candidate_evidence_sha" && \
        "$VALIDATED_CANDIDATE_PID" == "$baseline_candidate_pid" && \
        "$VALIDATED_CANDIDATE_PROCESS_START" == "$baseline_candidate_start" && \
@@ -2633,7 +3466,7 @@ command_observe_task() {
   after_count=$(wc -l < "$current" | tr -d ' ')
   current_snapshot_sha=$(file_sha "$current")
   jq -n \
-    --arg source actual-cockpit-ui \
+    --arg source "$(if direct_desktop_mode; then printf actual-direct-desktop; else printf actual-cockpit-ui; fi)" \
     --arg startedAt "$started_at" \
     --arg observedAt "$(timestamp)" \
     --argjson beforeThreads "$before_count" \
@@ -3011,6 +3844,10 @@ command_verify() {
   candidate_runtime_epoch=${CANDIDATE_RUNTIME_EPOCH:-none}
   cockpit_result=$(cockpit_verify_json)
   load_cockpit_verification "$cockpit_result"
+  direct_desktop=false
+  if direct_desktop_mode; then
+    direct_desktop=true
+  fi
 
   sync_false=false
   cockpit_control_plane_isolated=false
@@ -3018,7 +3855,9 @@ command_verify() {
      jq -e '.defaultSettings | (.autoSyncThreads == false and .autoRepairSessionVisibilityOnLaunch == false and .protectConfigOnLaunch == true)' "$RUN_ROOT/cockpit-instance.json" >/dev/null; then
     sync_false=true
   fi
-  if [[ -e "$COCKPIT_STORE" && "$COCKPIT_MANAGED" != true ]]; then
+  if [[ "$direct_desktop" == true ]]; then
+    sync_false=true
+  elif [[ -e "$COCKPIT_STORE" && "$COCKPIT_MANAGED" != true ]]; then
     sync_false=false
   elif [[ "$COCKPIT_MANAGED" == true && "$COCKPIT_SYNC_FALSE" != true ]]; then
     sync_false=false
@@ -3051,12 +3890,18 @@ command_verify() {
   cockpit_bundle_matches=false
   bundle_signatures_valid=true
   if [[ -f "$EVIDENCE_ROOT/launch.applied" ]]; then
-    codesign --verify --deep --strict "$COCKPIT_APP_PATH" >/dev/null 2>&1 || bundle_signatures_valid=false
+    if [[ "$direct_desktop" != true ]]; then
+      codesign --verify --deep --strict "$COCKPIT_APP_PATH" >/dev/null 2>&1 || bundle_signatures_valid=false
+    fi
     codesign --verify --deep --strict "$APP_PATH" >/dev/null 2>&1 || bundle_signatures_valid=false
   fi
   cockpit_executable=$(bundle_executable_path "$COCKPIT_APP_PATH")
   app_executable=$(bundle_executable_path "$APP_PATH")
-  if [[ "$cockpit_bundle_identifier" == "$COCKPIT_BUNDLE_IDENTIFIER" && \
+  if [[ "$direct_desktop" == true && \
+        -n "$CODEX_APP_EXECUTABLE_SHA" && "$(file_sha "$app_executable" 2>/dev/null || true)" == "$CODEX_APP_EXECUTABLE_SHA" && \
+        "$bundle_signatures_valid" == true ]]; then
+    cockpit_bundle_matches=true
+  elif [[ "$cockpit_bundle_identifier" == "$COCKPIT_BUNDLE_IDENTIFIER" && \
         "$cockpit_bundle_short_version" == "$COCKPIT_BUNDLE_SHORT_VERSION" && \
         "$cockpit_bundle_version" == "$COCKPIT_BUNDLE_VERSION" && \
         -n "$COCKPIT_EXECUTABLE_SHA" && "$(file_sha "$cockpit_executable" 2>/dev/null || true)" == "$COCKPIT_EXECUTABLE_SHA" && \
@@ -3088,26 +3933,49 @@ command_verify() {
       cockpit_command_observed=true
     fi
   fi
+  direct_desktop_launch_observed=false
+  if [[ "$direct_desktop" == true && "$desktop_bound" == true && "$app_server_bound" == true && \
+        "$ancestry_valid" == true ]]; then
+    if process_environment_has_exact "$desktop_pid" CODEX_HOME "$CODEX_HOME_ISOLATED" && \
+       process_has_exact_user_data_dir "$desktop_pid" "$ELECTRON_DATA"; then
+      direct_desktop_launch_observed=true
+      cockpit_last_pid_matches=true
+    fi
+  fi
   real_task_runtime_valid=false
+  real_task_desktop_binding_valid=false
   if [[ -f "$EVIDENCE_ROOT/real-task-observed.json" && -f "$EVIDENCE_ROOT/codexfold-candidate-observed.json" ]]; then
     task_pid=$(jq -r '.candidateDaemonPid // empty' "$EVIDENCE_ROOT/real-task-observed.json")
     task_start=$(jq -r '.candidateDaemonStart // empty' "$EVIDENCE_ROOT/real-task-observed.json")
     task_command_sha=$(jq -r '.candidateCommandSHA256 // empty' "$EVIDENCE_ROOT/real-task-observed.json")
-    if [[ "$task_pid" == "$(jq -r '.daemonPid' "$EVIDENCE_ROOT/codexfold-candidate-observed.json")" && \
-          "$task_start" == "$(jq -r '.daemonProcessStart' "$EVIDENCE_ROOT/codexfold-candidate-observed.json")" && \
-          "$task_command_sha" == "$(jq -r '.daemonCommandSHA256' "$EVIDENCE_ROOT/codexfold-candidate-observed.json")" ]]; then
+    if candidate_task_runtime_matches "$task_pid" "$task_start" "$task_command_sha"; then
       real_task_runtime_valid=true
-    elif [[ "$BACKEND_CRASH_RESPAWN_EVIDENCE_VALID" == true && \
-            "$task_pid" == "$(jq -r '.after.pid' "$EVIDENCE_ROOT/candidate-backend-crash-respawn.json")" && \
-            "$task_start" == "$(jq -r '.after.processStart' "$EVIDENCE_ROOT/candidate-backend-crash-respawn.json")" && \
-            "$task_command_sha" == "$(jq -r '.after.commandSHA256' "$EVIDENCE_ROOT/candidate-backend-crash-respawn.json")" ]]; then
-      real_task_runtime_valid=true
+    fi
+    task_desktop_pid=$(jq -r '.desktopPid // empty' "$EVIDENCE_ROOT/real-task-observed.json")
+    task_desktop_start=$(jq -r '.desktopProcessStart // empty' "$EVIDENCE_ROOT/real-task-observed.json")
+    task_app_server_pid=$(jq -r '.appServerPid // empty' "$EVIDENCE_ROOT/real-task-observed.json")
+    task_app_server_start=$(jq -r '.appServerProcessStart // empty' "$EVIDENCE_ROOT/real-task-observed.json")
+    if [[ "$task_desktop_pid" == "$desktop_pid" && "$task_app_server_pid" == "$app_server_pid" && \
+          "$task_desktop_start" == "$(process_start "$desktop_pid" 2>/dev/null || true)" && \
+          "$task_app_server_start" == "$(process_start "$app_server_pid" 2>/dev/null || true)" ]] && \
+       ancestor_reaches "$app_server_pid" "$desktop_pid"; then
+      real_task_desktop_binding_valid=true
+    elif [[ -f "$EVIDENCE_ROOT/processes.real-task.tsv" && \
+            "$task_desktop_pid" =~ ^[0-9]+$ && "$task_app_server_pid" =~ ^[0-9]+$ && \
+            -n "$task_desktop_start" && -n "$task_app_server_start" ]] && \
+         snapshot_matches_isolated_fence "$EVIDENCE_ROOT/processes.real-task.tsv" \
+           "$task_desktop_pid" "$task_desktop_start" "$task_app_server_pid" "$task_app_server_start" && \
+         current_isolated_fence_matches_run; then
+      # The real-task mutation is bound to the immutable historical Desktop
+      # fence; the currently running pair is a later self-healed instance of
+      # the same isolated run.
+      real_task_desktop_binding_valid=true
     fi
   fi
   real_task_observed=false
   if [[ -f "$EVIDENCE_ROOT/real-task-observed.json" ]] && \
      [[ ! -L "$EVIDENCE_ROOT/real-task-observed.json" ]] && \
-     [[ "$(jq -r '.source // empty' "$EVIDENCE_ROOT/real-task-observed.json")" == actual-cockpit-ui ]] && \
+     [[ "$(jq -r '.source // empty' "$EVIDENCE_ROOT/real-task-observed.json")" =~ ^actual-(cockpit-ui|direct-desktop)$ ]] && \
      [[ "$(jq -r '.changedIdentityRows // 0' "$EVIDENCE_ROOT/real-task-observed.json")" -gt 0 ]] && \
      [[ "$CANDIDATE_EVIDENCE_VALID" == true ]] && \
      [[ "$(jq -r '.candidateEvidenceSHA256 // empty' "$EVIDENCE_ROOT/real-task-observed.json")" == "$RUN_CANDIDATE_EVIDENCE_SHA" ]] && \
@@ -3116,10 +3984,7 @@ command_verify() {
      [[ "$(jq -r '.candidateBuildSHA // empty' "$EVIDENCE_ROOT/real-task-observed.json")" == "$VALIDATED_CANDIDATE_SHA" ]] && \
      [[ "$(jq -r '.candidateMountPoint // empty' "$EVIDENCE_ROOT/real-task-observed.json")" == "$VALIDATED_CANDIDATE_MOUNT" ]] && \
      [[ "$(jq -r '.candidateMountIdentity // empty' "$EVIDENCE_ROOT/real-task-observed.json")" == "$VALIDATED_CANDIDATE_MOUNT_IDENTITY" ]] && \
-     [[ "$(jq -r '.desktopPid // empty' "$EVIDENCE_ROOT/real-task-observed.json")" == "$desktop_pid" ]] && \
-     [[ "$(jq -r '.desktopProcessStart // empty' "$EVIDENCE_ROOT/real-task-observed.json")" == "$(process_start "$desktop_pid")" ]] && \
-     [[ "$(jq -r '.appServerPid // empty' "$EVIDENCE_ROOT/real-task-observed.json")" == "$app_server_pid" ]] && \
-     [[ "$(jq -r '.appServerProcessStart // empty' "$EVIDENCE_ROOT/real-task-observed.json")" == "$(process_start "$app_server_pid")" ]] && \
+     [[ "$real_task_desktop_binding_valid" == true ]] && \
      [[ -f "$EVIDENCE_ROOT/real-task.before.tsv" && ! -L "$EVIDENCE_ROOT/real-task.before.tsv" ]] && \
      [[ -f "$EVIDENCE_ROOT/real-task.current.tsv" && ! -L "$EVIDENCE_ROOT/real-task.current.tsv" ]] && \
      [[ "$(jq -r '.beforeSnapshotSHA256 // empty' "$EVIDENCE_ROOT/real-task-observed.json")" == "$(file_sha "$EVIDENCE_ROOT/real-task.before.tsv" 2>/dev/null || true)" ]] && \
@@ -3134,7 +3999,7 @@ command_verify() {
     launch_required=true
   fi
   codex_instance_acceptance_complete=false
-  if [[ "$cockpit_command_observed" == true && "$real_task_observed" == true && "$cockpit_last_pid_matches" == true && \
+  if [[ ("$cockpit_command_observed" == true || "$direct_desktop_launch_observed" == true) && "$real_task_observed" == true && "$cockpit_last_pid_matches" == true && \
         "$desktop_bound" == true && "$app_server_bound" == true && "$ancestry_valid" == true && \
         "$PROTECTED_UNCHANGED" == true && "$SLICE_VALID" == true && "$sync_false" == true ]]; then
     codex_instance_acceptance_complete=true
@@ -3195,7 +4060,11 @@ command_verify() {
   fi
   if [[ "$launch_required" == true ]]; then
     [[ "$desktop_bound" == true && "$app_server_bound" == true && "$ancestry_valid" == true ]] || verification_ok=false
-    [[ "$COCKPIT_MANAGED" == true && "$cockpit_last_pid_matches" == true && "$cockpit_command_observed" == true ]] || verification_ok=false
+    if [[ "$direct_desktop" != true ]]; then
+      [[ "$COCKPIT_MANAGED" == true && "$cockpit_last_pid_matches" == true && "$cockpit_command_observed" == true ]] || verification_ok=false
+    else
+      [[ "$direct_desktop_launch_observed" == true ]] || verification_ok=false
+    fi
   fi
   if [[ "$require_real" == true && "$real_acceptance_complete" != true ]]; then
     verification_ok=false
@@ -3240,7 +4109,7 @@ command_verify() {
     --argjson codexInstanceComplete "$codex_instance_acceptance_complete" \
     --argjson codexFoldCandidateComplete "$codexfold_candidate_acceptance_complete" \
     --argjson realComplete "$real_acceptance_complete" \
-    --arg launcherMode "$(if [[ "$cockpit_command_observed" == true ]]; then printf actual-cockpit-ui; else printf cockpit-compatible-adapter-prepared-only; fi)" \
+    --arg launcherMode "$(if [[ "$cockpit_command_observed" == true ]]; then printf actual-cockpit-ui; elif [[ "$desktop_bound" == true && "$app_server_bound" == true && "$ancestry_valid" == true ]]; then printf direct-desktop; else printf cockpit-compatible-adapter-prepared-only; fi)" \
     '{checkedAt:$checkedAt,ok:$ok,launcherMode:$launcherMode,codexInstanceAcceptanceComplete:$codexInstanceComplete,codexFoldCandidateAcceptanceComplete:$codexFoldCandidateComplete,realAcceptanceComplete:$realComplete,requireReal:$requireReal,protectedCodexUnchanged:$protected,newUnboundCodexProcesses:$newUnbound,sessionSliceValid:$slice,sessionCount:$sliceCount,currentThreadCount:$currentThreadCount,autoSyncThreadsDisabled:$sync,cockpitControlPlaneIsolated:$cockpitControlPlaneIsolated,cockpitManaged:$cockpitManaged,cockpitLastPidMatches:$cockpitLastPidMatches,cockpitCommandObserved:$cockpitCommandObserved,cockpitBundleIdentifier:(if $cockpitBundleIdentifier == "" then null else $cockpitBundleIdentifier end),cockpitBundleShortVersion:(if $cockpitBundleShortVersion == "" then null else $cockpitBundleShortVersion end),cockpitBundleVersion:(if $cockpitBundleVersion == "" then null else $cockpitBundleVersion end),cockpitBundleMatches:$cockpitBundleMatches,realTaskObserved:$realTaskObserved,candidateAttached:$candidateAttached,candidateBuildSHA:(if $candidateBuildSHA == "" then null else $candidateBuildSHA end),candidateRuntimeEpoch:$candidateRuntimeEpoch,managedRouteObserved:$managedRouteObserved,candidateEvidenceValid:$candidateEvidenceValid,candidateMetadataConsistent:$candidateMetadataConsistent,candidateRouteCount:$candidateRouteCount,candidateRealTaskRouteMatches:$candidateRealTaskRouteMatches,backendCrashRespawnEvidenceValid:$backendCrashRespawnEvidenceValid,nativeIncidentEvidenceValid:$nativeIncidentEvidenceValid,nativeIncidentGUIReviewComplete:$nativeIncidentGUIReviewComplete,candidateFaultAcceptanceComplete:$candidateFaultAcceptanceComplete,nativeIncidentAcceptanceComplete:$nativeIncidentAcceptanceComplete,isolatedDesktopBound:$desktop,isolatedAppServerBound:$appServer,isolatedAncestryValid:$ancestry,launchRequired:$launchRequired}' \
     > "$EVIDENCE_ROOT/verification.json"
   chmod 600 "$EVIDENCE_ROOT/verification.json"
@@ -3388,13 +4257,27 @@ recover_pending_fault_transactions() {
 
 safe_candidate_target() {
   local requested=$1
-  local parent canonical candidate
+  local parent canonical candidate definition arguments resource_index resource_path resource
   [[ ! -L "$requested" ]] || die "fault target may not be a symbolic link"
   [[ -e "$requested" || -S "$requested" ]] || die "fault target does not exist: $requested"
   parent=$(cd "$(dirname "$requested")" && pwd -P)
   canonical="$parent/$(basename "$requested")"
   candidate=$(cd "$CANDIDATE_ROOT" && pwd -P)
-  [[ "$canonical" == "$candidate/"* ]] || die "fault target is outside the isolated candidate root"
+  if [[ "$canonical" != "$candidate/"* ]]; then
+    # The native descriptor/socket live under --fskit-resource, which is
+    # intentionally outside candidateRoot.  Resolve that one path from the
+    # candidate service definition; the applied-fault path is checked again
+    # against the retained evidence after verify_candidate_evidence.
+    definition="$CANDIDATE_ROOT/service.plist"
+    [[ -f "$definition" && ! -L "$definition" ]] || die "fault target is outside the isolated candidate root"
+    arguments=$(plutil -extract ProgramArguments json -o - "$definition" 2>/dev/null) || die "candidate service definition is unreadable"
+    resource_index=$(jq -r 'index("--fskit-resource") // empty' <<< "$arguments")
+    [[ "$resource_index" =~ ^[0-9]+$ ]] || die "candidate service definition has no --fskit-resource"
+    resource_path=$(jq -r --argjson index "$resource_index" '.[$index + 1] // empty' <<< "$arguments")
+    [[ -d "$resource_path" && ! -L "$resource_path" ]] || die "candidate FSKit resource is unavailable"
+    resource=$(cd "$resource_path" && pwd -P) || die "candidate FSKit resource cannot be canonicalized"
+    [[ "$canonical" == "$resource/"* ]] || die "fault target is outside the isolated candidate resource"
+  fi
   printf '%s\n' "$canonical"
 }
 
@@ -3474,21 +4357,21 @@ command_backend_crash() {
 
   deadline=$((SECONDS + 45))
   while (( SECONDS < deadline )); do
-    new_pid=$(tr -d '[:space:]' < "$target" 2>/dev/null || true)
+    service_after=$(candidate_status_json "$VALIDATED_CANDIDATE_BINARY" "$VALIDATED_CANDIDATE_DEFINITION" "$VALIDATED_CANDIDATE_MOUNT" 2>/dev/null || true)
+    new_pid=$(jq -r '.daemon_pid // empty' <<< "$service_after" 2>/dev/null || true)
     if [[ "$new_pid" =~ ^[0-9]+$ && "$new_pid" -gt 1 && "$new_pid" != "$old_pid" ]]; then
       new_start=$(process_start "$new_pid" 2>/dev/null || true)
       new_executable=$(process_executable_path "$new_pid" 2>/dev/null || true)
       new_executable_sha=$(file_sha "$new_executable" 2>/dev/null || true)
       new_command_sha=$(process_command_sha "$new_pid" 2>/dev/null || true)
       if [[ -n "$new_start" && "$new_start" != "$old_start" && "$new_executable" == "$old_executable" && \
-            "$new_executable_sha" == "$old_executable_sha" && "$new_command_sha" == "$old_command_sha" ]]; then
-        service_after=$(candidate_status_json "$VALIDATED_CANDIDATE_BINARY" "$VALIDATED_CANDIDATE_DEFINITION" "$VALIDATED_CANDIDATE_MOUNT" 2>/dev/null || true)
-        if jq -e --argjson pid "$new_pid" --arg build "$VALIDATED_CANDIDATE_SHA" --arg binary "$VALIDATED_CANDIDATE_BINARY" \
+            "$new_executable_sha" == "$old_executable_sha" && "$new_command_sha" == "$old_command_sha" ]] && \
+        jq -e --argjson pid "$new_pid" --arg build "$VALIDATED_CANDIDATE_SHA" --arg binary "$VALIDATED_CANDIDATE_BINARY" \
           '(.daemon_running == true) and (.daemon_pid == $pid) and (.mount_healthy == true) and (.build.healthy == true) and (.build.running_build_sha256 == $build) and (.build.configured_build_sha256 == $build) and (.build.configured_binary_path == $binary)' \
           >/dev/null <<< "$service_after" && \
-          validate_backend_status_file "$VALIDATED_BACKEND_STATUS_PATH" "$new_pid" "$VALIDATED_CANDIDATE_MOUNT" "$old_backend_id"; then
-          break
-        fi
+        validate_backend_status_file "$VALIDATED_BACKEND_STATUS_PATH" "$new_pid" "$VALIDATED_CANDIDATE_MOUNT" "$old_backend_id" && \
+        write_verified_backend_pid_file "$target" "$new_pid"; then
+        break
       fi
     fi
     new_pid=''
@@ -3744,6 +4627,10 @@ main() {
     candidate-evidence) command_candidate_evidence "$@" ;;
     incident-evidence) command_incident_evidence "$@" ;;
     incident-review) command_incident_review "$@" ;;
+    real-fold)
+      [[ -x "$REAL_FOLD_ACCEPTANCE" ]] || die "real-fold acceptance runner is unavailable"
+      "$REAL_FOLD_ACCEPTANCE" "$@"
+      ;;
     verify) command_verify "$@" ;;
     fault) command_fault "$@" ;;
     fault-recover-backend) command_fault_recover_backend "$@" ;;

@@ -42,6 +42,19 @@ func ResolveHome(explicit string) (string, error) {
 }
 
 func LoadSessions(home string) ([]Session, error) {
+	return loadSessions(home, nil)
+}
+
+// LoadSessionsByID reads one fresh snapshot of the requested rows. Missing rows
+// remain absent so callers can preserve their existing missing-route handling.
+func LoadSessionsByID(home string, ids []string) ([]Session, error) {
+	if len(ids) == 0 {
+		return []Session{}, nil
+	}
+	return loadSessions(home, ids)
+}
+
+func loadSessions(home string, ids []string) ([]Session, error) {
 	dbPath := filepath.Join(home, "state_5.sqlite")
 	if _, err := os.Stat(dbPath); err != nil {
 		return nil, fmt.Errorf("locate Codex state database %s: %w", dbPath, err)
@@ -56,12 +69,20 @@ func LoadSessions(home string) ([]Session, error) {
 		return nil, fmt.Errorf("configure Codex state database: %w", err)
 	}
 
-	rows, err := db.Query(`
+	query := `
 		select id, title, cwd, rollout_path, model_provider, coalesce(model, ''),
 		       updated_at, archived, coalesce(git_branch, '')
 		from threads
-		order by updated_at desc
-	`)
+	`
+	var args []any
+	if len(ids) > 0 {
+		query += " where id in (" + strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",") + ")"
+		for _, id := range ids {
+			args = append(args, id)
+		}
+	}
+	query += " order by updated_at desc"
+	rows, err := db.Query(query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("query Codex sessions: %w", err)
 	}

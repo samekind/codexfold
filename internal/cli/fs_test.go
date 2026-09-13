@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"syscall"
@@ -1063,6 +1064,9 @@ func TestEnrollmentPlanRunsFullStorageHealthOnlyForCandidateBatch(t *testing.T) 
 		return errors.New("corrupt store")
 	}
 	t.Cleanup(func() { enrollmentStorageHealthProbe = oldHealthProbe })
+	oldRunner := runEnrollmentCommand
+	runEnrollmentCommand = func(context.Context, []string) error { return nil }
+	t.Cleanup(func() { runEnrollmentCommand = oldRunner })
 	flags := enrollmentFlags{
 		codexHome: home, storeDir: storeDir, mountPoint: filepath.Join(home, "mount"),
 		nativeRoot: filepath.Join(home, "fold-native"), canonicalNamespace: true,
@@ -1083,7 +1087,9 @@ func TestEnrollmentPlanRunsFullStorageHealthOnlyForCandidateBatch(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if healthCalls != 1 || len(second.Selected) != 0 {
+	// Two calls: the batch gate, then the re-check after the repack attempt. A
+	// store that stays unhealthy still blocks the batch.
+	if healthCalls != 2 || len(second.Selected) != 0 {
 		t.Fatalf("candidate plan health calls=%d plan=%#v", healthCalls, second)
 	}
 	foundDoctorReason := false
@@ -1183,10 +1189,15 @@ func TestFSEnrollmentApplyBatchesFoldAndPackBeforeMigration(t *testing.T) {
 	if result.Apply.Selected != 2 || result.Apply.Applied != 2 {
 		t.Fatalf("batch enrollment result = %#v", result.Apply)
 	}
-	if len(calls) < 5 {
+	if len(calls) < 7 {
 		t.Fatalf("batch enrollment commands = %#v", calls)
 	}
-	if calls[0][0] != "fold" || calls[1][0] != "fold" || calls[2][0] != "pack" || calls[2][1] != "build" || calls[3][0] != "fs" || calls[3][1] != "migrate" || calls[4][0] != "fs" || calls[4][1] != "migrate" {
+	if calls[0][0] != "fold" || calls[1][0] != "fold" ||
+		calls[2][0] != "pack" || calls[2][1] != "build" ||
+		calls[3][0] != "pack" || calls[3][1] != "doctor" ||
+		calls[4][0] != "fs" || calls[4][1] != "migrate" ||
+		calls[5][0] != "fs" || calls[5][1] != "migrate" ||
+		calls[6][0] != "doctor" {
 		t.Fatalf("batch enrollment command order = %#v", calls)
 	}
 	packBuilds := 0
@@ -1197,6 +1208,82 @@ func TestFSEnrollmentApplyBatchesFoldAndPackBeforeMigration(t *testing.T) {
 	}
 	if packBuilds != 1 {
 		t.Fatalf("batch enrollment pack builds = %d, calls=%#v", packBuilds, calls)
+	}
+}
+
+func TestFSEnrollmentApplyReportsMonotonicCommandProgress(t *testing.T) {
+	home, storeDir, firstPath := fsFixture(t, true)
+	secondPath := addEnrollmentFixtureSession(t, home, "second", 0)
+	allowEnrollmentWriterProbe(t)
+	allowEnrollmentNamespaceReadiness(t)
+	oldProbe := mountHealthProbe
+	mountHealthProbe = func(string) error { return nil }
+	t.Cleanup(func() { mountHealthProbe = oldProbe })
+	saveEnrollmentObservations(t, storeDir, map[string]string{"session": firstPath, "second": secondPath})
+
+	oldRunner := runEnrollmentCommand
+	runEnrollmentCommand = func(context.Context, []string) error { return nil }
+	t.Cleanup(func() { runEnrollmentCommand = oldRunner })
+
+	type progressPoint struct{ done, total int }
+	var got []progressPoint
+	result, err := applyEnrollmentCycle(context.Background(), enrollmentFlags{
+		codexHome: home, storeDir: storeDir, mountPoint: filepath.Join(home, "mount"),
+		nativeRoot: filepath.Join(home, "fold-native"), canonicalNamespace: true,
+		stableFor: time.Nanosecond, batchSize: 2,
+	}, enrollmentApplyHooks{
+		skipMaintenance: true,
+		onProgress: func(done, total int) {
+			got = append(got, progressPoint{done: done, total: total})
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Apply.Applied != 2 {
+		t.Fatalf("applied = %d, want 2", result.Apply.Applied)
+	}
+	want := []progressPoint{{0, 7}, {1, 7}, {2, 7}, {3, 7}, {4, 7}, {5, 7}, {6, 7}, {7, 7}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("progress = %#v, want %#v", got, want)
+	}
+}
+
+func TestFSEnrollmentApplyRequiresPackDoctorBeforeMigration(t *testing.T) {
+	home, storeDir, nativePath := fsFixture(t, true)
+	allowEnrollmentWriterProbe(t)
+	allowEnrollmentNamespaceReadiness(t)
+	oldProbe := mountHealthProbe
+	mountHealthProbe = func(string) error { return nil }
+	t.Cleanup(func() { mountHealthProbe = oldProbe })
+	saveEnrollmentObservations(t, storeDir, map[string]string{"session": nativePath})
+
+	oldRunner := runEnrollmentCommand
+	var calls [][]string
+	runEnrollmentCommand = func(_ context.Context, args []string) error {
+		calls = append(calls, append([]string(nil), args...))
+		if len(args) >= 2 && args[0] == "pack" && args[1] == "doctor" {
+			return errors.New("pack doctor failed")
+		}
+		return nil
+	}
+	t.Cleanup(func() { runEnrollmentCommand = oldRunner })
+
+	result, err := runEnrollmentCycle(context.Background(), enrollmentFlags{
+		codexHome: home, storeDir: storeDir, mountPoint: filepath.Join(home, "mount"),
+		nativeRoot: filepath.Join(home, "fold-native"), canonicalNamespace: true,
+		stableFor: time.Nanosecond, batchSize: 1,
+	})
+	if err == nil || !strings.Contains(err.Error(), "pack doctor failed") {
+		t.Fatalf("pack verification error = %v", err)
+	}
+	if result.Apply.Applied != 0 {
+		t.Fatalf("migration ran after pack verification failure: %#v", result.Apply)
+	}
+	for _, call := range calls {
+		if len(call) >= 2 && call[0] == "fs" && call[1] == "migrate" {
+			t.Fatalf("migration command ran after pack verification failure: %#v", calls)
+		}
 	}
 }
 
@@ -1237,15 +1324,20 @@ func TestFSEnrollmentApplyPreservesPartialMigrationProgress(t *testing.T) {
 		return errors.New("second migration failed")
 	}
 	t.Cleanup(func() { runEnrollmentCommand = oldRunner })
+	// Reclaiming data the pack already holds stays safe when a migration fails,
+	// and it has to keep running: the pack build earlier in the cycle has already
+	// written a new generation, so skipping it entirely leaves the store growing
+	// every cycle for as long as one session stays stuck. Deleting a user's
+	// original is the part that waits for a clean cycle.
 	oldDiscover := discoverEnrollmentSessionStates
 	discoverEnrollmentSessionStates = func(string) ([]vfs.SessionState, error) {
-		t.Fatal("maintenance discovery ran after partial migration failure")
-		return nil, nil
+		return []vfs.SessionState{{SessionID: migratedID, NativeSnapshot: vfs.NativeFile{Path: firstPath}}}, nil
 	}
 	t.Cleanup(func() { discoverEnrollmentSessionStates = oldDiscover })
+	gcRan := false
 	oldGC := runEnrollmentStorageGC
 	runEnrollmentStorageGC = func(context.Context, string) (storage.StorageGCResult, error) {
-		t.Fatal("maintenance GC ran after partial migration failure")
+		gcRan = true
 		return storage.StorageGCResult{}, nil
 	}
 	t.Cleanup(func() { runEnrollmentStorageGC = oldGC })
@@ -1260,6 +1352,12 @@ func TestFSEnrollmentApplyPreservesPartialMigrationProgress(t *testing.T) {
 	}
 	if result.Apply.Applied != 1 {
 		t.Fatalf("partial migration applied = %d", result.Apply.Applied)
+	}
+	if result.Maintenance.NativeRetired != 0 || result.Maintenance.NativeDeferred == 0 {
+		t.Fatalf("native retirement must wait for a clean cycle: %+v", result.Maintenance)
+	}
+	if !gcRan {
+		t.Fatal("space reclamation must still run after a partial migration failure")
 	}
 	sessions, loadErr := codex.LoadSessions(home)
 	if loadErr != nil {
@@ -1398,7 +1496,7 @@ func TestEnrollmentMaintenanceRetiresNativeLooseAndOldGenerations(t *testing.T) 
 		return storage.StorageGCResult{RemovedCount: 3, ActualReclaimedBytes: 4096}, nil
 	}
 	t.Cleanup(func() { runEnrollmentStorageGC = previousGC })
-	result, err := runEnrollmentMaintenance(context.Background(), "/codex", "/store", 0)
+	result, err := runEnrollmentMaintenance(context.Background(), "/codex", "/store", 0, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1449,7 +1547,7 @@ func TestEnrollmentMaintenanceHonorsManualNativeRetention(t *testing.T) {
 		return storage.StorageGCResult{}, nil
 	}
 
-	result, err := runEnrollmentMaintenance(context.Background(), "/codex", store, 0)
+	result, err := runEnrollmentMaintenance(context.Background(), "/codex", store, 0, true)
 	if err != nil {
 		t.Fatalf("runEnrollmentMaintenance: %v", err)
 	}
@@ -1536,7 +1634,7 @@ func TestEnrollmentMaintenanceSurfacesVerificationFailure(t *testing.T) {
 		return storage.StorageGCResult{}, nil
 	}
 	t.Cleanup(func() { runEnrollmentStorageGC = previousGC })
-	result, err := runEnrollmentMaintenance(context.Background(), "/codex", "/store", 0)
+	result, err := runEnrollmentMaintenance(context.Background(), "/codex", "/store", 0, true)
 	if err == nil || !strings.Contains(err.Error(), "pack-only recovery proof failed") {
 		t.Fatalf("maintenance verification error = %v", err)
 	}
@@ -1552,10 +1650,16 @@ func TestPeriodicEnrollmentLoopRunsSerialCyclesAndStopsWithContext(t *testing.T)
 	started := make(chan struct{}, 2)
 	release := make(chan struct{}, 2)
 	flagErrors := make(chan error, 1)
-	runServiceEnrollmentCycle = func(ctx context.Context, flags enrollmentFlags) (FSEnrollmentApplyResult, error) {
+	runServiceEnrollmentCycle = func(ctx context.Context, flags enrollmentFlags, hooks enrollmentApplyHooks) (FSEnrollmentApplyResult, error) {
 		if flags.batchSize != 3 || flags.stableFor != 2*time.Hour || !flags.canonicalNamespace {
 			select {
 			case flagErrors <- fmt.Errorf("unexpected enrollment flags: %#v", flags):
+			default:
+			}
+		}
+		if hooks.skipMaintenance {
+			select {
+			case flagErrors <- errors.New("automatic enrollment skipped verified space reclamation"):
 			default:
 			}
 		}
@@ -1601,6 +1705,289 @@ func TestPeriodicEnrollmentLoopRunsSerialCyclesAndStopsWithContext(t *testing.T)
 	case err := <-flagErrors:
 		t.Fatal(err)
 	default:
+	}
+}
+
+func TestPeriodicEnrollmentStaysIdleWhenDisabled(t *testing.T) {
+	oldRunner := runServiceEnrollmentCycle
+	oldPoll := enrollmentPolicyPollInterval
+	t.Cleanup(func() {
+		runServiceEnrollmentCycle = oldRunner
+		enrollmentPolicyPollInterval = oldPoll
+	})
+	enrollmentPolicyPollInterval = time.Millisecond
+	ran := make(chan struct{}, 1)
+	runServiceEnrollmentCycle = func(context.Context, enrollmentFlags, enrollmentApplyHooks) (FSEnrollmentApplyResult, error) {
+		ran <- struct{}{}
+		return FSEnrollmentApplyResult{}, nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		runPeriodicEnrollment(ctx, enrollmentFlags{}, 0, nil)
+		close(done)
+	}()
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("disabled enrollment loop did not stop")
+	}
+	select {
+	case <-ran:
+		t.Fatal("disabled enrollment loop applied a cycle")
+	default:
+	}
+}
+
+func TestPeriodicEnrollmentPolicyEnableStartsCycleWithoutFlagInterval(t *testing.T) {
+	oldRunner := runServiceEnrollmentCycle
+	oldPoll := enrollmentPolicyPollInterval
+	oldMin := enrollmentPolicyMinInterval
+	t.Cleanup(func() {
+		runServiceEnrollmentCycle = oldRunner
+		enrollmentPolicyPollInterval = oldPoll
+		enrollmentPolicyMinInterval = oldMin
+	})
+	enrollmentPolicyPollInterval = time.Millisecond
+	enrollmentPolicyMinInterval = time.Millisecond
+
+	store := t.TempDir()
+	if err := enroll.SaveControl(enroll.ControlPath(store), enroll.Control{
+		Enabled: true, Interval: 30 * time.Minute, StableFor: time.Hour, ArchivedOnly: true, BatchSize: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	started := make(chan enrollmentFlags, 1)
+	runServiceEnrollmentCycle = func(_ context.Context, flags enrollmentFlags, _ enrollmentApplyHooks) (FSEnrollmentApplyResult, error) {
+		started <- flags
+		return FSEnrollmentApplyResult{}, nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		runPeriodicEnrollment(ctx, enrollmentFlags{storeDir: store}, 0, nil)
+		close(done)
+	}()
+	var flags enrollmentFlags
+	select {
+	case flags = <-started:
+	case <-time.After(time.Second):
+		t.Fatal("policy-enabled enrollment did not start a cycle")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("policy-enabled enrollment did not stop")
+	}
+	if !flags.archivedOnly || flags.batchSize != 1 || flags.stableFor != time.Hour {
+		t.Fatalf("policy flags = %#v", flags)
+	}
+	progress, err := enroll.LoadProgress(enroll.ProgressPath(store))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if progress.StorePath != store || progress.Phase == "" {
+		t.Fatalf("progress = %#v", progress)
+	}
+}
+
+func TestPeriodicEnrollmentPolicyDisablePreventsNextCycle(t *testing.T) {
+	oldRunner := runServiceEnrollmentCycle
+	oldPoll := enrollmentPolicyPollInterval
+	oldMin := enrollmentPolicyMinInterval
+	t.Cleanup(func() {
+		runServiceEnrollmentCycle = oldRunner
+		enrollmentPolicyPollInterval = oldPoll
+		enrollmentPolicyMinInterval = oldMin
+	})
+	enrollmentPolicyPollInterval = time.Millisecond
+	enrollmentPolicyMinInterval = time.Millisecond
+
+	store := t.TempDir()
+	path := enroll.ControlPath(store)
+	if err := enroll.SaveControl(path, enroll.Control{
+		Enabled: true, Interval: time.Millisecond, StableFor: time.Hour, BatchSize: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	started := make(chan struct{}, 8)
+	release := make(chan struct{})
+	runServiceEnrollmentCycle = func(ctx context.Context, _ enrollmentFlags, _ enrollmentApplyHooks) (FSEnrollmentApplyResult, error) {
+		started <- struct{}{}
+		select {
+		case <-ctx.Done():
+			return FSEnrollmentApplyResult{}, ctx.Err()
+		case <-release:
+			return FSEnrollmentApplyResult{}, nil
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		runPeriodicEnrollment(ctx, enrollmentFlags{storeDir: store}, 0, nil)
+		close(done)
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("policy enrollment did not start")
+	}
+	if err := enroll.SaveControl(path, enroll.Control{
+		Enabled: false, Interval: 30 * time.Minute, StableFor: time.Hour, BatchSize: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case release <- struct{}{}:
+	case <-time.After(time.Second):
+		// Disabling the policy is allowed to cancel the in-flight cycle.
+	}
+	time.Sleep(30 * time.Millisecond)
+	select {
+	case <-started:
+		t.Fatal("disabled policy started another cycle")
+	default:
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("policy enrollment did not stop")
+	}
+}
+
+func TestResolveEnrollmentControlFailsClosedOnMalformedPolicy(t *testing.T) {
+	store := t.TempDir()
+	path := enroll.ControlPath(store)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(`{"version":1,"enabled":true,"interval":"30m","stable_for":"not-a-duration","archived_only":false,"batch_size":1}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	control := resolveEnrollmentControl(enrollmentFlags{storeDir: store, stableFor: time.Hour, batchSize: 3}, 5*time.Minute)
+	if !control.Present || control.Enabled || control.ConfigError == "" {
+		t.Fatalf("malformed policy control = %#v", control)
+	}
+	if control.Interval != 0 || control.BatchSize != 0 {
+		t.Fatalf("malformed policy revived process flags: %#v", control)
+	}
+}
+
+func TestPeriodicEnrollmentRecoversAfterMalformedPolicyIsFixed(t *testing.T) {
+	oldRunner := runServiceEnrollmentCycle
+	oldPoll := enrollmentPolicyPollInterval
+	oldMin := enrollmentPolicyMinInterval
+	t.Cleanup(func() {
+		runServiceEnrollmentCycle = oldRunner
+		enrollmentPolicyPollInterval = oldPoll
+		enrollmentPolicyMinInterval = oldMin
+	})
+	enrollmentPolicyPollInterval = time.Millisecond
+	enrollmentPolicyMinInterval = time.Millisecond
+
+	store := t.TempDir()
+	path := enroll.ControlPath(store)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(`{"version":1,"enabled":true,"interval":"1ms","stable_for":"invalid","archived_only":false,"batch_size":1}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	started := make(chan struct{}, 1)
+	runServiceEnrollmentCycle = func(context.Context, enrollmentFlags, enrollmentApplyHooks) (FSEnrollmentApplyResult, error) {
+		started <- struct{}{}
+		return FSEnrollmentApplyResult{}, nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		runPeriodicEnrollment(ctx, enrollmentFlags{storeDir: store}, 0, nil)
+		close(done)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		progress, err := enroll.LoadProgress(enroll.ProgressPath(store))
+		if err == nil && !progress.Enabled && progress.ErrorKind == "configuration" && progress.LastError != "" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("malformed policy status = %#v err=%v", progress, err)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	select {
+	case <-started:
+		t.Fatal("malformed policy started an enrollment cycle")
+	default:
+	}
+
+	if err := enroll.SaveControl(path, enroll.Control{
+		Enabled: true, Interval: time.Millisecond, StableFor: time.Hour, BatchSize: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	deadline = time.Now().Add(time.Second)
+	for {
+		progress, err := enroll.LoadProgress(enroll.ProgressPath(store))
+		if err == nil && progress.Enabled && progress.ErrorKind == "" && progress.LastError == "" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("repaired policy status = %#v err=%v", progress, err)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("repaired policy did not start an enrollment cycle")
+	}
+}
+
+func TestEnrollmentCycleStopsBeforeMutationWhenAsked(t *testing.T) {
+	home, storeDir, nativePath := fsFixture(t, true)
+	allowEnrollmentWriterProbe(t)
+	allowEnrollmentNamespaceReadiness(t)
+	oldProbe := mountHealthProbe
+	mountHealthProbe = func(string) error { return nil }
+	t.Cleanup(func() { mountHealthProbe = oldProbe })
+	info, err := os.Stat(nativePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := enroll.SaveObservations(enrollmentObservationPath(storeDir), enroll.Observations{"session": {
+		Path: nativePath, Size: info.Size(), ModTimeUnixNano: info.ModTime().UnixNano(), StableSinceUnixNano: time.Now().Add(-time.Hour).UnixNano(),
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	oldRunner := runEnrollmentCommand
+	t.Cleanup(func() { runEnrollmentCommand = oldRunner })
+	runEnrollmentCommand = func(context.Context, []string) error {
+		t.Fatal("stopped enrollment cycle attempted a mutation")
+		return nil
+	}
+	_, err = applyEnrollmentCycle(context.Background(), enrollmentFlags{
+		codexHome: home, storeDir: storeDir, mountPoint: filepath.Join(home, "mount"),
+		nativeRoot: filepath.Join(home, "fold-native"), canonicalNamespace: true,
+		stableFor: time.Nanosecond, batchSize: 1, archivedOnly: true,
+	}, enrollmentApplyHooks{stop: func() bool { return true }})
+	if !errors.Is(err, errEnrollmentStopped) {
+		t.Fatalf("stopped cycle err = %v", err)
 	}
 }
 
@@ -4659,5 +5046,184 @@ func TestCanonicalNativePassthroughProbeRequiresEveryNativeRoute(t *testing.T) {
 	}
 	if err := probeCanonicalNativePassthrough(mount, nativeRoot); err != nil {
 		t.Fatalf("complete native passthrough failed readiness: %v", err)
+	}
+}
+
+func TestRetainCanonicalSnapshotReusesAnIdenticalStagedSnapshot(t *testing.T) {
+	storeDir := t.TempDir()
+	nativePath := filepath.Join(t.TempDir(), "native.jsonl")
+	if err := os.WriteFile(nativePath, []byte("{\"a\":1}\n{\"b\":2}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	source, err := hashPath(nativePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	first, err := retainCanonicalSnapshot(context.Background(), storeDir, "session", source, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A migration that staged the snapshot and then failed before routing must be
+	// retryable. Refusing the staged copy strands the session forever, because
+	// every retry stages into the same path.
+	second, err := retainCanonicalSnapshot(context.Background(), storeDir, "session", source, nil)
+	if err != nil {
+		t.Fatalf("retrying a staged migration: %v", err)
+	}
+	if second.Path != first.Path || second.SHA256 != source.SHA256 || second.Bytes != source.Bytes {
+		t.Fatalf("retry returned a different snapshot: %#v want %#v", second, first)
+	}
+}
+
+func TestRetainCanonicalSnapshotStillRefusesAMismatchedStagedSnapshot(t *testing.T) {
+	storeDir := t.TempDir()
+	nativePath := filepath.Join(t.TempDir(), "native.jsonl")
+	if err := os.WriteFile(nativePath, []byte("{\"a\":1}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	source, err := hashPath(nativePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retainedPath := filepath.Join(storeDir, "fs", "snapshots", "session", "native.jsonl")
+	if err := os.MkdirAll(filepath.Dir(retainedPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(retainedPath, []byte("{\"different\":true}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := retainCanonicalSnapshot(context.Background(), storeDir, "session", source, nil); err == nil {
+		t.Fatal("a staged snapshot that does not match the source must still be refused")
+	}
+}
+
+func TestRetainCanonicalSnapshotRefusesASymlinkedStagedSnapshot(t *testing.T) {
+	storeDir := t.TempDir()
+	nativePath := filepath.Join(t.TempDir(), "native.jsonl")
+	if err := os.WriteFile(nativePath, []byte("{\"a\":1}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	source, err := hashPath(nativePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retainedPath := filepath.Join(storeDir, "fs", "snapshots", "session", "native.jsonl")
+	if err := os.MkdirAll(filepath.Dir(retainedPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// Matching content reached through a symlink is not a staged snapshot.
+	if err := os.Symlink(nativePath, retainedPath); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := retainCanonicalSnapshot(context.Background(), storeDir, "session", source, nil); err == nil {
+		t.Fatal("a symlinked staged snapshot must be refused")
+	}
+}
+
+func TestEnrollmentPlanRepacksAnUnpackedStoreInsteadOfStallingForever(t *testing.T) {
+	home, storeDir, _ := fsFixture(t, true)
+	allowEnrollmentWriterProbe(t)
+	allowEnrollmentNamespaceReadiness(t)
+	oldMountProbe := mountHealthProbe
+	mountHealthProbe = func(string) error { return nil }
+	t.Cleanup(func() { mountHealthProbe = oldMountProbe })
+
+	// A pack build refused for free space leaves manifests pointing at objects
+	// the pack cannot read. Packing what is already on disk clears it.
+	packed := false
+	oldRunner := runEnrollmentCommand
+	runEnrollmentCommand = func(_ context.Context, args []string) error {
+		if len(args) > 1 && args[0] == "pack" && args[1] == "build" {
+			packed = true
+		}
+		return nil
+	}
+	t.Cleanup(func() { runEnrollmentCommand = oldRunner })
+	oldHealthProbe := enrollmentStorageHealthProbe
+	enrollmentStorageHealthProbe = func(context.Context, string) error {
+		if packed {
+			return nil
+		}
+		return errors.New("object is not packed")
+	}
+	t.Cleanup(func() { enrollmentStorageHealthProbe = oldHealthProbe })
+
+	flags := enrollmentFlags{
+		codexHome: home, storeDir: storeDir, mountPoint: filepath.Join(home, "mount"),
+		nativeRoot: filepath.Join(home, "fold-native"), canonicalNamespace: true,
+		stableFor: time.Nanosecond, batchSize: 1,
+	}
+	first, _, err := buildEnrollmentPlan(context.Background(), flags)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := enroll.SaveObservations(enrollmentObservationPath(storeDir), first.Observations); err != nil {
+		t.Fatal(err)
+	}
+
+	plan, _, err := buildEnrollmentPlan(context.Background(), flags)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !packed {
+		t.Fatal("an unpacked store was never repacked; the doctor gate would stall every future cycle")
+	}
+	if len(plan.Selected) != 1 || plan.Selected[0].SessionID != "session" {
+		t.Fatalf("a healed store must enrol again: %#v", plan.Selected)
+	}
+}
+
+func TestEnrollmentPlanSizesAnAutomaticBatchFromMeasuredCost(t *testing.T) {
+	home, storeDir, firstPath := fsFixture(t, true)
+	allowEnrollmentWriterProbe(t)
+	allowEnrollmentNamespaceReadiness(t)
+	oldMountProbe := mountHealthProbe
+	mountHealthProbe = func(string) error { return nil }
+	t.Cleanup(func() { mountHealthProbe = oldMountProbe })
+	oldHealthProbe := enrollmentStorageHealthProbe
+	enrollmentStorageHealthProbe = func(context.Context, string) error { return nil }
+	t.Cleanup(func() { enrollmentStorageHealthProbe = oldHealthProbe })
+
+	sessions := map[string]string{"session": firstPath}
+	for index := range 40 {
+		id := fmt.Sprintf("extra-%02d", index)
+		sessions[id] = addEnrollmentFixtureSession(t, home, id, 0)
+	}
+	saveEnrollmentObservations(t, storeDir, sessions)
+
+	// A cycle whose pack rebuild costs twenty times one session has to fold far
+	// more than one session behind it, or the rebuild is nearly all the work.
+	if err := enroll.SaveTuning(enrollmentTuningPath(storeDir), enroll.BatchTuning{
+		PackSeconds: 200, FoldSecondsPerSession: 10,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Zero is the automatic setting, not a batch of one.
+	flags := enrollmentFlags{
+		codexHome: home, storeDir: storeDir, mountPoint: filepath.Join(home, "mount"),
+		nativeRoot: filepath.Join(home, "fold-native"), canonicalNamespace: true,
+		stableFor: time.Nanosecond, batchSize: 0,
+	}
+	plan, _, err := buildEnrollmentPlan(context.Background(), flags)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Selected) != 41 {
+		t.Fatalf("automatic batch selected %d sessions; a measured rebuild that costs 20 sessions must take every one available", len(plan.Selected))
+	}
+
+	// A number the user chose is honoured exactly.
+	flags.batchSize = 3
+	manual, _, err := buildEnrollmentPlan(context.Background(), flags)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(manual.Selected) != 3 {
+		t.Fatalf("manual batch selected %d sessions, want exactly 3", len(manual.Selected))
 	}
 }

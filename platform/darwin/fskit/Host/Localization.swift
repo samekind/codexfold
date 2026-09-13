@@ -109,6 +109,35 @@ enum L10nKey: String {
     case supervisor
     case daemon
     case storage
+    case autoFold
+    case autoFoldDetail
+    case autoFoldCheckInterval
+    case autoFoldIdleFor
+    case autoFoldScope
+    case autoFoldBatch
+    case autoFoldBatchAutomatic
+    case autoFoldBatchCountFormat
+    case autoFoldScopeArchived
+    case autoFoldScopeArchivedAndIdle
+    case autoFoldProgressFoldedFormat
+    case autoFoldProgressFoldedOnlyFormat
+    case autoFoldChecking
+    case autoFoldFolding
+    case autoFoldReclaiming
+    case autoFoldReclaimWaiting
+    case autoFoldOff
+    case autoFoldWaitingForCheck
+    case autoFoldRetry
+    case autoFoldConfigurationError
+    case autoFoldCheckSoon
+    case autoFoldCheckUnderTwoMinutes
+    case autoFoldCheckMinutesFormat
+    case autoFoldCheckHoursFormat
+    case autoFoldSaveFailed
+    case durationThirtyMinutes
+    case durationTwoHours
+    case durationSixHours
+    case durationOneDay
 }
 
 enum L10n {
@@ -254,6 +283,35 @@ enum L10n {
         .supervisor: "文件服务守护",
         .daemon: "后台服务",
         .storage: "存储",
+        .autoFold: "自动折叠",
+        .autoFoldDetail: "关掉后不再自动折。正在折的这一条会在当前步骤结束后停下，不用退出 Codex。",
+        .autoFoldCheckInterval: "多久检查一次",
+        .autoFoldIdleFor: "闲置多久才折",
+        .autoFoldScope: "折哪些",
+        .autoFoldBatch: "每轮折多少",
+        .autoFoldBatchAutomatic: "自动",
+        .autoFoldBatchCountFormat: "%d 个会话",
+        .autoFoldScopeArchived: "只已归档",
+        .autoFoldScopeArchivedAndIdle: "已归档和闲置中的",
+        .autoFoldProgressFoldedFormat: "已折叠 %d · 还剩 %d",
+        .autoFoldProgressFoldedOnlyFormat: "已折叠 %d",
+        .autoFoldChecking: "正在检查闲置对话",
+        .autoFoldFolding: "正在折叠",
+        .autoFoldReclaiming: "正在校验并释放空间",
+        .autoFoldReclaimWaiting: "等待正在使用的任务释放文件后继续回收",
+        .autoFoldOff: "已关闭",
+        .autoFoldWaitingForCheck: "打开后会按设定检查",
+        .autoFoldRetry: "这一轮没折成，会按设定再试",
+        .autoFoldConfigurationError: "自动折叠设置有问题，已暂停，请修复后再试。",
+        .autoFoldCheckSoon: "即将再检查",
+        .autoFoldCheckUnderTwoMinutes: "不到 2 分钟后再检查",
+        .autoFoldCheckMinutesFormat: "约 %d 分钟后再检查",
+        .autoFoldCheckHoursFormat: "约 %d 小时后再检查",
+        .autoFoldSaveFailed: "自动折叠设置没能保存，请再试一次。",
+        .durationThirtyMinutes: "30 分钟",
+        .durationTwoHours: "2 小时",
+        .durationSixHours: "6 小时",
+        .durationOneDay: "1 天",
     ]
 
     private static let traditionalChinese: [L10nKey: String] = [
@@ -365,6 +423,35 @@ enum L10n {
         .supervisor: "檔案服務守護",
         .daemon: "背景服務",
         .storage: "儲存",
+        .autoFold: "自動折疊",
+        .autoFoldDetail: "關掉後不再自動折。正在折的這一條會在目前步驟結束後停下，不用結束 Codex。",
+        .autoFoldCheckInterval: "多久檢查一次",
+        .autoFoldIdleFor: "閒置多久才折",
+        .autoFoldScope: "折哪些",
+        .autoFoldBatch: "每轮折多少",
+        .autoFoldBatchAutomatic: "自动",
+        .autoFoldBatchCountFormat: "%d 个会话",
+        .autoFoldScopeArchived: "只已封存",
+        .autoFoldScopeArchivedAndIdle: "已封存和閒置中的",
+        .autoFoldProgressFoldedFormat: "已折疊 %d · 還剩 %d",
+        .autoFoldProgressFoldedOnlyFormat: "已折疊 %d",
+        .autoFoldChecking: "正在檢查閒置對話",
+        .autoFoldFolding: "正在折疊",
+        .autoFoldReclaiming: "正在校驗並釋放空間",
+        .autoFoldReclaimWaiting: "等待使用中的任務釋放檔案後繼續回收",
+        .autoFoldOff: "已關閉",
+        .autoFoldWaitingForCheck: "打開後會按設定檢查",
+        .autoFoldRetry: "這一輪沒折成，會按設定再試",
+        .autoFoldConfigurationError: "自動折疊設定有問題，已暫停，請修復後再試。",
+        .autoFoldCheckSoon: "即將再檢查",
+        .autoFoldCheckUnderTwoMinutes: "不到 2 分鐘後再檢查",
+        .autoFoldCheckMinutesFormat: "約 %d 分鐘後再檢查",
+        .autoFoldCheckHoursFormat: "約 %d 小時後再檢查",
+        .autoFoldSaveFailed: "自動折疊設定沒能儲存，請再試一次。",
+        .durationThirtyMinutes: "30 分鐘",
+        .durationTwoHours: "2 小時",
+        .durationSixHours: "6 小時",
+        .durationOneDay: "1 天",
     ]
 
     private static let english: [L10nKey: String] = [
@@ -476,5 +563,34 @@ enum L10n {
         .supervisor: "File service monitor",
         .daemon: "Background service",
         .storage: "Storage",
+        .autoFold: "Auto fold",
+        .autoFoldDetail: "Turning this off stops future folding. A fold already in progress finishes its current step. You do not need to quit Codex.",
+        .autoFoldCheckInterval: "How often to check",
+        .autoFoldIdleFor: "How long idle before folding",
+        .autoFoldScope: "What to fold",
+        .autoFoldBatch: "How many per pass",
+        .autoFoldBatchAutomatic: "Automatic",
+        .autoFoldBatchCountFormat: "%d sessions",
+        .autoFoldScopeArchived: "Archived only",
+        .autoFoldScopeArchivedAndIdle: "Archived and idle",
+        .autoFoldProgressFoldedFormat: "Folded %d · %d remaining",
+        .autoFoldProgressFoldedOnlyFormat: "Folded %d",
+        .autoFoldChecking: "Checking idle conversations",
+        .autoFoldFolding: "Folding now",
+        .autoFoldReclaiming: "Verifying and freeing space",
+        .autoFoldReclaimWaiting: "Waiting for active tasks to release files before cleanup",
+        .autoFoldOff: "Off",
+        .autoFoldWaitingForCheck: "Will check on the schedule you set",
+        .autoFoldRetry: "This pass did not fold. It will try again on schedule.",
+        .autoFoldConfigurationError: "Auto-fold settings are invalid, so folding is paused until they are fixed.",
+        .autoFoldCheckSoon: "Checking again shortly",
+        .autoFoldCheckUnderTwoMinutes: "Checking again in under 2 minutes",
+        .autoFoldCheckMinutesFormat: "Checking again in about %d minutes",
+        .autoFoldCheckHoursFormat: "Checking again in about %d hours",
+        .autoFoldSaveFailed: "Could not save auto-fold settings. Try again.",
+        .durationThirtyMinutes: "30 minutes",
+        .durationTwoHours: "2 hours",
+        .durationSixHours: "6 hours",
+        .durationOneDay: "1 day",
     ]
 }

@@ -14,6 +14,7 @@ import (
 type FSNativeSupervisorResult struct {
 	ResourcePath string        `json:"resource_path"`
 	MountPoint   string        `json:"mount_point"`
+	FSKitType    string        `json:"fskit_type"`
 	Interval     time.Duration `json:"interval"`
 	ProbeTimeout time.Duration `json:"probe_timeout"`
 	Recovery     time.Duration `json:"recovery_timeout"`
@@ -21,7 +22,7 @@ type FSNativeSupervisorResult struct {
 }
 
 func newFSNativeSupervisorCommand() *cobra.Command {
-	var resourcePath, mountPoint string
+	var resourcePath, mountPoint, fskitType string
 	var interval, probeTimeout, recoveryTimeout time.Duration
 	var apply, jsonOutput bool
 	command := &cobra.Command{
@@ -36,9 +37,13 @@ func newFSNativeSupervisorCommand() *cobra.Command {
 			if interval <= 0 || probeTimeout <= 0 || recoveryTimeout <= 0 {
 				return errors.New("supervisor timing values must be positive")
 			}
+			if !service.ValidNativeFSKitMountType(fskitType) {
+				return errors.New("FSKit mount type must start with a lowercase letter and contain only lowercase letters or digits")
+			}
 			result := FSNativeSupervisorResult{
 				ResourcePath: filepath.Clean(resourcePath), MountPoint: filepath.Clean(mountPoint),
-				Interval: interval, ProbeTimeout: probeTimeout, Recovery: recoveryTimeout, DryRun: !apply,
+				FSKitType: fskitType,
+				Interval:  interval, ProbeTimeout: probeTimeout, Recovery: recoveryTimeout, DryRun: !apply,
 			}
 			if !apply {
 				if jsonOutput {
@@ -56,7 +61,7 @@ func newFSNativeSupervisorCommand() *cobra.Command {
 			}
 			defer processLock.Close()
 			return service.RunNativeFSKitSupervisor(command.Context(), service.NativeFSKitSupervisorOptions{
-				ResourcePath: result.ResourcePath, MountPoint: result.MountPoint,
+				ResourcePath: result.ResourcePath, MountPoint: result.MountPoint, FSKitType: result.FSKitType,
 				Interval: result.Interval, ProbeTimeout: result.ProbeTimeout, RecoveryTimeout: result.Recovery,
 				StatusPath: service.FSKitStatusPath(result.ResourcePath, "supervisor"),
 				Event: func(message string) {
@@ -67,6 +72,7 @@ func newFSNativeSupervisorCommand() *cobra.Command {
 	}
 	command.Flags().StringVar(&resourcePath, "resource", "", "Absolute native FSKit resource descriptor path")
 	command.Flags().StringVar(&mountPoint, "mount", "", "Absolute native FSKit mount point")
+	command.Flags().StringVar(&fskitType, "fskit-type", service.NativeFSKitMountType, "Registered native FSKit mount type")
 	command.Flags().DurationVar(&interval, "interval", time.Second, "Health reconciliation interval")
 	command.Flags().DurationVar(&probeTimeout, "probe-timeout", 2*time.Second, "Maximum duration of one mount health probe")
 	command.Flags().DurationVar(&recoveryTimeout, "recovery-timeout", 15*time.Second, "Maximum duration of one mount or unmount recovery")

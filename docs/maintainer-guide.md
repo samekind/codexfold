@@ -19,6 +19,8 @@ The storage engine is released separately from the transparent filesystem previe
 
 FUSE-T NFS evidence is retained to preserve regression knowledge. FUSE-T's own FSKit backend is rejected and must not be confused with the native Swift extension in `platform/darwin/fskit`.
 
+For the final real Desktop/native-FSKit handoff, use [external-ai-codexfold-acceptance.md](external-ai-codexfold-acceptance.md). It pins the single Verification App identity, the isolated API-key route, the real behavior matrix, the 10-second incident UI gate, and the separate production-canary boundary.
+
 ## Required Pull Request Gates
 
 Every pull request must pass:
@@ -69,6 +71,37 @@ An isolated Codex Desktop process requires both `CODEX_ELECTRON_USER_DATA_PATH` 
 
 The supported automation entrypoint is `scripts/run-isolated-codex-acceptance.sh`. Preparation is non-destructive: it makes a private run root, APFS-clones immutable inputs where possible, copies a small exact rollout selection, creates a consistent SQLite snapshot with `VACUUM INTO`, removes unselected thread rows and remote-control enrollment rows, rewrites selected rollout paths, and verifies every copied rollout by byte count and SHA-256. Each selected source rollout must remain the same regular non-symlink device/inode/size/timestamp/content identity from copy through the completed SQLite snapshot, and the target is rehashed both before and after `VACUUM INTO`. The complete selected `threads` row—not only `archived` and `rollout_path`—is hashed before copy, before the snapshot, after the snapshot in the source, and in the unpruned snapshot. `session_index.jsonl` is also copied from one stable source identity and must contain exactly one row for every selected session. A changing default candidate is skipped when it can be identified safely; an explicit selection or an unstable shared index aborts and removes the target. The preparer never prints `auth.json`, session contents, process environments, or raw process command lines.
 
+The current-worktree automatic-fold gate is the `real-fold` command. It is not
+substituted by enrollment unit tests, synthetic JSONL, or historical candidate
+evidence. It builds a fresh candidate, copies one complete real archived session
+into a disposable `CODEX_HOME`, hot-enables the same policy used by the Host GUI,
+waits for the two stability cycles and the complete `fold -> pack -> migrate`
+progress sequence, verifies an already-managed no-op cycle, and hot-disables the
+policy. The unmodified Codex CLI must then unarchive and resume the managed session
+with `gpt-5.6-terra`, append only to the managed delta, preserve the complete base
+prefix, and leave both full and delta JSONL valid. Native snapshot retirement,
+loose-object retirement, and GC must not run. Cleanup rolls the disposable session
+back, deactivates its namespace, stops only the marked candidate, removes copied
+credentials, and re-verifies that the production source inode/bytes/SHA did not
+change.
+
+```bash
+scripts/run-isolated-codex-acceptance.sh real-fold \
+  --source-home "$HOME/.codex" \
+  --frontend fuse
+```
+
+Use `--frontend native-fskit` for the same transaction through the registered
+native module. A FUSE pass is not native FSKit evidence, and a native registration
+or mount limitation must be reported as such instead of being downgraded to a
+synthetic pass.
+
+For an installation candidate, pass the exact prebuilt helper with
+`--candidate-bin "$CANDIDATE_BIN"`. The runner executes a byte-exact copy inside
+its disposable process fence and records the same SHA-256 in the result. A pass
+from an internally rebuilt helper does not validate a different binary that will
+later be installed.
+
 ```bash
 run_root="${TMPDIR:-/tmp}/codexfold-acceptance-$(date +%Y%m%d-%H%M%S)"
 
@@ -76,11 +109,28 @@ scripts/run-isolated-codex-acceptance.sh prepare \
   --source-home "$HOME/.codex" \
   --run-root "$run_root" \
   --session-count 3 \
-  --cockpit-app "/Applications/Cockpit Tools Dev.app" \
+  --app "~/Applications/CodexFold Acceptance.app" \
+  --protected-app "/Applications/ChatGPT.app" \
+  --cockpit-app "~/Applications/CodexFold Acceptance.app" \
   --workspace "$PWD"
 ```
 
+Native macOS runs also require the signed extension to be enabled once by the
+user. In **System Settings > General > Login Items & Extensions**, choose **By
+Category**, open **CodexFoldFSKit FSKit Modules**, and turn on **Extend file
+system functionality without kernel-level access**. The runner never toggles
+this security-sensitive switch; when it is off, the supervisor reports the
+exact setting and keeps production processes untouched.
+
 Preparation captures the PID, process start, executable-path hash, and command hash of the production Desktop and app-server before creating executable harnesses. It creates an entirely isolated Cockpit control plane at `cockpit-data/`; the canonical instance store is `cockpit-data/codex_instances.json`, addressed by `COCKPIT_TOOLS_TEST_DATA_DIR`. Cockpit itself also receives the isolated `CODEX_HOME`, preventing its shared-skills/rules initialization from consulting or modifying the real `~/.codex`. The real `~/.antigravity_cockpit` is never read or changed. `run.json` records the real path and device/inode identity of the run root, isolated home, candidate root, evidence root, Cockpit data root, and Electron data root. Every command rejects a symlink, real-path change, or inode replacement before reading, writing, launching, or injecting a fault. Preparation also binds the Cockpit and Codex executable SHA-256 values in addition to bundle metadata.
+
+When a previous acceptance Desktop is already open, its matching Desktop/app-server processes are captured in the pre-launch fence as pre-existing state. They are never treated as new unbound processes and are never closed by a fresh run; only a newly launched process must prove the isolated `CODEX_HOME` and Electron data binding.
+
+Verifier reads that can cross the candidate mount use bounded `stat`, regular-file, and SHA-256 operations. A stale or unresponsive mount therefore fails the evidence step instead of wedging the acceptance runner or a Codex control process indefinitely.
+
+The acceptance preparer does not carry source OAuth state or provider bearer values into the disposable home. It rewrites the local auth mode to `apikey`, uses the `file` credential store scoped to that disposable `CODEX_HOME`, and installs the operator-supplied API key only through the isolated launch path. The file is mode `600`, is accepted only in the exact `OPENAI_API_KEY`/`auth_mode=apikey` shape, and is never copied into evidence; the production keychain and `~/.codex/auth.json` are never used as acceptance evidence. A process-only `ephemeral` store is intentionally not used because its credential disappears when the login subprocess exits, causing Desktop to redirect to Sign in.
+
+The Desktop shell may still initialize its bundled Computer Use hook and issue background ChatGPT/WHAM and remote-control status probes. In an API-key acceptance these requests have no ChatGPT access token and can log `401 Unauthorized`; they are optional Desktop telemetry/control-plane probes, not the Codex composer auth path. The acceptance contract is the observable one: `auth.json` remains file-backed `apikey`, the provider uses `OPENAI_API_KEY`, and a real Desktop task completes without a Sign in page. Desktop may rewrite `notify` to a Computer Use wrapper with `--previous-notify`; this is isolated under the disposable home and must not be treated as copied OAuth state.
 
 Tauri single-instance arbitration is keyed by the compiled bundle identifier, not by `COCKPIT_TOOLS_TEST_DATA_DIR`. When production Cockpit is already running, use `--cockpit-app` with a same-source development build that has a different bundle identifier, such as `Cockpit Tools Dev.app`; merely copying or renaming the production bundle is insufficient. Never unlink or move `/tmp/com_jlcodes_cockpit_tools_si.sock`, and never close or restart production Cockpit to make an acceptance run proceed. If a distinct-identifier build is unavailable, remain prepared-only.
 
@@ -126,7 +176,7 @@ Candidate attachment must be recorded before the Desktop task baseline. The obse
 "$run_root/verify.sh"
 ```
 
-The external input schema is `codexfold.external-candidate-evidence.v3`. It binds the prepared source snapshot and candidate build manifest, the signed candidate App and exact nested/registered Swift FSKit module, the module process identity, the isolated home/root, an actual kernel mount below `candidateRoot`, the executable Go candidate, the candidate-local service definition, the exact backend PID file and daemon status publisher, and at least one exact managed route. The recorder does not trust supplied health booleans: it reruns signature, registration, process, build, mount, backend-ID, status, route, byte-count, and SHA checks. The retained candidate file is an immutable anchor. A later backend PID may replace its initial runtime only through a separately validated crash/respawn artifact; overwriting the anchor to describe a new PID is forbidden.
+The external input schema is `codexfold.external-candidate-evidence.v3`. It binds the prepared source snapshot and candidate build manifest, the signed candidate App and exact nested/registered Swift FSKit module, the module process identity, the isolated home/root, an actual kernel mount inside the isolated `CODEX_HOME`, the executable Go candidate, the candidate-local service definition, the exact backend PID file and daemon status publisher, and at least one exact managed route. The signed FSKit host may be the exact App currently registered by `pluginkit`; this is the macOS registration boundary, not a permission to place backend state outside the isolated candidate. The recorder does not trust supplied health booleans: it reruns signature, registration, process, build, mount, backend-ID, status, route, byte-count, and SHA checks. The retained candidate file is an immutable anchor. A later backend PID may replace its initial runtime only through a separately validated crash/respawn artifact; overwriting the anchor to describe a new PID is forbidden.
 
 Recording valid candidate evidence changes `run.json` from `candidateAttached=false`, `candidateBuildSHA=null`, and `managedRouteObserved=false` to the verified values and binds them to the retained evidence SHA-256. The report distinguishes three results:
 
@@ -203,3 +253,111 @@ Readiness claims must use only the capability names defined in the product contr
 8. Never delete retained native sources or enable bulk enrollment before the contract permits it.
 
 If a release or service update fails, preserve the failing evidence, restore the last verified app/binary/definition generation, verify exact bytes and build identity, and keep automatic enrollment disabled until the incident is understood.
+
+## Automatic Enrollment Safety Boundary
+
+The Host auto-fold controls are a scheduling policy, not a storage-retention
+authorization. The serve loop reads `<store>/enrollment/policy.json` every few
+seconds. A missing policy file means that the explicitly supplied process flags
+remain in force; a policy file that exists but is malformed, unreadable, or has
+an unsupported version fails closed, disables the loop, and publishes the
+configuration error in `<store>/enrollment/status.json`. It must never silently
+fall back to stale launch arguments.
+
+Each automatic cycle is strictly serialized:
+
+```text
+fold (one selected session at a time)
+-> pack build
+-> pack doctor
+-> migrate (one selected session at a time)
+-> fold doctor
+```
+
+The cycle may be cancelled by disabling the policy while an operation is in
+flight; the current child command receives the cancellation context and the
+status file reports the stopped/retry state. For `N` selected sessions, the GUI
+progress denominator is the actual `2N+3` child commands: `N` folds, one pack
+build, one pack doctor, `N` migrations, and one final fold doctor. Empty batches
+publish no invented work, and progress cannot reach 100% until the final fold
+doctor succeeds. This is command progress, not byte-level progress for a large
+JSONL file.
+
+Automatic enrollment never runs `fs retire-native --apply`, `pack retire-loose
+--apply`, or storage GC. Those operations remain explicit maintenance commands
+with their own retention and deletion proofs. A manual `fs enroll apply` keeps
+the existing explicit maintenance behavior, but its command output and evidence
+must be reviewed separately from the background GUI loop.
+
+## Native FSKit Probe and Host Cleanup Boundaries
+
+The Darwin mount probe uses one bounded `getfsstat(MNT_NOWAIT)` slot. If that
+underlying call is still in flight after its caller times out, a later probe
+returns `ErrNativeFSKitMountProbeInProgress` immediately. The supervisor keeps
+the last published state and emits no new recovery event for this slot
+contention.
+
+A probe that runs out of time is treated the same way. `getfsstat(MNT_NOWAIT)`
+contends with unrelated volumes and with the scheduler, so on a loaded machine
+the deadline expires while the file service is healthy; a mount that actually
+went away is reported by a lookup that *completes*, never by one that times out.
+The supervisor therefore asks the backend directly and returns
+`ErrNativeFSKitMountProbeInconclusive` when the daemon still answers, keeping
+the last conclusive observation. A daemon that stops answering enters recovery
+immediately, so this cannot hide a real outage. Before this rule the production
+store logged 12,776 probe deadlines, each flipping the supervisor to
+`recovering` and reaching the user as a "needs attention" alert that healed
+itself within half a minute.
+
+Status publication never waits on reconciliation. Mount recovery can hold a
+single pass for `RecoveryTimeout`, and the heartbeat has to keep advancing
+through it: the Host treats a status channel that stops advancing as an
+incident, so a supervisor that is merely busy would otherwise report itself as
+gone. Reconciliation runs on its own cadence and the run loop republishes the
+latest observation every interval.
+
+## macOS LiveFS State After an FSKit App Replacement
+
+Replacing the installed FSKit App bundle leaves `fskitd` holding the previous
+mount-point record. Every subsequent mount then fails with `exit status 69`:
+
+    mount: Final mount step ended with error: The file couldn't be saved
+    because a file with the same name already exists.
+
+The unified log shows the real error under `com.apple.LiveFS`:
+
+    Failed to store the mount point in settings file!:
+    Error Domain=NSCocoaErrorDomain Code=516
+
+`NSCocoaErrorDomain` 516 is `NSFileWriteFileExistsError`. Nothing in the store,
+the App Group resource, `/Volumes`, or the mount table is stale — the record
+lives inside `fskitd`. `fs service install --apply` cannot recover on its own:
+its health gate fails and it correctly rolls the App bundle back, which leaves
+the service down with `exit status 113` until the daemon is restarted.
+
+Install an App bundle in this order instead:
+
+1. `codexfold fs service stop --apply` — the explicit stop unmounts and releases
+   the record, which is what keeps `fskitd` from holding a stale one
+2. Replace `~/Applications/CodexFoldFSKit.app` (the candidate `CFBundleVersion`
+   must exceed the installed one)
+3. `lsregister -f -R -trusted ~/Applications/CodexFoldFSKit.app`, then confirm
+   `pluginkit -mAvvv -p com.apple.fskit.fsmodule` lists the module with a `+`
+4. `codexfold fs service start --apply`, then verify `fs service status` and
+   `fs doctor`
+
+Step 1 is the one that is easy to skip, and skipping it is what strands the
+record. An install done this way needs no privileged step.
+
+Recovering once the record is already stranded — after a failed `fs service
+install --apply`, say — does need one: `sudo killall -9 fskitd`, which launchd
+restarts with no record. Verify afterwards that the mount is back and that
+`fs doctor` is clean.
+
+Residency cleanup may signal the exact currently installed Host executable or
+an argument-free Host whose executable is structurally inside an explicit
+`.codexfold-fskit-stage-*` App staging directory. A same-named
+`CodexFoldFSKit` executable from another installation path is not a stale stage
+Host and must not be signalled. Process identity is revalidated as narrowly as
+the platform permits before signalling; this does not remove the small macOS
+PID-reuse window between process inspection and `kill`.

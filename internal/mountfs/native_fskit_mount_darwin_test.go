@@ -409,6 +409,51 @@ func TestNativeFSKitMountedExternalNamespaceRefresh(t *testing.T) {
 	waitForMountedContent(t, mountedPath, []byte("external-two\n"), 3*time.Second)
 }
 
+func TestNativeFSKitMountedSamePathReplacementWatch(t *testing.T) {
+	root := nativeFSKitMountedTestRoot(t)
+	nativeRoot := os.Getenv(nativeFSKitNativeRootEnv)
+	if nativeRoot == "" {
+		t.Skip("native backing required")
+	}
+	relative, err := filepath.Rel(nativeFSKitMountPoint(t), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nativePath := filepath.Join(nativeRoot, relative, "replace.jsonl")
+	mountedPath := filepath.Join(root, "replace.jsonl")
+	if err := os.WriteFile(nativePath, []byte("old\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	waitForMountedContent(t, mountedPath, []byte("old\n"), 3*time.Second)
+	replacement := filepath.Join(filepath.Dir(nativePath), ".replacement")
+	if err := os.WriteFile(replacement, []byte("new\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(replacement, nativePath); err != nil {
+		t.Fatal(err)
+	}
+	want := []byte("new\n")
+	waitForMountedContent(t, mountedPath, want, 3*time.Second)
+	for round := 0; round < 2; round++ {
+		time.Sleep(100 * time.Millisecond)
+		before, observed := nativeFSKitMountedNamespaceVersion(t)
+		file, err := os.OpenFile(nativePath, os.O_APPEND|os.O_WRONLY, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, writeErr := file.WriteString("append\n")
+		closeErr := file.Close()
+		if err := errors.Join(writeErr, closeErr); err != nil {
+			t.Fatal(err)
+		}
+		if observed {
+			waitForNativeFSKitNamespaceAdvance(t, before, 3*time.Second)
+		}
+		want = append(want, []byte("append\n")...)
+		waitForMountedContent(t, mountedPath, want, 3*time.Second)
+	}
+}
+
 func TestNativeFSKitMountedExternalDirectoryNamespaceRefresh(t *testing.T) {
 	mountPoint := nativeFSKitMountPoint(t)
 	nativeRoot := os.Getenv(nativeFSKitNativeRootEnv)

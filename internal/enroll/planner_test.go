@@ -2,6 +2,7 @@ package enroll
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -88,6 +89,9 @@ func TestPlannerSeparatesActiveChangingManagedWriterBudgetAndBatchCases(t *testi
 	firstBatch := makeSession("batch-a", true)
 	secondBatch := makeSession("batch-b", true)
 	budgeted := makeSession("budgeted", true)
+	// Considered before the batch fills, so the plan still has room to price it
+	// and the budget rejection is the reason that surfaces.
+	budgeted.UpdatedAt = now.Add(-3 * time.Hour).Unix()
 	previous := make(Observations)
 	for _, session := range []codex.Session{changing, managed, writer, firstBatch, secondBatch, budgeted} {
 		info, err := os.Stat(session.RolloutPath)
@@ -370,4 +374,56 @@ func assertDecisionReason(t *testing.T, plan Plan, sessionID string, reason Reas
 		t.Fatalf("decision %s reasons = %v, want %s", sessionID, decision.Reasons, reason)
 	}
 	t.Fatalf("decision not found: %s", sessionID)
+}
+
+type countingBudget struct{ calls int }
+
+func (b *countingBudget) Check(context.Context, storage.Projection) (storage.Assessment, error) {
+	b.calls++
+	return storage.Assessment{}, nil
+}
+
+func TestPlannerDoesNotPriceSessionsBeyondTheBatchLimit(t *testing.T) {
+	root := t.TempDir()
+	now := time.Unix(30_000, 0)
+	var sessions []codex.Session
+	previous := make(Observations)
+	for index := range 200 {
+		id := fmt.Sprintf("session-%03d", index)
+		path := filepath.Join(root, id+".jsonl")
+		if err := os.WriteFile(path, []byte(id+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(path, now.Add(-2*time.Hour), now.Add(-2*time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sessions = append(sessions, codex.Session{ID: id, RolloutPath: path, Archived: true, UpdatedAt: now.Add(-2 * time.Hour).Unix()})
+		previous[id] = Observation{Path: path, Size: info.Size(), ModTimeUnixNano: info.ModTime().UnixNano(), StableSinceUnixNano: now.Add(-2 * time.Hour).UnixNano()}
+	}
+
+	budget := &countingBudget{}
+	plan, err := Build(context.Background(), Input{
+		Sessions: sessions, Managed: map[string]struct{}{}, Previous: previous, Now: now,
+		Policy: Policy{StableFor: time.Hour, BatchSize: 5, ArchivedOnly: true},
+		Gates:  Gates{DoctorHealthy: true, MountHealthy: true, CanonicalNamespace: true, NamespaceActive: true, NamespaceReady: true, EnrollmentAllowed: true},
+		Budget: budget,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Selected) != 5 {
+		t.Fatalf("selected = %d, want 5", len(plan.Selected))
+	}
+	// Every price is a full store inventory scan. Paying one per candidate is
+	// what made planning over a real corpus take minutes instead of a moment.
+	if budget.calls != 5 {
+		t.Fatalf("budget priced %d sessions, want only the %d the batch could take", budget.calls, 5)
+	}
+	if WaitingCount(plan) != len(sessions) {
+		t.Fatalf("waiting = %d, want %d: sessions past the limit are still waiting", WaitingCount(plan), len(sessions))
+	}
 }

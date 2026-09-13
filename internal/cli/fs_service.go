@@ -508,6 +508,11 @@ func newFSServiceInstallCommand() *cobra.Command {
 			if cleanupErr != nil {
 				return cleanupErr
 			}
+			if apply && frontend == "native-fskit" {
+				if err := reapIdleCodexFoldFSKitModuleProcesses(command.Context(), fskitAppPath); err != nil {
+					return err
+				}
+			}
 			if apply && frontend == "native-fskit" && result.FSKitResidency != nil {
 				menuBar := ensureFSKitMenuBarResidency(command.Context(), fskitAppPath)
 				completeFSKitResidency(result.FSKitResidency, menuBar)
@@ -648,6 +653,7 @@ func waitPlatformServiceInactive(ctx context.Context, platform service.Platform,
 	var daemonLock, supervisorLock service.ProcessLockStatus
 	var mountPresent bool
 	var mountPresenceErr error
+	var lastReclaim time.Time
 	for {
 		status, err := platformServiceStatus(ctx, platform, mountPoint, definitionPath)
 		if err != nil {
@@ -663,6 +669,11 @@ func waitPlatformServiceInactive(ctx context.Context, platform service.Platform,
 				return fmt.Errorf("inspect supervisor process lock: %w", err)
 			}
 			mountPresent, mountPresenceErr = service.MountPresent(mountPoint)
+			if mountPresent && mountPresenceErr == nil && (lastReclaim.IsZero() || time.Since(lastReclaim) >= time.Second) {
+				lastReclaim = time.Now()
+				_ = reclaimNativeFSKitMount(ctx, definitionPath, mountPoint)
+				mountPresent, mountPresenceErr = service.MountPresent(mountPoint)
+			}
 		}
 		if nativeFSKitServiceInactive(status, daemonLock, supervisorLock, mountPresent, mountPresenceErr) {
 			return nil
@@ -960,14 +971,11 @@ func stopPlatformService(ctx context.Context, platform service.Platform, definit
 			// keeps the session path present. An explicit stop reclaims that
 			// mount here, otherwise the path would stay occupied by a dead
 			// backend. Only unmount when CodexFold still owns it.
+			var reclaimErr error
 			if mountPoint, mountErr := service.DefinitionMountPoint(platform, definitionPath); mountErr == nil && mountPoint != "" {
-				unmountCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-				if unmountErr := service.UnmountNativeFSKit(unmountCtx, mountPoint, false); unmountErr != nil {
-					_ = service.UnmountNativeFSKit(unmountCtx, mountPoint, true)
-				}
-				cancel()
+				reclaimErr = reclaimNativeFSKitMount(ctx, definitionPath, mountPoint)
 			}
-			return errors.Join(supervisorErr, daemonErr)
+			return errors.Join(supervisorErr, daemonErr, reclaimErr)
 		}
 		return (service.Manager{}).Bootout(ctx, definitionPath)
 	case service.PlatformSystemd:
@@ -1260,8 +1268,26 @@ func retainCanonicalSnapshot(ctx context.Context, store string, sessionID string
 	if err := os.MkdirAll(retainedDir, 0o700); err != nil {
 		return vfs.NativeFile{}, err
 	}
-	if _, err := os.Lstat(retainedPath); err == nil {
-		return vfs.NativeFile{}, errors.New("retained canonical snapshot already exists")
+	if existing, err := os.Lstat(retainedPath); err == nil {
+		// A previous migration staged this snapshot and then failed before it
+		// routed the session. The snapshot is only ever a byte-identical copy of
+		// the source, so one that still matches is this step already done rather
+		// than a collision. Refusing it strands the session permanently, because
+		// every retry stages into the same path and hits the same refusal; that
+		// is what left folded sessions sitting next to their originals. A
+		// snapshot that does not match, or is not a plain file, is still refused.
+		if !existing.Mode().IsRegular() {
+			return vfs.NativeFile{}, errors.New("retained canonical snapshot is not a regular file")
+		}
+		retained, hashErr := hashPath(retainedPath)
+		if hashErr != nil {
+			return vfs.NativeFile{}, fmt.Errorf("verify retained canonical snapshot: %w", hashErr)
+		}
+		if retained.Bytes != source.Bytes || retained.SHA256 != source.SHA256 {
+			return vfs.NativeFile{}, errors.New("retained canonical snapshot already exists")
+		}
+		retained.Path = retainedPath
+		return retained, nil
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return vfs.NativeFile{}, err
 	}

@@ -26,7 +26,10 @@ type OpenOptions struct {
 	BypassOSCache bool
 }
 
-var ErrInvalidCurrent = errors.New("invalid pack CURRENT")
+var (
+	ErrInvalidCurrent  = errors.New("invalid pack CURRENT")
+	ErrObjectNotPacked = errors.New("object is not packed")
+)
 
 type Resolver struct {
 	directory            string
@@ -479,7 +482,7 @@ func (r *Resolver) ReadAt(ctx context.Context, ref fold.ObjectRef, destination [
 		return 0, lookupErr
 	}
 	if !ok {
-		return 0, fmt.Errorf("object %s is not packed", ref.SHA256)
+		return 0, fmt.Errorf("object %s: %w", ref.SHA256, ErrObjectNotPacked)
 	}
 	if object.RawBytes != ref.RawBytes {
 		return 0, fmt.Errorf("object %s raw size %d, want %d", ref.SHA256, object.RawBytes, ref.RawBytes)
@@ -528,7 +531,7 @@ func (r *Resolver) OpenObject(ctx context.Context, ref fold.ObjectRef) (io.ReadC
 		return nil, lookupErr
 	}
 	if !ok {
-		return nil, fmt.Errorf("object %s is not packed", ref.SHA256)
+		return nil, fmt.Errorf("object %s: %w", ref.SHA256, ErrObjectNotPacked)
 	}
 	if object.RawBytes != ref.RawBytes {
 		return nil, fmt.Errorf("object %s raw size %d, want %d", ref.SHA256, object.RawBytes, ref.RawBytes)

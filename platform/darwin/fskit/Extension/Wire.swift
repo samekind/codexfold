@@ -1,6 +1,37 @@
 import Darwin
 import Foundation
 
+// One bounded snapshot per in-progress directory enumeration. A new enumeration
+// always rereads the backend; only continuation pages reuse the same listing.
+final class DirectoryEnumerationCache<Element> {
+    private struct Snapshot {
+        var generation: UInt64
+        var entries: [Element]
+    }
+    private let lock = NSLock()
+    private var snapshots: [UInt64: Snapshot] = [:]
+
+    func continuation(node: UInt64, generation: UInt64, start: UInt64) -> [Element]? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard start != 0, let snapshot = snapshots[node], snapshot.generation == generation else {
+            snapshots[node] = nil
+            return nil
+        }
+        return snapshot.entries
+    }
+
+    func store(node: UInt64, generation: UInt64, entries: [Element]) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard entries.count <= 16_384 else { snapshots[node] = nil; return }
+        if snapshots[node] == nil && snapshots.count >= 4 {
+            snapshots.removeAll(keepingCapacity: true)
+        }
+        snapshots[node] = Snapshot(generation: generation, entries: entries)
+    }
+}
+
 private let wireMagic = Data([0x43, 0x46, 0x53, 0x50])
 private let descriptorMagic = Data([0x43, 0x46, 0x53, 0x52])
 private let wireVersion: UInt16 = 2
@@ -22,7 +53,28 @@ private let sharedFileWindowFDMarker: UInt8 = 0x52
 private let socketBufferBytes: Int32 = 4 * 1024 * 1024
 private let socketIdleTimeout: TimeInterval = 2
 private let frontendAppGroupIdentifier = "group.vip.jstar.codexfold"
+private let frontendRuntimeScopeEnvironmentKey = "CODEXFOLD_RUNTIME_SCOPE"
 let frontendRecoveryTimeout: TimeInterval = 10
+
+enum FrontendRuntimeLocation {
+    static func containerURL(
+        appGroupURL: URL?,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> URL? {
+        guard let appGroupURL else { return nil }
+        guard let scope = environment[frontendRuntimeScopeEnvironmentKey] else {
+            return appGroupURL
+        }
+        guard !scope.isEmpty,
+              scope.count <= 64,
+              scope != ".",
+              scope != "..",
+              scope.range(of: "^[A-Za-z0-9][A-Za-z0-9._-]*$", options: .regularExpression) != nil else {
+            return nil
+        }
+        return appGroupURL.appendingPathComponent(scope, isDirectory: true)
+    }
+}
 
 func isWireTransportError(_ error: any Error) -> Bool {
     let code: POSIXErrorCode?
@@ -132,9 +184,14 @@ final class FrontendStatusWriter {
     private let statusDirectory: URL?
     private let onError: ((any Error) -> Void)?
 
-    init(containerURL: URL? = FileManager.default.containerURL(
-        forSecurityApplicationGroupIdentifier: frontendAppGroupIdentifier
-    ), onError: ((any Error) -> Void)? = nil) {
+    init(
+        containerURL: URL? = FrontendRuntimeLocation.containerURL(
+            appGroupURL: FileManager.default.containerURL(
+                forSecurityApplicationGroupIdentifier: frontendAppGroupIdentifier
+            )
+        ),
+        onError: ((any Error) -> Void)? = nil
+    ) {
         statusDirectory = containerURL?.appendingPathComponent("status", isDirectory: true)
         self.onError = onError
     }

@@ -50,6 +50,7 @@ var (
 	listFSKitUserProcessIDs       = userProcessIDs
 	inspectFSKitProcessExecutable = fsKitProcessExecutablePath
 	inspectFSKitProcessCommand    = fsKitProcessCommandLine
+	inspectFSKitModuleUnixSocket  = fsKitModuleProcessHasUnixSocket
 	signalFSKitProcess            = unix.Kill
 )
 
@@ -198,7 +199,34 @@ func refreshFSKitApp(ctx context.Context, appPath string, manageResidency bool) 
 }
 
 func quiesceFSKitAppForUpdate(ctx context.Context, appPath string) error {
-	return stopCodexFoldFSKitModuleProcesses(ctx, appPath)
+	hostErr := stopCodexFoldFSKitHostProcesses(ctx, appPath)
+	moduleErr := stopCodexFoldFSKitModuleProcesses(ctx, appPath)
+	return errors.Join(hostErr, moduleErr)
+}
+
+func quiesceNativeFSKitDefinition(ctx context.Context, definitionPath string) error {
+	launcher, err := service.DefinitionLauncher(service.PlatformLaunchd, definitionPath)
+	if err != nil {
+		return err
+	}
+	if launcher == "" {
+		return nil
+	}
+	appPath, err := service.FSKitAppPathFromLauncher(launcher)
+	if err != nil {
+		return err
+	}
+	return quiesceFSKitAppForUpdate(ctx, appPath)
+}
+
+func reclaimNativeFSKitMount(ctx context.Context, definitionPath string, mountPoint string) error {
+	quiesceErr := quiesceNativeFSKitDefinition(ctx, definitionPath)
+	unmountCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if unmountErr := service.UnmountNativeFSKit(unmountCtx, mountPoint, false); unmountErr != nil {
+		_ = service.UnmountNativeFSKit(unmountCtx, mountPoint, true)
+	}
+	return quiesceErr
 }
 
 func unregisterFSKitAppRegistration(ctx context.Context, appPath string) error {
@@ -646,11 +674,17 @@ func ensureFSKitMenuBarResidency(ctx context.Context, appPath string) FSKitResid
 	if err != nil {
 		return FSKitResidencyServiceOutcome{State: "unavailable", Detail: err.Error()}
 	}
+	if err := stopStaleFSKitMenuBarProcesses(ctx, launcher); err != nil {
+		return FSKitResidencyServiceOutcome{State: "unavailable", Detail: err.Error()}
+	}
 	running, err := inspectFSKitMenuBarProcess(ctx, launcher)
 	if err != nil {
 		return FSKitResidencyServiceOutcome{State: "unavailable", Detail: err.Error()}
 	}
 	if running {
+		if collapseErr := collapseFSKitMenuBarProcesses(ctx, launcher); collapseErr != nil {
+			return FSKitResidencyServiceOutcome{State: "unavailable", Detail: collapseErr.Error()}
+		}
 		return FSKitResidencyServiceOutcome{State: "enabled"}
 	}
 	output, err := runFSKitMenuBarOpenCommand(ctx, appPath)
@@ -687,32 +721,195 @@ func ensureFSKitMenuBarResidency(ctx context.Context, appPath string) FSKitResid
 }
 
 func fsKitMenuBarProcessRunning(ctx context.Context, launcher string) (bool, error) {
+	pids, err := fsKitMenuBarProcessIDs(ctx, launcher)
+	if err != nil {
+		return false, err
+	}
+	return len(pids) > 0, nil
+}
+
+func fsKitMenuBarProcessIDs(ctx context.Context, launcher string) ([]int, error) {
 	pids, err := listFSKitUserProcessIDs(ctx, codexFoldFSKitHostProcessName)
 	if err != nil {
-		return false, fmt.Errorf("inspect CodexFold menu-bar processes: %w", err)
+		return nil, fmt.Errorf("inspect CodexFold menu-bar processes: %w", err)
 	}
 	launcher = filepath.Clean(launcher)
+	matched := make([]int, 0, len(pids))
 	for _, pid := range pids {
 		executable, commandErr := inspectFSKitProcessExecutable(ctx, pid)
 		if commandErr != nil {
-			return false, fmt.Errorf("inspect CodexFold menu-bar process %d: %w", pid, commandErr)
+			return nil, fmt.Errorf("inspect CodexFold menu-bar process %d: %w", pid, commandErr)
 		}
 		if executable != launcher {
 			continue
 		}
 		command, commandErr := inspectFSKitProcessCommand(ctx, pid)
 		if commandErr != nil {
-			return false, fmt.Errorf("inspect CodexFold menu-bar process %d arguments: %w", pid, commandErr)
+			return nil, fmt.Errorf("inspect CodexFold menu-bar process %d arguments: %w", pid, commandErr)
 		}
 		if fsKitMenuBarCommandHasNoArguments(command, launcher) {
-			return true, nil
+			matched = append(matched, pid)
 		}
 	}
-	return false, nil
+	return matched, nil
+}
+
+func collapseFSKitMenuBarProcesses(ctx context.Context, launcher string) error {
+	pids, err := fsKitMenuBarProcessIDs(ctx, launcher)
+	if err != nil {
+		return err
+	}
+	if len(pids) <= 1 {
+		return nil
+	}
+	sort.Ints(pids)
+	keep := pids[len(pids)-1]
+	for _, pid := range pids[:len(pids)-1] {
+		if err := signalFSKitProcess(pid, unix.SIGTERM); err != nil && !errors.Is(err, unix.ESRCH) {
+			return fmt.Errorf("stop extra CodexFold menu-bar process %d: %w", pid, err)
+		}
+	}
+	return waitForFSKitMenuBarProcessIDs(ctx, launcher, []int{keep}, fsKitMenuBarLaunchWait)
+}
+
+func staleFSKitMenuBarProcessIDs(ctx context.Context, launcher string) ([]int, error) {
+	launcher = filepath.Clean(launcher)
+	pids, err := listFSKitUserProcessIDs(ctx, codexFoldFSKitHostProcessName)
+	if err != nil {
+		return nil, fmt.Errorf("inspect CodexFold menu-bar processes: %w", err)
+	}
+	stale := make([]int, 0, len(pids))
+	for _, pid := range pids {
+		executable, commandErr := inspectFSKitProcessExecutable(ctx, pid)
+		if commandErr != nil {
+			return nil, fmt.Errorf("inspect CodexFold menu-bar process %d: %w", pid, commandErr)
+		}
+		executable = filepath.Clean(executable)
+		if executable == "." || executable == launcher || !isStagedFSKitHostLauncher(executable) {
+			continue
+		}
+		command, commandErr := inspectFSKitProcessCommand(ctx, pid)
+		if commandErr != nil {
+			return nil, fmt.Errorf("inspect CodexFold menu-bar process %d arguments: %w", pid, commandErr)
+		}
+		if fsKitMenuBarCommandHasNoArguments(command, executable) {
+			stale = append(stale, pid)
+		}
+	}
+	return stale, nil
+}
+
+func isStagedFSKitHostLauncher(launcher string) bool {
+	appPath, err := service.FSKitAppPathFromLauncher(launcher)
+	if err != nil {
+		return false
+	}
+	return strings.HasPrefix(filepath.Base(filepath.Dir(appPath)), ".codexfold-fskit-stage-")
+}
+
+func stopStaleFSKitMenuBarProcesses(ctx context.Context, launcher string) error {
+	deadline := time.NewTimer(fsKitMenuBarLaunchWait)
+	defer deadline.Stop()
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	var lastStale []int
+	for {
+		stale, err := staleFSKitMenuBarProcessIDs(ctx, launcher)
+		if err != nil {
+			return err
+		}
+		if len(stale) == 0 {
+			return nil
+		}
+		lastStale = stale
+		for _, pid := range stale {
+			if err := signalFSKitProcess(pid, unix.SIGTERM); err != nil && !errors.Is(err, unix.ESRCH) {
+				return fmt.Errorf("stop leftover CodexFold menu-bar process %d: %w", pid, err)
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-deadline.C:
+			return fmt.Errorf("leftover CodexFold menu-bar processes remain: %v", lastStale)
+		case <-ticker.C:
+		}
+	}
+}
+
+func stopCodexFoldFSKitHostProcesses(ctx context.Context, appPath string) error {
+	launcher, err := service.FSKitHostLauncherPath(appPath)
+	if err != nil {
+		return err
+	}
+	if err := stopStaleFSKitMenuBarProcesses(ctx, launcher); err != nil {
+		return err
+	}
+	pids, err := fsKitMenuBarProcessIDs(ctx, launcher)
+	if err != nil {
+		return err
+	}
+	for _, pid := range pids {
+		if err := signalFSKitProcess(pid, unix.SIGTERM); err != nil && !errors.Is(err, unix.ESRCH) {
+			return fmt.Errorf("stop CodexFold menu-bar process %d: %w", pid, err)
+		}
+	}
+	if err := waitForFSKitMenuBarProcessIDs(ctx, launcher, nil, fsKitMenuBarLaunchWait); err != nil {
+		remaining, inspectErr := fsKitMenuBarProcessIDs(ctx, launcher)
+		if inspectErr != nil {
+			return errors.Join(err, inspectErr)
+		}
+		for _, pid := range remaining {
+			if killErr := signalFSKitProcess(pid, unix.SIGKILL); killErr != nil && !errors.Is(killErr, unix.ESRCH) {
+				return errors.Join(err, fmt.Errorf("force-stop CodexFold menu-bar process %d: %w", pid, killErr))
+			}
+		}
+		return waitForFSKitMenuBarProcessIDs(ctx, launcher, nil, fsKitMenuBarLaunchWait)
+	}
+	return nil
+}
+
+func waitForFSKitMenuBarProcessIDs(ctx context.Context, launcher string, allowed []int, timeout time.Duration) error {
+	if timeout <= 0 {
+		timeout = fsKitMenuBarLaunchWait
+	}
+	allowedSet := make(map[int]struct{}, len(allowed))
+	for _, pid := range allowed {
+		allowedSet[pid] = struct{}{}
+	}
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		pids, err := fsKitMenuBarProcessIDs(ctx, launcher)
+		if err != nil {
+			return err
+		}
+		extra := make([]int, 0, len(pids))
+		for _, pid := range pids {
+			if _, ok := allowedSet[pid]; !ok {
+				extra = append(extra, pid)
+			}
+		}
+		if len(extra) == 0 {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-deadline.C:
+			return fmt.Errorf("CodexFold menu-bar processes remain: %v", extra)
+		case <-ticker.C:
+		}
+	}
 }
 
 func fsKitMenuBarCommandHasNoArguments(command, launcher string) bool {
 	command = strings.TrimSpace(command)
+	if command == "" || strings.TrimSpace(launcher) == "" {
+		return false
+	}
 	launcher = filepath.Clean(launcher)
 	return command == launcher || command == filepath.Base(launcher)
 }
@@ -1017,6 +1214,84 @@ func stopCodexFoldFSKitModuleProcesses(ctx context.Context, appPath string) erro
 		return waitForNoCodexFoldFSKitModuleProcesses(ctx, appPath, fsKitModuleShutdownWait)
 	}
 	return nil
+}
+
+func reapIdleCodexFoldFSKitModuleProcesses(ctx context.Context, appPath string) error {
+	pids, err := fsKitModuleProcessIDs(ctx, appPath)
+	if err != nil {
+		return err
+	}
+	if len(pids) <= 1 {
+		return nil
+	}
+	idle := make([]int, 0, len(pids))
+	live := 0
+	for _, pid := range pids {
+		hasSocket, inspectErr := inspectFSKitModuleUnixSocket(ctx, pid)
+		if inspectErr != nil {
+			return fmt.Errorf("inspect CodexFold FSKit module process %d sockets: %w", pid, inspectErr)
+		}
+		if hasSocket {
+			live++
+			continue
+		}
+		idle = append(idle, pid)
+	}
+	if live == 0 || len(idle) == 0 {
+		return nil
+	}
+	for _, pid := range idle {
+		if err := signalFSKitProcess(pid, unix.SIGKILL); err != nil && !errors.Is(err, unix.ESRCH) {
+			return fmt.Errorf("stop idle CodexFold FSKit module process %d: %w", pid, err)
+		}
+	}
+	deadline := time.NewTimer(fsKitModuleShutdownWait)
+	defer deadline.Stop()
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		remaining, inspectErr := fsKitModuleProcessIDs(ctx, appPath)
+		if inspectErr != nil {
+			return inspectErr
+		}
+		stillIdle := 0
+		for _, pid := range remaining {
+			for _, idlePID := range idle {
+				if pid == idlePID {
+					stillIdle++
+				}
+			}
+		}
+		if stillIdle == 0 {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-deadline.C:
+			return fmt.Errorf("idle CodexFold FSKit module processes remain: %v", remaining)
+		case <-ticker.C:
+		}
+	}
+}
+
+func fsKitModuleProcessHasUnixSocket(ctx context.Context, pid int) (bool, error) {
+	output, err := exec.CommandContext(
+		ctx,
+		"/usr/sbin/lsof",
+		"-nP",
+		"-p", strconv.Itoa(pid),
+		"-a",
+		"-U",
+	).Output()
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+			return false, nil
+		}
+		return false, err
+	}
+	return strings.TrimSpace(string(output)) != "", nil
 }
 
 func waitForNoCodexFoldFSKitModuleProcesses(ctx context.Context, appPath string, timeout time.Duration) error {

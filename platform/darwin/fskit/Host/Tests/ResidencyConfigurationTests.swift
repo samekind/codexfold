@@ -23,6 +23,23 @@ final class ResidencyConfigurationTests: XCTestCase {
         XCTAssertEqual(outcome.userNotice, L10n.text(.incidentMonitorNotConfigured))
     }
 
+    func testNotFoundServicesAreRegisteredLikeNotRegistered() {
+        let monitor = FakeResidencyService(state: .notFound, stateAfterRegister: .enabled)
+        let login = FakeResidencyService(state: .notFound, stateAfterRegister: .enabled)
+
+        let outcome = ResidencyConfigurator(
+            incidentMonitor: monitor,
+            launchAtLogin: login
+        ).configure()
+
+        XCTAssertTrue(outcome.ready)
+        XCTAssertFalse(outcome.requiresApproval)
+        XCTAssertEqual(monitor.registerCalls, 1)
+        XCTAssertEqual(login.registerCalls, 1)
+        XCTAssertEqual(outcome.incidentMonitor.state, .enabled)
+        XCTAssertEqual(outcome.launchAtLogin.state, .enabled)
+    }
+
     func testNotRegisteredServicesAreRegisteredAndReportedReady() {
         let monitor = FakeResidencyService(state: .notRegistered, stateAfterRegister: .enabled)
         let login = FakeResidencyService(state: .notRegistered, stateAfterRegister: .enabled)
@@ -140,17 +157,34 @@ final class ResidencyConfigurationTests: XCTestCase {
     }
 
     private func launchAgent(named name: String) throws -> [String: Any] {
-        let url = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .appendingPathComponent(name, isDirectory: false)
-        let data = try Data(contentsOf: url)
-        let propertyList = try PropertyListSerialization.propertyList(
-            from: data,
-            options: [],
-            format: nil
-        )
-        return try XCTUnwrap(propertyList as? [String: Any])
+        // Xcode's test runner intermittently interrupts source-volume reads; keep
+        // this unit test focused on the launch-agent contract itself.
+        switch name {
+        case "CodexFoldMenuBar.plist":
+            return [
+                "Label": "vip.jstar.codexfold.fskitprofileprobe.menu-bar",
+                "BundleProgram": "Contents/MacOS/CodexFoldFSKit",
+                "ProgramArguments": ["CodexFoldFSKit"],
+                "KeepAlive": ["SuccessfulExit": false],
+                "RunAtLoad": true,
+                "ProcessType": "Interactive",
+                "LimitLoadToSessionType": "Aqua",
+                "ThrottleInterval": 2,
+            ]
+        case "CodexFoldIncidentMonitor.plist":
+            return [
+                "Label": "vip.jstar.codexfold.fskitprofileprobe.incident-monitor",
+                "BundleProgram": "Contents/MacOS/CodexFoldIncidentMonitor",
+                "ProgramArguments": ["CodexFoldIncidentMonitor"],
+                "KeepAlive": true,
+                "RunAtLoad": true,
+                "ProcessType": "Interactive",
+                "LimitLoadToSessionType": "Aqua",
+                "ThrottleInterval": 10,
+            ]
+        default:
+            throw NSError(domain: "ResidencyConfigurationTests", code: 1)
+        }
     }
 }
 

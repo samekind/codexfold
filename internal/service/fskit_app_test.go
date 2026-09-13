@@ -54,3 +54,30 @@ func TestFSKitHostLauncherRejectsNonAppAndRelativePaths(t *testing.T) {
 		}
 	}
 }
+
+func TestFSKitAppPathFromLauncherRoundTripsHostLauncher(t *testing.T) {
+	app := filepath.Join(t.TempDir(), "user", "Applications", FSKitAppBundleName)
+	launcher, err := FSKitHostLauncherPath(app)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := FSKitAppPathFromLauncher(launcher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != app {
+		t.Fatalf("app path = %q, want %q", got, app)
+	}
+}
+
+func TestFSKitAppPathFromLauncherRejectsNonBundlePaths(t *testing.T) {
+	for _, path := range []string{
+		"CodexFoldFSKit",
+		filepath.Join(t.TempDir(), "CodexFoldFSKit"),
+		filepath.Join(t.TempDir(), "Contents", "MacOS", FSKitHostExecutableName),
+	} {
+		if _, err := FSKitAppPathFromLauncher(path); err == nil {
+			t.Fatalf("FSKitAppPathFromLauncher(%q) succeeded", path)
+		}
+	}
+}

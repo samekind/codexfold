@@ -207,7 +207,8 @@ copy_selected_rollout() {
   local id=$1
   local db_archived=$2
   local db_rollout_path=$3
-  local source_path source_parent target_path relative_path actual_archived
+  local source_path source_parent source_namespace source_namespace_root sessions_root archived_root namespace_name target_path relative_path actual_archived
+  local namespace_identity_before namespace_identity_after namespace_root_identity_before namespace_root_identity_after
   local source_identity_before source_identity_after source_sha_before source_sha_after source_bytes
   local target_sha target_bytes current_row expected_row row_identity_before row_identity_after
 
@@ -225,20 +226,29 @@ copy_selected_rollout() {
   fi
   source_parent=$(cd "$(dirname "$db_rollout_path")" 2>/dev/null && pwd -P) || return 1
   source_path="$source_parent/$(basename "$db_rollout_path")"
+  sessions_root=$(cd "$source_home/sessions" 2>/dev/null && pwd -P) || return 1
+  archived_root=$(cd "$source_home/archived_sessions" 2>/dev/null && pwd -P) || return 1
   case "$source_path" in
-    "$source_home/sessions/"*)
+    "$sessions_root/"*)
       actual_archived=0
-      relative_path="sessions/${source_path#"$source_home/sessions/"}"
+      namespace_name=sessions
+      source_namespace="$source_home/sessions"
+      source_namespace_root=$sessions_root
       ;;
-    "$source_home/archived_sessions/"*)
+    "$archived_root/"*)
       actual_archived=1
-      relative_path="archived_sessions/${source_path#"$source_home/archived_sessions/"}"
+      namespace_name=archived_sessions
+      source_namespace="$source_home/archived_sessions"
+      source_namespace_root=$archived_root
       ;;
     *)
       echo "selected rollout escaped the Codex session namespace: $id" >&2
       return 1
       ;;
   esac
+  namespace_identity_before=$(stat -f '%d:%i:%z:%m:%c:%p:%HT:%Y' "$source_namespace" 2>/dev/null) || return 1
+  namespace_root_identity_before=$(stat -f '%d:%i:%m:%c:%p:%HT' "$source_namespace_root" 2>/dev/null) || return 1
+  relative_path="$namespace_name/${source_path#"$source_namespace_root/"}"
   if [[ "$actual_archived" != "$db_archived" ]]; then
     echo "session archive state disagrees with its rollout location: $id" >&2
     return 1
@@ -268,10 +278,14 @@ copy_selected_rollout() {
     echo "selected rollout changed type during copy: $id" >&2
     return 1
   }
+  namespace_identity_after=$(stat -f '%d:%i:%z:%m:%c:%p:%HT:%Y' "$source_namespace" 2>/dev/null || true)
+  namespace_root_identity_after=$(stat -f '%d:%i:%m:%c:%p:%HT' "$source_namespace_root" 2>/dev/null || true)
   source_sha_after=$(shasum -a 256 "$source_path" | awk '{print $1}')
   target_bytes=$(stat -f '%z' "$target_path")
   target_sha=$(shasum -a 256 "$target_path" | awk '{print $1}')
-  if [[ "$source_identity_before" != "$source_identity_after" || \
+  if [[ "$namespace_identity_before" != "$namespace_identity_after" || \
+        "$namespace_root_identity_before" != "$namespace_root_identity_after" || \
+        "$source_identity_before" != "$source_identity_after" || \
         "$source_sha_before" != "$source_sha_after" || \
         "$target_bytes" != "$source_bytes" || "$target_sha" != "$source_sha_before" ]]; then
     rm -f "$target_path"

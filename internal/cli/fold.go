@@ -38,6 +38,9 @@ func newFoldCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			if err := refuseManagedFoldOverwrite(options.StoreDir, session.ID, options.Apply, options.Overwrite); err != nil {
+				return err
+			}
 			resolver, packErr := pack.Open(options.StoreDir, pack.OpenOptions{CacheBytes: -1})
 			if packErr == nil {
 				defer resolver.Close()
@@ -218,6 +221,24 @@ func newGCCommand() *cobra.Command {
 	command.Flags().BoolVar(&apply, "apply", false, "Remove unreferenced objects")
 	command.Flags().BoolVar(&jsonOutput, "json", false, "Emit JSON output")
 	return command
+}
+
+func refuseManagedFoldOverwrite(storeDir string, sessionID string, apply bool, overwrite bool) error {
+	if !apply || !overwrite || storeDir == "" || sessionID == "" {
+		return nil
+	}
+	statePath := filepath.Join(storeDir, "fs", "sessions", sessionID, "state.json")
+	info, err := os.Lstat(statePath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("managed session state is not a regular file: %s", sessionID)
+	}
+	return fmt.Errorf("refusing to overwrite fold manifest for managed session %s", sessionID)
 }
 
 func resolveFoldStore(codexHome string, explicit string) string {

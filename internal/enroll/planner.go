@@ -208,18 +208,28 @@ func Build(ctx context.Context, input Input) (Plan, error) {
 		if overflow {
 			return Plan{}, errors.New("enrollment batch byte estimate overflow")
 		}
-		if input.Budget == nil {
-			decision.Reasons = append(decision.Reasons, ReasonInsufficientBudget)
-		} else if _, err := input.Budget.Check(ctx, storage.Projection{
-			Operation: "enroll:" + session.ID, AdditionalPersistentBytes: cumulative, TemporaryBytes: info.Size(),
-		}); err != nil {
-			if !errors.Is(err, storage.ErrBudgetExceeded) {
-				return Plan{}, err
-			}
-			decision.Reasons = append(decision.Reasons, ReasonInsufficientBudget)
-		}
-		if len(decision.Reasons) == 0 && len(plan.Selected) >= input.Policy.BatchSize {
+		// Pricing a session against the store costs a full inventory scan, so it
+		// is the last question asked rather than the first. A decision that is
+		// already made does not change with a price, and once the batch is full
+		// nothing more can be selected this cycle: asking anyway meant one scan
+		// per candidate, which on a real corpus turned a sub-second plan into one
+		// that never finished. Sessions past the limit are priced on the cycle
+		// that can actually take them.
+		switch {
+		case len(decision.Reasons) != 0:
+		case len(plan.Selected) >= input.Policy.BatchSize:
 			decision.Reasons = append(decision.Reasons, ReasonBatchLimit)
+		case input.Budget == nil:
+			decision.Reasons = append(decision.Reasons, ReasonInsufficientBudget)
+		default:
+			if _, err := input.Budget.Check(ctx, storage.Projection{
+				Operation: "enroll:" + session.ID, AdditionalPersistentBytes: cumulative, TemporaryBytes: info.Size(),
+			}); err != nil {
+				if !errors.Is(err, storage.ErrBudgetExceeded) {
+					return Plan{}, err
+				}
+				decision.Reasons = append(decision.Reasons, ReasonInsufficientBudget)
+			}
 		}
 		if len(decision.Reasons) == 0 {
 			decision.Eligible = true
@@ -230,6 +240,36 @@ func Build(ctx context.Context, input Input) (Plan, error) {
 		plan.Decisions = append(plan.Decisions, decision)
 	}
 	return plan, nil
+}
+
+// WaitingCount is the Host progress denominator: sessions that are ready now
+// or only waiting on idle time / this cycle's one-session limit. Busy, open
+// (when archived-only), unhealthy, or already managed sessions are excluded.
+func WaitingCount(plan Plan) int {
+	count := 0
+	for _, decision := range plan.Decisions {
+		if decisionCountsAsWaiting(decision) {
+			count++
+		}
+	}
+	return count
+}
+
+func decisionCountsAsWaiting(decision Decision) bool {
+	if decision.Selected || decision.Eligible {
+		return true
+	}
+	if len(decision.Reasons) == 0 {
+		return false
+	}
+	for _, reason := range decision.Reasons {
+		switch reason {
+		case ReasonStabilityPending, ReasonFileChanged, ReasonBatchLimit:
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func safeSessionID(sessionID string) bool {

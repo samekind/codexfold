@@ -176,6 +176,59 @@ func TestWatchNativeNamespaceBumpsVersionForExternalEntryChanges(t *testing.T) {
 	}
 }
 
+func TestWatchNativeNamespaceContinuesAfterSamePathReplacement(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "sessions"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(root, "sessions", "replace.jsonl")
+	if err := os.WriteFile(target, []byte("old\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	filesystem := NewCanonical()
+	filesystem.SetNativeRoot(root)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	initial := filesystem.NamespaceVersion()
+	go func() { done <- filesystem.WatchNativeNamespace(ctx) }()
+	defer func() { cancel(); <-done }()
+	waitChange := func(before uint64) {
+		t.Helper()
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			if filesystem.NamespaceVersion() > before {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		t.Fatal("replacement inode is no longer watched")
+	}
+	waitChange(initial)
+	before := filesystem.NamespaceVersion()
+	if err := os.Rename(target, filepath.Join(root, "old.jsonl")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("replacement\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	waitChange(before)
+	// Let the rename/create batch drain before testing content-only events.
+	for round := 0; round < 2; round++ {
+		time.Sleep(100 * time.Millisecond)
+		before = filesystem.NamespaceVersion()
+		file, err := os.OpenFile(target, os.O_APPEND|os.O_WRONLY, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, writeErr := file.WriteString("new content\n")
+		closeErr := file.Close()
+		if err := errors.Join(writeErr, closeErr); err != nil {
+			t.Fatal(err)
+		}
+		waitChange(before)
+	}
+}
+
 func TestRetryNativeNamespaceRefreshesKeepsTransientFailuresPending(t *testing.T) {
 	pending := make(map[string]nativeNamespaceRefreshEntry)
 	mergeNativeNamespaceRefreshEntries(pending, []nativeNamespaceRefreshEntry{

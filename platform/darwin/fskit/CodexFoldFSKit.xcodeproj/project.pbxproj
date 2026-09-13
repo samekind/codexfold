@@ -10,9 +10,12 @@
 		1126078CAC05FE1CFC3F31C0 /* IncidentMonitorMain.swift in Sources */ = {isa = PBXBuildFile; fileRef = F105D02F11FEDC0664735D55 /* IncidentMonitorMain.swift */; };
 		118E475716649E77BB5D9074 /* ResidencyConfiguration.swift in Sources */ = {isa = PBXBuildFile; fileRef = 104B2BB8741B08CB7C0922EC /* ResidencyConfiguration.swift */; };
 		1FECB94AF87B4CC57FA9ED64 /* StatusModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = FE5FC430A47ABBFFE41EEF4C /* StatusModel.swift */; };
+		31519F9D07327E58EADCE9AB /* ReadAheadDecision.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5D1F01CA40798E56411384CC /* ReadAheadDecision.swift */; };
+		35EFE7B3725EB18A3295A026 /* EnrollmentControlTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FD2247732B6618AA3001C004 /* EnrollmentControlTests.swift */; };
 		3B24746FD5E596D0511372DB /* CodexFoldIncidentMonitor in Embed Dependencies */ = {isa = PBXBuildFile; fileRef = E02C92E4D4218DF5F14CE165 /* CodexFoldIncidentMonitor */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		3EF56420169A31AF48024389 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A16429B9F847F716D1C76DC /* AppDelegate.swift */; };
 		426379E23B9A1AFED16F0937 /* DurableAppGroupFile.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7B372BEA7948BF76AB0EC35A /* DurableAppGroupFile.swift */; };
+		42EF2EEC88C5DED699EA0902 /* EnrollmentControl.swift in Sources */ = {isa = PBXBuildFile; fileRef = D4D0C15348FB9611175F51EC /* EnrollmentControl.swift */; };
 		47511B1B34B3423EFD828F9B /* Localization.swift in Sources */ = {isa = PBXBuildFile; fileRef = C4CB65E9E7A527A2D26907E7 /* Localization.swift */; };
 		5422E685B3EE757D7CAF55DA /* StatusViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = 480E49A3010F0EE3C67C3EE1 /* StatusViews.swift */; };
 		54CC8E546672A2B2EB8778AE /* ProfileModule.swift in Sources */ = {isa = PBXBuildFile; fileRef = A321270CF90754EFB5FB4F82 /* ProfileModule.swift */; };
@@ -23,12 +26,15 @@
 		662F395DE6DC7E0DB1192A55 /* IncidentPresentation.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2F1A0AA13077222EA426E43C /* IncidentPresentation.swift */; };
 		68399BE2088A0EB8A09E1D50 /* XCTest.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = D51257DA9412E8D619331A65 /* XCTest.framework */; };
 		6A2D4F5EEFC99467C2FCF79D /* StatusModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = FE5FC430A47ABBFFE41EEF4C /* StatusModel.swift */; };
+		76A1D3488702FA761C286F5A /* ReadAheadDecisionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 95714CB6ED7BB110B40B7A94 /* ReadAheadDecisionTests.swift */; };
+		8C2A6A70877C8222C02BB474 /* ReadAheadDecision.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5D1F01CA40798E56411384CC /* ReadAheadDecision.swift */; };
 		8EE5BB4AACB30CF1EB309212 /* BackendRecoveryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 22B5D22E40036D703D2431E8 /* BackendRecoveryTests.swift */; };
 		9E3FEAE6555FA9C4E7CD2D8A /* ResidencyConfigurationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7F3F37862E2FB5E245ECC936 /* ResidencyConfigurationTests.swift */; };
 		AC5E7B1EB1279405828432A1 /* Wire.swift in Sources */ = {isa = PBXBuildFile; fileRef = 442319991E8D02494E8E8966 /* Wire.swift */; };
 		AFA1CF4359A57AAEBDA8561D /* StatusModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FCBA69E301AA452CF7B4C6CA /* StatusModelTests.swift */; };
 		AFA637AFD0D3BF96599439C0 /* CodexFoldMenuBar.plist in CopyFiles */ = {isa = PBXBuildFile; fileRef = D90AE362E14F3C28884B6FBC /* CodexFoldMenuBar.plist */; };
 		B32FC887AE78D2D3EBD86405 /* IncidentPresentation.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2F1A0AA13077222EA426E43C /* IncidentPresentation.swift */; };
+		BEF25DAE1E92E442DB771940 /* EnrollmentControl.swift in Sources */ = {isa = PBXBuildFile; fileRef = D4D0C15348FB9611175F51EC /* EnrollmentControl.swift */; };
 		C90CD99DB351C756EB0E7BB5 /* CodexFoldIncidentMonitor.plist in CopyFiles */ = {isa = PBXBuildFile; fileRef = D2CB59DC1709B5B78BA6397E /* CodexFoldIncidentMonitor.plist */; };
 		C923F2EAEFD070DA33D26E58 /* DurableAppGroupFileTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6EF4D4AABC87888341A8F9E6 /* DurableAppGroupFileTests.swift */; };
 		D146B22FE62339A25BA1F531 /* CodexFoldFSKitModule.appex in Embed ExtensionKit Extensions */ = {isa = PBXBuildFile; fileRef = 0EB68F3D6D26A8642A137511 /* CodexFoldFSKitModule.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
@@ -38,6 +44,7 @@
 		E2B75A9EA23B294894920CC6 /* DurableAppGroupFile.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7B372BEA7948BF76AB0EC35A /* DurableAppGroupFile.swift */; };
 		E7D6B3519F924FB0C2D357FD /* DurableAppGroupFile.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7B372BEA7948BF76AB0EC35A /* DurableAppGroupFile.swift */; };
 		E97C6453BE419B70A4E0FA5D /* IncidentPresentationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2F6F8A99D9E0A9A2837607BC /* IncidentPresentationTests.swift */; };
+		F4C46EE7F8491E6BD3147F64 /* EnrollmentControl.swift in Sources */ = {isa = PBXBuildFile; fileRef = D4D0C15348FB9611175F51EC /* EnrollmentControl.swift */; };
 		F5B87A303BF4BD2D5651CFF8 /* ReadCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = E70FB31455A1202A1C719C64 /* ReadCache.swift */; };
 		F75F229D09CAC918EBD12B8C /* StatusModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = FE5FC430A47ABBFFE41EEF4C /* StatusModel.swift */; };
 		FE0EF203ED125F9570940AF2 /* Localization.swift in Sources */ = {isa = PBXBuildFile; fileRef = C4CB65E9E7A527A2D26907E7 /* Localization.swift */; };
@@ -108,14 +115,17 @@
 		442319991E8D02494E8E8966 /* Wire.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Wire.swift; sourceTree = "<group>"; };
 		45646F5D9CFE136ED2DC3D6E /* CodexFoldFSKitModule.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = CodexFoldFSKitModule.entitlements; sourceTree = "<group>"; };
 		480E49A3010F0EE3C67C3EE1 /* StatusViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StatusViews.swift; sourceTree = "<group>"; };
+		5D1F01CA40798E56411384CC /* ReadAheadDecision.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReadAheadDecision.swift; sourceTree = "<group>"; };
 		683C4E970391FE59129607C0 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		6EF4D4AABC87888341A8F9E6 /* DurableAppGroupFileTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DurableAppGroupFileTests.swift; sourceTree = "<group>"; };
 		7B372BEA7948BF76AB0EC35A /* DurableAppGroupFile.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DurableAppGroupFile.swift; sourceTree = "<group>"; };
 		7F3F37862E2FB5E245ECC936 /* ResidencyConfigurationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResidencyConfigurationTests.swift; sourceTree = "<group>"; };
 		8B37F589115C048AA0DA2C76 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		95714CB6ED7BB110B40B7A94 /* ReadAheadDecisionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReadAheadDecisionTests.swift; sourceTree = "<group>"; };
 		A321270CF90754EFB5FB4F82 /* ProfileModule.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProfileModule.swift; sourceTree = "<group>"; };
 		C4CB65E9E7A527A2D26907E7 /* Localization.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Localization.swift; sourceTree = "<group>"; };
 		D2CB59DC1709B5B78BA6397E /* CodexFoldIncidentMonitor.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = CodexFoldIncidentMonitor.plist; sourceTree = "<group>"; };
+		D4D0C15348FB9611175F51EC /* EnrollmentControl.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EnrollmentControl.swift; sourceTree = "<group>"; };
 		D51257DA9412E8D619331A65 /* XCTest.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = XCTest.framework; path = System/Library/Frameworks/XCTest.framework; sourceTree = SDKROOT; };
 		D90AE362E14F3C28884B6FBC /* CodexFoldMenuBar.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = CodexFoldMenuBar.plist; sourceTree = "<group>"; };
 		E02C92E4D4218DF5F14CE165 /* CodexFoldIncidentMonitor */ = {isa = PBXFileReference; includeInIndex = 0; path = CodexFoldIncidentMonitor; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -123,6 +133,7 @@
 		E7F7729C310C40D1BD8DEBC6 /* CodexFoldFSKitHostTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = CodexFoldFSKitHostTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		F105D02F11FEDC0664735D55 /* IncidentMonitorMain.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IncidentMonitorMain.swift; sourceTree = "<group>"; };
 		FCBA69E301AA452CF7B4C6CA /* StatusModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StatusModelTests.swift; sourceTree = "<group>"; };
+		FD2247732B6618AA3001C004 /* EnrollmentControlTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EnrollmentControlTests.swift; sourceTree = "<group>"; };
 		FE5FC430A47ABBFFE41EEF4C /* StatusModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StatusModel.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
@@ -153,7 +164,9 @@
 			isa = PBXGroup;
 			children = (
 				6EF4D4AABC87888341A8F9E6 /* DurableAppGroupFileTests.swift */,
+				FD2247732B6618AA3001C004 /* EnrollmentControlTests.swift */,
 				2F6F8A99D9E0A9A2837607BC /* IncidentPresentationTests.swift */,
+				95714CB6ED7BB110B40B7A94 /* ReadAheadDecisionTests.swift */,
 				7F3F37862E2FB5E245ECC936 /* ResidencyConfigurationTests.swift */,
 				FCBA69E301AA452CF7B4C6CA /* StatusModelTests.swift */,
 			);
@@ -179,6 +192,7 @@
 				2A16429B9F847F716D1C76DC /* AppDelegate.swift */,
 				D2CB59DC1709B5B78BA6397E /* CodexFoldIncidentMonitor.plist */,
 				D90AE362E14F3C28884B6FBC /* CodexFoldMenuBar.plist */,
+				D4D0C15348FB9611175F51EC /* EnrollmentControl.swift */,
 				0299A73CFDD46513958B3173 /* Host.swift */,
 				F105D02F11FEDC0664735D55 /* IncidentMonitorMain.swift */,
 				2F1A0AA13077222EA426E43C /* IncidentPresentation.swift */,
@@ -208,6 +222,7 @@
 			isa = PBXGroup;
 			children = (
 				7B372BEA7948BF76AB0EC35A /* DurableAppGroupFile.swift */,
+				5D1F01CA40798E56411384CC /* ReadAheadDecision.swift */,
 			);
 			path = Shared;
 			sourceTree = "<group>";
@@ -339,9 +354,9 @@
 			projectRoot = "";
 			targets = (
 				07E85731B7BEF398A8C4E4EC /* CodexFoldFSKit */,
+				9CC25A001BD7B7FEC79BEF5D /* CodexFoldIncidentMonitor */,
 				2592EB1E0A0400CC2501A47B /* CodexFoldFSKitHostTests */,
 				00016AAD22571AA1F375B40A /* CodexFoldFSKitModule */,
-				9CC25A001BD7B7FEC79BEF5D /* CodexFoldIncidentMonitor */,
 			);
 		};
 /* End PBXProject section */
@@ -353,6 +368,7 @@
 			files = (
 				3EF56420169A31AF48024389 /* AppDelegate.swift in Sources */,
 				D9A1DBBF0387421FB21C0E54 /* DurableAppGroupFile.swift in Sources */,
+				F4C46EE7F8491E6BD3147F64 /* EnrollmentControl.swift in Sources */,
 				5A3E15ED0688984A0382281F /* Host.swift in Sources */,
 				B32FC887AE78D2D3EBD86405 /* IncidentPresentation.swift in Sources */,
 				FE0EF203ED125F9570940AF2 /* Localization.swift in Sources */,
@@ -368,9 +384,13 @@
 			files = (
 				426379E23B9A1AFED16F0937 /* DurableAppGroupFile.swift in Sources */,
 				C923F2EAEFD070DA33D26E58 /* DurableAppGroupFileTests.swift in Sources */,
+				42EF2EEC88C5DED699EA0902 /* EnrollmentControl.swift in Sources */,
+				35EFE7B3725EB18A3295A026 /* EnrollmentControlTests.swift in Sources */,
 				6143C972E3993BF09AE585C9 /* IncidentPresentation.swift in Sources */,
 				E97C6453BE419B70A4E0FA5D /* IncidentPresentationTests.swift in Sources */,
 				E1AF4286C3C4F2A879050507 /* Localization.swift in Sources */,
+				31519F9D07327E58EADCE9AB /* ReadAheadDecision.swift in Sources */,
+				76A1D3488702FA761C286F5A /* ReadAheadDecisionTests.swift in Sources */,
 				56496F9C40A1D2351C06DE5E /* ResidencyConfiguration.swift in Sources */,
 				9E3FEAE6555FA9C4E7CD2D8A /* ResidencyConfigurationTests.swift in Sources */,
 				6A2D4F5EEFC99467C2FCF79D /* StatusModel.swift in Sources */,
@@ -386,6 +406,7 @@
 				8EE5BB4AACB30CF1EB309212 /* BackendRecoveryTests.swift in Sources */,
 				E7D6B3519F924FB0C2D357FD /* DurableAppGroupFile.swift in Sources */,
 				54CC8E546672A2B2EB8778AE /* ProfileModule.swift in Sources */,
+				8C2A6A70877C8222C02BB474 /* ReadAheadDecision.swift in Sources */,
 				F5B87A303BF4BD2D5651CFF8 /* ReadCache.swift in Sources */,
 				AC5E7B1EB1279405828432A1 /* Wire.swift in Sources */,
 			);
@@ -396,6 +417,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				E2B75A9EA23B294894920CC6 /* DurableAppGroupFile.swift in Sources */,
+				BEF25DAE1E92E442DB771940 /* EnrollmentControl.swift in Sources */,
 				1126078CAC05FE1CFC3F31C0 /* IncidentMonitorMain.swift in Sources */,
 				662F395DE6DC7E0DB1192A55 /* IncidentPresentation.swift in Sources */,
 				47511B1B34B3423EFD828F9B /* Localization.swift in Sources */,
@@ -488,7 +510,7 @@
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				CODE_SIGN_STYLE = Automatic;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 103;
+				CURRENT_PROJECT_VERSION = 114;
 				DEBUG_INFORMATION_FORMAT = dwarf;
 				DEVELOPMENT_TEAM = Y987FUR837;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
@@ -620,7 +642,7 @@
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				CODE_SIGN_STYLE = Automatic;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 103;
+				CURRENT_PROJECT_VERSION = 114;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
 				DEVELOPMENT_TEAM = Y987FUR837;
 				ENABLE_NS_ASSERTIONS = NO;
@@ -666,6 +688,7 @@
 			buildSettings = {
 				APPLICATION_EXTENSION_API_ONLY = YES;
 				CODE_SIGN_ENTITLEMENTS = Extension/CodexFoldFSKitModule.entitlements;
+				CODE_SIGN_INJECT_BASE_ENTITLEMENTS = NO;
 				COMBINE_HIDPI_IMAGES = YES;
 				ENABLE_APP_SANDBOX = YES;
 				INFOPLIST_FILE = Extension/Info.plist;
