@@ -93,6 +93,52 @@ func TestNativeFSKitDaemonStatusHeartbeatAdvancesCausally(t *testing.T) {
 	}
 }
 
+func TestNativeFSKitOnReadyAfterBackendPublication(t *testing.T) {
+	root := t.TempDir()
+	socketRoot := shortNativeFSKitTestDir(t, "cfs-ready-")
+	socket := filepath.Join(socketRoot, "daemon.sock")
+	resource := filepath.Join(root, "resource.bin")
+	ready := make(chan error, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- ServeNativeFSKit(ctx, NewCanonical(), NativeFSKitServerOptions{
+			SocketPath: socket, ResourcePath: resource,
+			Token: bytes.Repeat([]byte{0x61}, 32), Generation: 123,
+			BuildSHA256: strings.Repeat("d", 64),
+			OnReady: func() {
+				_, socketErr := os.Stat(socket)
+				_, resourceErr := os.Stat(resource)
+				ready <- errors.Join(socketErr, resourceErr)
+			},
+		})
+	}()
+	defer func() {
+		cancel()
+		select {
+		case err := <-done:
+			if err != nil && !errors.Is(err, context.Canceled) {
+				t.Errorf("server shutdown: %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Error("server did not stop")
+		}
+	}()
+	select {
+	case err := <-ready:
+		if err != nil {
+			t.Fatalf("backend was not published before readiness: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("native FSKit server did not report readiness")
+	}
+	client, err := fskitproto.DialResource(resource, time.Second)
+	if err != nil {
+		t.Fatalf("published backend is not reachable: %v", err)
+	}
+	_ = client.Close()
+}
+
 func TestNativeFSKitDaemonStatusTrackerPreservesLogicalBackendAcrossPublisherReplacement(t *testing.T) {
 	options := NativeFSKitServerOptions{ResourcePath: "/private/tmp/codexfold-resource", MountPoint: "/private/tmp/codexfold-mount"}
 	identity := mountid.Identity{Nonce: strings.Repeat("a", 32)}
@@ -950,13 +996,17 @@ func startNativeFSKitTestServerWithActivity(
 	root string,
 	activity *IOActivityCounter,
 ) (*fskitproto.Client, func()) {
+	return startNativeFSKitTestServerGeneration(t, filesystem, root, activity, 77)
+}
+
+func startNativeFSKitTestServerGeneration(t *testing.T, filesystem *Filesystem, root string, activity *IOActivityCounter, generation uint64) (*fskitproto.Client, func()) {
 	t.Helper()
 	socketRoot := shortNativeFSKitTestDir(t, "cfs-")
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	options := NativeFSKitServerOptions{
 		SocketPath: filepath.Join(socketRoot, "daemon.sock"), ResourcePath: filepath.Join(root, "resource.bin"),
-		Token: bytes.Repeat([]byte{0x42}, 32), Generation: 77, BuildSHA256: strings.Repeat("a", 64),
+		Token: bytes.Repeat([]byte{0x42}, 32), Generation: generation, BuildSHA256: strings.Repeat("a", 64),
 		Activity: activity,
 	}
 	go func() { done <- ServeNativeFSKit(ctx, filesystem, options) }()
@@ -992,6 +1042,31 @@ func startNativeFSKitTestServerWithActivity(
 		}
 	}
 	return client, stop
+}
+
+func TestNativeFSKitRestartChangesNamespaceEvenWithIdenticalSessions(t *testing.T) {
+	var versions []uint64
+	for _, generation := range []uint64{100, 200} {
+		filesystem := NewCanonical()
+		client, stop := startNativeFSKitTestServerGeneration(t, filesystem, t.TempDir(), nil, generation)
+		response, err := client.Call(fskitproto.OpNamespaceVersion, nil)
+		if err != nil {
+			client.Close()
+			stop()
+			t.Fatal(err)
+		}
+		decoder := fskitproto.NewDecoder(response)
+		version, err := decoder.Uint64()
+		client.Close()
+		stop()
+		if err != nil {
+			t.Fatal(err)
+		}
+		versions = append(versions, version)
+	}
+	if versions[0] == versions[1] {
+		t.Fatal("restarted backend replayed the old namespace; retained FSKit cache will not refresh")
+	}
 }
 
 func shortNativeFSKitTestDir(t *testing.T, pattern string) string {

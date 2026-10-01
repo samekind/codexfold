@@ -19,10 +19,12 @@ import (
 )
 
 const managedRecoveryDeadline = 10 * time.Second
+const managedObservationStallDeadline = 20 * time.Second
 
 type managedReloadObservation struct {
 	Sequence         uint64
 	Fatal            error
+	NeedsReload      bool
 	StateIssues      []vfs.SessionStateIssue
 	MissingState     []string
 	MissingRoute     []string
@@ -145,14 +147,17 @@ func (t *managedStatusTracker) snapshot(observation managedReloadObservation, no
 }
 
 type managedStatusReporter struct {
-	mu           sync.Mutex
-	tracker      *managedStatusTracker
-	publisher    *fskitstatus.Publisher
-	publish      func(fskitstatus.Snapshot)
-	lastSequence uint64
-	now          func() time.Time
-	mountPoint   string
-	resourcePath string
+	mu             sync.Mutex
+	tracker        *managedStatusTracker
+	publisher      *fskitstatus.Publisher
+	publish        func(fskitstatus.Snapshot)
+	lastSequence   uint64
+	lastObserved   managedReloadObservation
+	hasObserved    bool
+	lastObservedAt time.Time
+	now            func() time.Time
+	mountPoint     string
+	resourcePath   string
 }
 
 func newManagedStatusReporter(path string, mountPoint string, resourcePath string, onError func(error)) *managedStatusReporter {
@@ -236,7 +241,38 @@ func (r *managedStatusReporter) Observe(observation managedReloadObservation) {
 	if observation.Sequence != 0 {
 		r.lastSequence = observation.Sequence
 	}
-	snapshot := r.tracker.snapshot(observation, r.now())
+	r.lastObserved = observation
+	r.hasObserved = true
+	r.lastObservedAt = r.now()
+	snapshot := r.tracker.snapshot(observation, r.lastObservedAt)
+	snapshot.MountPoint = r.mountPoint
+	snapshot.ResourcePath = r.resourcePath
+	if r.publish != nil {
+		r.publish(snapshot)
+	}
+}
+
+// Heartbeat advances durable status causality without rescanning thousands of
+// managed sessions merely to prove that this reporter is still alive.
+func (r *managedStatusReporter) Heartbeat() {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.hasObserved {
+		return
+	}
+	now := r.now()
+	observation := r.lastObserved
+	if now.Sub(r.lastObservedAt) > managedObservationStallDeadline {
+		observation = managedReloadObservation{
+			Fatal:            errors.New("managed session refresh has stalled"),
+			ManagedSessions:  r.lastObserved.ManagedSessions,
+			FailureStartedAt: r.lastObservedAt.Add(managedRecoveryDeadline),
+		}
+	}
+	snapshot := r.tracker.snapshot(observation, now)
 	snapshot.MountPoint = r.mountPoint
 	snapshot.ResourcePath = r.resourcePath
 	if r.publish != nil {

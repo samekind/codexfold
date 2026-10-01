@@ -22,6 +22,7 @@ import (
 )
 
 type BuildOptions struct {
+	Incremental          bool
 	BlockBytes           int64
 	PackBytes            int64
 	Budget               storage.Checker
@@ -30,13 +31,14 @@ type BuildOptions struct {
 }
 
 type BuildResult struct {
-	Generation  string                      `json:"generation"`
-	ObjectCount int64                       `json:"object_count"`
-	BlockCount  int64                       `json:"block_count"`
-	PackCount   int                         `json:"pack_count"`
-	RawBytes    int64                       `json:"raw_bytes"`
-	StoredBytes int64                       `json:"stored_bytes"`
-	Storage     *storage.MutationAccounting `json:"storage,omitempty"`
+	Generation           string                      `json:"generation"`
+	ObjectCount          int64                       `json:"object_count"`
+	BlockCount           int64                       `json:"block_count"`
+	PackCount            int                         `json:"pack_count"`
+	RawBytes             int64                       `json:"raw_bytes"`
+	StoredBytes          int64                       `json:"stored_bytes"`
+	ReusedEncodedObjects int64                       `json:"reused_encoded_objects"`
+	Storage              *storage.MutationAccounting `json:"storage,omitempty"`
 }
 
 type packWriter struct {
@@ -80,6 +82,31 @@ func Build(ctx context.Context, storeDir string, options BuildOptions) (BuildRes
 		return BuildResult{}, err
 	}
 	defer references.Close()
+	var packedSource *Resolver
+	if previousGeneration != "" {
+		packedSource, err = openGeneration(filepath.Join(storeDir, "packs", previousGeneration), -1, false)
+		if err != nil {
+			return BuildResult{}, err
+		}
+		defer packedSource.Close()
+		if options.Incremental {
+			dropped, err := hasDroppedPackedObjects(ctx, references, packedSource)
+			if err != nil {
+				return BuildResult{}, err
+			}
+			blockBytes := packedSource.index.BlockBytes
+			if packedSource.v3 != nil {
+				blockBytes = packedSource.v3.meta.BlockBytes
+			}
+			packLimit, limitErr := compactPackFileLimit(packedSource, options.PackBytes)
+			if limitErr != nil {
+				return BuildResult{}, limitErr
+			}
+			if dropped || len(packedSource.packs) >= packLimit || options.BlockBytes < blockBytes {
+				options.Incremental = false
+			}
+		}
+	}
 	budget := options.Budget
 	if budget == nil {
 		guard, err := storage.DefaultGuard(storeDir)
@@ -88,9 +115,21 @@ func Build(ctx context.Context, storeDir string, options BuildOptions) (BuildRes
 		}
 		budget = guard
 	}
-	estimatedBytes, err := estimatedGenerationBytes(rawBytes)
+	// A full compaction copies compatible encoded blocks rather than expanding
+	// every packed object. Price those exact copies as stored bytes; pricing the
+	// entire logical corpus as new raw data can reject a sub-16-GiB generation
+	// even when the disk has ample room to build it.
+	estimatedBytes, err := estimateCompactedGeneration(ctx, storeDir, references, packedSource, objectCount, rawBytes, options.BlockBytes)
 	if err != nil {
 		return BuildResult{}, err
+	}
+	if options.Incremental && packedSource != nil {
+		incrementalBytes, projectionErr := estimateIncrementalGeneration(ctx, storeDir, references, packedSource, objectCount, rawBytes, options.BlockBytes)
+		err = projectionErr
+		if err != nil {
+			return BuildResult{}, err
+		}
+		estimatedBytes = min(estimatedBytes, incrementalBytes)
 	}
 	storageAssessment, err := budget.Check(ctx, storage.Projection{
 		Operation:                       "pack-build",
@@ -134,14 +173,6 @@ func Build(ctx context.Context, storeDir string, options BuildOptions) (BuildRes
 	}
 	defer encoder.Close()
 	store := fold.NewObjectStore(storeDir)
-	var packedSource *Resolver
-	if previousGeneration != "" {
-		packedSource, err = openGeneration(filepath.Join(storeDir, "packs", previousGeneration), -1, false)
-		if err != nil {
-			return BuildResult{}, err
-		}
-		defer packedSource.Close()
-	}
 	buffer := make([]byte, int(options.BlockBytes))
 	rows, err := references.QueryContext(ctx, `select digest, raw_bytes from pack_references order by digest`)
 	if err != nil {
@@ -151,6 +182,7 @@ func Build(ctx context.Context, storeDir string, options BuildOptions) (BuildRes
 	}
 	packIndexes := make(map[string]uint32)
 	packNames := make([]string, 0)
+	imported := make(map[string]string)
 	for rows.Next() {
 		if err := ctx.Err(); err != nil {
 			_ = rows.Close()
@@ -160,6 +192,89 @@ func Build(ctx context.Context, storeDir string, options BuildOptions) (BuildRes
 		if err := rows.Scan(&ref.SHA256, &ref.RawBytes); err != nil {
 			_ = rows.Close()
 			return BuildResult{}, err
+		}
+		// Keep immutable compressed blocks compressed. Candidate verification
+		// below still reconstructs and hashes them before publication.
+		if packedSource != nil {
+			if _, statErr := os.Stat(store.ObjectPath(ref.SHA256)); errors.Is(statErr, os.ErrNotExist) {
+				object, found, lookupErr := packedSource.lookupObject(ref.SHA256)
+				if lookupErr != nil {
+					return BuildResult{}, lookupErr
+				}
+				compatible := found && object.RawBytes == ref.RawBytes
+				for _, block := range object.Blocks {
+					if block.RawBytes > options.BlockBytes {
+						compatible = false
+					}
+				}
+				if compatible {
+					first := result.BlockCount
+					for _, block := range object.Blocks {
+						if err := ctx.Err(); err != nil {
+							return BuildResult{}, err
+						}
+						file := packedSource.packs[block.Pack]
+						if file == nil {
+							return BuildResult{}, fmt.Errorf("missing source pack %s", block.Pack)
+						}
+						var name string
+						var offset int64
+						if options.Incremental {
+							name = imported[block.Pack]
+							if name == "" {
+								key := sha256.Sum256([]byte(previousGeneration + "/" + block.Pack))
+								name = fmt.Sprintf("pack-reused-%x.pack", key[:16])
+								if err := os.Link(filepath.Join(storeDir, "packs", previousGeneration, block.Pack), filepath.Join(temporaryDir, name)); err != nil {
+									return BuildResult{}, fmt.Errorf("reuse immutable pack extent: %w", err)
+								}
+								imported[block.Pack] = name
+							}
+							offset = block.PackOffset
+						} else {
+							data := make([]byte, int(block.StoredBytes))
+							if _, err := file.ReadAt(data, block.PackOffset); err != nil {
+								return BuildResult{}, err
+							}
+							var err error
+							name, offset, err = writer.write(data)
+							if err != nil {
+								return BuildResult{}, err
+							}
+						}
+						index, exists := packIndexes[name]
+						if !exists {
+							index = uint32(len(packNames))
+							packIndexes[name] = index
+							packNames = append(packNames, name)
+						}
+						digest, err := decodeDigest(block.SHA256)
+						if err != nil {
+							return BuildResult{}, err
+						}
+						encoding := byte(0)
+						if block.Encoding == EncodingRaw {
+							encoding = 1
+						}
+						if _, err := blocksFile.Write(encodeBlockV3(blockV3Record{PackIndex: index, PackOffset: offset, StoredBytes: block.StoredBytes, RawOffset: block.RawOffset, RawBytes: block.RawBytes, Digest: digest, Encoding: encoding})); err != nil {
+							return BuildResult{}, err
+						}
+						result.BlockCount++
+						result.RawBytes += block.RawBytes
+						result.StoredBytes += block.StoredBytes
+					}
+					digest, err := decodeDigest(ref.SHA256)
+					if err != nil {
+						return BuildResult{}, err
+					}
+					if _, err := objectsFile.Write(encodeObjectV3(objectV3Record{Digest: digest, RawBytes: ref.RawBytes, FirstBlock: first, BlockCount: uint32(len(object.Blocks))})); err != nil {
+						return BuildResult{}, err
+					}
+					result.ReusedEncodedObjects++
+					continue
+				}
+			} else if statErr != nil {
+				return BuildResult{}, statErr
+			}
 		}
 		stream, err := store.OpenStream(ref)
 		if err != nil && errors.Is(err, os.ErrNotExist) && packedSource != nil {
@@ -249,7 +364,7 @@ func Build(ctx context.Context, storeDir string, options BuildOptions) (BuildRes
 	if err := syncAndCloseIndexFiles(objectsFile, blocksFile); err != nil {
 		return BuildResult{}, err
 	}
-	result.PackCount = writer.sequence
+	result.PackCount = len(packNames)
 	meta := indexV3Meta{Version: indexV3Version, Kind: indexV3Kind, Generation: generation, CreatedAt: time.Now().UTC().Format(time.RFC3339Nano), BlockBytes: options.BlockBytes, ObjectCount: result.ObjectCount, BlockCount: result.BlockCount, Packs: packNames}
 	if err := writeIndexV3Meta(temporaryDir, meta); err != nil {
 		return BuildResult{}, err
@@ -305,6 +420,74 @@ func Build(ctx context.Context, storeDir string, options BuildOptions) (BuildRes
 	}
 	result.Storage = storage.CompleteAccounting(ctx, storageAssessment, storeDir)
 	return result, nil
+}
+
+// A large corpus naturally needs more than sixteen full-sized pack files.
+// Compact only when file count exceeds its packed-byte lower bound by enough
+// to indicate fragmentation; deleted objects still force immediate compaction.
+func compactPackFileLimit(previous *Resolver, packBytes int64) (int, error) {
+	if previous == nil || packBytes <= 0 {
+		return 16, nil
+	}
+	var stored int64
+	for _, file := range previous.packs {
+		info, err := file.Stat()
+		if err != nil {
+			return 0, err
+		}
+		if info.Size() < 0 || stored > math.MaxInt64-info.Size() {
+			return 0, errors.New("pack file size projection overflow")
+		}
+		stored += info.Size()
+	}
+	minimum := stored / packBytes
+	if stored%packBytes != 0 {
+		minimum++
+	}
+	if minimum > int64(math.MaxInt-8) {
+		return 0, errors.New("pack file count projection overflow")
+	}
+	return max(16, int(minimum)+8), nil
+}
+
+func hasDroppedPackedObjects(ctx context.Context, references *sql.DB, previous *Resolver) (bool, error) {
+	rows, err := references.QueryContext(ctx, `select digest from pack_references order by digest`)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	var position int64
+	var previousDigest string
+	for rows.Next() {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		var digest string
+		if err := rows.Scan(&digest); err != nil {
+			return false, err
+		}
+		if position >= previous.ObjectCount() {
+			continue
+		}
+		if previousDigest == "" {
+			object, err := previous.objectAt(position)
+			if err != nil {
+				return false, err
+			}
+			previousDigest = object.SHA256
+		}
+		if previousDigest < digest {
+			return true, nil
+		}
+		if previousDigest == digest {
+			position++
+			previousDigest = ""
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	return position < previous.ObjectCount(), nil
 }
 
 func preferRawBlock(raw []byte, compressed []byte) bool {

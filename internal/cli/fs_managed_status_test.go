@@ -218,6 +218,42 @@ func TestManagedStatusPublisherEpochIsPerReporterAndSequenceStartsAtOne(t *testi
 	}
 }
 
+func TestManagedStatusHeartbeatPreservesIncidentWithoutReloading(t *testing.T) {
+	reporter := newManagedStatusReporterForStore("", "/store", "/mount", "/resource", nil)
+	now := time.Unix(100, 0)
+	reporter.now = func() time.Time { return now }
+	var snapshots []fskitstatus.Snapshot
+	reporter.publish = func(snapshot fskitstatus.Snapshot) { snapshots = append(snapshots, snapshot) }
+	reporter.Heartbeat()
+	if len(snapshots) != 0 {
+		t.Fatal("heartbeat published before any real observation")
+	}
+	reporter.Observe(managedReloadObservation{Sequence: 1, Fatal: errors.New("transient"), FailureStartedAt: now})
+	now = now.Add(time.Second)
+	reporter.Heartbeat()
+	if len(snapshots) != 2 || snapshots[1].ObservationSequence != snapshots[0].ObservationSequence+1 || snapshots[1].IncidentID != snapshots[0].IncidentID || snapshots[1].State != "recovering" {
+		t.Fatalf("heartbeat changed incident identity: %#v", snapshots)
+	}
+	reporter.Observe(managedReloadObservation{Sequence: 2})
+	if len(snapshots) != 3 || snapshots[2].State != "healthy" || snapshots[2].IncidentID != snapshots[0].IncidentID {
+		t.Fatalf("real recovery was not published: %#v", snapshots)
+	}
+}
+
+func TestManagedStatusHeartbeatDoesNotMaskStalledReload(t *testing.T) {
+	reporter := newManagedStatusReporterForStore("", "/store", "/mount", "/resource", nil)
+	now := time.Unix(100, 0)
+	reporter.now = func() time.Time { return now }
+	var snapshots []fskitstatus.Snapshot
+	reporter.publish = func(snapshot fskitstatus.Snapshot) { snapshots = append(snapshots, snapshot) }
+	reporter.Observe(managedReloadObservation{Sequence: 1, ManagedSessions: 7})
+	now = now.Add(managedObservationStallDeadline + time.Second)
+	reporter.Heartbeat()
+	if len(snapshots) != 2 || snapshots[1].State != "recovering" || snapshots[1].ManagedSessions == nil || *snapshots[1].ManagedSessions != 7 {
+		t.Fatalf("stalled reload was reported healthy: %#v", snapshots)
+	}
+}
+
 func TestManagedBackendIDBindsStoreMountAndResourcePaths(t *testing.T) {
 	base := managedBackendID("/store/./primary", "/mount/./sessions", "/resource/./native")
 	cleaned := managedBackendID("/store/primary", "/mount/sessions", "/resource/native")

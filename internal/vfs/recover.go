@@ -23,21 +23,22 @@ func (s *Session) recover(ctx context.Context, writerLeaseHeld bool) error {
 	if err != nil {
 		return err
 	}
-	var recoveryLease *os.File
+	var recoveryLease *WriterLeaseGuard
 	recoveryLeaseHeld := writerLeaseHeld
 	if !writerLeaseHeld {
-		recoveryLease, err = acquireWriterLease(filepath.Join(s.directory, "writer.lease"))
-		if errors.Is(err, ErrWriterBusy) && terminalJournalRecords(ordered) {
+		var acquired bool
+		recoveryLease, acquired, err = TryAcquireWriterLeaseGuardAtPath(filepath.Join(s.directory, "writer.lease"))
+		if !acquired && err == nil && terminalJournalRecords(ordered) {
 			return nil
 		}
 		if err != nil {
 			return fmt.Errorf("acquire session journal recovery lease: %w", err)
 		}
+		if !acquired {
+			return fmt.Errorf("acquire session journal recovery lease: %w", ErrWriterBusy)
+		}
 		recoveryLeaseHeld = true
-		defer func() {
-			_ = unlockWriterFile(recoveryLease)
-			_ = recoveryLease.Close()
-		}()
+		defer recoveryLease.Close()
 		records, err = readJournal(s.directory)
 		if err != nil {
 			return err

@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestGuardScansCurrentFootprintAndChecksLiveFreeSpace(t *testing.T) {
@@ -42,4 +43,65 @@ func TestGuardPropagatesSpaceProbeFailure(t *testing.T) {
 	if _, err := guard.Check(context.Background(), Projection{Operation: "pack"}); !errors.Is(err, want) {
 		t.Fatalf("Guard.Check error = %v, want %v", err, want)
 	}
+}
+
+func TestOnceInventoryGuardReusesPlanningSnapshotAndChecksLiveSpace(t *testing.T) {
+	store := t.TempDir()
+	writeSizedFile(t, filepath.Join(store, "first.bin"), 32)
+	probes := 0
+	guard := Guard{StoreDir: store, Probe: func(string) (int64, error) {
+		probes++
+		return int64(1000 - probes*100), nil
+	}}
+	planning := &OnceInventoryGuard{Guard: guard}
+	first, err := planning.Check(context.Background(), Projection{Operation: "first"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeSizedFile(t, filepath.Join(store, "second.bin"), 4096)
+	second, err := planning.Check(context.Background(), Projection{Operation: "second"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Inventory.TotalFiles != first.Inventory.TotalFiles || second.Budget.CurrentPhysicalBytes != first.Budget.CurrentPhysicalBytes {
+		t.Fatalf("planning inventory changed within one batch: first=%#v second=%#v", first.Inventory, second.Inventory)
+	}
+	if second.Budget.AvailableBytes != 800 || probes != 2 {
+		t.Fatalf("free-space probe was not refreshed: available=%d probes=%d", second.Budget.AvailableBytes, probes)
+	}
+	fresh, err := guard.Check(context.Background(), Projection{Operation: "apply"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fresh.Inventory.TotalFiles <= second.Inventory.TotalFiles || probes != 3 {
+		t.Fatalf("fresh mutation guard reused stale inventory: fresh=%d planned=%d probes=%d", fresh.Inventory.TotalFiles, second.Inventory.TotalFiles, probes)
+	}
+}
+
+func TestProductionPlanningBudgetReadOnlyScale(t *testing.T) {
+	store := os.Getenv("CODEXFOLD_READONLY_PLANNING_STORE")
+	if store == "" {
+		t.Skip("requires an explicitly selected read-only production-scale store")
+	}
+	guard, err := DefaultGuard(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	planning := &OnceInventoryGuard{Guard: guard}
+	started := time.Now()
+	first, err := planning.Check(context.Background(), Projection{Operation: "planning-first"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstElapsed := time.Since(started)
+	for index := range 200 {
+		current, err := planning.Check(context.Background(), Projection{Operation: "planning-repeat"})
+		if err != nil {
+			t.Fatalf("budget check %d: %v", index, err)
+		}
+		if current.Inventory.TotalFiles != first.Inventory.TotalFiles || current.Budget.CurrentPhysicalBytes != first.Budget.CurrentPhysicalBytes {
+			t.Fatal("planning budget did not retain its one-cycle inventory")
+		}
+	}
+	t.Logf("planning budget first_inventory=%s repeat_200=%s scanned_files=%d", firstElapsed, time.Since(started)-firstElapsed, first.Inventory.TotalFiles)
 }

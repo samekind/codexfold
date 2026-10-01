@@ -221,12 +221,21 @@ func quiesceNativeFSKitDefinition(ctx context.Context, definitionPath string) er
 
 func reclaimNativeFSKitMount(ctx context.Context, definitionPath string, mountPoint string) error {
 	quiesceErr := quiesceNativeFSKitDefinition(ctx, definitionPath)
-	unmountCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	if unmountErr := service.UnmountNativeFSKit(unmountCtx, mountPoint, false); unmountErr != nil {
-		_ = service.UnmountNativeFSKit(unmountCtx, mountPoint, true)
+	// A graceful unmount can consume its whole deadline while an FSKit vnode
+	// operation is still inside the extension. Force must get a fresh budget;
+	// sharing the expired context makes the second call return before umount
+	// runs, and the mount stays attached.
+	unmountErr := unmountNativeFSKitWithBudget(ctx, mountPoint, false, 10*time.Second)
+	if unmountErr != nil {
+		unmountErr = unmountNativeFSKitWithBudget(ctx, mountPoint, true, 10*time.Second)
 	}
-	return quiesceErr
+	return errors.Join(quiesceErr, unmountErr)
+}
+
+func unmountNativeFSKitWithBudget(ctx context.Context, mountPoint string, force bool, budget time.Duration) error {
+	unmountCtx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+	return service.UnmountNativeFSKit(unmountCtx, mountPoint, force)
 }
 
 func unregisterFSKitAppRegistration(ctx context.Context, appPath string) error {
@@ -1393,4 +1402,77 @@ func commandOutputError(action string, output []byte, err error) error {
 		return fmt.Errorf("%s: %w", action, err)
 	}
 	return fmt.Errorf("%s: %w: %s", action, err, detail)
+}
+
+// requireLaunchableServiceBinary refuses a service binary the launcher will
+// never be allowed to exec.
+//
+// The launcher is a Team-signed app, and macOS refuses to let it exec a binary
+// carrying a different signing team: the kernel sends SIGKILL with "Code
+// Signature Invalid" before the helper writes a line of its own log. An ad-hoc
+// `go build` output installed here looks correct from every angle that does not
+// involve launchd — it passes `codesign --verify`, satisfies its designated
+// requirement, and runs for as long as you like when started from a shell —
+// and then crash-loops silently under the launch agent, leaving the mount down
+// with an empty service log.
+func requireLaunchableServiceBinary(ctx context.Context, launcher string, candidate string) error {
+	launcherTeam, err := codesignTeamIdentifier(ctx, launcher)
+	if err != nil {
+		return err
+	}
+	if launcherTeam == "" {
+		// An unsigned launcher imposes no team of its own, so there is nothing
+		// for the candidate to violate, and reading its signature would only
+		// fail an unsigned local build for no reason.
+		return nil
+	}
+	candidateTeam, err := codesignTeamIdentifier(ctx, candidate)
+	if err != nil {
+		return err
+	}
+	return launchableServiceBinaryRefusal(launcherTeam, candidateTeam, launcher, candidate)
+}
+
+// launchableServiceBinaryRefusal reports why a candidate cannot be launched by
+// the launcher, or nil when it can.
+func launchableServiceBinaryRefusal(launcherTeam, candidateTeam, launcher, candidate string) error {
+	if launcherTeam == "" || candidateTeam == launcherTeam {
+		return nil
+	}
+	described := candidateTeam
+	if described == "" {
+		described = "none (ad-hoc)"
+	}
+	return fmt.Errorf(
+		"service binary signing team=%s does not match launcher %s team=%s; macOS would kill it with an invalid code signature at every launch. Sign the binary with the launcher's identity, for example: codesign -f -s <identity for team %s> --options runtime %s",
+		described, launcher, launcherTeam, launcherTeam, candidate,
+	)
+}
+
+// codesignTeamIdentifier reports the signing team of a binary or bundle, and
+// the empty string when it carries none.
+func codesignTeamIdentifier(ctx context.Context, path string) (string, error) {
+	output, err := exec.CommandContext(ctx, "/usr/bin/codesign", "-dv", path).CombinedOutput()
+	if err != nil {
+		return "", commandOutputError("read code signature of "+path, output, err)
+	}
+	return parseCodesignTeamIdentifier(string(output)), nil
+}
+
+// parseCodesignTeamIdentifier extracts the team from `codesign -dv` output.
+// codesign reports an unsigned-for-distribution binary as "not set" rather than
+// omitting the field.
+func parseCodesignTeamIdentifier(output string) string {
+	for _, line := range strings.Split(output, "\n") {
+		value, ok := strings.CutPrefix(strings.TrimSpace(line), "TeamIdentifier=")
+		if !ok {
+			continue
+		}
+		value = strings.TrimSpace(value)
+		if value == "not set" {
+			return ""
+		}
+		return value
+	}
+	return ""
 }

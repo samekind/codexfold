@@ -332,6 +332,32 @@ func initialSessionLockName(sessionID string) string {
 	return initialSessionStagingPrefix + sessionIDHash(sessionID) + ".lease"
 }
 
+func initialSessionPublicationActive(parent, sessionID string) bool {
+	path := filepath.Join(parent, initialSessionLockName(sessionID))
+	before, err := os.Lstat(path)
+	if err != nil || !before.Mode().IsRegular() {
+		return false
+	}
+	file, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		return false
+	}
+	defer file.Close()
+	opened, err := file.Stat()
+	if err != nil || !os.SameFile(before, opened) {
+		return false
+	}
+	locked, err := tryLockWriterFile(file)
+	if err != nil {
+		return false
+	}
+	if locked {
+		_ = unlockWriterFile(file)
+		return false
+	}
+	return true
+}
+
 func initialSessionStagingNamePrefix(sessionID string) string {
 	return initialSessionStagingPrefix + strconv.Itoa(len(sessionID)) + "-" + sessionID + "-"
 }

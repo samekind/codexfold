@@ -279,7 +279,11 @@ struct EnrollmentProgress: Equatable {
             parts.append(L10n.text(.autoFoldWaitingForCheck))
         }
         if !lastError.isEmpty {
-            parts.append(L10n.text(.autoFoldRetry))
+            switch errorKind {
+            case "budget": parts.append(L10n.text(.autoFoldWaitingSpace))
+            case "storage": parts.append(L10n.text(.autoFoldStorageNeedsReview))
+            default: parts.append(L10n.text(.autoFoldRetry))
+            }
         }
         // The next check only means something once this pass has stopped.
         if let nextCheckAt, !isWorking {

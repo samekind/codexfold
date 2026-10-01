@@ -36,6 +36,7 @@ type nativeNamespaceRefreshEntry struct {
 type nativeNamespaceWatcher struct {
 	path      string
 	directory bool
+	objectID  string
 }
 
 type nativeNamespaceSnapshot map[string]nativeNamespaceSnapshotEntry
@@ -46,6 +47,14 @@ func (f *Filesystem) WatchNativeNamespace(ctx context.Context) error {
 	f.mu.RUnlock()
 	if root == "" {
 		return nil
+	}
+	// A new native root may not have either namespace yet. Without these
+	// directory watches, the first mounted mkdir and subsequent native writes
+	// produce no event at all until the daemon is restarted.
+	for _, namespace := range []string{"sessions", "archived_sessions"} {
+		if err := os.MkdirAll(filepath.Join(root, namespace), 0o700); err != nil {
+			return fmt.Errorf("prepare native namespace %s: %w", namespace, err)
+		}
 	}
 	queue, err := unix.Kqueue()
 	if err != nil {
@@ -64,14 +73,21 @@ func (f *Filesystem) WatchNativeNamespace(ctx context.Context) error {
 	defer closeWatchers()
 	rescan := func() (nativeNamespaceSnapshot, error) {
 		seen := make(map[string]struct{})
-		snapshot, err := scanNativeNamespace(root, func(name string, directory bool) error {
+		watchEntry := func(name string, info os.FileInfo) error {
 			name = filepath.Clean(name)
 			seen[name] = struct{}{}
+			objectID := fileObjectIdentity(info)
 			if descriptor, exists := watchersByPath[name]; exists {
 				watcher := watchers[descriptor]
-				watcher.directory = directory
-				watchers[descriptor] = watcher
-				return nil
+				if watcher.directory == info.IsDir() && watcher.objectID == objectID {
+					return nil
+				}
+				// A parent-directory event can arrive without a useful event for
+				// the displaced inode. Reopen by pathname whenever its identity
+				// changed, or subsequent appends stay attached to the old inode.
+				_ = unix.Close(descriptor)
+				delete(watchers, descriptor)
+				delete(watchersByPath, name)
 			}
 			descriptor, err := unix.Open(name, unix.O_EVTONLY|unix.O_CLOEXEC, 0)
 			if err != nil {
@@ -90,10 +106,29 @@ func (f *Filesystem) WatchNativeNamespace(ctx context.Context) error {
 				_ = unix.Close(descriptor)
 				return err
 			}
-			watchers[descriptor] = nativeNamespaceWatcher{path: name, directory: directory}
+			var opened unix.Stat_t
+			if err := unix.Fstat(descriptor, &opened); err != nil {
+				_ = unix.Close(descriptor)
+				return err
+			}
+			watchers[descriptor] = nativeNamespaceWatcher{
+				path: name, directory: info.IsDir(),
+				objectID: fmt.Sprintf("native:%d:%d", opened.Dev, opened.Ino),
+			}
 			watchersByPath[name] = descriptor
 			return nil
-		})
+		}
+		rootInfo, err := os.Lstat(root)
+		if err != nil {
+			return nil, err
+		}
+		if !rootInfo.IsDir() || rootInfo.Mode()&os.ModeSymlink != 0 {
+			return nil, errors.New("native namespace root is not a plain directory")
+		}
+		if err := watchEntry(root, rootInfo); err != nil {
+			return nil, err
+		}
+		snapshot, err := scanNativeNamespace(root, watchEntry)
 		if err != nil {
 			return nil, err
 		}
@@ -135,6 +170,16 @@ func (f *Filesystem) WatchNativeNamespace(ctx context.Context) error {
 			for _, event := range events[:count] {
 				watcher, exists := watchers[int(event.Ident)]
 				if !exists {
+					continue
+				}
+				if watcher.path == root {
+					// Activation replaces both namespace directories after the
+					// daemon has started. Keep their parent watched so a rename or
+					// recreation restores the child watches immediately.
+					externalChange = true
+					fullRescan = true
+					changedSet["/sessions"] = struct{}{}
+					changedSet["/archived_sessions"] = struct{}{}
 					continue
 				}
 				route, ok := nativeNamespaceRoute(root, watcher.path)
@@ -228,7 +273,7 @@ func (f *Filesystem) WatchNativeNamespace(ctx context.Context) error {
 	}
 }
 
-func scanNativeNamespace(root string, watchEntry func(string, bool) error) (nativeNamespaceSnapshot, error) {
+func scanNativeNamespace(root string, watchEntry func(string, os.FileInfo) error) (nativeNamespaceSnapshot, error) {
 	snapshot := make(nativeNamespaceSnapshot)
 	for _, namespace := range []string{"sessions", "archived_sessions"} {
 		base := filepath.Join(root, namespace)
@@ -261,7 +306,7 @@ func scanNativeNamespace(root string, watchEntry func(string, bool) error) (nati
 				return nil
 			}
 			if watchEntry != nil {
-				if err := watchEntry(name, info.IsDir()); err != nil {
+				if err := watchEntry(name, info); err != nil {
 					return err
 				}
 				info, err = os.Lstat(name)

@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 
 	"github.com/samekind/codexfold/internal/fold"
 )
@@ -42,37 +43,56 @@ func Doctor(ctx context.Context, storeDir string) (DoctorResult, error) {
 	}
 	defer resolver.Close()
 	result := DoctorResult{Generation: resolver.Generation(), ObjectCount: resolver.ObjectCount()}
-	for position := int64(0); position < resolver.ObjectCount(); position++ {
-		object, objectErr := resolver.objectAt(position)
-		if objectErr != nil {
-			result.Issues = append(result.Issues, DoctorIssue{Message: objectErr.Error()})
-			continue
-		}
-		hasher := sha256.New()
-		buffer := make([]byte, 128<<10)
-		var offset int64
-		failed := false
-		for offset < object.RawBytes {
-			n, readErr := resolver.ReadAt(ctx, fold.ObjectRef{SHA256: object.SHA256, RawBytes: object.RawBytes}, buffer, offset)
-			if n > 0 {
-				_, _ = hasher.Write(buffer[:n])
-				offset += int64(n)
+	buffer := make([]byte, 128<<10)
+	for position := int64(0); position < resolver.ObjectCount(); {
+		batch := make([]Object, 0, 256)
+		for len(batch) < 256 && position < resolver.ObjectCount() {
+			if err := ctx.Err(); err != nil {
+				return DoctorResult{}, err
 			}
-			if readErr != nil && !errors.Is(readErr, io.EOF) {
+			object, objectErr := resolver.objectAt(position)
+			position++
+			if objectErr != nil {
+				result.Issues = append(result.Issues, DoctorIssue{Message: objectErr.Error()})
+				continue
+			}
+			batch = append(batch, object)
+		}
+		// A bounded physical-order window reduces pack switches without a
+		// corpus-sized object map or reordering a session's reconstruction.
+		sort.Slice(batch, func(i, j int) bool {
+			if len(batch[i].Blocks) == 0 || len(batch[j].Blocks) == 0 {
+				if len(batch[i].Blocks) != len(batch[j].Blocks) {
+					return len(batch[i].Blocks) == 0
+				}
+				return batch[i].SHA256 < batch[j].SHA256
+			}
+			a, b := batch[i].Blocks[0], batch[j].Blocks[0]
+			if a.Pack != b.Pack {
+				return a.Pack < b.Pack
+			}
+			return a.PackOffset < b.PackOffset
+		})
+		for _, object := range batch {
+			hasher := sha256.New()
+			stream := &objectStream{ctx: ctx, resolver: resolver, ref: fold.ObjectRef{SHA256: object.SHA256, RawBytes: object.RawBytes}, object: object}
+			var readErr error
+			var offset int64
+			if readErr == nil {
+				offset, readErr = io.CopyBuffer(hasher, stream, buffer)
+				readErr = errors.Join(readErr, stream.Close())
+			}
+			failed := readErr != nil
+			if failed {
 				result.Issues = append(result.Issues, DoctorIssue{ObjectSHA256: object.SHA256, Message: readErr.Error()})
+			}
+			if !failed && (offset != object.RawBytes || hex.EncodeToString(hasher.Sum(nil)) != object.SHA256) {
+				result.Issues = append(result.Issues, DoctorIssue{ObjectSHA256: object.SHA256, Message: fmt.Sprintf("object reconstruction mismatch at %d of %d bytes", offset, object.RawBytes)})
 				failed = true
-				break
 			}
-			if n == 0 {
-				break
+			if !failed {
+				result.VerifiedCount++
 			}
-		}
-		if !failed && (offset != object.RawBytes || hex.EncodeToString(hasher.Sum(nil)) != object.SHA256) {
-			result.Issues = append(result.Issues, DoctorIssue{ObjectSHA256: object.SHA256, Message: fmt.Sprintf("object reconstruction mismatch at %d of %d bytes", offset, object.RawBytes)})
-			failed = true
-		}
-		if !failed {
-			result.VerifiedCount++
 		}
 	}
 	if err := verifyPackedManifests(ctx, storeDir, resolver, &result); err != nil {

@@ -1031,3 +1031,63 @@ func installFakeFSKitRegistrationCommands(
 		return nil, nil
 	}
 }
+
+func TestParseCodesignTeamIdentifier(t *testing.T) {
+	// Real `codesign -dv` output for the signed launcher app.
+	signed := `Executable=/Users/x/Applications/CodexFoldFSKit.app/Contents/MacOS/CodexFoldFSKit
+Identifier=vip.jstar.codexfold.fskitprofileprobe
+CodeDirectory v=20400 size=4521 flags=0x0(none) hashes=130+7 location=embedded
+Signature size=4775
+TeamIdentifier=Y987FUR837
+Sealed Resources version=2 rules=13 files=42
+`
+	if got := parseCodesignTeamIdentifier(signed); got != "Y987FUR837" {
+		t.Fatalf("signed launcher team=%q want Y987FUR837", got)
+	}
+
+	// Real output for a `go build` binary. This is the case that crash-loops
+	// under launchd, so reading it as "no team" rather than as the literal
+	// string "not set" is what makes the comparison refuse it.
+	adhoc := `Executable=/Users/x/Library/Application Support/CodexFold/codexfold
+Identifier=a.out
+CodeDirectory v=20400 size=139390 flags=0x20002(adhoc,linker-signed) hashes=4353+0 location=embedded
+Signature=adhoc
+TeamIdentifier=not set
+`
+	if got := parseCodesignTeamIdentifier(adhoc); got != "" {
+		t.Fatalf("ad-hoc binary team=%q want empty", got)
+	}
+
+	if got := parseCodesignTeamIdentifier("Identifier=a.out\n"); got != "" {
+		t.Fatalf("output without a team field=%q want empty", got)
+	}
+}
+
+func TestLaunchableServiceBinaryRefusal(t *testing.T) {
+	const launcher = "/Users/x/Applications/CodexFoldFSKit.app/Contents/MacOS/CodexFoldFSKit"
+	const candidate = "/Users/x/Library/Application Support/CodexFold/codexfold"
+
+	// A `go build` output under the signed launcher: exactly the combination
+	// macOS kills with an invalid code signature at every launch, with nothing
+	// written to the service log to say so.
+	err := launchableServiceBinaryRefusal("Y987FUR837", "", launcher, candidate)
+	if err == nil {
+		t.Fatal("expected an ad-hoc candidate under a signed launcher to be refused")
+	}
+	for _, want := range []string{"ad-hoc", "Y987FUR837", candidate} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("refusal should mention %q, got: %v", want, err)
+		}
+	}
+
+	if err := launchableServiceBinaryRefusal("Y987FUR837", "Y987FUR837", launcher, candidate); err != nil {
+		t.Fatalf("matching teams must be accepted: %v", err)
+	}
+	if err := launchableServiceBinaryRefusal("Y987FUR837", "5SW9C7LFLW", launcher, candidate); err == nil {
+		t.Fatal("a candidate signed by a different team must be refused")
+	}
+	// An unsigned launcher imposes no team, so a local build stays usable.
+	if err := launchableServiceBinaryRefusal("", "", launcher, candidate); err != nil {
+		t.Fatalf("unsigned launcher must not refuse an unsigned candidate: %v", err)
+	}
+}

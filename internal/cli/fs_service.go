@@ -116,6 +116,7 @@ func newFSServiceCommand() *cobra.Command {
 	command.AddCommand(newFSServiceRestartCommand())
 	command.AddCommand(newFSServiceStatusCommand())
 	command.AddCommand(newFSServiceUpdateBinaryCommand())
+	addLiveDaemonUpdateCommand(command)
 	command.AddCommand(newFSServiceUpdatePreflightCommand())
 	addPlatformServiceCommands(command)
 	return command
@@ -177,6 +178,18 @@ func newFSServiceUpdateBinaryCommand() *cobra.Command {
 					return err
 				}
 				mount := defaultMountPoint(home, mountPoint)
+				launcher, err := service.DefinitionLauncher(platform, definition)
+				if err != nil {
+					return err
+				}
+				// A binary the launcher is not allowed to exec is refused here
+				// rather than after the running service has been stopped for
+				// it, because that failure is invisible to the health check
+				// that would otherwise roll it back: the helper is killed
+				// before it can report anything at all.
+				if err := requireLaunchableServiceBinary(command.Context(), launcher, candidate); err != nil {
+					return err
+				}
 				update, err := service.StageBinaryUpdate(candidate, target)
 				if err != nil {
 					return err
@@ -1611,6 +1624,19 @@ func writeMountAcknowledgement(store string, sessionID string, generation uint64
 		return errors.New("complete mount acknowledgement metadata is required")
 	}
 	directory := filepath.Join(filepath.Clean(store), "fs", "sessions", sessionID)
+	path := filepath.Join(directory, "mounted.json")
+	// Acknowledgements are durable once published. A daemon restart must not
+	// fsync thousands of identical records before it can serve the mount.
+	if info, err := os.Lstat(path); err == nil && info.Mode().IsRegular() && info.Size() <= 4096 {
+		if data, err := os.ReadFile(path); err == nil {
+			var current mountAcknowledgement
+			if json.Unmarshal(data, &current) == nil && current.Generation == generation && current.Route == route {
+				return nil
+			}
+		}
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
 	return writeSessionControlFile(directory, "mounted.json", mountAcknowledgement{Generation: generation, Route: route})
 }
 

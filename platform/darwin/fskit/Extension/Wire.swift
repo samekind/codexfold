@@ -270,6 +270,7 @@ final class BackendRecoveryCoordinator {
     private var activeRunID: UInt64?
     private var completed: [UInt64: Result<UInt64, any Error>] = [:]
     private var generation: UInt64
+    private var lastStatus: FrontendRecoveryStatus?
 
     init(
         mountID: String,
@@ -286,20 +287,29 @@ final class BackendRecoveryCoordinator {
     }
 
     func markHealthy() {
-        let currentGeneration = condition.withLock { generation }
-        statusWriter?.publish(FrontendRecoveryStatus(
+        condition.lock()
+        defer { condition.unlock() }
+        guard activeRunID == nil, lastStatus?.state != .healthy else { return }
+        let previous = lastStatus
+        let now = Date()
+        let recovered = previous?.incidentID != nil
+        let status = FrontendRecoveryStatus(
             state: .healthy,
-            updatedAt: Date(),
-            summary: "CodexFold file service is available",
-            detail: "The FSKit frontend is connected to the backend.",
+            updatedAt: now,
+            summary: recovered ? "CodexFold file service recovered" : "CodexFold file service is available",
+            detail: recovered
+                ? "A successful backend request confirmed that file operations can continue."
+                : "The FSKit frontend is connected to the backend.",
             mountID: mountID,
-            generation: currentGeneration,
-            recoveryStartedAt: nil,
-            recoveryDeadlineAt: nil,
-            elapsedMilliseconds: 0,
-            lastTransportError: nil,
-            incidentID: nil
-        ))
+            generation: generation,
+            recoveryStartedAt: previous?.recoveryStartedAt,
+            recoveryDeadlineAt: previous?.recoveryDeadlineAt,
+            elapsedMilliseconds: previous?.recoveryStartedAt.map { Self.elapsedMilliseconds(from: $0, to: now) } ?? 0,
+            lastTransportError: previous?.lastTransportError,
+            incidentID: previous?.incidentID
+        )
+        lastStatus = status
+        statusWriter?.publish(status)
     }
 
     @discardableResult
@@ -324,19 +334,31 @@ final class BackendRecoveryCoordinator {
             runID = nextRunID
             nextRunID &+= 1
             activeRunID = runID
-            startedAt = Date()
-            deadline = min(callerDeadline, startedAt.addingTimeInterval(timeout))
-            incidentID = UUID().uuidString.lowercased()
+            let attemptStartedAt = Date()
+            if let unresolved = lastStatus,
+               unresolved.state == .unavailable,
+               let unresolvedID = unresolved.incidentID,
+               let unresolvedSince = unresolved.recoveryStartedAt {
+                startedAt = unresolvedSince
+                incidentID = unresolvedID
+            } else {
+                startedAt = attemptStartedAt
+                incidentID = UUID().uuidString.lowercased()
+            }
+            deadline = min(callerDeadline, attemptStartedAt.addingTimeInterval(timeout))
             leader = true
         }
         condition.unlock()
 
         if !leader {
-            return try waitForCompletion(of: runID, noLaterThan: callerDeadline)
+            // Followers share the leader's bounded attempt. A caller whose
+            // own deadline is far away must not stay parked in an FSKit reply
+            // after that attempt has already failed or been forgotten.
+            return try waitForCompletion(of: runID, noLaterThan: min(callerDeadline, Date().addingTimeInterval(timeout)))
         }
 
         let initialError = transportErrorSummary(transportError)
-        statusWriter?.publish(FrontendRecoveryStatus(
+        publishStatus(FrontendRecoveryStatus(
             state: .recovering,
             updatedAt: startedAt,
             summary: "CodexFold file service is recovering",
@@ -354,9 +376,8 @@ final class BackendRecoveryCoordinator {
         while Date() < deadline {
             do {
                 let recoveredGeneration = try reconnect(deadline)
-                finish(runID: runID, result: .success(recoveredGeneration))
                 let finishedAt = Date()
-                statusWriter?.publish(FrontendRecoveryStatus(
+                publishStatus(FrontendRecoveryStatus(
                     state: .healthy,
                     updatedAt: finishedAt,
                     summary: "CodexFold file service recovered",
@@ -369,6 +390,7 @@ final class BackendRecoveryCoordinator {
                     lastTransportError: initialError,
                     incidentID: incidentID
                 ))
+                finish(runID: runID, result: .success(recoveredGeneration))
                 return recoveredGeneration
             } catch {
                 lastError = error
@@ -379,9 +401,8 @@ final class BackendRecoveryCoordinator {
             Thread.sleep(forTimeInterval: min(retryDelay, deadline.timeIntervalSince(now)))
         }
 
-        finish(runID: runID, result: .failure(lastError))
         let failedAt = Date()
-        statusWriter?.publish(FrontendRecoveryStatus(
+        publishStatus(FrontendRecoveryStatus(
             state: .unavailable,
             updatedAt: failedAt,
             summary: "CodexFold file service needs attention",
@@ -394,7 +415,15 @@ final class BackendRecoveryCoordinator {
             lastTransportError: transportErrorSummary(lastError),
             incidentID: incidentID
         ))
+        finish(runID: runID, result: .failure(lastError))
         throw lastError
+    }
+
+    private func publishStatus(_ status: FrontendRecoveryStatus) {
+        condition.lock()
+        lastStatus = status
+        statusWriter?.publish(status)
+        condition.unlock()
     }
 
     private func waitForCompletion(of runID: UInt64, noLaterThan deadline: Date) throws -> UInt64 {
@@ -1818,12 +1847,18 @@ final class DaemonClient {
     }
 
     func namespaceVersion() throws -> UInt64 {
-        return try withReadOnlyControl { control in
+        let version = try withReadOnlyControl { control in
             var reader = WireReader(try control.request(.namespaceVersion))
             let version = try reader.uint64()
             try reader.finish()
             return version
         }
+        // The background namespace probe continues even when Codex is idle.
+        // After a recovery attempt times out, its next successful backend
+        // request must close the same incident rather than leave the frontend
+        // permanently "unavailable" until remount or explicit ping.
+        recovery.markHealthy()
+        return version
     }
 
     func setAttributes(

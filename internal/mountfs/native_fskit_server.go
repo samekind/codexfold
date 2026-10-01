@@ -42,6 +42,7 @@ type NativeFSKitServerOptions struct {
 	Activity                   *IOActivityCounter
 	PrewarmSharedMemoryWindows int
 	PrewarmSharedFileWindows   int
+	OnReady                    func()
 }
 
 type IOActivityTotals struct {
@@ -359,6 +360,11 @@ func ServeNativeFSKit(ctx context.Context, filesystem *Filesystem, options Nativ
 			return fmt.Errorf("hash native FSKit daemon executable: %w", err)
 		}
 	}
+	// The FSKit volume can outlive this daemon. Replaying the same session set
+	// must not replay the same namespace version, or its monitor keeps cached
+	// vnodes (including the old build identity). Reserve half the counter space
+	// for ordinary mutations after this per-boot epoch.
+	filesystem.namespaceVersion.Add((options.Generation >> 1) + 1)
 	health, err := mountid.New(options.BuildSHA256)
 	if err != nil {
 		return fmt.Errorf("generate native FSKit mount identity: %w", err)
@@ -457,6 +463,9 @@ func ServeNativeFSKit(ctx context.Context, filesystem *Filesystem, options Nativ
 		return err
 	}
 	writeStatus("healthy", "File service backend is available", "")
+	if options.OnReady != nil {
+		options.OnReady()
+	}
 	heartbeatCtx, cancelHeartbeat := context.WithCancel(ctx)
 	heartbeatCancel = cancelHeartbeat
 	heartbeatDone = make(chan struct{})
@@ -1546,7 +1555,7 @@ func (s *nativeFSKitServer) entry(name string) (fskitproto.Entry, syscall.Errno)
 			Type: fskitproto.EntryFile, Mode: 0o400, UID: uint32(os.Getuid()), GID: uint32(os.Getgid()),
 			Size: uint64(len(s.health)), AllocSize: uint64((len(s.health) + 4095) &^ 4095),
 			ModTime: s.startedAt, ChangeTime: s.startedAt, AccessTime: s.startedAt,
-			NamespaceID: s.filesystem.NamespaceVersion(), ContentGeneration: 0,
+			NamespaceID: s.filesystem.NamespaceVersion(), ContentGeneration: s.generation,
 		}, 0
 	}
 	attribute, errno := s.filesystem.Getattr(cleaned)

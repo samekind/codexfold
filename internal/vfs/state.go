@@ -231,6 +231,9 @@ func discoverSessionStatesDetailed(root string, load func(string) (SessionState,
 		entryRelative := filepath.Join("fs", "sessions", entry.Name())
 		entryInfo, entryErr := storeRoot.Lstat(entryRelative)
 		if entryErr != nil {
+			if errors.Is(entryErr, os.ErrNotExist) && strings.HasPrefix(entry.Name(), initialSessionStagingPrefix) {
+				continue
+			}
 			issues = append(issues, SessionStateIssue{
 				SessionID: entry.Name(), Path: filepath.Join(directory, entry.Name()), Kind: SessionStateIssueInvalidState,
 				Err: fmt.Errorf("inspect managed session entry: %w", entryErr),
@@ -255,6 +258,9 @@ func discoverSessionStatesDetailed(root string, load func(string) (SessionState,
 			continue
 		}
 		if sessionID, ok := initialSessionStagingID(entry.Name()); ok {
+			if initialSessionPublicationActive(directory, sessionID) {
+				continue
+			}
 			issues = append(issues, SessionStateIssue{
 				SessionID: sessionID, Path: entryPath, Kind: SessionStateIssueStaging,
 				Err: errors.New("initial session publication did not complete"),

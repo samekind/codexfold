@@ -14,7 +14,9 @@ private enum BackendRecoveryTests {
         try testRecoveryRereadsDescriptor()
         try testConcurrentCallersShareRecovery()
         try testRecoveryDeadlineIsBounded()
+        try testFollowerDoesNotInheritDistantCallerDeadline()
         try testCoordinatorPublishesUnavailable()
+        try testTimedOutRecoveryClosesOnlyAfterConfirmedBackendSuccess()
         try testFrontendRuntimeScopeIsValidatedAndApplied()
         try testFrontendStatusIsAtomicallyPublished()
         try testFrontendStatusUsesProvidedRuntimeRoot()
@@ -224,6 +226,68 @@ private enum BackendRecoveryTests {
         }
     }
 
+    private static func testFollowerDoesNotInheritDistantCallerDeadline() throws {
+        let coordinator = BackendRecoveryCoordinator(
+            mountID: "test-mount",
+            generation: 1,
+            timeout: 0.05,
+            retryDelay: 0.005,
+            statusWriter: nil
+        )
+        let leaderStarted = DispatchSemaphore(value: 0)
+        let releaseLeader = DispatchSemaphore(value: 0)
+        let group = DispatchGroup()
+        let lock = NSLock()
+        var reconnects = 0
+        var followerError: (any Error)?
+        var followerElapsed: TimeInterval = -1
+
+        group.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+            defer { group.leave() }
+            _ = try? coordinator.recover(
+                noLaterThan: Date().addingTimeInterval(30),
+                after: POSIXError(.ECONNRESET)
+            ) { _ in
+                let attempt = lock.withLock { () -> Int in
+                    reconnects += 1
+                    return reconnects
+                }
+                if attempt == 1 {
+                    leaderStarted.signal()
+                    releaseLeader.wait()
+                }
+                throw POSIXError(.ECONNREFUSED)
+            }
+        }
+        try require(leaderStarted.wait(timeout: .now() + 1) == .success, "leader did not start recovery")
+
+        group.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+            defer { group.leave() }
+            let startedAt = Date()
+            do {
+                _ = try coordinator.recover(
+                    noLaterThan: Date().addingTimeInterval(30),
+                    after: POSIXError(.EPIPE)
+                ) { _ in
+                    throw POSIXError(.ECONNREFUSED)
+                }
+            } catch {
+                lock.withLock {
+                    followerError = error
+                    followerElapsed = Date().timeIntervalSince(startedAt)
+                }
+            }
+        }
+        Thread.sleep(forTimeInterval: 0.02)
+        releaseLeader.signal()
+        try require(group.wait(timeout: .now() + 2) == .success, "follower stayed parked after the shared attempt")
+        let elapsed = lock.withLock { followerElapsed }
+        try require(lock.withLock { followerError != nil }, "follower must observe the failed shared attempt")
+        try require(elapsed < 0.5, "follower waited on the caller's distant deadline")
+    }
+
     private static func testFrontendRuntimeScopeIsValidatedAndApplied() throws {
         let root = URL(fileURLWithPath: "/tmp/group.vip.jstar.codexfold", isDirectory: true)
         let scoped = FrontendRuntimeLocation.containerURL(
@@ -402,6 +466,68 @@ private enum BackendRecoveryTests {
         try require(payload["state"] as? String == "unavailable", "deadline expiry must publish unavailable")
         try require(payload["incidentID"] as? String != nil, "unavailable status must retain its incident ID")
         try require(payload["recoveryStartedAt"] as? String != nil, "unavailable status must retain its start time")
+    }
+
+    private static func testTimedOutRecoveryClosesOnlyAfterConfirmedBackendSuccess() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "codexfold-recovery-closure-\(UUID().uuidString.lowercased())",
+            isDirectory: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+        let writer = FrontendStatusWriter(containerURL: root)
+        let coordinator = BackendRecoveryCoordinator(
+            mountID: "test-mount",
+            generation: 3,
+            timeout: 0.02,
+            retryDelay: 0.002,
+            statusWriter: writer
+        )
+        let destination = root.appendingPathComponent("status/frontend.json")
+        func payload() throws -> [String: Any] {
+            writer.waitForPendingWrites()
+            let data = try Data(contentsOf: destination)
+            guard let parsed = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                throw TestFailure("frontend status is not a JSON object")
+            }
+            return parsed
+        }
+        coordinator.markHealthy()
+        let initial = try payload()
+        try require(initial["state"] as? String == "healthy", "initial ping must publish healthy")
+        var firstIncidentID: String?
+        var firstStartedAt: String?
+        for attempt in 0..<2 {
+            do {
+                _ = try coordinator.recover(
+                    noLaterThan: Date().addingTimeInterval(0.02),
+                    after: POSIXError(.ECONNRESET)
+                ) { _ in throw POSIXError(.ECONNREFUSED) }
+                throw TestFailure("timed-out recovery unexpectedly succeeded")
+            } catch is TestFailure {
+                throw TestFailure("timed-out recovery unexpectedly succeeded")
+            } catch {}
+            let failed = try payload()
+            try require(failed["state"] as? String == "unavailable", "attempt \(attempt) must stay unavailable")
+            let incidentID = failed["incidentID"] as? String
+            try require(incidentID != nil, "timed-out recovery must have an occurrence ID")
+            if attempt == 0 {
+                firstIncidentID = incidentID
+                firstStartedAt = failed["recoveryStartedAt"] as? String
+            } else {
+                try require(incidentID == firstIncidentID, "continuous outage must not create another occurrence")
+                try require(failed["recoveryStartedAt"] as? String == firstStartedAt, "continuous outage must retain its start")
+            }
+        }
+        coordinator.markHealthy()
+        let recovered = try payload()
+        try require(recovered["state"] as? String == "healthy", "successful backend request must close unavailable")
+        try require(recovered["incidentID"] as? String == firstIncidentID, "recovery must close the same occurrence")
+        try require(recovered["recoveryStartedAt"] as? String == firstStartedAt, "recovery must retain causal start")
+        let recoveredBytes = try Data(contentsOf: destination)
+        coordinator.markHealthy()
+        writer.waitForPendingWrites()
+        let unchangedBytes = try Data(contentsOf: destination)
+        try require(unchangedBytes == recoveredBytes, "healthy polling must not rewrite status")
     }
 
     private static func writeDescriptor(generation: UInt64, to directory: URL) throws {

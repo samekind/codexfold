@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"sync"
 )
 
 type Projection struct {
@@ -34,21 +35,74 @@ type Assessment struct {
 	Budget    BudgetReport `json:"budget"`
 }
 
+// OnceInventoryGuard prices a bounded planning batch against one store
+// snapshot while still probing free space for every decision. Mutating
+// operations must continue to use a fresh Guard.Check at their own fence.
+type OnceInventoryGuard struct {
+	Guard     Guard
+	mu        sync.Mutex
+	inventory Inventory
+	loaded    bool
+}
+
+func (g *OnceInventoryGuard) Check(ctx context.Context, projection Projection) (Assessment, error) {
+	if g == nil {
+		return Assessment{}, errors.New("storage inventory guard is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return Assessment{}, err
+	}
+	store, err := g.Guard.absoluteStore()
+	if err != nil {
+		return Assessment{}, err
+	}
+	g.mu.Lock()
+	if !g.loaded {
+		inventory, scanErr := Scan(ctx, Options{StoreDir: store, AllowMetadataIssues: true})
+		if scanErr != nil {
+			g.mu.Unlock()
+			return Assessment{}, scanErr
+		}
+		g.inventory = inventory
+		g.loaded = true
+	}
+	inventory := g.inventory
+	g.mu.Unlock()
+	return g.Guard.checkWithInventory(ctx, store, inventory, projection)
+}
+
 func (g Guard) Check(ctx context.Context, projection Projection) (Assessment, error) {
 	if err := ctx.Err(); err != nil {
 		return Assessment{}, err
 	}
-	if g.StoreDir == "" {
-		return Assessment{}, errors.New("storage guard store directory is required")
-	}
-	store, err := filepath.Abs(g.StoreDir)
+	store, err := g.absoluteStore()
 	if err != nil {
 		return Assessment{}, err
 	}
-	store = filepath.Clean(store)
 	inventory, err := Scan(ctx, Options{StoreDir: store, AllowMetadataIssues: true})
 	if err != nil {
 		return Assessment{}, err
+	}
+	return g.checkWithInventory(ctx, store, inventory, projection)
+}
+
+func (g Guard) absoluteStore() (string, error) {
+	if g.StoreDir == "" {
+		return "", errors.New("storage guard store directory is required")
+	}
+	store, err := filepath.Abs(g.StoreDir)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Clean(store), nil
+}
+
+func (g Guard) checkWithInventory(ctx context.Context, store string, inventory Inventory, projection Projection) (Assessment, error) {
+	if err := ctx.Err(); err != nil {
+		return Assessment{}, err
+	}
+	if filepath.Clean(inventory.StoreDir) != store {
+		return Assessment{}, errors.New("storage inventory does not match guard store")
 	}
 	probe := g.Probe
 	if probe == nil {

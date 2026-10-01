@@ -421,8 +421,8 @@ func TestManagedReloadDelayStaysFastUntilRecoveryDeadline(t *testing.T) {
 	if delay := state.next(temporaryFailure, start.Add(12*time.Second)); delay != 4*time.Second {
 		t.Fatalf("second post-deadline delay = %s, want 4s", delay)
 	}
-	if delay := state.next(nil, start.Add(13*time.Second)); delay != time.Second {
-		t.Fatalf("recovery delay = %s, want 1s", delay)
+	if delay := state.next(nil, start.Add(13*time.Second)); delay != 30*time.Second {
+		t.Fatalf("healthy reload delay = %s, want 30s", delay)
 	}
 	if delay := state.next(temporaryFailure, start.Add(14*time.Second)); delay != time.Second {
 		t.Fatalf("new incident delay = %s, want 1s", delay)
@@ -1740,6 +1740,16 @@ func TestPeriodicEnrollmentStaysIdleWhenDisabled(t *testing.T) {
 	case <-ran:
 		t.Fatal("disabled enrollment loop applied a cycle")
 	default:
+	}
+}
+
+func TestApplyEnrollmentControlPreservesLastManagedCount(t *testing.T) {
+	store := t.TempDir()
+	progress := enroll.Progress{ManagedCount: 7, Phase: enroll.PhaseIdle}
+	control := enroll.Control{Enabled: false, Interval: 30 * time.Minute, StableFor: time.Hour}
+	updated := applyEnrollmentControl(progress, enrollmentFlags{storeDir: store}, control)
+	if updated.ManagedCount != 7 || updated.Phase != enroll.PhaseIdle || updated.Enabled {
+		t.Fatalf("policy heartbeat discarded last managed observation: %#v", updated)
 	}
 }
 
@@ -4581,7 +4591,7 @@ func TestStartupStorageGCRunsOnlyAfterHealthyStoreVerification(t *testing.T) {
 	if err != nil {
 		t.Fatalf("startupStorageGC: %v", err)
 	}
-	if !ran || before != 3 || result.RemovedCount != 1 || countPackGenerationDirectories(t, storeDir) != 2 {
+	if !ran || before != 3 || result.RemovedCount != 2 || countPackGenerationDirectories(t, storeDir) != 1 {
 		t.Fatalf("healthy startup GC result: before=%d ran=%t result=%#v after=%d", before, ran, result, countPackGenerationDirectories(t, storeDir))
 	}
 
@@ -4607,6 +4617,24 @@ func TestStartupStorageGCRunsOnlyAfterHealthyStoreVerification(t *testing.T) {
 	}
 	if ran || countPackGenerationDirectories(t, storeDir) != before {
 		t.Fatalf("unhealthy store was mutated: ran=%t before=%d after=%d", ran, before, countPackGenerationDirectories(t, storeDir))
+	}
+}
+
+func TestStartupStorageGCSkipsLegacyPackWithNoDeletionAuthority(t *testing.T) {
+	_, storeDir, _ := fsFixture(t, true)
+	legacy := filepath.Join(storeDir, "packs", "gen-legacy-unpublished")
+	if err := os.Mkdir(legacy, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if hasPotentialStartupPackGCCandidate(storeDir) {
+		t.Fatal("unpublished legacy generation was treated as automatically removable")
+	}
+	result, ran, err := startupStorageGC(context.Background(), storeDir)
+	if err != nil || ran || result.RemovedCount != 0 {
+		t.Fatalf("startup GC result=%#v ran=%t err=%v, want skipped", result, ran, err)
+	}
+	if _, err := os.Stat(legacy); err != nil {
+		t.Fatalf("legacy generation changed during skipped startup GC: %v", err)
 	}
 }
 
@@ -4691,7 +4719,8 @@ func TestStorageStatusSnapshotPublishesMeasuredBytesWithoutClaimingHealthyOnIssu
 func TestStorageStatusReporterWaitsForStartupMaintenanceAndStopsWithService(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	startupDone := make(chan struct{})
-	published := make(chan fskitstatus.Snapshot, 1)
+	refresh := make(chan struct{}, 1)
+	published := make(chan fskitstatus.Snapshot, 2)
 	done := startStorageStatusReporter(
 		ctx,
 		io.Discard,
@@ -4699,6 +4728,7 @@ func TestStorageStatusReporterWaitsForStartupMaintenanceAndStopsWithService(t *t
 		"/status/storage.json",
 		time.Hour,
 		startupDone,
+		refresh,
 		func(context.Context, storage.Options) (storage.Inventory, error) {
 			return storage.Inventory{LogicalSessionBytes: 100, TotalPhysicalBytes: 25}, nil
 		},
@@ -4721,6 +4751,12 @@ func TestStorageStatusReporterWaitsForStartupMaintenanceAndStopsWithService(t *t
 		}
 	case <-time.After(time.Second):
 		t.Fatal("storage status was not published")
+	}
+	refresh <- struct{}{}
+	select {
+	case <-published:
+	case <-time.After(time.Second):
+		t.Fatal("storage status did not refresh after a completed operation")
 	}
 	cancel()
 	select {

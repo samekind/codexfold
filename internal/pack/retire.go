@@ -11,7 +11,9 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/samekind/codexfold/internal/fold"
@@ -21,12 +23,16 @@ import (
 type RetireLooseOptions struct {
 	Apply        bool
 	BeforeRemove func(string) error
+	// Workers bounds simultaneous verification. Zero samples object sizes and
+	// uses one worker for small objects, or up to four for larger objects.
+	Workers int
 }
 
 type RetireLooseResult struct {
 	StoreDir              string `json:"store_dir"`
 	Generation            string `json:"generation"`
 	DryRun                bool   `json:"dry_run"`
+	VerificationWorkers   int    `json:"verification_workers"`
 	PackManifestCount     int    `json:"pack_manifest_count"`
 	VerifiedManifestCount int    `json:"verified_manifest_count"`
 	CandidateCount        int    `json:"candidate_count"`
@@ -39,6 +45,10 @@ type RetireLooseResult struct {
 
 // RetireLoose removes only loose objects that the current verified pack can read.
 func RetireLoose(ctx context.Context, storeDir string, options RetireLooseOptions) (RetireLooseResult, error) {
+	workers := options.Workers
+	if workers < 0 || workers > 16 {
+		return RetireLooseResult{}, errors.New("retirement workers must be between 0 and 16")
+	}
 	result := RetireLooseResult{StoreDir: filepath.Clean(storeDir), DryRun: !options.Apply}
 	guard, err := storage.AcquireManagedSessionDeletionGuard(ctx, storeDir)
 	if err != nil {
@@ -59,6 +69,11 @@ func RetireLoose(ctx context.Context, storeDir string, options RetireLooseOption
 		return RetireLooseResult{}, err
 	}
 	defer resolver.Close()
+	workers, err = retirementWorkerCount(resolver, workers)
+	if err != nil {
+		return RetireLooseResult{}, err
+	}
+	result.VerificationWorkers = workers
 	result.Generation = resolver.Generation()
 	packReport, err := Doctor(ctx, storeDir)
 	if err != nil {
@@ -68,22 +83,22 @@ func RetireLoose(ctx context.Context, storeDir string, options RetireLooseOption
 		return RetireLooseResult{}, fmt.Errorf("refusing loose retirement: pack doctor reported %d issue(s)", packReport.IssueCount)
 	}
 	result.PackManifestCount = packReport.ManifestCount
-	proof, err := fold.DoctorWithOptions(ctx, storeDir, fold.DoctorOptions{Reader: resolver})
-	if err != nil {
-		return RetireLooseResult{}, err
+	// Pack.Doctor already reconstructs and hashes every object and every live
+	// manifest from this exact resolver. Repeating Fold.Doctor with the same
+	// resolver reads the whole corpus again without adding an independent data
+	// source. The inventory above separately checks managed-state references.
+	if packReport.VerifiedManifestCount != packReport.ManifestCount {
+		return RetireLooseResult{}, errors.New("refusing loose retirement: pack-only manifest verification is incomplete")
 	}
-	if proof.IssueCount != 0 || proof.ManifestCount != packReport.ManifestCount || proof.VerifiedManifestCount != proof.ManifestCount {
-		return RetireLooseResult{}, errors.New("refusing loose retirement: pack-only fold verification is incomplete")
-	}
-	result.VerifiedManifestCount = proof.VerifiedManifestCount
+	result.VerifiedManifestCount = packReport.VerifiedManifestCount
 	if _, err := verifyManagedSessionManifests(ctx, resolver, guard.References); err != nil {
 		return RetireLooseResult{}, err
 	}
 	objectRoot := filepath.Join(storeDir, "objects")
-	err = filepath.WalkDir(objectRoot, func(path string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var serial sync.Mutex
+	process := func(path string, entry fs.DirEntry) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -105,8 +120,10 @@ func RetireLoose(ctx context.Context, storeDir string, options RetireLooseOption
 		if err != nil {
 			return err
 		}
+		serial.Lock()
 		result.CandidateCount++
 		result.CandidateBytes += info.Size()
+		serial.Unlock()
 		if !options.Apply {
 			return nil
 		}
@@ -115,9 +132,21 @@ func RetireLoose(ctx context.Context, storeDir string, options RetireLooseOption
 			return fmt.Errorf("refusing unproved loose retirement candidate %s: %w", digest, err)
 		}
 		if options.BeforeRemove != nil {
-			if err := options.BeforeRemove(path); err != nil {
+			serial.Lock()
+			err := options.BeforeRemove(path)
+			serial.Unlock()
+			if err != nil {
 				return err
 			}
+		}
+		// CPU-heavy proof is parallel; authority checks and removal are serial.
+		if err := verifyPackedLooseRetirementCandidate(ctx, resolver, digest, packedObject.RawBytes); err != nil {
+			return err
+		}
+		serial.Lock()
+		defer serial.Unlock()
+		if err := ctx.Err(); err != nil {
+			return err
 		}
 		current, err := CurrentGeneration(storeDir)
 		if err != nil {
@@ -133,9 +162,6 @@ func RetireLoose(ctx context.Context, storeDir string, options RetireLooseOption
 		if len(managed) != len(guard.References) {
 			return errors.New("managed-session deletion proof changed before loose retirement")
 		}
-		if err := verifyPackedLooseRetirementCandidate(ctx, resolver, digest, packedObject.RawBytes); err != nil {
-			return err
-		}
 		finalIdentity, err := fold.CaptureLooseObjectIdentity(path, digest, packedObject.RawBytes)
 		if err != nil {
 			return fmt.Errorf("revalidate loose retirement candidate %s: %w", digest, err)
@@ -149,10 +175,53 @@ func RetireLoose(ctx context.Context, storeDir string, options RetireLooseOption
 		result.RetiredCount++
 		result.RetiredBytes += finalIdentity.StoredBytes
 		return nil
-	})
-	if errors.Is(err, os.ErrNotExist) {
-		err = nil
 	}
+	type candidate struct {
+		path  string
+		entry fs.DirEntry
+	}
+	jobs := make(chan candidate, workers)
+	var wg sync.WaitGroup
+	var firstError error
+	var errorOnce sync.Once
+	fail := func(err error) {
+		if err != nil {
+			errorOnce.Do(func() { firstError = err; cancel() })
+		}
+	}
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for job := range jobs {
+				if err := process(job.path, job.entry); err != nil {
+					fail(err)
+					return
+				}
+			}
+		}()
+	}
+	err = filepath.WalkDir(objectRoot, func(path string, entry fs.DirEntry, walkErr error) error {
+		if path == objectRoot && errors.Is(walkErr, os.ErrNotExist) {
+			return nil
+		}
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".zst" {
+			return nil
+		}
+		select {
+		case jobs <- candidate{path, entry}:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	})
+	fail(err)
+	close(jobs)
+	wg.Wait()
+	err = firstError
 	if err != nil {
 		return RetireLooseResult{}, err
 	}
@@ -172,6 +241,26 @@ func RetireLoose(ctx context.Context, storeDir string, options RetireLooseOption
 	}
 	result.AuditPath = auditPath
 	return result, nil
+}
+
+func retirementWorkerCount(resolver *Resolver, requested int) (int, error) {
+	if requested != 0 {
+		return requested, nil
+	}
+	// A bounded, evenly spaced sample avoids another corpus-wide scan. Small
+	// objects are dominated by serialized metadata checks, not decompression.
+	count := resolver.ObjectCount()
+	samples := min(int64(64), count)
+	for i := int64(0); i < samples; i++ {
+		object, err := resolver.objectAt(i * count / samples)
+		if err != nil {
+			return 0, err
+		}
+		if object.RawBytes >= 256<<10 {
+			return min(4, runtime.GOMAXPROCS(0)), nil
+		}
+	}
+	return 1, nil
 }
 
 func verifyPackedLooseRetirementCandidate(ctx context.Context, resolver *Resolver, digest string, rawBytes int64) error {

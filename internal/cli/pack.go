@@ -17,6 +17,7 @@ func newPackCommand() *cobra.Command {
 }
 
 func newPackRetireLooseCommand() *cobra.Command {
+	var workers int
 	var codexHome string
 	var storeDir string
 	var apply bool
@@ -30,7 +31,7 @@ func newPackRetireLooseCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			result, err := pack.RetireLoose(command.Context(), resolveFoldStore(home, storeDir), pack.RetireLooseOptions{Apply: apply})
+			result, err := pack.RetireLoose(command.Context(), resolveFoldStore(home, storeDir), pack.RetireLooseOptions{Apply: apply, Workers: workers})
 			if err != nil {
 				return err
 			}
@@ -44,6 +45,7 @@ func newPackRetireLooseCommand() *cobra.Command {
 	command.Flags().StringVar(&codexHome, "codex-home", "", "Codex home directory; defaults to CODEX_HOME or ~/.codex")
 	command.Flags().StringVar(&storeDir, "store", "", "Fold store directory; defaults to <codex-home>/fold-store")
 	command.Flags().BoolVar(&apply, "apply", false, "Delete eligible loose objects after pack-only verification")
+	command.Flags().IntVar(&workers, "workers", 0, "Verification workers (0: size-aware automatic, at most 4; 1-16: explicit limit)")
 	command.Flags().BoolVar(&jsonOutput, "json", false, "Emit JSON output")
 	return command
 }
@@ -76,6 +78,7 @@ func newPackBuildCommand() *cobra.Command {
 	command.Flags().StringVar(&codexHome, "codex-home", "", "Codex home directory; defaults to CODEX_HOME or ~/.codex")
 	command.Flags().StringVar(&storeDir, "store", "", "Fold store directory; defaults to <codex-home>/fold-store")
 	command.Flags().Int64Var(&options.BlockBytes, "block-bytes", 0, "Uncompressed bytes per independently compressed block")
+	command.Flags().BoolVar(&options.Incremental, "incremental", true, "Reuse immutable pack files for append-only builds; automatically compact deleted objects or 16+ files; false always compacts")
 	command.Flags().Int64Var(&options.PackBytes, "pack-bytes", 0, "Maximum stored bytes per pack file")
 	command.Flags().BoolVar(&jsonOutput, "json", false, "Emit JSON output")
 	return command

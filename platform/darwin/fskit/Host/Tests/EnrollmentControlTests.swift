@@ -16,6 +16,19 @@ final class EnrollmentControlTests: XCTestCase {
         assertCaption(progress, startsWith: .autoFoldReclaimWaiting, folded: 3, remaining: 0)
         XCTAssertTrue(progress.lastError.isEmpty)
     }
+
+    func testBudgetAndStorageFailuresExplainWhatIsRetained() {
+        var progress = EnrollmentProgress.empty
+        progress.enabled = true
+        progress.phase = "idle"
+        progress.lastError = "retry"
+        progress.errorKind = "budget"
+        XCTAssertTrue(progress.caption(now: Date()).contains(L10n.text(.autoFoldWaitingSpace)))
+        XCTAssertFalse(progress.caption(now: Date()).contains(L10n.text(.autoFoldRetry)))
+
+        progress.errorKind = "storage"
+        XCTAssertTrue(progress.caption(now: Date()).contains(L10n.text(.autoFoldStorageNeedsReview)))
+    }
     func testPolicyRoundTripPreservesSettings() throws {
         let store = FileManager.default.temporaryDirectory
             .appendingPathComponent("codexfold-enrollment-policy-\(UUID().uuidString)", isDirectory: true)

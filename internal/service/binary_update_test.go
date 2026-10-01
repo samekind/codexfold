@@ -35,6 +35,26 @@ func TestBinaryUpdatePromotesAndCommitsAtomically(t *testing.T) {
 	assertNoBinaryUpdateArtifacts(t, root)
 }
 
+func TestPreserveBinaryForRecoveryKeepsExecutableBytes(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "installed")
+	if err := os.WriteFile(source, []byte("signed-previous-build"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path, err := PreserveBinaryForRecovery(source, filepath.Join(root, "Recovery"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || string(data) != "signed-previous-build" {
+		t.Fatalf("preserved binary=%q err=%v", data, err)
+	}
+	info, err := os.Stat(path)
+	if err != nil || info.Mode().Perm()&0o111 == 0 {
+		t.Fatalf("preserved binary is not executable: info=%v err=%v", info, err)
+	}
+}
+
 func TestBinaryUpdateRollsBackPromotedCandidate(t *testing.T) {
 	root := t.TempDir()
 	target := filepath.Join(root, "codexfold")

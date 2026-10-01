@@ -59,21 +59,48 @@ jq -e '.enabled == true' "$policy" >/dev/null || fail "policy hot-enable contrac
 
 config="$TMP_ROOT/config.toml"
 cat > "$config" <<'EOF'
+model = "must-not-be-used"
+model_provider = "openai"
+profile = "production-hybrid"
 [model_providers.main]
 base_url = "https://example.invalid/v1"
 experimental_bearer_token = "must-be-removed"
 env_key = "OPENAI_API_KEY"
 requires_openai_auth = true
+[desktop]
+"ambient-suggestions-enabled" = true
 EOF
 normalize_isolated_api_key_config "$config"
 ! grep -Eq '^env_key[[:space:]]*=' "$config" || fail "environment dependency was retained"
 grep -Fq 'requires_openai_auth = true' "$config" || fail "file API key auth was not enabled"
 grep -Fq 'forced_login_method = "api"' "$config" || fail "API-only login was not enforced"
 grep -Fq 'cli_auth_credentials_store = "file"' "$config" || fail "file credential store was not enforced"
+grep -Fq 'model_provider = "main"' "$config" || fail "third-party provider was not selected"
+grep -Fq 'model = "gpt-5.6-terra"' "$config" || fail "requested model was not selected"
+grep -Fq '"ambient-suggestions-enabled" = false' "$config" || fail "Desktop background model requests were not disabled"
 normalize_isolated_api_key_config "$config"
 [[ $(grep -c '^forced_login_method =' "$config") == 1 ]] || fail "normalization duplicated auth settings"
+[[ $(grep -c '^model_provider =' "$config") == 1 ]] || fail "normalization duplicated provider settings"
+! grep -Fq 'production-hybrid' "$config" || fail "production profile still overrides the isolated provider"
 if grep -Fq 'must-be-removed' "$config"; then
   fail "copied inline bearer token was retained"
+fi
+
+desktop_home="$TMP_ROOT/desktop-home"
+mkdir -p "$desktop_home"
+if validate_isolated_desktop_auth "$desktop_home" >/dev/null 2>&1; then
+  fail "empty Desktop home was accepted"
+fi
+cp "$config" "$desktop_home/config.toml"
+write_isolated_api_key_auth "$desktop_home/auth.json" 'isolated-test-placeholder'
+write_isolated_desktop_state "$TMP_ROOT/absent-source-state" "$desktop_home/.codex-global-state.json"
+validate_isolated_desktop_auth "$desktop_home" || fail "prepared API-only Desktop home was rejected"
+jq -e '."ambient-suggestions-enabled" == false' "$desktop_home/.codex-global-state.json" >/dev/null || fail "background suggestions were not disabled before launch"
+jq -e '."electron-persisted-atom-state"."electron:onboarding-projectless-completed" == true' "$desktop_home/.codex-global-state.json" >/dev/null || fail "isolated Desktop repeats the unrelated welcome flow"
+jq '.tokens = {access_token:"must-not-be-accepted"}' "$desktop_home/auth.json" > "$desktop_home/auth-with-tokens.json"
+mv "$desktop_home/auth-with-tokens.json" "$desktop_home/auth.json"
+if validate_isolated_desktop_auth "$desktop_home" >/dev/null 2>&1; then
+  fail "Desktop credentials containing OAuth tokens were accepted"
 fi
 
 rollout="$source_home/archived.jsonl"
@@ -91,7 +118,7 @@ fi
 
 run_marker="$TMP_ROOT/marked-run"
 mkdir -p "$run_marker"
-/bin/sh -c 'sleep 30' "$run_marker" &
+/bin/sh -c 'sleep 30; :' "$run_marker" &
 owned_pid=$!
 process_belongs_to_run "$owned_pid" "$run_marker" || fail "marked disposable process was not recognized"
 if process_belongs_to_run "$$" "$run_marker"; then

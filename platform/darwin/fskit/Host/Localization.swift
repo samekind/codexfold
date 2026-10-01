@@ -128,6 +128,8 @@ enum L10nKey: String {
     case autoFoldOff
     case autoFoldWaitingForCheck
     case autoFoldRetry
+    case autoFoldWaitingSpace
+    case autoFoldStorageNeedsReview
     case autoFoldConfigurationError
     case autoFoldCheckSoon
     case autoFoldCheckUnderTwoMinutes
@@ -302,6 +304,8 @@ enum L10n {
         .autoFoldOff: "已关闭",
         .autoFoldWaitingForCheck: "打开后会按设定检查",
         .autoFoldRetry: "这一轮没折成，会按设定再试",
+        .autoFoldWaitingSpace: "空间不足，原件已保留；有空间后继续",
+        .autoFoldStorageNeedsReview: "数据未完成验证，原件已保留；请查看诊断",
         .autoFoldConfigurationError: "自动折叠设置有问题，已暂停，请修复后再试。",
         .autoFoldCheckSoon: "即将再检查",
         .autoFoldCheckUnderTwoMinutes: "不到 2 分钟后再检查",
@@ -442,6 +446,8 @@ enum L10n {
         .autoFoldOff: "已關閉",
         .autoFoldWaitingForCheck: "打開後會按設定檢查",
         .autoFoldRetry: "這一輪沒折成，會按設定再試",
+        .autoFoldWaitingSpace: "空間不足，原件已保留；有空間後繼續",
+        .autoFoldStorageNeedsReview: "資料尚未完成驗證，原件已保留；請查看診斷",
         .autoFoldConfigurationError: "自動折疊設定有問題，已暫停，請修復後再試。",
         .autoFoldCheckSoon: "即將再檢查",
         .autoFoldCheckUnderTwoMinutes: "不到 2 分鐘後再檢查",
@@ -582,6 +588,8 @@ enum L10n {
         .autoFoldOff: "Off",
         .autoFoldWaitingForCheck: "Will check on the schedule you set",
         .autoFoldRetry: "This pass did not fold. It will try again on schedule.",
+        .autoFoldWaitingSpace: "Not enough free space. Originals are kept; folding will resume when space is available.",
+        .autoFoldStorageNeedsReview: "Data verification is incomplete. Originals are kept; review diagnostics.",
         .autoFoldConfigurationError: "Auto-fold settings are invalid, so folding is paused until they are fixed.",
         .autoFoldCheckSoon: "Checking again shortly",
         .autoFoldCheckUnderTwoMinutes: "Checking again in under 2 minutes",

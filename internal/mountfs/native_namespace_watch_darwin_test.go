@@ -176,6 +176,105 @@ func TestWatchNativeNamespaceBumpsVersionForExternalEntryChanges(t *testing.T) {
 	}
 }
 
+func TestWatchNativeNamespaceStartsWithMissingNamespaceDirectories(t *testing.T) {
+	root := t.TempDir()
+	filesystem := NewCanonical()
+	filesystem.SetNativeRoot(root)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	initial := filesystem.NamespaceVersion()
+	go func() { done <- filesystem.WatchNativeNamespace(ctx) }()
+	defer func() {
+		cancel()
+		if err := <-done; err != nil && !errors.Is(err, context.Canceled) {
+			t.Error(err)
+		}
+	}()
+	deadline := time.Now().Add(3 * time.Second)
+	for filesystem.NamespaceVersion() == initial && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if filesystem.NamespaceVersion() == initial {
+		t.Fatal("native namespace watcher did not become ready")
+	}
+	for _, name := range []string{"sessions", "archived_sessions"} {
+		if info, err := os.Stat(filepath.Join(root, name)); err != nil || !info.IsDir() {
+			t.Fatalf("native %s directory is unavailable: %v", name, err)
+		}
+	}
+	before := filesystem.NamespaceVersion()
+	if err := os.WriteFile(filepath.Join(root, "sessions", "new.jsonl"), []byte("old\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	deadline = time.Now().Add(3 * time.Second)
+	for filesystem.NamespaceVersion() == before && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if filesystem.NamespaceVersion() == before {
+		t.Fatal("first native file creation was not watched")
+	}
+}
+
+func TestWatchNativeNamespaceRearmsAfterNamespaceActivation(t *testing.T) {
+	root := t.TempDir()
+	home := t.TempDir()
+	for _, name := range []string{"sessions", "archived_sessions"} {
+		if err := os.Mkdir(filepath.Join(home, name), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	filesystem := NewCanonical()
+	filesystem.SetNativeRoot(root)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	initial := filesystem.NamespaceVersion()
+	go func() { done <- filesystem.WatchNativeNamespace(ctx) }()
+	defer func() {
+		cancel()
+		if err := <-done; err != nil && !errors.Is(err, context.Canceled) {
+			t.Error(err)
+		}
+	}()
+	waitAdvance := func(before uint64) {
+		t.Helper()
+		deadline := time.Now().Add(3 * time.Second)
+		for filesystem.NamespaceVersion() <= before && time.Now().Before(deadline) {
+			time.Sleep(10 * time.Millisecond)
+		}
+		if filesystem.NamespaceVersion() <= before {
+			t.Fatal("native namespace activation was not watched")
+		}
+	}
+	waitAdvance(initial)
+	for _, name := range []string{"sessions", "archived_sessions"} {
+		if err := os.Remove(filepath.Join(root, name)); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(filepath.Join(home, name), filepath.Join(root, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before := filesystem.NamespaceVersion()
+	target := filepath.Join(root, "sessions", "activated.jsonl")
+	if err := os.WriteFile(target, []byte("old\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	waitAdvance(before)
+	// The first content-only append must also be seen after the directory inode
+	// has been replaced, not just the earlier root rename event.
+	time.Sleep(100 * time.Millisecond)
+	before = filesystem.NamespaceVersion()
+	file, err := os.OpenFile(target, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, writeErr := file.WriteString("append\n")
+	if err := errors.Join(writeErr, file.Close()); err != nil {
+		t.Fatal(err)
+	}
+	waitAdvance(before)
+}
+
 func TestWatchNativeNamespaceContinuesAfterSamePathReplacement(t *testing.T) {
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, "sessions"), 0o700); err != nil {
@@ -205,10 +304,11 @@ func TestWatchNativeNamespaceContinuesAfterSamePathReplacement(t *testing.T) {
 	}
 	waitChange(initial)
 	before := filesystem.NamespaceVersion()
-	if err := os.Rename(target, filepath.Join(root, "old.jsonl")); err != nil {
+	replacement := filepath.Join(root, "sessions", ".replacement")
+	if err := os.WriteFile(replacement, []byte("replacement\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(target, []byte("replacement\n"), 0o600); err != nil {
+	if err := os.Rename(replacement, target); err != nil {
 		t.Fatal(err)
 	}
 	waitChange(before)

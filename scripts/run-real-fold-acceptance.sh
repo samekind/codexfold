@@ -42,7 +42,13 @@ Options:
   --performance       Run real native and managed read/write benchmarks before resume.
   --skip-resume       Do not send a model request; report CLI resume as NOT RUN.
   --desktop-app PATH  Open the independently identified Desktop on the reclaimed
-                      session; wait up to 20 minutes for evidence/desktop.done.
+                      session; wait for evidence/desktop.done.
+  --desktop-timeout SECONDS
+                      Desktop interaction deadline (default: 1200; range 60..7200).
+  --test-hold-timeout SECONDS
+                      Keep only the isolated mount alive for additional
+                      command-line probes until evidence/test-hold.done exists
+                      (default: 0; range 60..3600 when enabled).
   -h, --help          Show this help.
 
 The command never writes to the source CODEX_HOME and never signals production
@@ -268,17 +274,36 @@ normalize_isolated_api_key_config() {
       if (!in_main) return
       if (!seen_auth) print "requires_openai_auth = true"
     }
+    function flush_desktop() {
+      if (in_desktop) print "\"ambient-suggestions-enabled\" = false"
+    }
     BEGIN {
-      in_main=0; seen_main=0; seen_env=0; seen_auth=0
+      in_main=0; in_desktop=0; seen_desktop=0; in_section=0; seen_main=0; seen_env=0; seen_auth=0
       print "forced_login_method = \"api\""
       print "cli_auth_credentials_store = \"file\""
+      print "model_provider = \"main\""
+      print "model = \"" selected_model "\""
     }
     /^[[:space:]]*(forced_login_method|cli_auth_credentials_store)[[:space:]]*=/ { next }
+    !in_section && /^[[:space:]]*(model|model_provider|profile)[[:space:]]*=/ { next }
     /^[[:space:]]*model[[:space:]]*=/ { print "model = \"" selected_model "\""; next }
     /^[[:space:]]*chronicle[[:space:]]*=/ { print "chronicle = false"; next }
+    /^\[desktop\][[:space:]]*$/ {
+      flush_main()
+      flush_desktop()
+      in_main=0
+      in_desktop=1
+      seen_desktop=1
+      in_section=1
+      print
+      next
+    }
     /^\[model_providers\.main\][[:space:]]*$/ {
       flush_main()
+      flush_desktop()
       in_main=1
+      in_desktop=0
+      in_section=1
       seen_main=1
       seen_env=0
       seen_auth=0
@@ -287,13 +312,17 @@ normalize_isolated_api_key_config() {
     }
     /^\[/ {
       flush_main()
+      flush_desktop()
       in_main=0
+      in_desktop=0
+      in_section=1
       seen_env=0
       seen_auth=0
       print
       next
     }
     /^[[:space:]]*(experimental_bearer_token|api_key|access_token|refresh_token|client_secret)[[:space:]]*=/ { next }
+    in_desktop && /^[[:space:]]*"?ambient-suggestions-enabled"?[[:space:]]*=/ { next }
     in_main && /^[[:space:]]*env_key[[:space:]]*=/ {
       seen_env=1
       next
@@ -306,10 +335,16 @@ normalize_isolated_api_key_config() {
     { print }
     END {
       flush_main()
+      flush_desktop()
       if (!seen_main) {
         print ""
         print "[model_providers.main]"
         print "requires_openai_auth = true"
+      }
+      if (!seen_desktop) {
+        print ""
+        print "[desktop]"
+        print "\"ambient-suggestions-enabled\" = false"
       }
     }
   ' "$config" > "$temporary" || {
@@ -353,6 +388,36 @@ write_isolated_api_key_auth() {
   }
   chmod 600 "$temporary"
   mv "$temporary" "$auth_path"
+}
+
+write_isolated_desktop_state() {
+  local source_state=$1 target_state=$2 completed=false
+  [[ ! -L "$target_state" ]] || return 1
+  if [[ -f "$source_state" ]]; then
+    completed=$(jq -er '."electron-persisted-atom-state"."chatgpt-migration-announcement-completed-v1" == true' "$source_state") || completed=false
+  fi
+  # This is a Desktop global-state setting, not a config.toml feature flag.
+  # Seed it before the first window can request background Luna suggestions.
+  jq -n --argjson completed "$completed" \
+    '{"ambient-suggestions-enabled":false,"electron-persisted-atom-state":{"chatgpt-migration-announcement-completed-v1":$completed,"electron:onboarding-projectless-completed":true,"electron:onboarding-welcome-pending":false}}' \
+    > "$target_state" || return 1
+  chmod 600 "$target_state"
+}
+
+validate_isolated_desktop_auth() {
+  local isolated_home=$1
+  [[ -f "$isolated_home/config.toml" && ! -L "$isolated_home/config.toml" ]] || return 1
+  [[ -f "$isolated_home/auth.json" && ! -L "$isolated_home/auth.json" ]] || return 1
+  jq -e 'keys == ["OPENAI_API_KEY", "auth_mode"] and .auth_mode == "apikey" and
+    (.OPENAI_API_KEY | type == "string" and length > 0)' "$isolated_home/auth.json" >/dev/null || return 1
+  grep -Eq '^[[:space:]]*forced_login_method[[:space:]]*=[[:space:]]*"api"[[:space:]]*$' "$isolated_home/config.toml" || return 1
+  grep -Eq '^[[:space:]]*cli_auth_credentials_store[[:space:]]*=[[:space:]]*"file"[[:space:]]*$' "$isolated_home/config.toml" || return 1
+  awk '
+    /^\[/ { exit }
+    /^[[:space:]]*model_provider[[:space:]]*=[[:space:]]*"main"[[:space:]]*$/ { found=1 }
+    END { exit found ? 0 : 1 }
+  ' "$isolated_home/config.toml" || return 1
+  jq -e '."ambient-suggestions-enabled" == false' "$isolated_home/.codex-global-state.json" >/dev/null || return 1
 }
 
 mount_present() {
@@ -416,7 +481,8 @@ wait_for_real_fold() {
         packing) saw_packing=true ;;
         migrating) saw_migrating=true ;;
       esac
-      if [[ "$enabled" == true && "$phase" == idle && "$managed" == 1 && "$total" == 6 && "$completed" == 6 ]]; then
+      if [[ "$enabled" == true && "$phase" == idle && "$managed" == 1 && "$total" =~ ^[0-9]+$ && "$completed" == "$total" ]] && (( total >= 6 )); then
+        fold_progress="0/$total..$total/$total"
         # Fast pack/migrate phases can finish between samples. Record exactly
         # what was observed; the checks below verify their persisted outputs.
         jq -n --argjson checking "$saw_checking" --argjson folding "$saw_folding" \
@@ -432,14 +498,28 @@ wait_for_real_fold() {
 }
 
 critical_inventory() {
-  local store=$1 temporary
+  local store=$1 output=${2:-} temporary current
   temporary=$(mktemp "${TMPDIR:-/tmp}/codexfold-real-fold-inventory.XXXXXX")
-  for subtree in manifests objects packs fs; do
-    [[ -d "$store/$subtree" ]] || continue
-    find "$store/$subtree" -type f ! -name writer.lease -print
-  done | LC_ALL=C sort | while IFS= read -r path; do
+  current=$(tr -d '\n' < "$store/packs/CURRENT")
+  if [[ ! "$current" =~ ^gen-[0-9]+$ ]]; then
+    rm -f "$temporary"
+    return 1
+  fi
+  {
+    for subtree in manifests objects "packs/$current"; do
+      [[ -d "$store/$subtree" ]] || continue
+      find "$store/$subtree" -type f ! -path '*/leases/*' -print
+    done
+    printf '%s\n' "$store/packs/CURRENT" "$store/packs/PUBLISHED"
+    if [[ -d "$store/fs/sessions" ]]; then
+      find "$store/fs/sessions" -type f \( -name state.json -o -name delta.jsonl -o -name native-retirement.json \) -print
+    fi
+  } | LC_ALL=C sort | while IFS= read -r path; do
     printf '%s\t%s\n' "$(file_sha "$path")" "${path#"$store/"}"
   done > "$temporary"
+  if [[ -n "$output" ]]; then
+    cp "$temporary" "$output"
+  fi
   file_sha "$temporary"
   rm -f "$temporary"
 }
@@ -452,7 +532,7 @@ wait_for_idempotent_cycle() {
     if [[ -f "$status_path" ]]; then
       next_check=$(jq -r '.next_check_at // empty' "$status_path" 2>/dev/null)
       if [[ -n "$next_check" && "$next_check" != "$previous_next_check" ]] &&
-        jq -e '.enabled == true and .phase == "idle" and .managed_count == 1 and .cycle_total == 0 and .cycle_done == 0' "$status_path" >/dev/null 2>&1; then
+        jq -e '.enabled == true and .phase == "idle" and .managed_count == 1 and .cycle_total <= 2 and .cycle_done == .cycle_total' "$status_path" >/dev/null 2>&1; then
         return 0
       fi
     fi
@@ -522,6 +602,17 @@ cleanup_runtime() {
   if mount_present "$cleanup_mount"; then
     /sbin/umount "$cleanup_mount" >/dev/null 2>&1
   fi
+  if mount_present "$cleanup_mount"; then
+    # A dead FSKit backend can make umount time out while Disk Arbitration is
+    # still completing the request. Force only this marked test mount, then
+    # observe the actual mount table instead of treating a command timeout as
+    # either success or terminal failure.
+    bounded_exec 45 diskutil unmount force "$cleanup_mount" >/dev/null 2>&1
+    local unmount_deadline=$((SECONDS + 45))
+    while mount_present "$cleanup_mount" && (( SECONDS < unmount_deadline )); do
+      sleep 0.5
+    done
+  fi
   stop_owned_process "$serve_pid"
   if [[ -x "$cleanup_bin" && -L "$cleanup_home/sessions" && -L "$cleanup_home/archived_sessions" ]] && ! mount_present "$cleanup_mount"; then
     bounded_exec 30 "$cleanup_bin" fs namespace deactivate \
@@ -546,11 +637,32 @@ cleanup_runtime() {
     [[ "$(cat "$cleanup_mount/.acceptance-marker" 2>/dev/null)" == "$SCHEMA" ]]; then
     find "$cleanup_mount" -depth -delete >/dev/null 2>&1
   fi
+  # FSKit can replace the resource directory and leave only a final supervisor
+  # status after unmount. Remove that exact, bound remnant as well as the
+  # original marked directory; never remove a live mount or unexpected files.
   if [[ -n "${FSKIT_RESOURCE:-}" && -n "${FSKIT_ACCEPTANCE_PARENT:-}" ]] &&
     path_is_within "$FSKIT_RESOURCE" "$FSKIT_ACCEPTANCE_PARENT" &&
-    [[ "$(basename "$FSKIT_RESOURCE")" == rf-* && -f "$FSKIT_RESOURCE/.acceptance-marker" ]] &&
-    [[ "$(cat "$FSKIT_RESOURCE/.acceptance-marker" 2>/dev/null)" == "$SCHEMA" ]]; then
-    find "$FSKIT_RESOURCE" -depth -delete >/dev/null 2>&1
+    [[ "$(basename "$FSKIT_RESOURCE")" == rf-* ]] &&
+    [[ -f "${EVIDENCE_ROOT:-}/fskit-resource-identity.txt" && ! -L "${EVIDENCE_ROOT:-}/fskit-resource-identity.txt" ]] &&
+    ! mount_present "$cleanup_mount"; then
+    local resource_cleanup_attempt
+    for (( resource_cleanup_attempt = 0; resource_cleanup_attempt < 60; resource_cleanup_attempt++ )); do
+      [[ -d "$FSKIT_RESOURCE" && ! -L "$FSKIT_RESOURCE" ]] || break
+      if [[ "$(stat -f '%d:%i' "$FSKIT_RESOURCE" 2>/dev/null)" == "$(cat "$EVIDENCE_ROOT/fskit-resource-identity.txt" 2>/dev/null)" ]] &&
+        [[ -f "$FSKIT_RESOURCE/.acceptance-marker" ]] &&
+        [[ "$(cat "$FSKIT_RESOURCE/.acceptance-marker" 2>/dev/null)" == "$SCHEMA" ]]; then
+        find "$FSKIT_RESOURCE" -depth -delete >/dev/null 2>&1
+      elif [[ -d "$FSKIT_RESOURCE/status" && ! -L "$FSKIT_RESOURCE/status" ]] &&
+        [[ -f "$FSKIT_RESOURCE/status/supervisor.json" && ! -L "$FSKIT_RESOURCE/status/supervisor.json" ]] &&
+        [[ "$(find "$FSKIT_RESOURCE" -mindepth 1 -print | wc -l | tr -d ' ')" == 2 ]] &&
+        jq -e --arg mount "$cleanup_mount" --arg resource "$FSKIT_RESOURCE" \
+          '.component == "supervisor" and .mountPoint == $mount and .resourcePath == $resource' \
+          "$FSKIT_RESOURCE/status/supervisor.json" >/dev/null 2>&1; then
+        find "$FSKIT_RESOURCE" -depth -delete >/dev/null 2>&1
+      fi
+      [[ ! -e "$FSKIT_RESOURCE" ]] && break
+      sleep 0.5
+    done
   fi
   SERVE_PID=''
   SUPERVISOR_PID=''
@@ -573,6 +685,24 @@ on_exit() {
     write_failure_evidence "$exit_code"
   fi
   cleanup_runtime
+  if [[ -n "${MOUNT_ROOT:-}" ]] && mount_present "$MOUNT_ROOT"; then
+    # Do not erase the still-mounted namespace or the runtime needed to
+    # recover it. Remove only this test's credential copy and report the
+    # precise leftover for manual recovery.
+    if [[ -n "${CODEX_HOME_ISOLATED:-}" ]] && path_is_within "$CODEX_HOME_ISOLATED" "$RUN_ROOT"; then
+      rm -f "$CODEX_HOME_ISOLATED/auth.json"
+    fi
+    echo "isolated FSKit mount still active after cleanup: $MOUNT_ROOT" >&2
+    CURRENT_STEP=cleanup-isolated-runtime
+    write_failure_evidence 1
+    exit 1
+  fi
+  if [[ -n "${FSKIT_RESOURCE:-}" && -d "$FSKIT_RESOURCE" ]]; then
+    echo "isolated FSKit resource retained after cleanup: $FSKIT_RESOURCE" >&2
+    CURRENT_STEP=cleanup-isolated-runtime
+    write_failure_evidence 1
+    exit_code=1
+  fi
   if [[ "${RUNTIME_ROOT:-}" == /private/tmp/codexfold-acceptance-runtime.* && -f "$RUNTIME_ROOT/.acceptance-marker" ]] &&
     [[ "$(cat "$RUNTIME_ROOT/.acceptance-marker")" == "$SCHEMA" ]]; then
     rm -rf "$RUNTIME_ROOT"
@@ -591,11 +721,13 @@ main() {
   local model='gpt-5.6-terra' frontend=fuse codex_timeout=240
   local performance=false
   local skip_resume=false
-  local desktop_app='' desktop_executable='' desktop_deadline
+  local desktop_app='' desktop_executable='' desktop_deadline desktop_timeout=1200 desktop_project=''
+  local test_hold_timeout=0 test_hold_deadline
   local source_row source_archived source_rollout source_identity_before source_sha_before source_bytes
   local source_identity_after source_sha_after candidate_sha status_before_next inventory_before inventory_after
   local visible_path full_bytes delta_path delta_bytes full_sha manifest_sha generation
   local physical_before physical_after retirement_proof
+  local fold_progress=''
   local object_count loose_count pack_generation base_prefix_sha last_message marker disabled_inventory_before disabled_inventory_after
   local isolated_api_key api_key_source api_key_record isolated_base_url socket_suffix production_module_path
   local production_module_baseline candidate_module_process
@@ -607,6 +739,8 @@ main() {
       --codex-cli) codex_cli=${2:?}; shift 2 ;;
       --candidate-bin) candidate_input=${2:?}; shift 2 ;;
       --desktop-app) desktop_app=${2:?}; shift 2 ;;
+      --desktop-timeout) desktop_timeout=${2:?}; shift 2 ;;
+      --test-hold-timeout) test_hold_timeout=${2:?}; shift 2 ;;
       --skip-resume) skip_resume=true; shift ;;
       --candidate-app) candidate_app_input=${2:?}; shift 2 ;;
       --fskit-type) fskit_type_input=${2:?}; shift 2 ;;
@@ -625,6 +759,8 @@ main() {
     die "native-fskit real-fold requires --candidate-app so the loaded Swift module can be proven"
   fi
   [[ "$codex_timeout" =~ ^[0-9]+$ && "$codex_timeout" -ge 30 && "$codex_timeout" -le 900 ]] || die "--timeout must be 30..900 seconds"
+  [[ "$desktop_timeout" =~ ^[0-9]+$ && "$desktop_timeout" -ge 60 && "$desktop_timeout" -le 7200 ]] || die "--desktop-timeout must be 60..7200 seconds"
+  [[ "$test_hold_timeout" == 0 || ( "$test_hold_timeout" =~ ^[0-9]+$ && "$test_hold_timeout" -ge 60 && "$test_hold_timeout" -le 3600 ) ]] || die "--test-hold-timeout must be 0 or 60..3600 seconds"
   [[ -x "$codex_cli" ]] || die "Codex CLI is not executable: $codex_cli"
   [[ -x "$PREPARE_HOME" ]] || die "isolated CODEX_HOME preparer is unavailable"
   need_command go
@@ -680,7 +816,10 @@ main() {
   SERVE_PID=''
   SUPERVISOR_PID=''
   CURRENT_STEP=select-source-session
-  trap on_exit EXIT HUP INT TERM
+  trap on_exit EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
 
   source_row=$(source_session_row "$SOURCE_HOME" "$requested_session") || die "could not select a stable archived source session"
   IFS=$'\t' read -r SESSION_ID source_archived source_rollout <<EOF
@@ -725,7 +864,7 @@ EOF
     }
   ' "$CODEX_HOME_ISOLATED/config.toml")
   jq -n --arg schema "$SCHEMA" --arg source "$api_key_source" --arg base_url "$isolated_base_url" \
-    '{schema:$schema,auth_mode:"isolated-file-api-key",oauth_used:false,key_source:$source,base_url:$base_url}' \
+    '{schema:$schema,configured_auth_mode:"isolated-file-api-key",oauth_credentials_copied:false,runtime_auth_verified:false,key_source:$source,base_url:$base_url}' \
     > "$EVIDENCE_ROOT/auth-route.json"
 
   CURRENT_STEP=build-current-worktree
@@ -749,7 +888,7 @@ EOF
     --arg git_head "$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || true)" \
     --arg frontend "$frontend" --arg model "$model" --arg artifact_mode "$candidate_artifact_mode" \
     --argjson build_tags "$build_tags_json" \
-    '{schema:$schema,candidate_sha256:$sha256,git_head:$git_head,frontend:$frontend,model:$model,artifact_mode:$artifact_mode,build_tags:$build_tags,auth_mode:"isolated-file-api-key",oauth_used:false}' \
+    '{schema:$schema,candidate_sha256:$sha256,git_head:$git_head,frontend:$frontend,model:$model,artifact_mode:$artifact_mode,build_tags:$build_tags,configured_auth_mode:"isolated-file-api-key",oauth_credentials_copied:false}' \
     > "$EVIDENCE_ROOT/candidate.json"
 
   CURRENT_STEP='start-isolated-filesystem'
@@ -790,6 +929,7 @@ EOF
     chmod 700 "$FSKIT_RESOURCE"
     printf '%s\n' "$SCHEMA" > "$FSKIT_RESOURCE/.acceptance-marker"
     chmod 600 "$FSKIT_RESOURCE/.acceptance-marker"
+    stat -f '%d:%i' "$FSKIT_RESOURCE" > "$EVIDENCE_ROOT/fskit-resource-identity.txt"
   else
     mkdir -p "$MOUNT_ROOT"
   fi
@@ -844,6 +984,7 @@ EOF
       go test ./internal/mountfs -run '^TestNativeFSKitMountedSamePathReplacementWatch$' -count=1 -v -timeout 30s \
       > "$EVIDENCE_ROOT/native-file-replacement.log" 2>&1 || die "native file replacement tracking failed"
   fi
+  CURRENT_STEP=automatic-real-fold
 
   if [[ "$performance" == true ]]; then
     # The source may itself route through production FSKit. Use a disposable
@@ -886,13 +1027,13 @@ EOF
   [[ "$physical_after" -lt "$physical_before" ]] || die "automatic folding did not reduce allocated disk space"
 
   CURRENT_STEP=idempotent-automatic-cycle
-  inventory_before=$(critical_inventory "$STORE_ROOT")
+  inventory_before=$(critical_inventory "$STORE_ROOT" "$EVIDENCE_ROOT/core-before.tsv")
   status_before_next=$(jq -r '.next_check_at // empty' "$STATUS_PATH")
   : > "$EVIDENCE_ROOT/idempotent-cycle.tsv"
   wait_for_idempotent_cycle "$STATUS_PATH" "$EVIDENCE_ROOT/idempotent-cycle.tsv" "$status_before_next" 50 || \
     die "automatic folding did not complete an already-managed no-op cycle"
   rm -f "$EVIDENCE_ROOT/idempotent-cycle.tsv.last"
-  inventory_after=$(critical_inventory "$STORE_ROOT")
+  inventory_after=$(critical_inventory "$STORE_ROOT" "$EVIDENCE_ROOT/core-after.tsv")
   [[ "$inventory_after" == "$inventory_before" ]] || die "already-managed automatic cycle changed fold data"
 
   CURRENT_STEP=hot-disable
@@ -987,13 +1128,24 @@ EOF
     desktop_executable="$desktop_app/Contents/MacOS/$(bundle_info_value "$desktop_app" CFBundleExecutable)"
     [[ -x "$desktop_executable" ]] || die "isolated Desktop executable is missing"
     codesign --verify --deep --strict "$desktop_app" || die "isolated Desktop signature is invalid"
+    # The copied rollout remains byte-exact, but UI fork chooses a workspace
+    # from Codex metadata. Never let that action target the source repository.
+    desktop_project="$WORK_ROOT/desktop-project"
+    [[ "$desktop_project" =~ ^[A-Za-z0-9/_-]+$ ]] || die "Desktop test workspace has unsafe SQL path characters"
+    mkdir -p "$desktop_project"
+    git -C "$desktop_project" init -q || die "could not create an isolated Desktop project"
+    sqlite3 -batch "$CODEX_HOME_ISOLATED/state_5.sqlite" \
+      "UPDATE threads SET cwd='$desktop_project', git_branch='' WHERE id='$SESSION_ID';" || die "could not isolate the Desktop task workspace"
+    [[ "$(sqlite3 -batch -noheader "$CODEX_HOME_ISOLATED/state_5.sqlite" "SELECT cwd FROM threads WHERE id='$SESSION_ID';")" == "$desktop_project" ]] ||
+      die "Desktop task workspace did not become isolated"
+    jq -n --arg project "$desktop_project" --arg session "$SESSION_ID" \
+      '{session_id:$session,isolated_project:$project,source_rollout_bytes_unchanged:true}' > "$EVIDENCE_ROOT/desktop-workspace.json"
     isolated_api_key=$(jq -r '.OPENAI_API_KEY' "$CODEX_HOME_ISOLATED/auth.json")
     # Carry only the user's already-completed migration announcement, not
     # production thread lists, workspaces, cloud credentials or browser data.
-    if [[ -f "$SOURCE_HOME/.codex-global-state.json" ]]; then
-      jq '{"electron-persisted-atom-state": {"chatgpt-migration-announcement-completed-v1": (."electron-persisted-atom-state"."chatgpt-migration-announcement-completed-v1" // false)}}' \
-        "$SOURCE_HOME/.codex-global-state.json" > "$CODEX_HOME_ISOLATED/.codex-global-state.json"
-    fi
+    write_isolated_desktop_state "$SOURCE_HOME/.codex-global-state.json" "$CODEX_HOME_ISOLATED/.codex-global-state.json" || \
+      die "could not disable isolated Desktop background suggestions"
+    validate_isolated_desktop_auth "$CODEX_HOME_ISOLATED" || die "isolated Desktop requires prepared API-only credentials and disabled background suggestions"
     CODEX_HOME="$CODEX_HOME_ISOLATED" CODEX_ELECTRON_USER_DATA_PATH="$WORK_ROOT/desktop-data" OPENAI_API_KEY="$isolated_api_key" CODEX_API_KEY="$isolated_api_key" \
       "$desktop_executable" --user-data-dir="$WORK_ROOT/desktop-data" > "$EVIDENCE_ROOT/desktop.log" 2>&1 &
     DESKTOP_PID=$!
@@ -1001,7 +1153,7 @@ EOF
     jq -n --argjson pid "$DESKTOP_PID" --arg app "$desktop_app" --arg home "$CODEX_HOME_ISOLATED" \
       --arg data "$WORK_ROOT/desktop-data" --arg session "$SESSION_ID" --arg mount "$MOUNT_ROOT" \
       '{pid:$pid,app:$app,codex_home:$home,user_data:$data,session_id:$session,mount:$mount}' > "$EVIDENCE_ROOT/desktop-ready.json"
-    desktop_deadline=$((SECONDS + 1200))
+    desktop_deadline=$((SECONDS + desktop_timeout))
     while [[ ! -f "$EVIDENCE_ROOT/desktop.done" ]] && (( SECONDS < desktop_deadline )); do
       kill -0 "$DESKTOP_PID" 2>/dev/null || die "isolated Desktop exited before acceptance completed"
       sleep 1
@@ -1009,6 +1161,16 @@ EOF
     [[ -f "$EVIDENCE_ROOT/desktop.done" ]] || die "isolated Desktop acceptance timed out"
     stop_owned_process "$DESKTOP_PID"
     DESKTOP_PID=''
+  fi
+  if (( test_hold_timeout > 0 )); then
+    CURRENT_STEP=isolated-command-line-probes
+    jq -n --arg schema "$SCHEMA" --arg mount "$MOUNT_ROOT" --arg home "$CODEX_HOME_ISOLATED" \
+      '{schema:$schema,mount:$mount,codex_home:$home,desktop_started:false}' > "$EVIDENCE_ROOT/test-hold.ready.json"
+    test_hold_deadline=$((SECONDS + test_hold_timeout))
+    while [[ ! -f "$EVIDENCE_ROOT/test-hold.done" ]] && (( SECONDS < test_hold_deadline )); do
+      sleep 1
+    done
+    [[ -f "$EVIDENCE_ROOT/test-hold.done" ]] || die "isolated command-line probes timed out"
   fi
   CURRENT_STEP=verify-production-source-unchanged
   source_identity_after=$(source_file_identity "$source_rollout") || die "source rollout identity disappeared"
@@ -1019,7 +1181,11 @@ EOF
   CURRENT_STEP=cleanup-isolated-runtime
   cleanup_runtime
   mount_present "$MOUNT_ROOT" && die "isolated mount remained after cleanup"
-  if pgrep -f "$CANDIDATE_BIN" >/dev/null 2>&1 || pgrep -f "$MOUNT_ROOT" >/dev/null 2>&1; then
+  # Check only the processes this run started. A broad pgrep can match this
+  # script's own --candidate-bin argument or another isolated acceptance run.
+  if process_belongs_to_run "$SERVE_PID" "$RUN_ROOT" ||
+    process_belongs_to_run "$SUPERVISOR_PID" "$RUN_ROOT" ||
+    process_belongs_to_run "${DESKTOP_PID:-}" "$RUN_ROOT"; then
     die "isolated acceptance process remained after cleanup"
   fi
 
@@ -1027,6 +1193,7 @@ EOF
   jq -n \
     --arg schema "$SCHEMA" --arg result pass --arg completed_at "$(timestamp)" \
     --arg session_id "$SESSION_ID" --arg frontend "$frontend" --arg model "$model" \
+    --arg fold_progress "$fold_progress" \
     --arg candidate_artifact_mode "$candidate_artifact_mode" \
     --arg candidate_sha256 "$candidate_sha" --arg source_sha256 "$source_sha_before" \
     --argjson source_bytes "$source_bytes" --arg manifest_sha256 "$manifest_sha" \
@@ -1035,7 +1202,7 @@ EOF
     --argjson full_bytes "$full_bytes" --arg full_sha256 "$full_sha" --argjson delta_bytes "$delta_bytes" \
     --arg idempotent_inventory_sha256 "$inventory_after" --arg disabled_inventory_sha256 "$disabled_inventory_after" \
     --slurpfile physical_space "$EVIDENCE_ROOT/physical-space.json" \
-    '{schema:$schema,result:$result,completed_at:$completed_at,session:{id:$session_id,source_bytes:$source_bytes,source_sha256:$source_sha256,full_bytes:$full_bytes,full_sha256:$full_sha256,delta_bytes:$delta_bytes,base_prefix_unchanged:true,jsonl_valid:true},candidate:{sha256:$candidate_sha256,frontend:$frontend,model:$model,artifact_mode:$candidate_artifact_mode},automatic_enrollment:{hot_enable:true,waiting_observed:true,fold_pack_migrate_reclaim_progress:"0/6..6/6",managed_count:1,idempotent_cycle:true,idempotent_inventory_sha256:$idempotent_inventory_sha256,hot_disable:true,disabled_inventory_sha256:$disabled_inventory_sha256},fold:{manifest_sha256:$manifest_sha256,generation:$generation,pack_generation:$pack_generation,object_count:$object_count,loose_object_count:$loose_object_count,fold_doctor_issues:0,pack_doctor_issues:0,native_snapshot_retained:false,loose_objects_retained:false,physical_space:$physical_space[0]},codex:{unmodified_cli:true,reply_marker:"CODEXFOLD_REAL_FOLD_CURRENT_WORKTREE_OK",append_to_delta:true,writable_backing_created:false},isolation:{production_source_unchanged:true,runtime_cleaned:true,credentials_removed_with_work_root:true}}' \
+    '{schema:$schema,result:$result,completed_at:$completed_at,session:{id:$session_id,source_bytes:$source_bytes,source_sha256:$source_sha256,full_bytes:$full_bytes,full_sha256:$full_sha256,delta_bytes:$delta_bytes,base_prefix_unchanged:true,jsonl_valid:true},candidate:{sha256:$candidate_sha256,frontend:$frontend,model:$model,artifact_mode:$candidate_artifact_mode},automatic_enrollment:{hot_enable:true,waiting_observed:true,fold_pack_migrate_reclaim_progress:$fold_progress,managed_count:1,idempotent_cycle:true,idempotent_inventory_sha256:$idempotent_inventory_sha256,hot_disable:true,disabled_inventory_sha256:$disabled_inventory_sha256},fold:{manifest_sha256:$manifest_sha256,generation:$generation,pack_generation:$pack_generation,object_count:$object_count,loose_object_count:$loose_object_count,fold_doctor_issues:0,pack_doctor_issues:0,native_snapshot_retained:false,loose_objects_retained:false,physical_space:$physical_space[0]},codex:{unmodified_cli:true,reply_marker:"CODEXFOLD_REAL_FOLD_CURRENT_WORKTREE_OK",append_to_delta:true,writable_backing_created:false},isolation:{production_source_unchanged:true,runtime_cleaned:true,credentials_removed_with_work_root:true}}' \
     > "$EVIDENCE_ROOT/summary.json"
   if [[ "$skip_resume" == true ]]; then
     jq '.codex = {status:"NOT RUN",reason:"--skip-resume; no model request was sent"}' \
@@ -1053,7 +1220,7 @@ EOF
     # shellcheck disable=SC2016
     printf -- '- Candidate SHA-256: `%s`\n' "$candidate_sha"
     # shellcheck disable=SC2016
-    printf -- '- Automatic path: disabled -> waiting -> fold/pack/migrate/reclaim `0/6..6/6` -> idempotent -> disabled\n'
+    printf -- '- Automatic path: disabled -> waiting -> fold/pack/migrate/reclaim `%s` -> idempotent -> disabled\n' "$fold_progress"
     # shellcheck disable=SC2016
     if [[ "$skip_resume" == false ]]; then
       printf -- '- Codex: unmodified CLI, model `%s`, reply marker matched, delta=%s bytes\n' "$model" "$delta_bytes"

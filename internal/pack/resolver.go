@@ -519,10 +519,14 @@ func (r *Resolver) ReadAt(ctx context.Context, ref fold.ObjectRef, destination [
 }
 
 type objectStream struct {
-	ctx      context.Context
-	resolver *Resolver
-	ref      fold.ObjectRef
-	offset   int64
+	ctx        context.Context
+	resolver   *Resolver
+	ref        fold.ObjectRef
+	offset     int64
+	object     Object
+	blockIndex int
+	blockData  []byte
+	closed     bool
 }
 
 func (r *Resolver) OpenObject(ctx context.Context, ref fold.ObjectRef) (io.ReadCloser, error) {
@@ -536,16 +540,54 @@ func (r *Resolver) OpenObject(ctx context.Context, ref fold.ObjectRef) (io.ReadC
 	if object.RawBytes != ref.RawBytes {
 		return nil, fmt.Errorf("object %s raw size %d, want %d", ref.SHA256, object.RawBytes, ref.RawBytes)
 	}
-	return &objectStream{ctx: ctx, resolver: r, ref: ref}, nil
+	return &objectStream{ctx: ctx, resolver: r, ref: ref, object: object}, nil
 }
 
 func (s *objectStream) Read(destination []byte) (int, error) {
-	n, err := s.resolver.ReadAt(s.ctx, s.ref, destination, s.offset)
-	s.offset += int64(n)
-	return n, err
+	if s.closed {
+		return 0, os.ErrClosed
+	}
+	if len(destination) == 0 {
+		return 0, nil
+	}
+	if err := s.ctx.Err(); err != nil {
+		return 0, err
+	}
+	if s.offset >= s.object.RawBytes {
+		return 0, io.EOF
+	}
+	written := 0
+	for written < len(destination) && s.offset < s.object.RawBytes {
+		if err := s.ctx.Err(); err != nil {
+			return written, err
+		}
+		if s.blockIndex >= len(s.object.Blocks) {
+			return written, io.ErrUnexpectedEOF
+		}
+		block := s.object.Blocks[s.blockIndex]
+		if s.blockData == nil {
+			data, err := s.resolver.readBlock(s.ref.SHA256, s.blockIndex, block)
+			if err != nil {
+				return written, err
+			}
+			s.blockData = data
+		}
+		inside := s.offset - block.RawOffset
+		if inside < 0 || inside >= int64(len(s.blockData)) {
+			return written, errors.New("invalid packed stream block offset")
+		}
+		n := copy(destination[written:], s.blockData[inside:])
+		s.offset += int64(n)
+		written += n
+		if s.offset == block.RawOffset+block.RawBytes {
+			s.blockData = nil
+			s.blockIndex++
+		}
+	}
+	return written, nil
 }
 
-func (s *objectStream) Close() error { return nil }
+func (s *objectStream) Close() error { s.blockData = nil; s.closed = true; return nil }
 
 func (r *Resolver) readBlock(objectDigest string, blockIndex int, block Block) ([]byte, error) {
 	key := fmt.Sprintf("%s:%d", objectDigest, blockIndex)

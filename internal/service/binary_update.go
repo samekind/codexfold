@@ -200,3 +200,22 @@ func copyBinaryTemporary(source string, directory string, pattern string, mode o
 	}
 	return path, nil
 }
+
+// PreserveBinaryForRecovery keeps one independently usable previous executable
+// after a successful live update; Commit still removes its short-lived copy.
+func PreserveBinaryForRecovery(source, directory string) (string, error) {
+	if !filepath.IsAbs(source) || !filepath.IsAbs(directory) {
+		return "", errors.New("absolute binary and recovery directory paths are required")
+	}
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		return "", err
+	}
+	path, err := copyBinaryTemporary(source, directory, "codexfold-previous-*", 0o700)
+	if err != nil {
+		return "", err
+	}
+	if err := syncServiceDirectory(directory); err != nil {
+		return path, err
+	}
+	return path, nil
+}
