@@ -6,6 +6,74 @@ pre-1.0, so a minor version may contain compatibility changes.
 
 ## [Unreleased]
 
+## [0.4.0-beta.2] - 2026-10-01
+
+### Added
+
+- `fs service update-daemon-live` replaces only the filesystem daemon. Codex,
+  the supervisor and the FSKit mount all stay up, so a fix no longer costs a
+  maintenance window. The candidate must answer `fs serve --help` with the
+  required backend flags before the running daemon is signalled, and a
+  replacement that does not take over within nine seconds is rolled back to the
+  previous binary. This does not cover App or FSKit extension updates.
+- A signing-team preflight on every service binary update. macOS refuses to let
+  the Team-signed launcher exec a binary carrying a different team, and kills it
+  with an invalid code signature about a second after launch, before it can
+  write a line of its own log. An ad-hoc `go build` output passes
+  `codesign --verify` and runs from a shell, so the failure was invisible until
+  the mount stayed down; it is now refused with the command to sign it
+  correctly.
+
+### Fixed
+
+- Reclamation no longer blocks itself. The writer lease is held only for
+  recovery mutual exclusion rather than for the life of the daemon, so the
+  cleanup that must lock every managed session can actually run. On the
+  maintainer's 2,435-session store this took retained pack generations from
+  four to two and the reported saving from 18.8% to 69.1%.
+- Cold start recovers sessions eight at a time instead of serially, and no
+  longer rewrites and fsyncs a writer lease or an unchanged mount
+  acknowledgement per session. Backend readiness on a 2,435-session fixture
+  went from about 45.9s to about 4.8s, and a 300-session baseline from about
+  6.4s to about 2.5s.
+- Enrollment planning loads the storage inventory once per round while still
+  reading live free space for every budget decision. The first inventory takes
+  about 6.2s and the following 200 decisions in that round total about 0.3ms.
+  An idle policy heartbeat reuses the last known managed count instead of
+  rescanning every managed state every two seconds.
+- A cycle catches up manifests an earlier cycle left unpacked, and
+  `retire-loose` repacks and retries rather than deleting an original the pack
+  does not yet cover. Pack budgeting charges the actual encoded size of reused
+  chunks instead of counting the old pack again.
+- An old pack generation is collectible once its reader leases are released and
+  the per-object deletion proof passes, rather than retaining a second complete
+  compressed library indefinitely. The duplicate whole-store doctor pass before
+  reclamation is gone; the full pack and manifest readback and the per-object
+  proof are not.
+- A managed-state inspection cache could treat a changed store as unchanged.
+  It compared modification and change timestamps, which Linux quantises to the
+  kernel tick, so a same-size rewrite or a directory addition inside one tick
+  was indistinguishable. This cache sits on the path that proves an object is
+  unreferenced before it is deleted; a stamp is now only cached once it has
+  settled relative to the start of the refresh that read it.
+- The native namespace watcher survives a fresh mount. It follows
+  `sessions` and `archived_sessions` when activation replaces those
+  directories, and re-watches by inode after a file is atomically replaced at
+  the same path.
+- Managed-state reload runs on a ten-second fallback instead of a full scan
+  every second, with the one-second heartbeat still published independently and
+  an error if a reload stalls past twenty seconds. The full storage inventory
+  refreshes every ten minutes, or immediately after a fold or reclamation.
+- The real-fold acceptance script no longer hardcodes the previous flow's cycle
+  counts, and no longer mistakes its own command line for a leftover test
+  process.
+
+### Changed
+
+- The menu bar distinguishes waiting for free space from data that still needs
+  verification.
+
+
 ## [0.4.0-beta.1] - 2026-09-13
 
 ### Added
