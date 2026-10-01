@@ -45,6 +45,19 @@ materialization identity.
 
 ## Restart and rollback
 
+### Batched reclamation
+
+Automatic enrollment now retains one verified pack-only proof for the native
+retirement batch instead of starting a subprocess and rechecking the whole
+corpus for each session. The object-store operation lock and a generation lease
+keep the shared proof stable. Each target's exact manifest, writer exclusion,
+materialization and deletion transaction remain mandatory. Only read-only
+observation uses metadata caching; destructive fences do not.
+
+`codexfold fs enroll reclaim --apply --workers 4` can finish cleanup without
+starting another fold. The normal service yields new retirement work to active
+foreground I/O. See [the implementation and measurements](optimization-pass-2026-09-13.md).
+
 If a process stops after state publication but before file removal, rerunning
 `--apply` verifies the remaining snapshot's byte count and SHA-256 before
 deleting it. A missing snapshot is already complete. A changed snapshot fails
