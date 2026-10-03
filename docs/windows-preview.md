@@ -5,10 +5,15 @@ WinFsp, and the tray needs Microsoft WebView2 Runtime. Keep the store on a local
 NTFS volume: Windows writer leases rely on hard links.
 
 ```powershell
+$env:CGO_ENABLED='0'
 go build -tags winfsp -o dist/codexfold.exe ./cmd/codexfold
 go build -ldflags='-H=windowsgui' -o dist/codexfold-tray.exe ./cmd/codexfold-tray
 ./scripts/test-windows-use.ps1 -Mode Mount -KeepRunning
 ```
+
+The Windows preview uses cgofuse's native Go loader. The setting above avoids
+a build-time dependency on WinFsp's C SDK headers; WinFsp Runtime remains required
+to mount the drive.
 
 For the isolated native tray smoke check, use Node.js 22 or newer and the same
 WebView2 Runtime. It verifies settings, persistent history, material rendering,
