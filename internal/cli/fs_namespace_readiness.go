@@ -22,7 +22,7 @@ type canonicalNamespaceReadiness struct {
 // have repopulated, so readiness is intentionally distinct from mount health.
 var enrollmentCanonicalNamespaceReadinessProbe = probeEnrollmentCanonicalNamespaceReadiness
 
-var waitForCanonicalNamespaceActivation = waitForCanonicalNativePassthrough
+var waitForCanonicalNamespaceActivation = waitForCanonicalNamespacePassthrough
 
 func probeEnrollmentCanonicalNamespaceReadiness(home string, mount string, nativeRoot string) canonicalNamespaceReadiness {
 	status, err := sessionns.Inspect(sessionns.Options{Home: home, Mount: mount, NativeRoot: nativeRoot, MountProbe: mountHealthProbe})
@@ -30,6 +30,9 @@ func probeEnrollmentCanonicalNamespaceReadiness(home string, mount string, nativ
 		return canonicalNamespaceReadiness{}
 	}
 	if err := probeCanonicalNativePassthrough(mount, nativeRoot); err != nil {
+		return canonicalNamespaceReadiness{Active: true}
+	}
+	if err := probeCanonicalNativePassthrough(home, nativeRoot); err != nil {
 		return canonicalNamespaceReadiness{Active: true}
 	}
 	return canonicalNamespaceReadiness{Active: true, Ready: true}
@@ -44,6 +47,10 @@ func probeCanonicalNativePassthrough(mount string, nativeRoot string) error {
 }
 
 func waitForCanonicalNativePassthrough(ctx context.Context, mount string, nativeRoot string, timeout time.Duration) error {
+	return waitForCanonicalNamespacePassthrough(ctx, "", mount, nativeRoot, timeout)
+}
+
+func waitForCanonicalNamespacePassthrough(ctx context.Context, home string, mount string, nativeRoot string, timeout time.Duration) error {
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
@@ -51,6 +58,9 @@ func waitForCanonicalNativePassthrough(ctx context.Context, mount string, native
 	var lastErr error
 	for {
 		lastErr = probeCanonicalNativePassthroughMetadata(mount, nativeRoot, true)
+		if lastErr == nil && home != "" {
+			lastErr = probeCanonicalNativePassthroughMetadata(home, nativeRoot, true)
+		}
 		if lastErr == nil {
 			return nil
 		}

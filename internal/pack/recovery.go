@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/klauspost/compress/zstd"
+	"github.com/samekind/codexfold/internal/dirsync"
 	"github.com/samekind/codexfold/internal/fold"
 	"github.com/samekind/codexfold/internal/storage"
 	"github.com/samekind/codexfold/internal/vfs"
@@ -211,10 +212,10 @@ func collectRecoverySources(storeDir string, generationDir string, meta indexV3M
 			return nil
 		}
 		relative, err := filepath.Rel(filepath.Clean(storeDir), path)
-		if err != nil || !safeRecoveryPath(relative) || !strings.HasPrefix(filepath.ToSlash(relative), "manifests/") {
+		archivePath := filepath.ToSlash(relative)
+		if err != nil || !safeRecoveryPath(archivePath) || !strings.HasPrefix(archivePath, "manifests/") {
 			return fmt.Errorf("unsafe recovery manifest path %q", path)
 		}
-		archivePath := filepath.ToSlash(relative)
 		manifest, loadErr := fold.LoadManifestPath(path)
 		if loadErr != nil {
 			return loadErr
@@ -1023,7 +1024,7 @@ func syncRecoveryRootDirectory(root *os.Root, relative string) error {
 		return err
 	}
 	defer directory.Close()
-	return directory.Sync()
+	return dirsync.Sync(directory)
 }
 
 func markGenerationPublished(generationDir string, sequence uint64, previousGeneration string) (PublishedGeneration, error) {

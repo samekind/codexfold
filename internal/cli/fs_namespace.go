@@ -81,7 +81,7 @@ func newFSNamespaceActivateCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if err := waitForCanonicalNamespaceActivation(command.Context(), options.Mount, options.NativeRoot, 30*time.Second); err != nil {
+			if err := waitForCanonicalNamespaceActivation(command.Context(), options.Home, options.Mount, options.NativeRoot, 30*time.Second); err != nil {
 				_, rollbackErr := sessionns.Deactivate(options)
 				return errors.Join(fmt.Errorf("wait for canonical namespace passthrough: %w", err), rollbackErr)
 			}

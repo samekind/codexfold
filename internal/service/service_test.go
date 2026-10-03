@@ -304,12 +304,13 @@ func TestWindowsManagerInstallsStartsStopsAndReportsSCMState(t *testing.T) {
 	if err := manager.Start(context.Background(), "com.codexfold.fs"); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	if err := manager.Stop(context.Background(), "com.codexfold.fs"); err != nil {
-		t.Fatalf("Stop: %v", err)
-	}
 	status := manager.Status(context.Background(), "com.codexfold.fs", filepath.Join(t.TempDir(), "mount"))
 	if !status.DaemonRunning || !status.MountHealthy {
 		t.Fatalf("Windows service status = %#v", status)
+	}
+	statusRunner.outputs["sc.exe queryex com.codexfold.fs"] = []byte("STATE              : 1  STOPPED\n")
+	if err := manager.Stop(context.Background(), "com.codexfold.fs"); err != nil {
+		t.Fatalf("Stop: %v", err)
 	}
 }
 

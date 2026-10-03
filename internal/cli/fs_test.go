@@ -223,7 +223,7 @@ func TestFSNamespaceActivateAndDeactivateCommandsPreserveNativeFiles(t *testing.
 	t.Cleanup(func() { mountHealthProbe = previousProbe })
 	mountHealthProbe = func(string) error { return nil }
 	previousReadiness := waitForCanonicalNamespaceActivation
-	waitForCanonicalNamespaceActivation = func(context.Context, string, string, time.Duration) error { return nil }
+	waitForCanonicalNamespaceActivation = func(context.Context, string, string, string, time.Duration) error { return nil }
 	t.Cleanup(func() { waitForCanonicalNamespaceActivation = previousReadiness })
 	executeFS(t, []string{
 		"fs", "namespace", "activate", "--apply",
@@ -1916,7 +1916,12 @@ func TestPeriodicEnrollmentRecoversAfterMalformedPolicyIsFixed(t *testing.T) {
 
 	started := make(chan struct{}, 1)
 	runServiceEnrollmentCycle = func(context.Context, enrollmentFlags, enrollmentApplyHooks) (FSEnrollmentApplyResult, error) {
-		started <- struct{}{}
+		// Only the first start is observed below. Later 1ms cycles must not
+		// block the scheduler or cancellation while status is being polled.
+		select {
+		case started <- struct{}{}:
+		default:
+		}
 		return FSEnrollmentApplyResult{}, nil
 	}
 	ctx, cancel := context.WithCancel(context.Background())

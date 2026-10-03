@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/samekind/codexfold/internal/codex"
@@ -20,6 +21,13 @@ func probeFilesystemMigrationWriter(ctx context.Context, session codex.Session, 
 		if alias != "" && filepath.Clean(alias) != filepath.Clean(session.RolloutPath) {
 			sessions = append(sessions, codex.Session{ID: session.ID, RolloutPath: alias})
 		}
+	}
+	if runtime.GOOS == "windows" && len(sessions) > 1 {
+		// Canonical migration supplies the validated physical source and
+		// retained snapshot. Probing the mounted alias after publishing its
+		// managed owner would conflict with our own migration writer lease.
+		// Existing native writers remain visible as handles on these files.
+		sessions = sessions[1:]
 	}
 	writers, err := enrollmentWriterProbe(ctx, sessions)
 	if err != nil {

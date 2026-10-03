@@ -7,7 +7,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+
+	"github.com/samekind/codexfold/internal/mountfs"
 
 	_ "modernc.org/sqlite"
 )
@@ -95,29 +98,46 @@ func normalizeExistingRoutesStatement(options Options) string {
 }
 
 func routeGuardCase(options Options, value string) string {
-	activeMount := filepath.Join(options.Mount, "sessions") + string(filepath.Separator)
-	archiveMount := filepath.Join(options.Mount, "archived_sessions") + string(filepath.Separator)
-	activeHome := filepath.Join(options.Home, "sessions") + string(filepath.Separator)
-	archiveHome := filepath.Join(options.Home, "archived_sessions") + string(filepath.Separator)
-	activeMountSQL := quoteSQLString(activeMount)
-	archiveMountSQL := quoteSQLString(archiveMount)
-	return fmt.Sprintf(
-		`case when substr(%s, 1, length(%s)) = %s then %s || substr(%s, length(%s) + 1) else %s || substr(%s, length(%s) + 1) end`,
-		value, activeMountSQL, activeMountSQL, quoteSQLString(activeHome), value, activeMountSQL,
-		quoteSQLString(archiveHome), value, archiveMountSQL,
-	)
+	var result strings.Builder
+	result.WriteString("case ")
+	for _, prefix := range routePrefixes(options) {
+		from := quoteSQLString(prefix.mount)
+		fmt.Fprintf(&result, "when %s then %s || substr(%s, length(%s) + 1) ", routePrefixCondition(value, from), quoteSQLString(prefix.home), value, from)
+	}
+	fmt.Fprintf(&result, "else %s end", value)
+	return result.String()
 }
 
 func routeGuardCondition(options Options, value string) string {
-	activeMount := filepath.Join(options.Mount, "sessions") + string(filepath.Separator)
-	archiveMount := filepath.Join(options.Mount, "archived_sessions") + string(filepath.Separator)
-	activeMountSQL := quoteSQLString(activeMount)
-	archiveMountSQL := quoteSQLString(archiveMount)
-	return fmt.Sprintf(
-		`substr(%s, 1, length(%s)) = %s or substr(%s, 1, length(%s)) = %s`,
-		value, activeMountSQL, activeMountSQL,
-		value, archiveMountSQL, archiveMountSQL,
-	)
+	var conditions []string
+	for _, prefix := range routePrefixes(options) {
+		conditions = append(conditions, routePrefixCondition(value, quoteSQLString(prefix.mount)))
+	}
+	return strings.Join(conditions, " or ")
+}
+
+type routePrefix struct{ mount, home string }
+
+func routePrefixes(options Options) []routePrefix {
+	roots := []string{options.Mount}
+	if runtime.GOOS == "windows" && len(filepath.Clean(options.Mount)) == 3 && filepath.Dir(options.Mount) == options.Mount {
+		unc := mountfs.WindowsUNCPath(options.Home, options.Mount)
+		roots = append(roots, `\\?\`+filepath.Clean(options.Mount), unc, `\\?\UNC\`+strings.TrimPrefix(unc, `\\`))
+	}
+	var prefixes []routePrefix
+	for _, root := range roots {
+		for _, namespace := range sessionDirectories {
+			prefixes = append(prefixes, routePrefix{filepath.Join(root, namespace) + string(filepath.Separator), filepath.Join(options.Home, namespace) + string(filepath.Separator)})
+		}
+	}
+	return prefixes
+}
+
+func routePrefixCondition(value, prefix string) string {
+	if runtime.GOOS == "windows" {
+		return fmt.Sprintf("lower(substr(%s, 1, length(%s))) = lower(%s)", value, prefix, prefix)
+	}
+	return fmt.Sprintf("substr(%s, 1, length(%s)) = %s", value, prefix, prefix)
 }
 
 func quoteSQLString(value string) string {

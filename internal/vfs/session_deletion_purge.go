@@ -22,13 +22,16 @@ const (
 	sessionDeletionPurgeVersion = 3
 	sessionDeletionPurgeKind    = "managed-session-deletion-purge"
 
-	sessionDeletionObjectProofDarwin = "darwin-stat-generation-birthtime-v1"
-	sessionDeletionObjectProofLinux  = "linux-statx-btime-fs-ioc-getversion-v1"
+	sessionDeletionObjectProofDarwin  = "darwin-stat-generation-birthtime-v1"
+	sessionDeletionObjectProofLinux   = "linux-statx-btime-fs-ioc-getversion-v1"
+	sessionDeletionObjectProofWindows = "windows-ntfs-file-reference-creation-time-v1"
 
-	sessionDeletionGenerationSourceDarwin = "stat.st_gen"
-	sessionDeletionBirthtimeSourceDarwin  = "stat.st_birthtimespec"
-	sessionDeletionGenerationSourceLinux  = "FS_IOC_GETVERSION"
-	sessionDeletionBirthtimeSourceLinux   = "statx.AT_EMPTY_PATH.STATX_BTIME"
+	sessionDeletionGenerationSourceDarwin  = "stat.st_gen"
+	sessionDeletionBirthtimeSourceDarwin   = "stat.st_birthtimespec"
+	sessionDeletionGenerationSourceLinux   = "FS_IOC_GETVERSION"
+	sessionDeletionBirthtimeSourceLinux    = "statx.AT_EMPTY_PATH.STATX_BTIME"
+	sessionDeletionGenerationSourceWindows = "NTFS.file-reference.sequence"
+	sessionDeletionBirthtimeSourceWindows  = "BY_HANDLE_FILE_INFORMATION.CreationTime"
 
 	sessionDeletionPurgePrepared = "prepared"
 	sessionDeletionPurgeRenamed  = "renamed"
@@ -66,6 +69,8 @@ type SessionDeletionPurgeObject struct {
 	BirthtimeUnixNano int64  `json:"birthtime_unix_nano"`
 	UID               uint32 `json:"uid"`
 	GID               uint32 `json:"gid"`
+	SecuritySHA256    string `json:"security_sha256,omitempty"`
+	Attributes        uint32 `json:"attributes,omitempty"`
 }
 
 type SessionDeletionPurgeXattrs struct {
@@ -1181,6 +1186,9 @@ func validSessionDeletionPurgeObject(object SessionDeletionPurgeObject) bool {
 	if object.Device == 0 || object.Inode == 0 || object.BirthtimeUnixNano <= 0 {
 		return false
 	}
+	if object.IdentityProof != sessionDeletionObjectProofWindows && (object.SecuritySHA256 != "" || object.Attributes != 0) {
+		return false
+	}
 	switch object.IdentityProof {
 	case sessionDeletionObjectProofDarwin:
 		return object.GenerationSource == sessionDeletionGenerationSourceDarwin &&
@@ -1189,13 +1197,17 @@ func validSessionDeletionPurgeObject(object SessionDeletionPurgeObject) bool {
 		return object.Generation != 0 &&
 			object.GenerationSource == sessionDeletionGenerationSourceLinux &&
 			object.BirthtimeSource == sessionDeletionBirthtimeSourceLinux
+	case sessionDeletionObjectProofWindows:
+		return object.Generation != 0 && object.Generation == object.Inode>>48 &&
+			object.GenerationSource == sessionDeletionGenerationSourceWindows &&
+			object.BirthtimeSource == sessionDeletionBirthtimeSourceWindows && validStateSHA256(object.SecuritySHA256)
 	default:
 		return false
 	}
 }
 
 func deletionPurgeObjectHashFields(object SessionDeletionPurgeObject) string {
-	return object.IdentityProof + "\x00" +
+	fields := object.IdentityProof + "\x00" +
 		object.GenerationSource + "\x00" +
 		object.BirthtimeSource + "\x00" +
 		strconv.FormatUint(object.Device, 10) + "\x00" +
@@ -1204,6 +1216,10 @@ func deletionPurgeObjectHashFields(object SessionDeletionPurgeObject) string {
 		strconv.FormatInt(object.BirthtimeUnixNano, 10) + "\x00" +
 		strconv.FormatUint(uint64(object.UID), 10) + "\x00" +
 		strconv.FormatUint(uint64(object.GID), 10)
+	if object.IdentityProof == sessionDeletionObjectProofWindows {
+		fields += "\x00" + object.SecuritySHA256 + "\x00" + strconv.FormatUint(uint64(object.Attributes), 10)
+	}
+	return fields
 }
 
 func validSessionDeletionPurgeXattrs(xattrs SessionDeletionPurgeXattrs) bool {

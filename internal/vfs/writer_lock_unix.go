@@ -5,9 +5,22 @@ package vfs
 import (
 	"errors"
 	"os"
+	"path/filepath"
 
 	"golang.org/x/sys/unix"
 )
+
+func acquireInitialWriterLease(staging, _ string) (*os.File, error) {
+	return acquireWriterLease(filepath.Join(staging, "writer.lease"))
+}
+
+func openWriterLeaseFile(path string, create bool) (*os.File, error) {
+	flags := os.O_RDWR
+	if create {
+		flags |= os.O_CREATE
+	}
+	return os.OpenFile(path, flags, 0o600)
+}
 
 func tryLockWriterFile(file *os.File) (bool, error) {
 	err := unix.Flock(int(file.Fd()), unix.LOCK_EX|unix.LOCK_NB)

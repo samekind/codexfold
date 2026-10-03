@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/klauspost/compress/zstd"
+	"github.com/samekind/codexfold/internal/dirsync"
 	"github.com/samekind/codexfold/internal/fold"
 	"github.com/samekind/codexfold/internal/storage"
 	_ "modernc.org/sqlite"
@@ -714,7 +715,7 @@ func syncDirectory(path string) error {
 		return fmt.Errorf("open directory for sync %s: %w", path, err)
 	}
 	defer directory.Close()
-	if err := directory.Sync(); err != nil {
+	if err := dirsync.Sync(directory); err != nil {
 		return fmt.Errorf("sync directory %s: %w", path, err)
 	}
 	return nil

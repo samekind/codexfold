@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"sort"
 
+	"github.com/samekind/codexfold/internal/dirsync"
 	"github.com/samekind/codexfold/internal/storage"
 )
 
@@ -487,7 +488,7 @@ func syncManagedSessionRegistryRoot(root *os.Root) error {
 		return err
 	}
 	defer directory.Close()
-	if err := directory.Sync(); err != nil {
+	if err := dirsync.Sync(directory); err != nil {
 		return fmt.Errorf("sync managed session registry directory: %w", err)
 	}
 	return nil

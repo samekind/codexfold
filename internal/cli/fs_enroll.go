@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/samekind/codexfold/internal/codex"
@@ -39,6 +40,8 @@ type enrollmentFlags struct {
 	statusPaths        []string
 	reclaimWorkers     int
 	backgroundIdle     func() bool
+	externalWorker     bool
+	filesystemReady    func() error
 }
 
 type enrollmentApplyHooks struct {
@@ -92,6 +95,7 @@ var runEnrollmentCommand = func(ctx context.Context, args []string) error {
 		}
 	}
 	command.Env = enrollmentChildEnvironment(os.Environ())
+	configureEnrollmentChild(command)
 	output, err := command.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("%s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(output)))
@@ -142,6 +146,9 @@ func newFSEnrollCommand() *cobra.Command {
 	command.AddCommand(newFSEnrollPlanCommand())
 	command.AddCommand(newFSEnrollApplyCommand())
 	command.AddCommand(newFSEnrollReclaimCommand())
+	command.AddCommand(newFSEnrollRunCommand())
+	command.AddCommand(newFSEnrollStopCommand())
+	addPlatformEnrollmentCommands(command)
 	return command
 }
 
@@ -322,6 +329,10 @@ func applyEnrollmentCycle(ctx context.Context, flags enrollmentFlags, hooks enro
 			foldErrors = append(foldErrors, fmt.Errorf("prepare enrollment for %s: %w", decision.SessionID, err))
 			continue
 		}
+		if err := normalizeEnrollmentAlias(ctx, home, &decision); err != nil {
+			foldErrors = append(foldErrors, fmt.Errorf("normalize enrollment path for %s: %w", decision.SessionID, err))
+			continue
+		}
 		if err := runEnrollmentCommand(ctx, []string{"fold", decision.SessionID, "--codex-home", home, "--store", store, "--apply", "--overwrite"}); err != nil {
 			if ctx.Err() != nil {
 				return result, err
@@ -461,7 +472,7 @@ func runPeriodicEnrollment(ctx context.Context, flags enrollmentFlags, interval 
 	if control.Enabled {
 		nextApply = time.Now()
 	}
-	progress := applyEnrollmentControl(newEnrollmentProgress(flags, control, enroll.PhaseDisabled), flags, control)
+	progress := applyEnrollmentControl(newEnrollmentProgress(flags, control, enrollmentInactivePhase(control)), flags, control)
 	if control.Enabled {
 		progress.Phase = enroll.PhaseIdle
 		progress.NextCheckAt = nextApply
@@ -506,7 +517,7 @@ func runPeriodicEnrollment(ctx context.Context, flags enrollmentFlags, interval 
 				progress.Phase = enroll.PhaseIdle
 				progress.NextCheckAt = nextApply
 			} else {
-				progress.Phase = enroll.PhaseDisabled
+				progress.Phase = enrollmentInactivePhase(control)
 				progress.NextCheckAt = time.Time{}
 			}
 			publishEnrollmentProgress(flags, progress)
@@ -515,10 +526,12 @@ func runPeriodicEnrollment(ctx context.Context, flags enrollmentFlags, interval 
 		if !control.Enabled || nextApply.IsZero() || now.Before(nextApply) {
 			progress = applyEnrollmentControl(progress, flags, control)
 			if control.Enabled {
-				progress.Phase = enroll.PhaseIdle
+				if progress.Phase != enroll.PhaseWaitingReclaim {
+					progress.Phase = enroll.PhaseIdle
+				}
 				progress.NextCheckAt = nextApply
 			} else {
-				progress.Phase = enroll.PhaseDisabled
+				progress.Phase = enrollmentInactivePhase(control)
 				progress.NextCheckAt = time.Time{}
 			}
 			publishEnrollmentProgress(flags, progress)
@@ -536,6 +549,11 @@ func runPeriodicEnrollment(ctx context.Context, flags enrollmentFlags, interval 
 
 		cycleCtx, cycleCancel := context.WithCancel(ctx)
 		watchDone := make(chan struct{})
+		// The cycle can spend minutes inside a child command. Keep publishing
+		// worker liveness without inventing completed operations, and serialize
+		// those writes with phase/progress callbacks so an older snapshot cannot
+		// overwrite a newer one.
+		var progressMu sync.Mutex
 		go func() {
 			defer close(watchDone)
 			poll := enrollmentPolicyPollInterval
@@ -553,16 +571,27 @@ func runPeriodicEnrollment(ctx context.Context, flags enrollmentFlags, interval 
 						cycleCancel()
 						return
 					}
+					progressMu.Lock()
+					publishEnrollmentProgress(flags, progress)
+					progressMu.Unlock()
 				}
 			}
 		}()
 		result, err := runServiceEnrollmentCycle(cycleCtx, cycleFlags, enrollmentApplyHooks{
-			onManagedCount: func(count int) { progress.ManagedCount = count },
+			onManagedCount: func(count int) {
+				progressMu.Lock()
+				defer progressMu.Unlock()
+				progress.ManagedCount = count
+			},
 			onPhase: func(phase string) {
+				progressMu.Lock()
+				defer progressMu.Unlock()
 				progress.Phase = phase
 				publishEnrollmentProgress(flags, progress)
 			},
 			onProgress: func(done, total int) {
+				progressMu.Lock()
+				defer progressMu.Unlock()
 				progress.CycleDone = done
 				progress.CycleTotal = total
 				publishEnrollmentProgress(flags, progress)
@@ -603,7 +632,7 @@ func runPeriodicEnrollment(ctx context.Context, flags enrollmentFlags, interval 
 			progress.NextCheckAt = nextApply
 		} else {
 			nextApply = time.Time{}
-			progress.Phase = enroll.PhaseDisabled
+			progress.Phase = enrollmentInactivePhase(control)
 			progress.NextCheckAt = time.Time{}
 		}
 		progress = applyEnrollmentControl(progress, flags, control)
@@ -638,9 +667,30 @@ func resolveEnrollmentControl(flags enrollmentFlags, flagInterval time.Duration)
 	}
 	control, err := enroll.LoadControl(path)
 	if err != nil {
-		return enroll.Control{
+		invalid := enroll.Control{
 			Present:     true,
 			ConfigError: fmt.Sprintf("enrollment policy is invalid: %v", err),
+		}
+		if flags.externalWorker {
+			invalid.BlockedPhase = enroll.PhaseConfigInvalid
+		}
+		return invalid
+	}
+	if flags.externalWorker {
+		// A missing worker policy must not revive process defaults. The service
+		// stays available for a later valid policy, without changing user intent.
+		control.Present = true
+		control.RequestedEnabled = control.Enabled
+		if control.Enabled {
+			readyErr := requireBuiltinEnrollmentPaused(enrollmentStorePath(flags), time.Now())
+			if readyErr == nil && flags.filesystemReady != nil {
+				readyErr = flags.filesystemReady()
+			}
+			if readyErr != nil {
+				control.Enabled = false
+				control.BlockedPhase = enroll.PhaseWaitingFilesystem
+				control.BlockReason = readyErr.Error()
+			}
 		}
 	}
 	if !control.Present {
@@ -663,6 +713,9 @@ func flagEnrollmentControl(flags enrollmentFlags, flagInterval time.Duration) en
 }
 
 func enrollmentControlPath(flags enrollmentFlags) string {
+	if flags.externalWorker {
+		return enroll.WorkerControlPath(enrollmentStorePath(flags))
+	}
 	if flags.storeDir != "" {
 		if !filepath.IsAbs(flags.storeDir) {
 			return ""
@@ -695,6 +748,9 @@ func effectiveEnrollmentInterval(control enroll.Control, flagInterval time.Durat
 func enrollmentControlChanged(previous enroll.Control, next enroll.Control) bool {
 	return previous.Present != next.Present ||
 		previous.ConfigError != next.ConfigError ||
+		previous.RequestedEnabled != next.RequestedEnabled ||
+		previous.BlockedPhase != next.BlockedPhase ||
+		previous.BlockReason != next.BlockReason ||
 		previous.Enabled != next.Enabled ||
 		previous.Interval != next.Interval ||
 		previous.StableFor != next.StableFor ||
@@ -731,14 +787,17 @@ func newEnrollmentProgress(flags enrollmentFlags, control enroll.Control, phase 
 }
 
 func applyEnrollmentControl(progress enroll.Progress, flags enrollmentFlags, control enroll.Control) enroll.Progress {
-	progress.Enabled = control.Enabled
+	progress.Enabled = control.Enabled || control.RequestedEnabled
 	progress.Interval = control.Interval
 	progress.StableFor = control.StableFor
 	progress.ArchivedOnly = control.ArchivedOnly
 	if control.ConfigError != "" {
 		progress.LastError = control.ConfigError
 		progress.ErrorKind = "configuration"
-	} else if progress.ErrorKind == "configuration" {
+	} else if control.BlockReason != "" {
+		progress.LastError = control.BlockReason
+		progress.ErrorKind = "filesystem"
+	} else if progress.ErrorKind == "configuration" || progress.ErrorKind == "filesystem" {
 		progress.LastError = ""
 		progress.ErrorKind = ""
 	}
@@ -749,6 +808,13 @@ func applyEnrollmentControl(progress enroll.Progress, flags enrollmentFlags, con
 	// instead of rediscovering every managed state on each heartbeat; startup
 	// and completed cycles refresh it, while managed status reports live health.
 	return progress
+}
+
+func enrollmentInactivePhase(control enroll.Control) string {
+	if control.BlockedPhase != "" {
+		return control.BlockedPhase
+	}
+	return enroll.PhaseDisabled
 }
 
 func enrollmentStorePath(flags enrollmentFlags) string {
@@ -797,7 +863,11 @@ func enrollmentManagedCount(flags enrollmentFlags, result FSEnrollmentApplyResul
 func publishEnrollmentProgress(flags enrollmentFlags, progress enroll.Progress) {
 	paths := append([]string(nil), flags.statusPaths...)
 	if store := enrollmentStorePath(flags); store != "" {
-		paths = append(paths, enroll.ProgressPath(store))
+		if flags.externalWorker {
+			paths = append(paths, enroll.WorkerProgressPath(store))
+		} else {
+			paths = append(paths, enroll.ProgressPath(store))
+		}
 	}
 	seen := make(map[string]struct{}, len(paths))
 	for _, path := range paths {
