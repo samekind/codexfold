@@ -28,6 +28,13 @@ func InspectBuild(platform Platform, definitionPath string, mountPoint string) B
 		status.Error = err.Error()
 		return status
 	}
+	if platform == PlatformWindows {
+		binaryPath, err = configuredWindowsCoreImage(binaryPath)
+		if err != nil {
+			status.Error = err.Error()
+			return status
+		}
+	}
 	status.ConfiguredBinaryPath = binaryPath
 	status.ConfiguredBuildSHA256, err = buildid.FileSHA256(binaryPath)
 	if err != nil {
@@ -172,6 +179,9 @@ func DefinitionFSKitResource(platform Platform, definitionPath string) (string, 
 // DefinitionMountPoint reports the --mount argument of a native-fskit launchd
 // definition. It returns an empty string for non-native-fskit definitions.
 func DefinitionMountPoint(platform Platform, definitionPath string) (string, error) {
+	if platform == PlatformWindows {
+		return windowsDefinitionPath(definitionPath, "--mount")
+	}
 	frontend, err := DefinitionFrontend(platform, definitionPath)
 	if err != nil {
 		return "", err
@@ -200,6 +210,9 @@ func DefinitionMountPoint(platform Platform, definitionPath string) (string, err
 }
 
 func DefinitionStore(platform Platform, definitionPath string) (string, error) {
+	if platform == PlatformWindows {
+		return windowsDefinitionPath(definitionPath, "--store")
+	}
 	if !filepath.IsAbs(definitionPath) {
 		return "", errors.New("absolute service definition path is required")
 	}
@@ -231,6 +244,9 @@ func DefinitionStore(platform Platform, definitionPath string) (string, error) {
 // native FSKit is the macOS frontend and other service definitions do not yet
 // expose an equivalent introspection contract.
 func DefinitionNativeRoot(platform Platform, definitionPath string) (string, error) {
+	if platform == PlatformWindows {
+		return windowsDefinitionPath(definitionPath, "--native-root")
+	}
 	if !filepath.IsAbs(definitionPath) {
 		return "", errors.New("absolute service definition path is required")
 	}

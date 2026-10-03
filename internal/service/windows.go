@@ -14,6 +14,7 @@ import (
 const windowsConfigVersion = 1
 
 var windowsRunningState = regexp.MustCompile(`(?m)STATE\s*:\s*4\s+RUNNING\b`)
+var windowsStoppedState = regexp.MustCompile(`(?m)STATE\s*:\s*1\s+STOPPED\b`)
 
 type WindowsConfig struct {
 	Version     int      `json:"version"`
@@ -88,8 +89,37 @@ func (m WindowsManager) Install(ctx context.Context, name string, binaryPath str
 	if output, err := m.runner().Run(ctx, "sc.exe", "description", name, "CodexFold transparent Codex session filesystem"); err != nil {
 		return commandFailure("sc.exe description", output, err)
 	}
-	if output, err := m.runner().Run(ctx, "sc.exe", "failure", name, "reset=", "86400", "actions=", "restart/5000/restart/15000/\"\"/0"); err != nil {
+	if output, err := m.runner().Run(ctx, "sc.exe", "failure", name, "reset=", "86400", "actions=", "restart/5000/restart/15000/restart/60000"); err != nil {
 		return commandFailure("sc.exe failure", output, err)
+	}
+	if output, err := m.runner().Run(ctx, "sc.exe", "failureflag", name, "1"); err != nil {
+		return commandFailure("sc.exe failureflag", output, err)
+	}
+	return nil
+}
+
+func (m WindowsManager) InstallEnrollment(ctx context.Context, name, binary, definition string) error {
+	if !safeLabel(name) || !absoluteWindowsServicePath(binary) || !absoluteWindowsServicePath(definition) {
+		return errors.New("safe enrollment service name and absolute installation paths are required")
+	}
+	command := strings.Join([]string{quoteWindowsCommandLineArgument(binary), "fs", "enroll", "service", "run", "--definition", quoteWindowsCommandLineArgument(definition)}, " ")
+	_, existsErr := m.runner().Run(ctx, "sc.exe", "query", name)
+	operation := "create"
+	args := []string{operation, name, "binPath=", command, "start=", "delayed-auto", "DisplayName=", "CodexFold Automatic Enrollment"}
+	if existsErr == nil {
+		args[0] = "config"
+	}
+	if output, err := m.runner().Run(ctx, "sc.exe", args...); err != nil {
+		return commandFailure("sc.exe enrollment registration", output, err)
+	}
+	if output, err := m.runner().Run(ctx, "sc.exe", "description", name, "CodexFold persistent automatic session enrollment"); err != nil {
+		return commandFailure("sc.exe description", output, err)
+	}
+	if output, err := m.runner().Run(ctx, "sc.exe", "failure", name, "reset=", "86400", "actions=", "restart/5000/restart/15000/restart/60000"); err != nil {
+		return commandFailure("sc.exe failure", output, err)
+	}
+	if output, err := m.runner().Run(ctx, "sc.exe", "failureflag", name, "1"); err != nil {
+		return commandFailure("sc.exe failureflag", output, err)
 	}
 	return nil
 }
@@ -113,7 +143,24 @@ func (m WindowsManager) Stop(ctx context.Context, name string) error {
 	if err != nil {
 		return commandFailure("sc.exe stop", output, err)
 	}
-	return nil
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		output, err = m.runner().Run(ctx, "sc.exe", "queryex", name)
+		if err != nil {
+			return commandFailure("sc.exe queryex", output, err)
+		}
+		if windowsStoppedState.Match(output) {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return errors.New("Windows filesystem service did not finish stopping")
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
 }
 
 func (m WindowsManager) Status(ctx context.Context, name string, mountPoint string) Status {

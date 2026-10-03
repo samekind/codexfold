@@ -584,8 +584,11 @@ func newFSServeCommand() *cobra.Command {
 				}
 				nativeRoot = filepath.Clean(nativeRoot)
 			}
-			if frontend != "fuse" && frontend != "native-fskit" {
-				return errors.New("filesystem frontend must be fuse or native-fskit")
+			if frontend != "fuse" && frontend != "native-fskit" && frontend != "windows-proxy" && frontend != "windows-engine" {
+				return errors.New("filesystem frontend must be fuse, native-fskit, windows-proxy or windows-engine")
+			}
+			if strings.HasPrefix(frontend, "windows-") && runtime.GOOS != "windows" {
+				return errors.New("Windows engine frontends are available only on Windows")
 			}
 			if frontend == "native-fskit" {
 				if runtime.GOOS != "darwin" {
@@ -615,6 +618,16 @@ func newFSServeCommand() *cobra.Command {
 				if err := ensureFSServeStore(store); err != nil {
 					return err
 				}
+			}
+			if frontend == "windows-proxy" && apply {
+				return serveWindowsResidentHost(command, home, store, mount, foreground)
+			}
+			if frontend == "windows-engine" && apply {
+				stopEngine, err := prepareWindowsStorageEngine(command)
+				if err != nil {
+					return err
+				}
+				defer stopEngine()
 			}
 			states, _, err := vfs.DiscoverSessionStatesDetailedReadOnly(store)
 			if err != nil && !(errors.Is(err, os.ErrNotExist) && !apply) {
@@ -776,6 +789,8 @@ func newFSServeCommand() *cobra.Command {
 			known := make(map[string]uint64)
 			knownRoutes := make(map[string]string)
 			knownPacks := make(map[string]string)
+			pendingRecovery := make(map[string]bool)
+			recoveryRequested := make(chan struct{}, 1)
 			lastStateIssueSignature := ""
 			lastReloadError := ""
 			lastMissingKnownSignature := ""
@@ -788,6 +803,8 @@ func newFSServeCommand() *cobra.Command {
 			managedStatusPath := ""
 			if frontend == "native-fskit" {
 				managedStatusPath = service.FSKitStatusPath(nativeFSKitResource, "managed")
+			} else if runtime.GOOS == "windows" {
+				managedStatusPath = filepath.Join(store, "fs", "status", "managed.json")
 			}
 			managedStatus := newManagedStatusReporterForStore(managedStatusPath, store, mount, nativeFSKitResource, func(err error) {
 				_, _ = fmt.Fprintf(command.ErrOrStderr(), "write managed session status: %v\n", err)
@@ -811,6 +828,7 @@ func newFSServeCommand() *cobra.Command {
 				delete(known, sessionID)
 				delete(knownRoutes, sessionID)
 				delete(knownPacks, sessionID)
+				delete(pendingRecovery, sessionID)
 				observation := managedReloadObservation{
 					Sequence:        nextManagedObservationSequence(),
 					Fatal:           fmt.Errorf("open managed session %s: %w", sessionID, err),
@@ -842,6 +860,12 @@ func newFSServeCommand() *cobra.Command {
 					if err == nil {
 						known[state.SessionID] = state.Generation
 						knownPacks[state.SessionID] = resolver.Generation()
+						// An exact read-only open still needs background recovery.
+						pendingRecovery[state.SessionID] = true
+						select {
+						case recoveryRequested <- struct{}{}:
+						default:
+						}
 					} else {
 						recordManagedLoaderFailure(sessionID, started, err)
 					}
@@ -1156,7 +1180,7 @@ func newFSServeCommand() *cobra.Command {
 							continue
 						}
 						generation, generationKnown := known[state.SessionID]
-						if generationKnown && generation == state.Generation && knownPacks[state.SessionID] == currentPack {
+						if !pendingRecovery[state.SessionID] && generationKnown && generation == state.Generation && knownPacks[state.SessionID] == currentPack {
 							if knownRoutes[state.SessionID] == route {
 								continue
 							}
@@ -1177,9 +1201,10 @@ func newFSServeCommand() *cobra.Command {
 							return observation
 						}
 						upsertTime += time.Since(stepStarted)
+						delete(pendingRecovery, state.SessionID)
 						continue
 					}
-					if known[state.SessionID] == state.Generation && knownPacks[state.SessionID] == currentPack {
+					if !pendingRecovery[state.SessionID] && known[state.SessionID] == state.Generation && knownPacks[state.SessionID] == currentPack {
 						continue
 					}
 					managed, resolver, err := openState(state)
@@ -1193,6 +1218,7 @@ func newFSServeCommand() *cobra.Command {
 					}
 					known[state.SessionID] = managed.State().Generation
 					knownPacks[state.SessionID] = resolver.Generation()
+					delete(pendingRecovery, state.SessionID)
 				}
 				if profileStartup {
 					_, _ = fmt.Fprintf(command.ErrOrStderr(), "startup-profile loop retirement_sync=%s upsert=%s open=%s attach=%s ack=%s states=%d\n", retirementSyncTime, upsertTime, upsertProfile.Open, upsertProfile.Attach, upsertProfile.Ack, len(states))
@@ -1250,12 +1276,16 @@ func newFSServeCommand() *cobra.Command {
 			})
 			var storageStatusDone <-chan struct{}
 			var activityCounter *mountfs.IOActivityCounter
-			if frontend == "native-fskit" {
+			if frontend == "native-fskit" || runtime.GOOS == "windows" {
+				storageStatusPath := service.FSKitStatusPath(nativeFSKitResource, "storage")
+				if runtime.GOOS == "windows" {
+					storageStatusPath = filepath.Join(store, "fs", "status", "storage.json")
+				}
 				storageStatusDone = startStorageStatusReporter(
 					ctx,
 					command.ErrOrStderr(),
 					store,
-					service.FSKitStatusPath(nativeFSKitResource, "storage"),
+					storageStatusPath,
 					10*time.Minute,
 					storageMaintenanceDone,
 					storageStatusRefresh,
@@ -1268,12 +1298,14 @@ func newFSServeCommand() *cobra.Command {
 			watcherDone := make(chan struct{})
 			go func() {
 				defer close(watcherDone)
-				runManagedReloadLoopAfterInitial(ctx, time.Second, 10*time.Second, initialManagedReloadErr, load, func(err error) {
+				runManagedReloadLoopAfterInitial(ctx, time.Second, 10*time.Second, initialManagedReloadErr, recoveryRequested, load, func(err error) {
 					reportManagedReloadSafe(err)
 				})
 			}()
 			var mountErr error
-			if frontend == "native-fskit" {
+			if frontend == "windows-engine" {
+				mountErr = serveWindowsStorageEngine(ctx, command, filesystem, startEnrollment)
+			} else if frontend == "native-fskit" {
 				mountErr = mountfs.ServeNativeFSKit(ctx, filesystem, mountfs.NativeFSKitServerOptions{
 					SocketPath: nativeFSKitSocket, ResourcePath: nativeFSKitResource,
 					StatusPath: service.FSKitStatusPath(nativeFSKitResource, "daemon"), MountPoint: mount,
@@ -1283,8 +1315,10 @@ func newFSServeCommand() *cobra.Command {
 					OnReady:                    startEnrollment,
 				})
 			} else {
+				stopStatus := startPlatformDaemonStatus(ctx, store, mount, activityCounter, command.ErrOrStderr())
 				startEnrollment()
-				mountErr = mountfs.Mount(ctx, mountfs.HostOptions{MountPoint: mount, Filesystem: filesystem, Foreground: foreground, OperationRecorder: operationRecorder})
+				mountErr = mountfs.Mount(ctx, mountfs.HostOptions{MountPoint: mount, StorageRoot: store, NamespaceRoot: home, Filesystem: filesystem, Foreground: foreground, OperationRecorder: operationRecorder, Activity: activityCounter})
+				stopStatus()
 			}
 			cancel()
 			<-managedHeartbeatDone
@@ -1303,6 +1337,9 @@ func newFSServeCommand() *cobra.Command {
 				}
 			}
 			sessionCloseErr := filesystem.CloseSessions()
+			if frontend == "windows-engine" && errors.Is(mountErr, context.Canceled) {
+				mountErr = nil
+			}
 			return errors.Join(mountErr, nativeWatcherErr, sessionCloseErr)
 		},
 	}
@@ -1313,7 +1350,7 @@ func newFSServeCommand() *cobra.Command {
 	command.Flags().BoolVar(&foreground, "foreground", true, "Keep the FUSE host in the foreground")
 	command.Flags().BoolVar(&canonicalNamespace, "canonical-namespace", false, "Expose sessions and archived_sessions as a shared virtual namespace")
 	command.Flags().StringVar(&nativeRoot, "native-root", "", "Backing root for unmanaged canonical session files")
-	command.Flags().StringVar(&frontend, "frontend", "fuse", "Filesystem frontend: fuse or native-fskit")
+	command.Flags().StringVar(&frontend, "frontend", "fuse", "Filesystem frontend: fuse, native-fskit, windows-proxy or windows-engine")
 	command.Flags().StringVar(&nativeFSKitSocket, "fskit-socket", "", "Native FSKit daemon Unix socket; defaults to a short per-home path in /private/tmp")
 	command.Flags().StringVar(&nativeFSKitResource, "fskit-resource", "", "Native FSKit resource; defaults to the security-scoped <store>/fs/native-fskit directory")
 	command.Flags().StringVar(&operationTracePath, "operation-trace", "", "Absolute path for sanitized FUSE operation names")
@@ -1604,19 +1641,19 @@ func startManagedStatusHeartbeat(ctx context.Context, reporter *managedStatusRep
 func runManagedReloadLoop(ctx context.Context, minimumDelay time.Duration, maximumDelay time.Duration, load func() error, report func(error)) {
 	delayState := newManagedReloadDelayState(minimumDelay, maximumDelay, managedRecoveryDeadline)
 	delay := delayState.minimumDelay
-	runManagedReloadLoopWithDelay(ctx, delayState, delay, load, report)
+	runManagedReloadLoopWithDelay(ctx, delayState, delay, nil, load, report)
 }
 
-func runManagedReloadLoopAfterInitial(ctx context.Context, minimumDelay time.Duration, maximumDelay time.Duration, initialErr error, load func() error, report func(error)) {
+func runManagedReloadLoopAfterInitial(ctx context.Context, minimumDelay time.Duration, maximumDelay time.Duration, initialErr error, wake <-chan struct{}, load func() error, report func(error)) {
 	delayState := newManagedReloadDelayState(minimumDelay, maximumDelay, managedRecoveryDeadline)
 	// The synchronous startup load has already observed current state. A
 	// healthy backend can wait for the normal poll; a failed load must retry
 	// promptly so the ten-second incident deadline remains meaningful.
 	delay := delayState.next(initialErr, time.Now())
-	runManagedReloadLoopWithDelay(ctx, delayState, delay, load, report)
+	runManagedReloadLoopWithDelay(ctx, delayState, delay, wake, load, report)
 }
 
-func runManagedReloadLoopWithDelay(ctx context.Context, delayState managedReloadDelayState, delay time.Duration, load func() error, report func(error)) {
+func runManagedReloadLoopWithDelay(ctx context.Context, delayState managedReloadDelayState, delay time.Duration, wake <-chan struct{}, load func() error, report func(error)) {
 	for {
 		timer := time.NewTimer(delay)
 		select {
@@ -1626,6 +1663,8 @@ func runManagedReloadLoopWithDelay(ctx context.Context, delayState managedReload
 			}
 			return
 		case <-timer.C:
+		case <-wake:
+			timer.Stop()
 		}
 		err := load()
 		report(err)

@@ -14,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"unicode/utf8"
+
+	"github.com/samekind/codexfold/internal/dirsync"
 )
 
 const (
@@ -659,7 +661,7 @@ func syncDirectory(path string) error {
 	if err != nil {
 		return err
 	}
-	syncErr := directory.Sync()
+	syncErr := dirsync.Sync(directory)
 	closeErr := directory.Close()
 	return errors.Join(syncErr, closeErr)
 }

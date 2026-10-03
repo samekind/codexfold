@@ -61,7 +61,7 @@ func TestPeriodicEnrollmentDeferredReclaimStaysIncompleteWithoutError(t *testing
 		runPeriodicEnrollment(ctx, enrollmentFlags{storeDir: store}, time.Minute, nil)
 	}()
 	defer func() { cancel(); <-done }()
-	deadline := time.Now().Add(time.Second)
+	deadline := time.Now().Add(3 * enrollmentPolicyPollInterval)
 	for time.Now().Before(deadline) {
 		progress, err := enroll.LoadProgress(enroll.ProgressPath(store))
 		if err == nil && progress.Phase == enroll.PhaseWaitingReclaim {
@@ -72,7 +72,8 @@ func TestPeriodicEnrollmentDeferredReclaimStaysIncompleteWithoutError(t *testing
 		}
 		time.Sleep(time.Millisecond)
 	}
-	t.Fatal("deferred cleanup was not published")
+	progress, err := enroll.LoadProgress(enroll.ProgressPath(store))
+	t.Fatalf("deferred cleanup was not published: progress=%#v error=%v", progress, err)
 }
 
 func TestEnrollmentReclaimProgressWaitsForMaintenance(t *testing.T) {

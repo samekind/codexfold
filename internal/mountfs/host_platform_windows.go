@@ -37,17 +37,17 @@ func setFileTimes(path string, times []fuse.Timespec) int {
 }
 
 func setExtendedAttribute(string, string, []byte, int) int {
-	return -int(syscall.ENOSYS)
+	return fuseResult(syscall.ENOSYS)
 }
 
 func getExtendedAttribute(string, string) (int, []byte) {
-	return -int(syscall.ENOSYS), nil
+	return fuseResult(syscall.ENOSYS), nil
 }
 
 func listExtendedAttributes(string) (int, []string) {
-	return -int(syscall.ENOSYS), nil
+	return fuseResult(syscall.ENOSYS), nil
 }
 
 func removeExtendedAttribute(string, string) int {
-	return -int(syscall.ENOSYS)
+	return fuseResult(syscall.ENOSYS)
 }

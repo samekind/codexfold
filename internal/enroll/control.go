@@ -2,6 +2,8 @@ package enroll
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,14 +17,17 @@ const (
 	controlVersion  = 1
 	progressVersion = 1
 
-	PhaseDisabled       = "disabled"
-	PhaseIdle           = "idle"
-	PhaseChecking       = "checking"
-	PhaseFolding        = "folding"
-	PhasePacking        = "packing"
-	PhaseMigrating      = "migrating"
-	PhaseReclaiming     = "reclaiming"
-	PhaseWaitingReclaim = "waiting-reclaim"
+	PhaseDisabled          = "disabled"
+	PhaseIdle              = "idle"
+	PhaseChecking          = "checking"
+	PhaseFolding           = "folding"
+	PhasePacking           = "packing"
+	PhaseMigrating         = "migrating"
+	PhaseReclaiming        = "reclaiming"
+	PhaseWaitingReclaim    = "waiting-reclaim"
+	PhaseWaitingFilesystem = "waiting-filesystem"
+	PhaseConfigInvalid     = "config-invalid"
+	PhaseStopped           = "stopped"
 )
 
 // Control is the hot-reloaded automatic-folding policy written by the Host GUI
@@ -39,6 +44,11 @@ type Control struct {
 	// cannot be decoded or validated. A malformed policy must fail closed
 	// instead of silently reviving stale process flags.
 	ConfigError string
+	// Runtime gating is separate from the persisted user's intent. These fields
+	// are internal and never written back into the policy file.
+	RequestedEnabled bool
+	BlockedPhase     string
+	BlockReason      string
 }
 
 type controlFile struct {
@@ -97,14 +107,36 @@ func ProgressPath(store string) string {
 	return filepath.Join(filepath.Clean(store), "enrollment", "status.json")
 }
 
+func WorkerControlPath(store string) string {
+	return filepath.Join(filepath.Clean(store), "enrollment", "worker-policy.json")
+}
+
+func WorkerProgressPath(store string) string {
+	return filepath.Join(filepath.Clean(store), "enrollment", "worker-status.json")
+}
+
 func LoadControl(path string) (Control, error) {
-	data, err := os.ReadFile(path)
+	control, _, err := LoadControlRevision(path)
+	return control, err
+}
+
+// LoadControlRevision binds the displayed settings to the exact bytes read.
+// A malformed file still has a revision, allowing an explicit GUI repair to
+// reject a concurrent replacement rather than silently overwriting it.
+func LoadControlRevision(path string) (Control, string, error) {
+	data, err := readControlFile(path)
 	if errors.Is(err, os.ErrNotExist) {
-		return Control{}, nil
+		return Control{}, "", nil
 	}
 	if err != nil {
-		return Control{}, err
+		return Control{}, "", err
 	}
+	digest := sha256.Sum256(data)
+	control, err := decodeControl(data)
+	return control, hex.EncodeToString(digest[:]), err
+}
+
+func decodeControl(data []byte) (Control, error) {
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
 	var stored controlFile
@@ -164,7 +196,7 @@ func SaveControl(path string, control Control) error {
 }
 
 func LoadProgress(path string) (Progress, error) {
-	data, err := os.ReadFile(path)
+	data, err := readControlFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return Progress{}, nil
 	}
@@ -298,7 +330,7 @@ func writeAtomicJSON(path string, temporaryPattern string, value any) error {
 	if err := temporary.Close(); err != nil {
 		return err
 	}
-	if err := os.Rename(temporaryPath, path); err != nil {
+	if err := replaceControlFile(temporaryPath, path); err != nil {
 		return err
 	}
 	return syncObservationDirectory(directory)

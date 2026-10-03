@@ -346,7 +346,7 @@ func (s *Session) OpenWriter() (*WriteHandle, error) {
 }
 
 func acquireWriterLease(leasePath string) (*os.File, error) {
-	lease, err := os.OpenFile(leasePath, os.O_CREATE|os.O_RDWR, 0o600)
+	lease, err := openWriterLeaseFile(leasePath, true)
 	if err != nil {
 		return nil, fmt.Errorf("create writer lease: %w", err)
 	}
@@ -385,7 +385,7 @@ func TryAcquireWriterLeaseGuard(root string, sessionID string) (*WriterLeaseGuar
 		return nil, false, errors.New("session root and safe session ID are required")
 	}
 	leasePath := filepath.Join(filepath.Clean(root), "fs", "sessions", sessionID, "writer.lease")
-	file, err := os.OpenFile(leasePath, os.O_CREATE|os.O_RDWR, 0o600)
+	file, err := openWriterLeaseFile(leasePath, true)
 	if err != nil {
 		return nil, false, fmt.Errorf("open writer lease guard: %w", err)
 	}

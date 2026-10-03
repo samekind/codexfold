@@ -227,7 +227,7 @@ func (s *sessionDeletionStoreRoot) acquireWriterLease(path string) (*os.File, er
 	if err := s.requireSameDevice(before, path); err != nil {
 		return nil, err
 	}
-	file, err := s.root.OpenFile(relative, os.O_RDWR, 0)
+	file, err := openDeletionWriterLease(s, relative, path)
 	if err != nil {
 		return nil, err
 	}

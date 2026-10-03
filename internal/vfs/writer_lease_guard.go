@@ -22,7 +22,7 @@ func TryAcquireWriterLeaseGuardAtPath(leasePath string) (*WriterLeaseGuard, bool
 	if !before.Mode().IsRegular() {
 		return nil, false, errors.New("writer lease guard is not a regular file")
 	}
-	file, err := os.OpenFile(leasePath, os.O_RDWR, 0)
+	file, err := openWriterLeaseFile(leasePath, false)
 	if err != nil {
 		return nil, false, fmt.Errorf("open writer lease guard: %w", err)
 	}

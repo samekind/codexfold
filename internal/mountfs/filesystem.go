@@ -1125,7 +1125,7 @@ func (f *Filesystem) Open(name string, flags int) (uint64, syscall.Errno) {
 		// append and truncate semantics in the transaction layer instead of the
 		// backing descriptor.
 		nativeFlags := flags &^ (os.O_APPEND | os.O_TRUNC)
-		native, err := os.OpenFile(nativePath, nativeFlags, 0o600)
+		native, err := openNativeBacking(nativePath, nativeFlags, 0o600)
 		if err != nil {
 			return 0, errnoFor(err)
 		}
@@ -2449,6 +2449,8 @@ func errnoFor(err error) syscall.Errno {
 	}
 	switch {
 	case errors.Is(err, vfs.ErrWriterBusy):
+		return syscall.EBUSY
+	case errors.Is(err, vfs.ErrSessionRecoveryDeferred):
 		return syscall.EBUSY
 	case errors.Is(err, vfs.ErrSessionDeletionBusy):
 		return syscall.EBUSY
