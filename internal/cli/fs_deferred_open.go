@@ -2,8 +2,10 @@ package cli
 
 import (
 	"context"
+	"strings"
 
 	"github.com/samekind/codexfold/internal/fold"
+	"github.com/samekind/codexfold/internal/mountfs"
 	"github.com/samekind/codexfold/internal/pack"
 	"github.com/samekind/codexfold/internal/vfs"
 )
@@ -19,8 +21,12 @@ func openManagedSessionDeferred(ctx context.Context, store string, state vfs.Ses
 	if err != nil {
 		return nil, nil, err
 	}
+	var reader vfs.ObjectReader = resolver
+	if strings.HasPrefix(state.SessionID, "file-") {
+		reader = mountfs.NamespaceReader(store, resolver)
+	}
 	managed, err := vfs.OpenSession(ctx, vfs.SessionOptions{
-		Root: store, ManifestPath: state.ManifestPath, Manifest: manifest, Reader: resolver,
+		Root: store, ManifestPath: state.ManifestPath, Manifest: manifest, Reader: reader,
 		NativeSnapshot: state.NativeSnapshot, DeferRecovery: true,
 	})
 	if err != nil {

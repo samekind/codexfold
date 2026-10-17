@@ -48,7 +48,7 @@ func captureSessionDeletionXattrs(file *os.File, info os.FileInfo, path string) 
 	if err != nil {
 		return SessionDeletionPurgeXattrs{}, err
 	}
-	if first != second {
+	if !sameDeletionPurgeXattrs(first, second) {
 		return SessionDeletionPurgeXattrs{}, errors.New("extended attributes changed while exact purge metadata was captured")
 	}
 	return first, nil

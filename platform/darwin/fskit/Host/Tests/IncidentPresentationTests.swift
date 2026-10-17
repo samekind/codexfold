@@ -3,7 +3,78 @@ import AppKit
 import XCTest
 
 @MainActor
+final class RecordingIncidentNotifications: IncidentNotificationSending {
+    var onOpen: ((String) -> Void)?
+    var posted: [FrontendIncident] = []
+    var removed: [String] = []
+    func post(_ incident: FrontendIncident) { posted.append(incident) }
+    func remove(_ id: String) { removed.append(id) }
+}
+
+@MainActor
 final class IncidentWindowLifecycleTests: XCTestCase {
+    func testAutomaticIncidentUsesOneNotificationAndOnlyClickOpensDetails() throws {
+        _ = NSApplication.shared
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let notifications = RecordingIncidentNotifications()
+        var shown = 0
+        let presenter = IncidentWindowPresenter(appGroupURL: root, diagnosticPayload: { _ in nil }, presentWindow: { _ in shown += 1 }, notifications: notifications)
+        let incident = makeIncident("notification-only")
+        presenter.handle(.active(incident, isNew: true))
+        presenter.handle(.active(incident, isNew: false))
+        presenter.handle(.active(incident, isNew: true))
+        XCTAssertEqual(notifications.posted.count, 1)
+        XCTAssertEqual(shown, 0, "background incidents must not activate a window")
+        notifications.onOpen?(incident.id)
+        XCTAssertEqual(shown, 1, "only the user's notification click opens details")
+        var recovered = incident
+        recovered.recoveredAt = Date()
+        presenter.handle(.recovered(recovered))
+        XCTAssertEqual(notifications.removed, [incident.id])
+    }
+
+    func testNotificationDeliveryDoesNotNeedWritableAcknowledgement() {
+        let notifications = RecordingIncidentNotifications()
+        var windows = 0
+        let presenter = IncidentWindowPresenter(appGroupURL: URL(fileURLWithPath: "/nonexistent-codexfold-test-root"), diagnosticPayload: { _ in nil }, presentWindow: { _ in windows += 1 }, notifications: notifications)
+        let incident = makeIncident("full-disk")
+        presenter.handle(.active(incident, isNew: true))
+        presenter.handle(.active(incident, isNew: true))
+        XCTAssertEqual(notifications.posted.count, 1)
+        XCTAssertEqual(windows, 0)
+    }
+
+    func testOldNotificationClickCannotOpenAnotherIncident() throws {
+        _ = NSApplication.shared
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let notifications = RecordingIncidentNotifications()
+        var shown = 0
+        let presenter = IncidentWindowPresenter(appGroupURL: root, diagnosticPayload: { _ in nil }, presentWindow: { _ in shown += 1 }, notifications: notifications)
+        presenter.handle(.active(makeIncident("current"), isNew: true))
+        notifications.onOpen?("older")
+        XCTAssertEqual(shown, 0)
+        notifications.onOpen?("current")
+        XCTAssertEqual(shown, 1)
+    }
+
+    func testHealthyBaselineAfterRestartRemovesPersistedNotification() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let incident = makeIncident("before-restart")
+        let acknowledgement = IncidentAcknowledgementStore(appGroupURL: root)
+        try acknowledgement.acknowledge(incident)
+        let notifications = RecordingIncidentNotifications()
+        let presenter = IncidentWindowPresenter(appGroupURL: root, diagnosticPayload: { _ in nil }, notifications: notifications)
+        presenter.clearAcknowledgementAfterHealthyBaseline()
+        XCTAssertEqual(notifications.removed, [incident.id])
+        XCTAssertFalse(acknowledgement.contains(incident))
+    }
+
     func testOneWindowUpdatesWithoutRePresentingAndRecoveryClosesIt() throws {
         _ = NSApplication.shared
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)

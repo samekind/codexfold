@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 )
 
 type Lease struct {
@@ -19,6 +20,17 @@ type Lease struct {
 }
 
 func AcquireLease(directory string, label string) (*Lease, error) {
+	lease, err := acquireLease(directory, label)
+	if errors.Is(err, syscall.ENOSPC) && (label == "reader" || label == "resolver") {
+		// Another reader may have released the shared reserve after our failed
+		// attempt. Retry once even when that reader won the release race.
+		_ = releaseReadReserveFor(directory)
+		return acquireLease(directory, label)
+	}
+	return lease, err
+}
+
+func acquireLease(directory string, label string) (*Lease, error) {
 	if directory == "" || label == "" || filepath.Base(label) != label || strings.ContainsAny(label, "/\\\x00") {
 		return nil, errors.New("lease directory and safe label are required")
 	}

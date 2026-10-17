@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"sync"
+	"time"
 )
 
 type Projection struct {
@@ -68,6 +69,128 @@ func (g *OnceInventoryGuard) Check(ctx context.Context, projection Projection) (
 	}
 	inventory := g.inventory
 	g.mu.Unlock()
+	return g.Guard.checkWithInventory(ctx, store, inventory, projection)
+}
+
+// DefaultSharedInventoryMaxAge bounds how stale the shared inventory may be
+// before a background refresh starts. Free space is still probed on every check.
+const DefaultSharedInventoryMaxAge = 2 * time.Minute
+
+// scanInventory is replaced in tests to count or delay scans.
+var scanInventory = Scan
+
+// SharedInventoryGuard prices foreground work (copy-on-write, materialization)
+// against a process-wide inventory that is refreshed in the background. A full
+// Scan walks the whole store and takes seconds, so foreground paths that hold
+// handle or session locks must never run one themselves. Only the very first
+// check in a process waits for a scan; Prime starts it ahead of time.
+type SharedInventoryGuard struct {
+	Guard  Guard
+	MaxAge time.Duration
+}
+
+type inventoryCache struct {
+	mu       sync.Mutex
+	inv      Inventory
+	loadedAt time.Time
+	loaded   bool
+	flight   chan struct{}
+	lastErr  error
+}
+
+var (
+	sharedInventoriesMu sync.Mutex
+	sharedInventories   = map[string]*inventoryCache{}
+)
+
+func sharedInventoryFor(store string) *inventoryCache {
+	sharedInventoriesMu.Lock()
+	defer sharedInventoriesMu.Unlock()
+	cache := sharedInventories[store]
+	if cache == nil {
+		cache = &inventoryCache{}
+		sharedInventories[store] = cache
+	}
+	return cache
+}
+
+func (c *inventoryCache) startRefreshLocked(store string) {
+	flight := make(chan struct{})
+	c.flight = flight
+	scan := scanInventory
+	go func() {
+		inventory, err := scan(context.Background(), Options{StoreDir: store, AllowMetadataIssues: true})
+		c.mu.Lock()
+		if err == nil {
+			c.inv, c.loaded, c.loadedAt, c.lastErr = inventory, true, time.Now(), nil
+		} else {
+			c.lastErr = err
+		}
+		c.flight = nil
+		c.mu.Unlock()
+		close(flight)
+	}()
+}
+
+func (c *inventoryCache) get(ctx context.Context, store string, maxAge time.Duration) (Inventory, error) {
+	c.mu.Lock()
+	if c.loaded {
+		inventory := c.inv
+		if c.flight == nil && time.Since(c.loadedAt) > maxAge {
+			c.startRefreshLocked(store)
+		}
+		c.mu.Unlock()
+		return inventory, nil
+	}
+	if c.flight == nil {
+		c.startRefreshLocked(store)
+	}
+	flight := c.flight
+	c.mu.Unlock()
+	select {
+	case <-flight:
+	case <-ctx.Done():
+		return Inventory{}, ctx.Err()
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.loaded {
+		return c.inv, nil
+	}
+	return Inventory{}, c.lastErr
+}
+
+// Prime starts the first inventory scan in the background without waiting.
+func (g SharedInventoryGuard) Prime() {
+	store, err := g.Guard.absoluteStore()
+	if err != nil {
+		return
+	}
+	PrepareReadReserve(store)
+	cache := sharedInventoryFor(store)
+	cache.mu.Lock()
+	if !cache.loaded && cache.flight == nil {
+		cache.startRefreshLocked(store)
+	}
+	cache.mu.Unlock()
+}
+
+func (g SharedInventoryGuard) Check(ctx context.Context, projection Projection) (Assessment, error) {
+	if err := ctx.Err(); err != nil {
+		return Assessment{}, err
+	}
+	store, err := g.Guard.absoluteStore()
+	if err != nil {
+		return Assessment{}, err
+	}
+	maxAge := g.MaxAge
+	if maxAge <= 0 {
+		maxAge = DefaultSharedInventoryMaxAge
+	}
+	inventory, err := sharedInventoryFor(store).get(ctx, store, maxAge)
+	if err != nil {
+		return Assessment{}, err
+	}
 	return g.Guard.checkWithInventory(ctx, store, inventory, projection)
 }
 

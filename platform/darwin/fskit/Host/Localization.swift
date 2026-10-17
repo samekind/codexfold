@@ -1,6 +1,10 @@
 import Foundation
 
 enum L10nKey: String {
+    case diskSpaceExhausted
+    case diskSpaceImpact
+    case diskSpaceFreeRecommendation
+    case diskSpaceKeepOpenRecommendation
     case productName
     case statusHealthy
     case statusRecovering
@@ -177,6 +181,10 @@ enum L10n {
     }
 
     private static let simplifiedChinese: [L10nKey: String] = [
+        .diskSpaceExhausted: "磁盘空间不足，新的写入可能无法保存",
+        .diskSpaceImpact: "已有会话会尽量保持可读。新的消息或修改可能写入失败；释放空间前，不能把新内容视为已经保存。",
+        .diskSpaceFreeRecommendation: "释放系统盘或 CodexFold 存储盘的空间；不要手动删除 CodexFold 的会话、对象或恢复记录。",
+        .diskSpaceKeepOpenRecommendation: "保持 Codex 和 CodexFold 运行。空间恢复后会自动重试，无需重启或重新挂载。",
         .productName: "CodexFold",
         .statusHealthy: "运行正常",
         .statusRecovering: "正在恢复",
@@ -319,6 +327,10 @@ enum L10n {
     ]
 
     private static let traditionalChinese: [L10nKey: String] = [
+        .diskSpaceExhausted: "磁碟空間不足，新的寫入可能無法儲存",
+        .diskSpaceImpact: "既有對話會盡量保持可讀。新訊息或修改可能寫入失敗；釋放空間前，不能將新內容視為已儲存。",
+        .diskSpaceFreeRecommendation: "釋放系統碟或 CodexFold 儲存碟的空間；不要手動刪除 CodexFold 的對話、物件或復原紀錄。",
+        .diskSpaceKeepOpenRecommendation: "保持 Codex 和 CodexFold 執行。空間恢復後會自動重試，不需重新啟動或掛載。",
         .productName: "CodexFold",
         .statusHealthy: "運作正常",
         .statusRecovering: "正在復原",
@@ -461,6 +473,10 @@ enum L10n {
     ]
 
     private static let english: [L10nKey: String] = [
+        .diskSpaceExhausted: "The disk is nearly full; new writes may not be saved",
+        .diskSpaceImpact: "Existing sessions remain readable where possible. New messages or changes may fail to save; do not assume new content is saved until space is available.",
+        .diskSpaceFreeRecommendation: "Free space on the system or CodexFold storage volume. Do not manually delete CodexFold sessions, objects, or recovery records.",
+        .diskSpaceKeepOpenRecommendation: "Keep Codex and CodexFold open. Recovery retries automatically when space is available; no restart or remount is needed.",
         .productName: "CodexFold",
         .statusHealthy: "Running normally",
         .statusRecovering: "Recovering",

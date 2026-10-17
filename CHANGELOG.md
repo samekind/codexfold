@@ -6,6 +6,47 @@ pre-1.0, so a minor version may contain compatibility changes.
 
 ## [Unreleased]
 
+### Fixed
+
+- Foreground session opens can ask registered background maintenance to yield
+  and retry without bypassing writer locks. Copy-on-write budget checks reuse
+  a shared inventory instead of scanning the store while holding file locks;
+  current free space is still checked for each operation.
+- A failed deletion cleanup no longer blocks unrelated managed-session reloads.
+  macOS provenance-only metadata changes are accepted only when the original
+  deletion proof recorded that metadata form; unknown materials remain intact.
+- Transport health probes have one bounded deadline. Slow inventory refreshes
+  no longer manufacture a session-access outage; actual outstanding FSKit file
+  requests retain the ten-second incident threshold and bounded diagnostics.
+- Failed or short appends roll back only that append, and storage budget errors
+  map to ENOSPC. A verified 256 KiB read-lease reserve can be released under
+  disk pressure without bypassing reader/collector coordination.
+- macOS incidents use quiet, deduplicated system notifications instead of
+  automatically activating a fault window. Recovery removes notifications;
+  denied permission does not fall back to a modal window. Read-only disk-space
+  monitoring still works when status files cannot be written.
+- Daemon live updates accept a bounded `--takeover-timeout` for slower stores;
+  the default remains nine seconds and failed takeovers retain rollback.
+- Canonical managed rollouts now support same-namespace backup renames and
+  native temporary-file replacement used by `jstarctl codex rebind`. Durable
+  names preserve backups and old readers across replacement/reload; stable
+  replacements fold in the background, respect the automatic-folding policy,
+  and do not get enrolled again under their logical Codex thread ID.
+- A damaged active rollout no longer keeps the mount down. After the disk
+  filled, about 10 KB of binary memory was left inside one rollout; the
+  startup preflight rejected the file, `fs serve` exited, and launchd restarted
+  it every two seconds with no mount, so Codex hung on a dead
+  `~/.codex/sessions`. The startup preflight now repairs such files: damaged
+  records and an unfinished final record are moved to
+  `<native-root>/.codexfold-native-quarantine/` with a manifest that records
+  their offsets and SHA-256, and the rollout is rewritten through an atomic
+  rename of a clone (APFS clones share unchanged blocks, so this needs little
+  free space). Mode and modification time are kept. A complete final record
+  that only lacks its newline gets the newline. Anything that cannot be
+  repaired is logged and served unchanged instead of aborting startup.
+- `fs validate-native --repair` applies the same repair by hand while the
+  filesystem service is stopped. Without the flag the command stays read-only.
+
 ## [0.4.0-beta.2] - 2026-10-01
 
 ### Added

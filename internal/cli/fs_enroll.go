@@ -267,6 +267,13 @@ func applyEnrollmentCycle(ctx context.Context, flags enrollmentFlags, hooks enro
 	for _, state := range states {
 		managed[state.SessionID] = struct{}{}
 	}
+	sessions, err := codex.LoadSessions(home)
+	if err != nil {
+		return FSEnrollmentApplyResult{Plan: plan}, err
+	}
+	if err := addNamespaceManagedSessions(store, home, mount, sessions, managed); err != nil {
+		return FSEnrollmentApplyResult{Plan: plan}, err
+	}
 	selected, applied, err := enroll.Revalidate(ctx, plan, enroll.RevalidateOptions{
 		Limit: flags.batchSize,
 		IsManaged: func(_ context.Context, sessionID string) (bool, error) {
@@ -900,6 +907,9 @@ func buildEnrollmentPlan(ctx context.Context, flags enrollmentFlags) (enroll.Pla
 	for _, state := range states {
 		managed[state.SessionID] = struct{}{}
 	}
+	if err := addNamespaceManagedSessions(store, home, mount, sessions, managed); err != nil {
+		return enroll.Plan{}, "", err
+	}
 	observations, err := enroll.LoadObservations(enrollmentObservationPath(store))
 	if err != nil {
 		return enroll.Plan{}, "", err
@@ -962,6 +972,20 @@ func buildEnrollmentPlan(ctx context.Context, flags enrollmentFlags) (enroll.Pla
 	input.Gates.DoctorHealthy = false
 	plan, err = enroll.Build(ctx, input)
 	return plan, store, err
+}
+
+func addNamespaceManagedSessions(store, home, mount string, sessions []codex.Session, managed map[string]struct{}) error {
+	paths, err := mountfs.ManagedNamespacePaths(store)
+	if err != nil {
+		return err
+	}
+	for _, session := range sessions {
+		route, err := canonicalNamespaceRoute(home, mount, session.RolloutPath)
+		if err == nil && paths[route] {
+			managed[session.ID] = struct{}{}
+		}
+	}
+	return nil
 }
 
 func requireEnrollmentStorageHealth(ctx context.Context, store string) error {

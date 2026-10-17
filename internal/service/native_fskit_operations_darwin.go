@@ -36,15 +36,17 @@ func nativeFSKitOperationsForType(filesystemType string) (NativeFSKitOperations,
 }
 
 func (*nativeFSKitOperations) DaemonHealthy(ctx context.Context, resourcePath string) error {
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	client, err := fskitproto.DialResource(resourcePath, 2*time.Second)
+	client, err := fskitproto.DialResourceContext(ctx, resourcePath, 2*time.Second)
 	if err != nil {
 		return err
 	}
 	defer client.Close()
-	_, err = client.Call(fskitproto.OpPing, nil)
+	_, err = client.CallContext(ctx, fskitproto.OpPing, nil)
 	return err
 }
 

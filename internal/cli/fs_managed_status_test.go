@@ -240,7 +240,7 @@ func TestManagedStatusHeartbeatPreservesIncidentWithoutReloading(t *testing.T) {
 	}
 }
 
-func TestManagedStatusHeartbeatDoesNotMaskStalledReload(t *testing.T) {
+func TestManagedStatusHeartbeatDoesNotInventFailureForSlowReload(t *testing.T) {
 	reporter := newManagedStatusReporterForStore("", "/store", "/mount", "/resource", nil)
 	now := time.Unix(100, 0)
 	reporter.now = func() time.Time { return now }
@@ -249,8 +249,27 @@ func TestManagedStatusHeartbeatDoesNotMaskStalledReload(t *testing.T) {
 	reporter.Observe(managedReloadObservation{Sequence: 1, ManagedSessions: 7})
 	now = now.Add(managedObservationStallDeadline + time.Second)
 	reporter.Heartbeat()
-	if len(snapshots) != 2 || snapshots[1].State != "recovering" || snapshots[1].ManagedSessions == nil || *snapshots[1].ManagedSessions != 7 {
-		t.Fatalf("stalled reload was reported healthy: %#v", snapshots)
+	if len(snapshots) != 2 || snapshots[1].State != "healthy" || snapshots[1].IncidentID != "" || snapshots[1].Detail == "" || snapshots[1].ManagedSessions == nil || *snapshots[1].ManagedSessions != 7 {
+		t.Fatalf("slow refresh invented an availability failure or lost diagnostics: %#v", snapshots)
+	}
+}
+
+func TestManagedStatusSlowRefreshKeepsActualFailureUntilObservedRecovery(t *testing.T) {
+	reporter := newManagedStatusReporterForStore("", "/store", "/mount", "/resource", nil)
+	now := time.Unix(100, 0)
+	reporter.now = func() time.Time { return now }
+	var snapshot fskitstatus.Snapshot
+	reporter.publish = func(s fskitstatus.Snapshot) { snapshot = s }
+	reporter.Observe(managedReloadObservation{Sequence: 1, Fatal: errors.New("actual route failure"), ManagedSessions: 7})
+	id := snapshot.IncidentID
+	now = now.Add(time.Minute)
+	reporter.Heartbeat()
+	if snapshot.State != "recovering" || snapshot.IncidentID != id {
+		t.Fatalf("slow refresh masked a real failure: %+v", snapshot)
+	}
+	reporter.Observe(managedReloadObservation{Sequence: 2, ManagedSessions: 7})
+	if snapshot.State != "healthy" || snapshot.IncidentID != id {
+		t.Fatalf("fresh observation did not recover: %+v", snapshot)
 	}
 }
 

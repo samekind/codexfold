@@ -44,17 +44,19 @@ type RetireLooseResult struct {
 }
 
 // RetireLoose removes only loose objects that the current verified pack can read.
-func RetireLoose(ctx context.Context, storeDir string, options RetireLooseOptions) (RetireLooseResult, error) {
+func RetireLoose(ctx context.Context, storeDir string, options RetireLooseOptions) (result RetireLooseResult, runErr error) {
 	workers := options.Workers
 	if workers < 0 || workers > 16 {
 		return RetireLooseResult{}, errors.New("retirement workers must be between 0 and 16")
 	}
-	result := RetireLooseResult{StoreDir: filepath.Clean(storeDir), DryRun: !options.Apply}
+	result = RetireLooseResult{StoreDir: filepath.Clean(storeDir), DryRun: !options.Apply}
 	guard, err := storage.AcquireManagedSessionDeletionGuard(ctx, storeDir)
 	if err != nil {
 		return RetireLooseResult{}, fmt.Errorf("refusing loose retirement without complete managed-session proof: %w", err)
 	}
 	defer guard.Close()
+	ctx = guard.Context()
+	defer func() { runErr = guard.YieldError(runErr) }()
 	lock, err := storage.AcquireOperationLock(storeDir, "objects")
 	if err != nil {
 		return RetireLooseResult{}, err

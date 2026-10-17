@@ -39,7 +39,7 @@ private final class CodexFoldIncidentMonitorDelegate: NSObject, NSApplicationDel
             monitorDaemonStatus: true,
             recordsHistory: false
         )
-        let coordinator = IncidentPresentationCoordinator(appGroupURL: appGroupURL, statusStore: store)
+        let coordinator = IncidentPresentationCoordinator(appGroupURL: appGroupURL, statusStore: store, isNotificationHost: false)
         statusStore = store
         self.coordinator = coordinator
         coordinator.start()

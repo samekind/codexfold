@@ -38,6 +38,19 @@ The transparent filesystem preview has these explicit boundaries:
 
 See [the Linux FUSE3 validation](docs/validation-linux-fuse3.md) and [the macOS canary validation](docs/validation-macos-canary.md) for the evidence boundary. The default build remains storage-only; platform mounts require explicit build tags and installed host prerequisites.
 
+### Unreleased local fixes
+
+Development since the release adds foreground-priority storage access,
+durable backup/replacement names, isolated deletion cleanup, native-rollout
+repair, bounded transport health checks, disk-full append recovery and quiet
+macOS system notifications. These changes are not in the published archives.
+The dated [replacement compatibility](docs/rebind-compatibility-2026-10-16.md),
+[incident recovery](docs/incident-recovery-fix-2026-10-16.md), and
+[notification and disk-space](docs/notification-space-safety-fix-2026-10-17.md)
+reports distinguish the exact locally installed subsets from the complete
+development source. Combining those changes does not by itself validate a new
+production binary; this source update does not reinstall the running service.
+
 ## Install
 
 Install the versioned preview with Go:

@@ -6,6 +6,7 @@
 /*.sqlite-shm
 /*.sqlite-wal
 *.prof
+*.profraw
 *.test
 .DS_Store
 .worktrees/

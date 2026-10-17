@@ -30,11 +30,13 @@ type ManagedSessionReference struct {
 // ManagedSessionDeletionGuard keeps every managed session's writer lock held
 // while shared storage is being reclaimed.
 type ManagedSessionDeletionGuard struct {
-	References []ManagedSessionReference
-	files      []*os.File
-	sessions   managedSessionsStamp
-	proofFiles map[string]os.FileInfo
-	closed     bool
+	References  []ManagedSessionReference
+	files       []*os.File
+	maintenance *Maintenance
+	ctx         context.Context
+	sessions    managedSessionsStamp
+	proofFiles  map[string]os.FileInfo
+	closed      bool
 }
 
 // ErrManagedSessionBusy is ordinary live I/O contention, not corrupt storage.
@@ -267,16 +269,24 @@ var reloadManagedSessionReferences = ManagedSessionReferences
 
 // AcquireManagedSessionDeletionGuard reloads every managed state and current
 // manifest, then holds writer locks so that proof stays valid until Close.
-func AcquireManagedSessionDeletionGuard(ctx context.Context, storeDir string) (*ManagedSessionDeletionGuard, error) {
+func AcquireManagedSessionDeletionGuard(ctx context.Context, storeDir string) (result *ManagedSessionDeletionGuard, runErr error) {
 	s, exists, err := prepareScanner(ctx, Options{StoreDir: storeDir})
 	if err != nil {
 		return nil, err
 	}
 	if !exists {
-		return &ManagedSessionDeletionGuard{}, nil
+		return &ManagedSessionDeletionGuard{ctx: ctx}, nil
 	}
 	references := managedSessionReferences(s)
 	guard := &ManagedSessionDeletionGuard{References: references}
+	maintenance, err := BeginMaintenance(ctx, storeDir)
+	if err != nil {
+		return nil, err
+	}
+	guard.maintenance = maintenance
+	ctx = maintenance.Context()
+	guard.ctx = ctx
+	defer func() { runErr = maintenance.YieldError(runErr) }()
 	for _, reference := range references {
 		sessionID := reference.SessionID
 		if err := ctx.Err(); err != nil {
@@ -314,6 +324,17 @@ func AcquireManagedSessionDeletionGuard(ctx context.Context, storeDir string) (*
 		return nil, fmt.Errorf("refresh managed sessions after locking writers: %w", err)
 	}
 	return guard, nil
+}
+
+func (g *ManagedSessionDeletionGuard) Context() context.Context {
+	if g.ctx != nil {
+		return g.ctx
+	}
+	return context.Background()
+}
+
+func (g *ManagedSessionDeletionGuard) YieldError(err error) error {
+	return g.maintenance.YieldError(err)
 }
 
 // Refresh re-proves that the managed session set has not moved underneath a
@@ -497,7 +518,7 @@ func (g *ManagedSessionDeletionGuard) Close() error {
 	g.sessions = managedSessionsStamp{}
 	g.proofFiles = nil
 	g.closed = true
-	return result
+	return errors.Join(result, g.maintenance.Close())
 }
 
 func acquireExclusiveFileLock(path string) (*os.File, error) {

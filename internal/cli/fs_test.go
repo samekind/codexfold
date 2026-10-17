@@ -385,10 +385,12 @@ func TestManagedReloadLoopRetriesErrorsWithoutCancelingFileService(t *testing.T)
 			if attempts < 3 {
 				return errors.New("temporary metadata failure")
 			}
-			cancel()
 			return nil
 		}, func(err error) {
 			reports <- err
+			if err == nil {
+				cancel()
+			}
 		})
 	}()
 	select {

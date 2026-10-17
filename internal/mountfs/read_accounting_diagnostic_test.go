@@ -140,7 +140,9 @@ func dialAccountedNativeFSKitClient(t *testing.T, resourcePath string, done chan
 			t.Fatalf("FSKit test server exited during startup: %v", serveErr)
 		default:
 		}
-		client, dialErr := fskitproto.DialResource(resourcePath, 100*time.Millisecond)
+		// This fixture checks accounting, not a 100ms I/O latency guarantee.
+		// Call deadlines now apply beyond connect, including APFS fsync.
+		client, dialErr := fskitproto.DialResource(resourcePath, 2*time.Second)
 		if dialErr == nil {
 			return client
 		}

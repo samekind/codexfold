@@ -116,6 +116,7 @@ type WriteHandle struct {
 	appendHashPath  string
 	appendHashBytes int64
 	appendHashValid bool
+	appendWrite     func(*os.File, []byte) (int, error) // nil outside fault-injection tests
 }
 
 func (h *WriteHandle) Append(ctx context.Context, data []byte) (int, error) {
@@ -139,7 +140,36 @@ func (h *WriteHandle) Append(ctx context.Context, data []byte) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("open append target: %w", err)
 	}
-	n, writeErr := file.Write(data)
+	original, statErr := file.Stat()
+	if statErr != nil {
+		_ = file.Close()
+		return 0, statErr
+	}
+	write := h.appendWrite
+	if write == nil {
+		write = func(f *os.File, p []byte) (int, error) { return f.Write(p) }
+	}
+	n, writeErr := write(file, data)
+	if n != len(data) && writeErr == nil {
+		writeErr = io.ErrShortWrite
+	}
+	if writeErr != nil && n > 0 {
+		// A failed append must not leave half a JSONL record. The session's
+		// exclusive writer lease is held here. Preserve all earlier successful
+		// appends and let the caller retry this request from its original EOF.
+		rollbackErr := file.Truncate(original.Size())
+		if rollbackErr == nil {
+			rollbackErr = file.Sync()
+		}
+		if rollbackErr == nil {
+			_ = file.Close()
+			return 0, writeErr
+		}
+		h.appendHashValid = false
+		h.dirty = true
+		_ = file.Close()
+		return n, errors.Join(writeErr, fmt.Errorf("rollback incomplete append: %w", rollbackErr))
+	}
 	closeErr := file.Close()
 	if n > 0 {
 		_, _ = h.appendHasher.Write(data[:n])

@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 
 	"github.com/samekind/codexfold/internal/codex"
+	"github.com/samekind/codexfold/internal/mountfs"
 	"github.com/samekind/codexfold/internal/storage"
 	"github.com/samekind/codexfold/internal/vfs"
 )
@@ -39,6 +40,15 @@ func recoverManagedSessionStateIssues(
 	for _, session := range sessions {
 		if validSessionID(session.ID) {
 			current[session.ID] = struct{}{}
+		}
+	}
+	names, err := mountfs.ManagedNamespaceRoutes(store)
+	if err != nil {
+		return false, err
+	}
+	for id, route := range names {
+		if route != "" {
+			current[id] = struct{}{}
 		}
 	}
 	recovered := false

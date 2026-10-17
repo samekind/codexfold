@@ -1146,8 +1146,11 @@ func TestCanonicalFilesystemSupportsFSKitOpenUnlinkStaging(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(directory, "second.jsonl"), base, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if errno := filesystem.Rename(second, "/sessions/2026/07/12/.not-nfs"); errno != syscall.EPERM {
-		t.Fatalf("non-FSKit hidden rename errno=%v, want EPERM", errno)
+	if errno := filesystem.Rename(second, "/sessions/2026/07/12/.not-nfs"); errno != 0 {
+		t.Fatalf("ordinary hidden file rename errno=%v", errno)
+	}
+	if errno := filesystem.Rename("/sessions/2026/07/12/.not-nfs", second); errno != 0 {
+		t.Fatalf("ordinary hidden file restore errno=%v", errno)
 	}
 	if errno := filesystem.Rename(second, "/archived_sessions/.nfs.20051026.83fd"); errno != syscall.EPERM {
 		t.Fatalf("cross-directory open-unlink rename errno=%v, want EPERM", errno)

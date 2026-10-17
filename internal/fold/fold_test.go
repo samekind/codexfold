@@ -480,6 +480,28 @@ func TestFoldHonorsCanceledContextWithoutManifest(t *testing.T) {
 	}
 }
 
+func TestFoldOpaquePreservesExactBytes(t *testing.T) {
+	for _, data := range [][]byte{nil, []byte("not json\nlast line"), {0, 255, 128, '\n', 0}, []byte("{ \"x\" : 1 }\r\n")} {
+		root := t.TempDir()
+		source := filepath.Join(root, "source")
+		store := filepath.Join(root, "store")
+		if err := os.WriteFile(source, data, 0600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Fold(context.Background(), Session{ID: "opaque", RolloutPath: source}, FoldOptions{StoreDir: store, Apply: true, Opaque: true}); err != nil {
+			t.Fatal(err)
+		}
+		target := filepath.Join(root, "restored")
+		if _, err := Unfold(context.Background(), store, "opaque", target, false); err != nil {
+			t.Fatal(err)
+		}
+		got, err := os.ReadFile(target)
+		if err != nil || !bytes.Equal(got, data) {
+			t.Fatalf("opaque roundtrip: %x != %x (%v)", got, data, err)
+		}
+	}
+}
+
 func TestFoldCancellationAtCommitBoundaryRecoversOnRetry(t *testing.T) {
 	root := t.TempDir()
 	sourcePath := filepath.Join(root, "source.jsonl")

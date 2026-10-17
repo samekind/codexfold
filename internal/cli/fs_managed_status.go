@@ -24,6 +24,7 @@ const managedObservationStallDeadline = 20 * time.Second
 type managedReloadObservation struct {
 	Sequence         uint64
 	Fatal            error
+	CleanupError     error // Deleted objects remain hidden; unrelated reloads can proceed.
 	NeedsReload      bool
 	StateIssues      []vfs.SessionStateIssue
 	MissingState     []string
@@ -105,6 +106,9 @@ func (t *managedStatusTracker) snapshot(observation managedReloadObservation, no
 	t.observationSequence = snapshot.ObservationSequence
 	fault := observation.Err()
 	if fault == nil {
+		if observation.CleanupError != nil {
+			snapshot.Detail = "Deleted-session cleanup is deferred; session access and refresh remain available. " + observation.CleanupError.Error()
+		}
 		if t.active != nil {
 			t.recovered = t.active
 			t.active = nil
@@ -265,14 +269,13 @@ func (r *managedStatusReporter) Heartbeat() {
 	}
 	now := r.now()
 	observation := r.lastObserved
-	if now.Sub(r.lastObservedAt) > managedObservationStallDeadline {
-		observation = managedReloadObservation{
-			Fatal:            errors.New("managed session refresh has stalled"),
-			ManagedSessions:  r.lastObserved.ManagedSessions,
-			FailureStartedAt: r.lastObservedAt.Add(managedRecoveryDeadline),
-		}
-	}
 	snapshot := r.tracker.snapshot(observation, now)
+	// Completing a namespace scan is not an availability probe. Keep actual
+	// failures until Observe supplies recovery evidence, but never invent one
+	// merely because a large/background refresh is taking longer than usual.
+	if now.Sub(r.lastObservedAt) > managedObservationStallDeadline {
+		snapshot.Detail = strings.TrimSpace(snapshot.Detail + "\nBackground session refresh is taking longer than usual; the last completed observation is from " + r.lastObservedAt.UTC().Format(time.RFC3339) + ". Existing mounted routes remain in place; file access is monitored separately.")
+	}
 	snapshot.MountPoint = r.mountPoint
 	snapshot.ResourcePath = r.resourcePath
 	if r.publish != nil {

@@ -370,7 +370,7 @@ func verifyRecoveryArchive(ctx context.Context, generationDir string, catalog Re
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if err := verifyRecoveryDiskFile(root, identity.Path, identity); err != nil {
+		if err := verifyRecoveryDiskFile(ctx, root, identity.Path, identity); err != nil {
 			return fmt.Errorf("verify recovery pack %s: %w", identity.Path, err)
 		}
 	}
@@ -406,7 +406,7 @@ func verifyRecoveryArchive(ctx context.Context, generationDir string, catalog Re
 			return fmt.Errorf("duplicate pack recovery entry %q", header.Name)
 		}
 		hasher := sha256.New()
-		written, err := io.Copy(hasher, archive)
+		written, err := storage.CopyContext(ctx, hasher, archive)
 		if err != nil || written != identity.Bytes || hex.EncodeToString(hasher.Sum(nil)) != identity.SHA256 {
 			return fmt.Errorf("pack recovery entry %s failed verification", header.Name)
 		}
@@ -1717,13 +1717,13 @@ func validateRecoveryCatalog(catalog RecoveryCatalog, directoryName string) erro
 	return nil
 }
 
-func verifyRecoveryDiskFile(root *os.Root, name string, identity RecoveryFile) error {
+func verifyRecoveryDiskFile(ctx context.Context, root *os.Root, name string, identity RecoveryFile) error {
 	file, err := openPackGenerationFile(root, name)
 	if err != nil {
 		return err
 	}
 	hasher := sha256.New()
-	written, copyErr := io.Copy(hasher, file)
+	written, copyErr := storage.CopyContext(ctx, hasher, file)
 	closeErr := file.Close()
 	if copyErr != nil {
 		return copyErr

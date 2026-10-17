@@ -21,6 +21,8 @@ import (
 )
 
 type FoldOptions struct {
+	// Opaque imports arbitrary bytes with CDC, without JSON parsing.
+	Opaque               bool
 	StoreDir             string
 	ManifestPathOverride string
 	Apply                bool
@@ -313,7 +315,7 @@ func Fold(ctx context.Context, session Session, options FoldOptions) (FoldResult
 
 	reader := bufio.NewReaderSize(io.LimitReader(file, before.Size()), 1024*1024)
 	var line bytes.Buffer
-	oversized := false
+	oversized := options.Opaque
 	for {
 		if err := ctx.Err(); err != nil {
 			return FoldResult{}, err
@@ -348,7 +350,7 @@ func Fold(ctx context.Context, session Session, options FoldOptions) (FoldResult
 				}
 			}
 			line.Reset()
-			oversized = false
+			oversized = options.Opaque
 		case errors.Is(readErr, bufio.ErrBufferFull):
 			continue
 		case errors.Is(readErr, io.EOF):

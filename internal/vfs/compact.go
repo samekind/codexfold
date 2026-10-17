@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/samekind/codexfold/internal/fold"
+	"github.com/samekind/codexfold/internal/storage"
 )
 
 type PreparedGeneration struct {
@@ -33,7 +34,7 @@ type CompactResult struct {
 	SHA256     string `json:"sha256"`
 }
 
-func (s *Session) Compact(ctx context.Context, options CompactOptions) (CompactResult, error) {
+func (s *Session) Compact(ctx context.Context, options CompactOptions) (result CompactResult, runErr error) {
 	s.mu.Lock()
 	if s.recoveryDeferred {
 		s.mu.Unlock()
@@ -43,6 +44,14 @@ func (s *Session) Compact(ctx context.Context, options CompactOptions) (CompactR
 	if options.Prepare == nil {
 		return CompactResult{}, errors.New("compact preparation function is required")
 	}
+	store := filepath.Dir(filepath.Dir(filepath.Dir(s.directory)))
+	maintenance, err := storage.BeginMaintenance(ctx, store)
+	if err != nil {
+		return CompactResult{}, err
+	}
+	defer maintenance.Close()
+	defer func() { runErr = maintenance.YieldError(runErr) }()
+	ctx = maintenance.Context()
 	s.mu.Lock()
 	if s.writerOpen {
 		s.mu.Unlock()

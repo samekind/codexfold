@@ -21,6 +21,9 @@ type NativePreflightReport struct {
 	ValidatedBytes   int64  `json:"validated_bytes"`
 	CachePath        string `json:"cache_path,omitempty"`
 	CacheRebuilt     bool   `json:"cache_rebuilt,omitempty"`
+	// Repairs and Issues are only populated by the repairing preflight.
+	Repairs []NativeRolloutRepair  `json:"repairs,omitempty"`
+	Issues  []NativePreflightIssue `json:"issues,omitempty"`
 }
 
 func (f *Filesystem) ValidateNativeWriterRollouts(ctx context.Context) (NativePreflightReport, error) {
@@ -31,6 +34,21 @@ func (f *Filesystem) ValidateNativeWriterRollouts(ctx context.Context) (NativePr
 		return NativePreflightReport{}, nil
 	}
 	return validateNativeWriterRollouts(ctx, root)
+}
+
+// RepairNativeWriterRollouts is the startup preflight. Unlike
+// ValidateNativeWriterRollouts it never fails because of a damaged rollout: it
+// quarantines the damaged records, rewrites the rollout, and reports whatever
+// it could not fix as issues so the mount can still come up. Call it only
+// while nothing is writing the native root.
+func (f *Filesystem) RepairNativeWriterRollouts(ctx context.Context) (NativePreflightReport, error) {
+	f.mu.RLock()
+	root := f.nativeRoot
+	f.mu.RUnlock()
+	if root == "" {
+		return NativePreflightReport{}, nil
+	}
+	return preflightNativeWriterRollouts(ctx, root, true)
 }
 
 func validateNativeWriterRollouts(ctx context.Context, nativeRoot string) (NativePreflightReport, error) {

@@ -1,6 +1,7 @@
 package fskitproto
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -29,9 +30,17 @@ type Client struct {
 	generation uint64
 	maxPayload uint32
 	nextID     uint64
+	timeout    time.Duration
 }
 
 func DialResource(resourcePath string, timeout time.Duration) (*Client, error) {
+	return DialResourceContext(context.Background(), resourcePath, timeout)
+}
+
+func DialResourceContext(ctx context.Context, resourcePath string, timeout time.Duration) (*Client, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	descriptorPath, err := ResourceDescriptorPath(resourcePath)
 	if err != nil {
 		return nil, err
@@ -44,7 +53,7 @@ func DialResource(resourcePath string, timeout time.Duration) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	return Dial(descriptor, timeout)
+	return DialContext(ctx, descriptor, timeout)
 }
 
 func ResourceDescriptorPath(resourcePath string) (string, error) {
@@ -70,17 +79,23 @@ func UsesDirectoryResource(resourcePath string) bool {
 }
 
 func Dial(descriptor Descriptor, timeout time.Duration) (*Client, error) {
+	return DialContext(context.Background(), descriptor, timeout)
+}
+
+func DialContext(ctx context.Context, descriptor Descriptor, timeout time.Duration) (*Client, error) {
 	if timeout <= 0 {
 		timeout = 5 * time.Second
 	}
-	connection, err := net.DialTimeout("unix", descriptor.SocketPath, timeout)
+	dialCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	connection, err := (&net.Dialer{}).DialContext(dialCtx, "unix", descriptor.SocketPath)
 	if err != nil {
 		return nil, fmt.Errorf("connect to FSKit daemon: %w", err)
 	}
-	client := &Client{connection: connection, generation: descriptor.Generation, maxPayload: DefaultMaxPayload, nextID: 1}
+	client := &Client{connection: connection, generation: descriptor.Generation, maxPayload: DefaultMaxPayload, nextID: 1, timeout: timeout}
 	encoder := NewEncoder(len(descriptor.Token) + 4)
 	encoder.Bytes(descriptor.Token)
-	response, err := client.callLocked(OpHello, 0, encoder.Data())
+	response, err := client.callContextLocked(dialCtx, OpHello, 0, encoder.Data())
 	if err != nil {
 		_ = connection.Close()
 		return nil, err
@@ -111,9 +126,60 @@ func (c *Client) Close() error {
 }
 
 func (c *Client) Call(operation Op, payload []byte) ([]byte, error) {
+	return c.CallContext(context.Background(), operation, payload)
+}
+
+func (c *Client) CallContext(ctx context.Context, operation Op, payload []byte) ([]byte, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.callLocked(operation, c.generation, payload)
+	return c.callContextLocked(ctx, operation, c.generation, payload)
+}
+
+func (c *Client) callContextLocked(ctx context.Context, operation Op, generation uint64, payload []byte) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if c.connection == nil {
+		return nil, net.ErrClosed
+	}
+	timeout := c.timeout
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	deadline := time.Now().Add(timeout)
+	if limit, ok := ctx.Deadline(); ok && limit.Before(deadline) {
+		deadline = limit
+	}
+	connection := c.connection
+	if err := connection.SetDeadline(deadline); err != nil {
+		_ = connection.Close()
+		c.connection = nil
+		return nil, err
+	}
+	canceled := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		_ = connection.SetDeadline(time.Now())
+		close(canceled)
+	})
+	response, err := c.callLocked(operation, generation, payload)
+	if !stop() {
+		<-canceled
+	}
+	if ctx.Err() != nil {
+		err = ctx.Err()
+	}
+	var status StatusError
+	if err != nil && !errors.As(err, &status) {
+		// A partial frame cannot be reused: a late response would otherwise be
+		// mistaken for the next request. Closing also releases blocked peers.
+		_ = connection.Close()
+		c.connection = nil
+	} else if clearErr := connection.SetDeadline(time.Time{}); clearErr != nil {
+		_ = connection.Close()
+		c.connection = nil
+		return nil, clearErr
+	}
+	return response, err
 }
 
 func (c *Client) callLocked(operation Op, generation uint64, payload []byte) ([]byte, error) {

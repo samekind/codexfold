@@ -29,6 +29,7 @@ import (
 )
 
 type NativeFSKitServerOptions struct {
+	requestHealth              *nativeFSKitRequestHealth
 	SocketPath                 string
 	ResourcePath               string
 	Token                      []byte
@@ -39,6 +40,7 @@ type NativeFSKitServerOptions struct {
 	MountPoint                 string
 	StatusInterval             time.Duration
 	Recorder                   func(string)
+	StallDiagnosticPath        string
 	Activity                   *IOActivityCounter
 	PrewarmSharedMemoryWindows int
 	PrewarmSharedFileWindows   int
@@ -133,6 +135,12 @@ func (t *nativeFSKitDaemonStatusTracker) snapshot(
 		t.observationSequence++
 	}
 	now := time.Now().UTC()
+	blocked, hasBlocked := options.requestHealth.stalled(now)
+	if state == "healthy" && hasBlocked {
+		state = "recovering"
+		summary = "A session file operation has not completed within 10 seconds"
+		detail = fmt.Sprintf("operation=%s waiting=%s; existing routes remain mounted", nativeFSKitOperationName(blocked.op), now.Sub(blocked.started).Round(time.Millisecond))
+	}
 	unhealthy := state != "healthy"
 	if unhealthy && t.incidentID == "" {
 		var token [16]byte
@@ -142,6 +150,9 @@ func (t *nativeFSKitDaemonStatusTracker) snapshot(
 			t.incidentID = fmt.Sprintf("daemon-incident-%x", now.UnixNano())
 		}
 		t.incidentSince = now
+		if hasBlocked {
+			t.incidentSince = blocked.started
+		}
 	}
 	snapshot := fskitstatus.Snapshot{
 		Component: "daemon", State: state, Summary: summary, Detail: detail,
@@ -192,6 +203,8 @@ type nativeFSKitServer struct {
 	generation          uint64
 	maxPayload          uint32
 	recorder            func(string)
+	stallDiagnostics    *nativeFSKitStallDiagnostics
+	requestHealth       *nativeFSKitRequestHealth
 	activity            *IOActivityCounter
 	health              []byte
 	startedAt           time.Time
@@ -374,6 +387,7 @@ func ServeNativeFSKit(ctx context.Context, filesystem *Filesystem, options Nativ
 		return fmt.Errorf("parse native FSKit mount identity: %w", err)
 	}
 	var statusPublisher *fskitstatus.Publisher
+	options.requestHealth = &nativeFSKitRequestHealth{}
 	statusTracker := newNativeFSKitDaemonStatusTracker(options)
 	if options.StatusPath != "" {
 		statusPublisher = fskitstatus.NewPublisher(options.StatusPath, func(err error) {
@@ -425,14 +439,16 @@ func ServeNativeFSKit(ctx context.Context, filesystem *Filesystem, options Nativ
 		return fmt.Errorf("restrict FSKit socket: %w", err)
 	}
 	server := &nativeFSKitServer{
-		filesystem: filesystem,
-		token:      append([]byte(nil), options.Token...),
-		generation: options.Generation,
-		maxPayload: options.MaxPayload,
-		recorder:   options.Recorder,
-		activity:   options.Activity,
-		health:     []byte(health),
-		startedAt:  time.Now(),
+		filesystem:       filesystem,
+		token:            append([]byte(nil), options.Token...),
+		generation:       options.Generation,
+		maxPayload:       options.MaxPayload,
+		recorder:         options.Recorder,
+		stallDiagnostics: &nativeFSKitStallDiagnostics{path: options.StallDiagnosticPath},
+		activity:         options.Activity,
+		requestHealth:    options.requestHealth,
+		health:           []byte(health),
+		startedAt:        time.Now(),
 		nodes: nativeFSKitNodes{
 			version: filesystem.NamespaceVersion(),
 			byPath:  map[string]nativeFSKitNode{"/": {id: 2}},
@@ -597,6 +613,8 @@ func (c *nativeFSKitConnection) serve() {
 	defer c.conn.Close()
 	defer c.releaseHandles()
 	authenticated := false
+	endRequest := func() {}
+	defer func() { endRequest() }()
 	for {
 		request, err := fskitproto.ReadFrame(c.conn, c.server.maxPayload)
 		if err != nil {
@@ -605,6 +623,9 @@ func (c *nativeFSKitConnection) serve() {
 			}
 			return
 		}
+		endDiagnostic := c.server.stallDiagnostics.watch(request.Op, request.RequestID)
+		endHealth := c.server.requestHealth.begin(request.Op)
+		endRequest = func() { endDiagnostic(); endHealth() }
 		response := fskitproto.Frame{
 			Kind:       fskitproto.KindResponse,
 			Op:         request.Op,
@@ -632,6 +653,7 @@ func (c *nativeFSKitConnection) serve() {
 				response.Status = int32(errnoFor(streamErr))
 			} else if streamed && responseWritten {
 				c.server.record(fmt.Sprintf("operation=%s request=%d status=%d payload=%d", nativeFSKitOperationName(request.Op), request.RequestID, 0, len(request.Payload)))
+				endRequest()
 				continue
 			} else if streamed {
 				response.Status = streamStatus
@@ -649,6 +671,7 @@ func (c *nativeFSKitConnection) serve() {
 				response.Payload = nil
 			} else if handled && responseWritten {
 				c.server.record(fmt.Sprintf("operation=%s request=%d status=%d payload=%d", nativeFSKitOperationName(request.Op), request.RequestID, 0, len(request.Payload)))
+				endRequest()
 				continue
 			}
 		}
@@ -656,6 +679,7 @@ func (c *nativeFSKitConnection) serve() {
 		if err := fskitproto.WriteFrame(c.conn, response, c.server.maxPayload); err != nil {
 			return
 		}
+		endRequest()
 		if !authenticated || response.Status == int32(syscall.ESTALE) {
 			return
 		}

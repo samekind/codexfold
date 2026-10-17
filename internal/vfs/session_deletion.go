@@ -840,7 +840,7 @@ func cleanSessionDeletionRoute(route string) (string, error) {
 		return "", errors.New("canonical session deletion route is required")
 	}
 	cleaned := path.Clean("/" + strings.TrimPrefix(route, "/"))
-	if cleaned != route || !strings.HasSuffix(cleaned, ".jsonl") || (!strings.HasPrefix(cleaned, "/sessions/") && !strings.HasPrefix(cleaned, "/archived_sessions/")) {
+	if cleaned != route || (!strings.HasPrefix(cleaned, "/sessions/") && !strings.HasPrefix(cleaned, "/archived_sessions/")) {
 		return "", errors.New("session deletion route is not a clean canonical session path")
 	}
 	return cleaned, nil

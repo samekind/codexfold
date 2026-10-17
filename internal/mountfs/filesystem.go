@@ -21,6 +21,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/samekind/codexfold/internal/fskitproto"
+	"github.com/samekind/codexfold/internal/storage"
 	"github.com/samekind/codexfold/internal/vfs"
 )
 
@@ -142,8 +143,11 @@ type directoryState struct {
 }
 
 type Filesystem struct {
-	mu     sync.RWMutex
-	loadMu sync.Mutex
+	mu               sync.RWMutex
+	loadMu           sync.Mutex
+	renameMu         sync.RWMutex
+	namespaceStore   string
+	managedNamespace managedNamespace
 	// loadRetry bounds how long an unclassified session-load failure is retried
 	// before it reaches Codex. A managed route stays registered while
 	// enrollment swaps pack generations underneath it, so an access inside that
@@ -553,10 +557,15 @@ func (f *Filesystem) AddSessionAt(sessionID string, name string, session *vfs.Se
 func (f *Filesystem) AddSessionAtOwned(sessionID string, name string, session *vfs.Session, closer io.Closer) error {
 	owner := newSessionOwner(closer)
 	cleaned := cleanPath(name)
-	if !f.canonical || !safeSessionID(sessionID) || session == nil || !canonicalSessionPath(cleaned) {
+	if !f.canonical || !safeSessionID(sessionID) || session == nil || !namespaceFilePath(cleaned) {
 		return errors.Join(errors.New("canonical filesystem, safe session ID, path, and session are required"), owner.retire())
 	}
 	f.mu.Lock()
+	cleaned, visible := f.namespaceRouteLocked(sessionID, cleaned)
+	if !visible {
+		f.mu.Unlock()
+		return owner.retire()
+	}
 	if _, deleted := f.deletedManagedSessions[sessionID]; deleted {
 		f.mu.Unlock()
 		return errors.Join(errors.New("managed session has a durable deletion tombstone"), owner.retire())
@@ -589,10 +598,15 @@ func (f *Filesystem) UpsertSessionAt(sessionID string, name string, session *vfs
 func (f *Filesystem) UpsertSessionAtOwned(sessionID string, name string, session *vfs.Session, closer io.Closer) error {
 	owner := newSessionOwner(closer)
 	cleaned := cleanPath(name)
-	if !f.canonical || !safeSessionID(sessionID) || session == nil || !canonicalSessionPath(cleaned) {
+	if !f.canonical || !safeSessionID(sessionID) || session == nil || !namespaceFilePath(cleaned) {
 		return errors.Join(errors.New("canonical filesystem, safe session ID, path, and session are required"), owner.retire())
 	}
 	f.mu.Lock()
+	cleaned, visible := f.namespaceRouteLocked(sessionID, cleaned)
+	if !visible {
+		f.mu.Unlock()
+		return owner.retire()
+	}
 	if _, deleted := f.deletedManagedSessions[sessionID]; deleted {
 		f.mu.Unlock()
 		return errors.Join(errors.New("managed session has a durable deletion tombstone"), owner.retire())
@@ -636,11 +650,15 @@ func (f *Filesystem) UpsertSessionAtOwned(sessionID string, name string, session
 
 func (f *Filesystem) MoveSessionAt(sessionID string, name string) error {
 	cleaned := cleanPath(name)
-	if !f.canonical || !safeSessionID(sessionID) || !canonicalSessionPath(cleaned) {
+	if !f.canonical || !safeSessionID(sessionID) || !namespaceFilePath(cleaned) {
 		return errors.New("canonical filesystem, safe session ID, and path are required")
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	cleaned, visible := f.namespaceRouteLocked(sessionID, cleaned)
+	if !visible {
+		return nil
+	}
 	if _, publishing := f.publishingManagedDeletions[sessionID]; publishing {
 		return errors.New("managed session deletion publication is in progress")
 	}
@@ -826,7 +844,7 @@ func (f *Filesystem) SetSessionDeletionPublisher(publisher func(vfs.SessionState
 // durable managed-session deletion, including after a daemon restart.
 func (f *Filesystem) HideDeletedSessionAt(sessionID string, name string) error {
 	cleaned := cleanPath(name)
-	if !f.canonical || !safeSessionID(sessionID) || !canonicalSessionPath(cleaned) {
+	if !f.canonical || !safeSessionID(sessionID) || !namespaceFilePath(cleaned) {
 		return errors.New("canonical filesystem, safe session ID, and path are required")
 	}
 	f.mu.Lock()
@@ -873,7 +891,14 @@ func (f *Filesystem) ReadDir(name string) ([]string, syscall.Errno) {
 		hiddenEntries := make(map[string]struct{})
 		for retained := range f.retained {
 			if path.Dir(retained) == cleaned {
-				hiddenEntries[path.Base(retained)] = struct{}{}
+				if !f.managedNamespace.Native[retained] {
+					hiddenEntries[path.Base(retained)] = struct{}{}
+				}
+			}
+		}
+		for pending := range f.managedNamespace.Cleanup {
+			if path.Dir(pending) == cleaned {
+				hiddenEntries[path.Base(pending)] = struct{}{}
 			}
 		}
 		for directory := range f.directories {
@@ -1112,6 +1137,12 @@ func attrFromFileInfo(info os.FileInfo, size int64) Attr {
 }
 
 func (f *Filesystem) Open(name string, flags int) (uint64, syscall.Errno) {
+	// Serialize namespace cutover against native descriptor creation, while
+	// allowing unrelated foreground opens to proceed in parallel.
+	f.renameMu.RLock()
+	defer f.renameMu.RUnlock()
+	endIO := f.beginIO()
+	defer endIO()
 	session, owner, errno := f.acquireSessionForPath(name)
 	if errno != 0 {
 		if !f.canonical {
@@ -1170,7 +1201,7 @@ func (f *Filesystem) Open(name string, flags int) (uint64, syscall.Errno) {
 		handle.read = reader
 	}
 	if access == os.O_WRONLY || access == os.O_RDWR {
-		writer, err := session.OpenWriter()
+		writer, err := session.OpenForegroundWriter()
 		if err != nil {
 			if handle.read != nil {
 				_ = handle.read.Close()
@@ -1571,7 +1602,7 @@ func (f *Filesystem) TruncatePath(name string, size int64) syscall.Errno {
 		}
 		return 0
 	}
-	writer, err := session.OpenWriter()
+	writer, err := session.OpenForegroundWriter()
 	if err != nil {
 		return errnoFor(err)
 	}
@@ -1755,13 +1786,22 @@ func (f *Filesystem) Mkdir(name string, _ uint32) syscall.Errno {
 }
 
 func (f *Filesystem) Rename(oldName string, newName string) syscall.Errno {
+	f.renameMu.Lock()
+	defer f.renameMu.Unlock()
+	endIO := f.beginIO()
+	defer endIO()
 	if !f.canonical {
 		return syscall.EPERM
 	}
 	oldPath, newPath := cleanPath(oldName), cleanPath(newName)
 	openUnlinkRename := canonicalSessionPath(oldPath) && fskitOpenUnlinkPath(newPath) && path.Dir(oldPath) == path.Dir(newPath)
-	if !canonicalSessionPath(oldPath) || (!canonicalSessionPath(newPath) && !openUnlinkRename) {
+	if !namespaceFilePath(oldPath) || !namespaceFilePath(newPath) ||
+		(fskitOpenUnlinkPath(newPath) && !openUnlinkRename) {
 		return syscall.EPERM
+	}
+	if oldPath == newPath {
+		_, errno := f.Getattr(oldPath)
+		return errno
 	}
 	f.mu.Lock()
 	sessionID, exists := f.paths[oldPath]
@@ -1774,9 +1814,14 @@ func (f *Filesystem) Rename(oldName string, newName string) syscall.Errno {
 		oldNative := nativePathFromRoot(root, oldPath)
 		newNative := nativePathFromRoot(root, newPath)
 		appendState := f.nativeAppends[filepath.Clean(oldNative)]
+		_, managedTarget := f.paths[newPath]
+		importTarget := managedTarget || f.namespaceReplacementTargetLocked(newPath) || f.managedNamespace.Native[oldPath]
 		f.mu.Unlock()
 		if root == "" {
 			return syscall.ENOENT
+		}
+		if importTarget && namespaceFilePath(newPath) {
+			return f.importNativeRename(oldPath, newPath)
 		}
 		var renameErr error
 		if appendState != nil {
@@ -1800,6 +1845,8 @@ func (f *Filesystem) Rename(oldName string, newName string) syscall.Errno {
 				handle.nativePath = newNative
 			}
 		}
+		f.bumpDirectoryGenerationLocked(path.Dir(oldPath), time.Now())
+		f.bumpDirectoryGenerationLocked(path.Dir(newPath), time.Now())
 		f.mu.Unlock()
 		f.bumpNamespaceVersion()
 		return 0
@@ -1816,9 +1863,8 @@ func (f *Filesystem) Rename(oldName string, newName string) syscall.Errno {
 			return syscall.ENOENT
 		}
 	}
-	if _, exists := f.paths[newPath]; exists {
-		f.mu.Unlock()
-		return syscall.EEXIST
+	if !openUnlinkRename {
+		return f.renameManagedLocked(sessionID, oldPath, newPath)
 	}
 	if openUnlinkRename {
 		publisher := f.deletionPublisher
@@ -1876,6 +1922,8 @@ func (f *Filesystem) Rename(oldName string, newName string) syscall.Errno {
 }
 
 func (f *Filesystem) Unlink(name string) syscall.Errno {
+	f.renameMu.Lock()
+	defer f.renameMu.Unlock()
 	if !f.canonical {
 		return syscall.EPERM
 	}
@@ -1922,6 +1970,17 @@ func (f *Filesystem) Unlink(name string) syscall.Errno {
 		delete(f.sessions, sessionID)
 		delete(f.owners, sessionID)
 		delete(f.nativeFirst, sessionID)
+		if _, ok := f.managedNamespace.Names[sessionID]; ok {
+			n := f.cloneManagedNamespaceLocked()
+			entry := n.Names[sessionID]
+			entry.Path = ""
+			n.Names[sessionID] = entry
+			// The deletion publisher is already durable. A metadata-sync error
+			// cannot authorize rediscovery of that deleted inode.
+			if err := f.publishManagedNamespaceLocked(n); err != nil {
+				f.managedNamespace = n
+			}
+		}
 		for route, currentID := range f.paths {
 			if currentID == sessionID {
 				delete(f.paths, route)
@@ -1945,6 +2004,14 @@ func (f *Filesystem) Unlink(name string) syscall.Errno {
 	if err == nil {
 		f.mu.Lock()
 		delete(f.nativeAppends, filepath.Clean(nativePath))
+		if f.managedNamespace.Native[cleaned] {
+			n := f.cloneManagedNamespaceLocked()
+			delete(n.Native, cleaned)
+			if publishErr := f.publishManagedNamespaceLocked(n); publishErr != nil {
+				f.managedNamespace = n
+				err = publishErr
+			}
+		}
 		f.mu.Unlock()
 		f.bumpNamespaceVersion()
 	}
@@ -2281,7 +2348,7 @@ func moveManagedMetadata(root string, oldPath string, newPath string) error {
 }
 
 func moveManagedXattrCarrier(root string, oldPath string, newPath string) error {
-	if root == "" || oldPath == "" || newPath == "" || !canonicalSessionPath(oldPath) || !canonicalSessionPath(newPath) {
+	if root == "" || !namespaceFilePath(oldPath) || !namespaceFilePath(newPath) {
 		return nil
 	}
 	oldCarrier := managedXattrCarrier(root, oldPath)
@@ -2341,8 +2408,12 @@ func (f *Filesystem) nativePath(name string) (string, bool) {
 	f.mu.RLock()
 	root := f.nativeRoot
 	_, retained := f.retained[name]
+	if f.managedNamespace.Native[name] {
+		retained = false
+	}
+	_, pendingRename := f.managedNamespace.Cleanup[name]
 	f.mu.RUnlock()
-	if !f.canonical || root == "" || retained || name == "" || name == "/" || !canonicalNamespacePath(name) {
+	if !f.canonical || root == "" || retained || pendingRename || name == "" || name == "/" || !canonicalNamespacePath(name) {
 		return "", false
 	}
 	return nativePathFromRoot(root, name), true
@@ -2448,6 +2519,8 @@ func errnoFor(err error) syscall.Errno {
 		return errno
 	}
 	switch {
+	case errors.Is(err, storage.ErrBudgetExceeded):
+		return syscall.ENOSPC
 	case errors.Is(err, vfs.ErrWriterBusy):
 		return syscall.EBUSY
 	case errors.Is(err, vfs.ErrSessionDeletionBusy):

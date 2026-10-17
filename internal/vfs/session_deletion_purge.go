@@ -11,6 +11,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"sort"
 	"strconv"
@@ -984,15 +985,31 @@ func captureDeletionPurgeTreeIdentity(storeRoot string, root string) (deletionPu
 }
 
 func sameDeletionPurgeTreeIdentity(left deletionPurgeTreeIdentity, right deletionPurgeTreeIdentity) bool {
-	if left.SHA256 != right.SHA256 || left.Bytes != right.Bytes || left.Entries != right.Entries || left.RootMode != right.RootMode || left.RootObject != right.RootObject || left.RootXattrs != right.RootXattrs || len(left.Tree) != len(right.Tree) {
+	if left.Bytes != right.Bytes || left.Entries != right.Entries || left.RootMode != right.RootMode || left.RootObject != right.RootObject || !sameDeletionPurgeXattrs(left.RootXattrs, right.RootXattrs) {
 		return false
 	}
-	for index := range left.Tree {
-		if left.Tree[index] != right.Tree[index] {
-			return false
-		}
+	return sameDeletionPurgeEntries(left.Tree, right.Tree)
+}
+
+// Darwin capture rejects every xattr except com.apple.provenance, as well as
+// ACLs and BSD flags. Provenance is an OS-maintained origin tag, not session
+// content or object identity; moving an inode must not make its deletion proof
+// permanently unusable when that tag changes. Receipts remain hash-validated
+// exactly as written; only comparison with live, freshly inspected metadata
+// allows the known 11-byte tag (or its absence) to differ. No other metadata,
+// inode identity, path, file size or content digest is relaxed.
+func sameDeletionPurgeXattrs(left, right SessionDeletionPurgeXattrs) bool {
+	if left == right {
+		return true
 	}
-	return true
+	if runtime.GOOS != "darwin" {
+		return false
+	}
+	provenanceOnly := func(value SessionDeletionPurgeXattrs) bool {
+		return value.Count == 1 && value.Bytes == 11 && validStateSHA256(value.SHA256) ||
+			value.Count == 0 && value.Bytes == 0 && value.SHA256 == digestStateBytes(nil)
+	}
+	return provenanceOnly(left) && provenanceOnly(right)
 }
 
 func captureDeletionPurgeTreeIdentityOnce(storeRoot string, root string) (deletionPurgeTreeIdentity, error) {
@@ -1267,7 +1284,9 @@ func verifyDeletionPurgeTreeIdentity(storeRoot string, root string, receipt Sess
 	if err != nil {
 		return err
 	}
-	if identity.SHA256 != receipt.QuarantineTreeSHA256 || identity.Bytes != receipt.QuarantineBytes || identity.Entries != receipt.QuarantineEntries || identity.RootMode != receipt.QuarantineRootMode || identity.RootObject != receipt.QuarantineRootObject || identity.RootXattrs != receipt.QuarantineRootXattrs || !sameDeletionPurgeEntries(identity.Tree, receipt.Entries) {
+	// LoadSessionDeletionPurge validates the recorded aggregate hash. Comparing
+	// every live field also permits only the Darwin provenance exception above.
+	if identity.Bytes != receipt.QuarantineBytes || identity.Entries != receipt.QuarantineEntries || identity.RootMode != receipt.QuarantineRootMode || identity.RootObject != receipt.QuarantineRootObject || !sameDeletionPurgeXattrs(identity.RootXattrs, receipt.QuarantineRootXattrs) || !sameDeletionPurgeEntries(identity.Tree, receipt.Entries) {
 		return errors.New("deleted session quarantine differs from its durable purge proof")
 	}
 	return nil
@@ -1283,8 +1302,14 @@ func verifyDeletionPurgeEntry(storeRoot string, path string, entry SessionDeleti
 	if err != nil {
 		return err
 	}
-	if info.Mode()&os.ModeSymlink != 0 || uint32(info.Mode().Perm()) != entry.Mode || object != entry.Object || xattrs != entry.Xattrs {
+	if info.Mode()&os.ModeSymlink != 0 || uint32(info.Mode().Perm()) != entry.Mode {
 		return fmt.Errorf("deletion purge entry changed type or mode: %s", entry.Path)
+	}
+	if object != entry.Object {
+		return fmt.Errorf("deletion purge entry changed object identity: %s", entry.Path)
+	}
+	if !sameDeletionPurgeXattrs(xattrs, entry.Xattrs) {
+		return fmt.Errorf("deletion purge entry changed extended attributes: %s", entry.Path)
 	}
 	switch entry.Kind {
 	case "directory":
@@ -1303,7 +1328,7 @@ func verifyDeletionPurgeEntry(storeRoot string, path string, entry SessionDeleti
 			return fmt.Errorf("deletion purge file differs from its durable receipt: %s", entry.Path)
 		}
 		infoAfter, objectAfter, xattrsAfter, err := captureDeletionPurgeObject(store, path)
-		if err != nil || !os.SameFile(info, infoAfter) || objectAfter != object || xattrsAfter != xattrs {
+		if err != nil || !os.SameFile(info, infoAfter) || objectAfter != object || !sameDeletionPurgeXattrs(xattrsAfter, xattrs) {
 			if err == nil {
 				err = fmt.Errorf("deletion purge file metadata changed during verification: %s", entry.Path)
 			}
@@ -1593,7 +1618,7 @@ func removeDeletionPurgeStaging(storeRoot string, stagingRoot string, receipt Se
 	if err != nil {
 		return receipt, err
 	}
-	if !rootInfo.IsDir() || uint32(rootInfo.Mode().Perm()) != receipt.QuarantineRootMode || rootObject != receipt.QuarantineRootObject || rootXattrs != receipt.QuarantineRootXattrs {
+	if !rootInfo.IsDir() || uint32(rootInfo.Mode().Perm()) != receipt.QuarantineRootMode || rootObject != receipt.QuarantineRootObject || !sameDeletionPurgeXattrs(rootXattrs, receipt.QuarantineRootXattrs) {
 		return receipt, errors.New("deletion purge staging root differs from its durable receipt")
 	}
 	empty, err := deletionPurgeDirectoryEmpty(store, stagingRoot)
@@ -1700,7 +1725,7 @@ func inspectDeletionPurgeStaging(storeRoot string, stagingRoot string, receipt S
 				replacement = true
 				return fs.SkipAll
 			}
-			if uint32(info.Mode().Perm()) != receipt.QuarantineRootMode || object != receipt.QuarantineRootObject || xattrs != receipt.QuarantineRootXattrs {
+			if uint32(info.Mode().Perm()) != receipt.QuarantineRootMode || object != receipt.QuarantineRootObject || !sameDeletionPurgeXattrs(xattrs, receipt.QuarantineRootXattrs) {
 				replacement = true
 				return fs.SkipAll
 			}
@@ -1818,7 +1843,12 @@ func sameDeletionPurgeEntries(left []SessionDeletionPurgeEntry, right []SessionD
 		return false
 	}
 	for index := range left {
-		if left[index] != right[index] {
+		current, expected := left[index], right[index]
+		if !sameDeletionPurgeXattrs(current.Xattrs, expected.Xattrs) {
+			return false
+		}
+		current.Xattrs = expected.Xattrs
+		if current != expected {
 			return false
 		}
 	}

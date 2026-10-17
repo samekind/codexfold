@@ -1844,6 +1844,15 @@ func canonicalSessionRoutes(home string, mount string, store string, states []vf
 		}
 		routes[session.ID] = route
 	}
+	names, err := mountfs.ManagedNamespaceRoutes(store)
+	if err != nil {
+		return nil, err
+	}
+	for id, route := range names {
+		if _, exists := managed[id]; exists {
+			routes[id] = route
+		}
+	}
 	return routes, nil
 }
 

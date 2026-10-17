@@ -502,6 +502,57 @@ private extension ComponentStatus {
     }
 }
 
+// This probe deliberately needs no writable status/history/acknowledgement
+// file. A full status volume must not silence the very alert explaining it.
+struct RuntimeDiskSpaceMonitor {
+    // APFS may refuse new metadata while still reporting several MiB free.
+    // Warn before that boundary and require headroom before clearing it.
+    static let criticalBytes: Int64 = 16 << 20
+    static let recoveryBytes: Int64 = 64 << 20
+    private var activeID: String?
+    private var since: Date?
+
+    static func availableBytes(at url: URL) -> Int64? {
+        var path = url.path
+        var info = statfs()
+        while true {
+            if path.withCString({ statfs($0, &info) }) == 0 {
+                let (bytes, overflow) = Int64(clamping: info.f_bavail).multipliedReportingOverflow(by: Int64(info.f_bsize))
+                return overflow ? Int64.max : max(0, bytes)
+            }
+            if path == "/" { return nil }
+            path = (path as NSString).deletingLastPathComponent
+        }
+    }
+
+    mutating func evaluate(availableBytes: Int64?, at now: Date) -> ComponentStatus? {
+        guard let availableBytes else { return nil } // An unreadable probe is not proof of recovery.
+        if activeID == nil {
+            guard availableBytes < Self.criticalBytes else { return nil }
+            activeID = "disk-space-\(UUID().uuidString.lowercased())"
+            since = now
+        }
+        let recovered = availableBytes >= Self.recoveryBytes
+        let status = ComponentStatus(
+            id: "storage-pressure", schemaVersion: nil,
+            health: recovered ? .healthy : .recovering,
+            summary: L10n.text(.diskSpaceExhausted),
+            detail: "Available bytes on a required volume: \(availableBytes). Live filesystem-space probe; no status-file write is required.",
+            updatedAt: now, incidentID: activeID, incidentSince: since,
+            reason: L10n.text(.diskSpaceExhausted),
+            impact: L10n.text(.diskSpaceImpact),
+            recommendations: [L10n.text(.diskSpaceFreeRecommendation), L10n.text(.diskSpaceKeepOpenRecommendation)],
+            elapsedMilliseconds: Int64(max(0, now.timeIntervalSince(since ?? now)) * 1_000),
+            managedSessions: nil, observationSequence: nil, publisherInstanceID: nil,
+            backendID: nil, mountPoint: nil, resourcePath: nil, recoveryEpochID: nil,
+            recoveryEpochEstablishedAt: nil, logicalBytes: nil, physicalBytes: nil,
+            readBytesTotal: nil, writtenBytesTotal: nil
+        )
+        if recovered { activeID = nil; since = nil }
+        return status
+    }
+}
+
 struct FrontendIncident: Equatable {
     let id: String
     let since: Date
@@ -521,6 +572,7 @@ enum IncidentUpdate: Equatable {
 /// malformed, unknown, or stale observations never count as recovery evidence.
 struct IncidentTracker {
     private enum Source: Hashable {
+        case storagePressure
         case frontend
         case daemonStatusChannel
         case managed
@@ -582,6 +634,7 @@ struct IncidentTracker {
 
     mutating func evaluate(
         frontend: ComponentStatus?,
+        storagePressure: ComponentStatus? = nil,
         managed: ComponentStatus? = nil,
         daemonStatusChannel: ComponentStatus? = nil,
         managedStatusChannel: ComponentStatus? = nil,
@@ -592,6 +645,7 @@ struct IncidentTracker {
         let previousSource = selectedSource
         let previousState = previousSource.flatMap { incidents[$0] }
 
+        updateCriticalIncident(source: .storagePressure, status: storagePressure, at: now)
         updateCriticalIncident(source: .frontend, status: frontend, at: now)
         updateCriticalIncident(source: .daemonStatusChannel, status: daemonStatusChannel, at: now)
         updateCriticalIncident(source: .managed, status: managed, at: now)
@@ -599,6 +653,7 @@ struct IncidentTracker {
         updateCriticalIncident(source: .supervisorStatusChannel, status: supervisorStatusChannel, at: now)
         updateSupervisorIncident(supervisor, frontend: frontend, at: now)
 
+        resolveCriticalIncident(source: .storagePressure, status: storagePressure, supervisor: supervisor, at: now)
         resolveCriticalIncident(source: .frontend, status: frontend, supervisor: supervisor, at: now)
         resolveCriticalIncident(
             source: .daemonStatusChannel,
@@ -633,6 +688,13 @@ struct IncidentTracker {
                 : .active(merged.incident, isNew: false)
         }
 
+        if let pressure = incidents[.storagePressure] {
+            selectedSource = .storagePressure
+            if previousSource != .storagePressure || pressure.incident != previousState?.incident {
+                return .active(pressure.incident, isNew: previousSource == nil)
+            }
+            return nil
+        }
         if let previousSource, let current = incidents[previousSource] {
             selectedSource = previousSource
             let identityChanged = current.upstreamIdentity != previousState?.upstreamIdentity
@@ -661,7 +723,7 @@ struct IncidentTracker {
         status: ComponentStatus?,
         at now: Date
     ) {
-        guard source == .frontend
+        guard source == .storagePressure || source == .frontend
                 || source == .daemonStatusChannel
                 || source == .managed
                 || source == .managedStatusChannel
@@ -1033,7 +1095,7 @@ struct IncidentTracker {
                 L10n.text(.managedStatusChannelWaitRecommendation),
                 L10n.text(.openDashboardRecommendation),
             ]
-        case .daemonStatusChannel, .managedStatusChannel, .supervisorStatusChannel, .supervisor:
+        case .storagePressure, .daemonStatusChannel, .managedStatusChannel, .supervisorStatusChannel, .supervisor:
             reason = status.reason ?? status.summary.nonEmpty ?? L10n.text(.unknownReason)
             impact = status.impact ?? L10n.text(.unknownImpact)
             recommendations = status.recommendations.isEmpty
@@ -1092,7 +1154,7 @@ struct IncidentTracker {
     }
 
     private func nextIncident() -> ActiveState? {
-        for source in [Source.frontend, .daemonStatusChannel, .managed, .managedStatusChannel, .supervisorStatusChannel, .supervisor] {
+        for source in [Source.storagePressure, .frontend, .daemonStatusChannel, .managed, .managedStatusChannel, .supervisorStatusChannel, .supervisor] {
             if let incident = incidents[source] { return incident }
         }
         return nil
@@ -1137,6 +1199,7 @@ struct IncidentTracker {
 
     private static func sourceName(_ source: Source) -> String {
         switch source {
+        case .storagePressure: return "storage-pressure"
         case .frontend: return "frontend"
         case .daemonStatusChannel: return "daemon-status-channel"
         case .managed: return "managed"
@@ -2220,6 +2283,8 @@ final class StatusStore: ObservableObject {
     private var managedStatusChannel: ManagedStatusChannelMonitor
     private var supervisorStatusChannel: SupervisorStatusChannelMonitor
     private var hasObservedRuntime = false
+    private var diskSpaceMonitor = RuntimeDiskSpaceMonitor()
+    private let availableDiskBytes: (URL) -> Int64?
 
     init(
         appGroupURL: URL?,
@@ -2230,6 +2295,7 @@ final class StatusStore: ObservableObject {
         alertsBeforeRuntimeObserved: Bool = true,
         recordsHistory: Bool = true,
         enrollmentStoreURL: URL? = nil,
+        availableDiskBytes: @escaping (URL) -> Int64? = RuntimeDiskSpaceMonitor.availableBytes,
         now: @escaping () -> Date = Date.init
     ) {
         self.appGroupURL = appGroupURL
@@ -2239,6 +2305,7 @@ final class StatusStore: ObservableObject {
         self.recordsHistory = recordsHistory
         self.runtimeFreshness = managedStatusFreshness
         self.enrollmentStoreOverride = enrollmentStoreURL
+        self.availableDiskBytes = availableDiskBytes
         let historyArchive = StatusHistoryPersistence.load(appGroupURL: appGroupURL)
         self.historyArchive = historyArchive
         storageHistory = historyArchive.storageSamples
@@ -2262,7 +2329,7 @@ final class StatusStore: ObservableObject {
             let id = component.id.lowercased()
             return [
                 "frontend", "native-fskit", "fskit-frontend", "managed",
-                "supervisor", "daemon", "service", "backend",
+                "supervisor", "daemon", "service", "backend", "storage-pressure",
             ].contains(id)
         }
         return critical.map(\.health).max() ?? .unknown
@@ -2333,6 +2400,10 @@ final class StatusStore: ObservableObject {
         currentActivity = updateIOActivity()
         enrollmentProgress = loaded.enrollmentProgress
         enrollmentSettings = loaded.enrollmentSettings
+        let capacityPaths = [appGroupURL, enrollmentStoreURL()].compactMap { $0 }
+        let freeBytes = capacityPaths.compactMap { availableDiskBytes($0) }.min()
+        let pressure = monitorsRuntime ? diskSpaceMonitor.evaluate(availableBytes: freeBytes, at: observedAt) : nil
+        if let pressure { components.append(pressure) }
         let frontend = componentStatus(aliases: ["frontend", "native-fskit", "fskit-frontend"])
         let daemonChannel = monitorDaemonStatus && monitorsRuntime
             ? daemonStatusChannel.evaluate(
@@ -2359,6 +2430,7 @@ final class StatusStore: ObservableObject {
             : nil
         let incidentUpdate = incidentTracker.evaluate(
             frontend: frontend,
+            storagePressure: pressure,
             managed: managed,
             daemonStatusChannel: daemonChannel,
             managedStatusChannel: managedChannel,

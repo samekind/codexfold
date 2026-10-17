@@ -1200,7 +1200,7 @@ func exactCandidateTreeIdentity(ctx context.Context, root string) (int, int64, s
 				return errors.New("exact deletion candidate changed while opening a file")
 			}
 			contentHash := sha256.New()
-			bytesRead, copyErr := io.Copy(contentHash, file)
+			bytesRead, copyErr := CopyContext(ctx, contentHash, file)
 			after, statErr := file.Stat()
 			closeErr := file.Close()
 			if err := errors.Join(copyErr, statErr, closeErr); err != nil {

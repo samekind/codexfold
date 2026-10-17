@@ -148,12 +148,19 @@ func newFSRetireNativeCommand() *cobra.Command {
 		Use:   "retire-native <session-id>",
 		Short: "Retire a canonical native snapshot after pack-only recovery proof",
 		Args:  cobra.ExactArgs(1),
-		RunE: func(command *cobra.Command, args []string) error {
+		RunE: func(command *cobra.Command, args []string) (runErr error) {
 			home, err := codex.ResolveHome(codexHome)
 			if err != nil {
 				return err
 			}
 			store := resolveFoldStore(home, storeDir)
+			maintenance, err := storage.BeginMaintenance(command.Context(), store)
+			if err != nil {
+				return err
+			}
+			defer maintenance.Close()
+			defer func() { runErr = maintenance.YieldError(runErr) }()
+			command.SetContext(maintenance.Context())
 			state, err := nativeRetirementState(command.Context(), store, args[0])
 			if err != nil {
 				return err
@@ -290,6 +297,7 @@ func newFSValidateNativeCommand() *cobra.Command {
 	var codexHome string
 	var nativeRoot string
 	var auditAll bool
+	var repairDamaged bool
 	var jsonOutput bool
 	command := &cobra.Command{
 		Use:   "validate-native",
@@ -316,10 +324,19 @@ func newFSValidateNativeCommand() *cobra.Command {
 			} else {
 				filesystem := mountfs.NewCanonical()
 				filesystem.SetNativeRoot(root)
-				result.Report, err = filesystem.ValidateNativeWriterRollouts(command.Context())
-				if err != nil {
-					result.Healthy = false
-					result.Issues = []mountfs.NativePreflightIssue{{Message: err.Error()}}
+				if repairDamaged {
+					result.Report, err = filesystem.RepairNativeWriterRollouts(command.Context())
+					result.Issues = result.Report.Issues
+					result.Healthy = err == nil && len(result.Issues) == 0
+					if err != nil {
+						result.Issues = []mountfs.NativePreflightIssue{{Message: err.Error()}}
+					}
+				} else {
+					result.Report, err = filesystem.ValidateNativeWriterRollouts(command.Context())
+					if err != nil {
+						result.Healthy = false
+						result.Issues = []mountfs.NativePreflightIssue{{Message: err.Error()}}
+					}
 				}
 			}
 			if jsonOutput {
@@ -340,6 +357,7 @@ func newFSValidateNativeCommand() *cobra.Command {
 	command.Flags().StringVar(&codexHome, "codex-home", "", "Codex home directory; defaults to CODEX_HOME or ~/.codex")
 	command.Flags().StringVar(&nativeRoot, "native-root", "", "Native rollout root; defaults to <codex-home>/fold-native")
 	command.Flags().BoolVar(&auditAll, "audit-all", false, "Bypass the cache and report every invalid active rollout")
+	command.Flags().BoolVar(&repairDamaged, "repair", false, "Quarantine damaged records and rewrite the rollout; only while the filesystem service is stopped")
 	command.Flags().BoolVar(&jsonOutput, "json", false, "Emit JSON output")
 	return command
 }
@@ -690,6 +708,9 @@ func newFSServeCommand() *cobra.Command {
 			if canonicalNamespace {
 				filesystem = mountfs.NewCanonical()
 				filesystem.SetNativeRoot(nativeRoot)
+				if err := filesystem.SetManagedStore(store); err != nil {
+					return fmt.Errorf("recover managed file names: %w", err)
+				}
 				filesystem.SetSessionDeletionPublisher(func(state vfs.SessionState, route string) error {
 					_, err := vfs.PublishSessionDeletion(store, state, route)
 					return err
@@ -705,8 +726,18 @@ func newFSServeCommand() *cobra.Command {
 				if err := filesystem.RecoverNativeAppendTransactions(); err != nil {
 					return fmt.Errorf("recover native append transactions: %w", err)
 				}
-				if _, err := filesystem.ValidateNativeWriterRollouts(command.Context()); err != nil {
+				// A damaged rollout must never keep the mount down: repair it,
+				// and report anything that cannot be repaired rather than exit.
+				preflight, err := filesystem.RepairNativeWriterRollouts(command.Context())
+				if err != nil {
 					return fmt.Errorf("validate native writer rollouts: %w", err)
+				}
+				for _, repair := range preflight.Repairs {
+					_, _ = fmt.Fprintf(command.ErrOrStderr(), "native writer preflight repaired %s: removed %d damaged range(s), %d byte(s) from offset %d, added_final_newline=%t; original bytes kept in %s\n",
+						repair.Path, repair.RemovedRanges, repair.RemovedBytes, repair.FirstDamagedAt, repair.AddedFinalLF, repair.QuarantinePath)
+				}
+				for _, issue := range preflight.Issues {
+					_, _ = fmt.Fprintf(command.ErrOrStderr(), "native writer preflight could not fix %s: %s; serving it unchanged\n", issue.Path, issue.Message)
 				}
 			}
 			// Session-load incidents are the only place a client I/O error can be
@@ -778,9 +809,13 @@ func newFSServeCommand() *cobra.Command {
 			knownPacks := make(map[string]string)
 			lastStateIssueSignature := ""
 			lastReloadError := ""
+			lastDeletionCleanupError := ""
 			lastMissingKnownSignature := ""
 			var managedReportMu sync.Mutex
 			reportManagedReloadSafe := func(err error) {
+				if ctx.Err() != nil && errors.Is(err, ctx.Err()) {
+					return
+				}
 				managedReportMu.Lock()
 				defer managedReportMu.Unlock()
 				reportManagedReload(command.ErrOrStderr(), err, &lastReloadError)
@@ -793,6 +828,7 @@ func newFSServeCommand() *cobra.Command {
 				_, _ = fmt.Fprintf(command.ErrOrStderr(), "write managed session status: %v\n", err)
 			})
 			defer func() { _ = managedStatus.Close(500 * time.Millisecond) }()
+			storage.PrepareReadReserve(store)
 			var loadMu sync.Mutex
 			inspectionCache := &vfs.StateInspectionCache{}
 			var managedObservationSequence uint64
@@ -801,7 +837,7 @@ func newFSServeCommand() *cobra.Command {
 				return managedObservationSequence
 			}
 			openState := func(state vfs.SessionState) (*vfs.Session, *pack.Resolver, error) {
-				managed, resolver, err := openManagedSession(ctx, store, state)
+				managed, resolver, err := openManagedNamespaceSession(ctx, store, state)
 				if err != nil {
 					return nil, nil, err
 				}
@@ -941,11 +977,13 @@ func newFSServeCommand() *cobra.Command {
 					mergeManagedSessionRegistryGenerations(expectedManaged, registry)
 					registryMissing = false
 				}
-				deleted, err := reconcileManagedSessionDeletionSet(store, filesystem, canonicalNamespace, deletions, known, knownRoutes, knownPacks)
+				deleted, err, cleanupErr := reconcileManagedSessionDeletionSet(store, filesystem, canonicalNamespace, deletions, known, knownRoutes, knownPacks)
 				if err != nil {
 					observation.Fatal = err
 					return observation
 				}
+				observation.CleanupError = cleanupErr
+				reportManagedDeletionCleanup(command.ErrOrStderr(), cleanupErr, &lastDeletionCleanupError)
 				for sessionID := range deleted {
 					delete(expectedManaged, sessionID)
 					registryRemovals[sessionID] = struct{}{}
@@ -1118,6 +1156,9 @@ func newFSServeCommand() *cobra.Command {
 						if _, exists := routes[state.SessionID]; !exists {
 							return false
 						}
+						if routes[state.SessionID] == "" {
+							return false
+						}
 						_, retiring, err := readRetirementRequest(store, state.SessionID)
 						return err == nil && !retiring
 					}, openState, 12)
@@ -1136,6 +1177,9 @@ func newFSServeCommand() *cobra.Command {
 							}
 						}
 						route, exists := routes[state.SessionID]
+						if exists && route == "" {
+							continue
+						}
 						if !exists {
 							missingRoutes = append(missingRoutes, state.SessionID)
 						}
@@ -1234,6 +1278,9 @@ func newFSServeCommand() *cobra.Command {
 						break
 					}
 				}
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
 				managedStatus.Observe(observation)
 				return observation.Err()
 			}
@@ -1265,6 +1312,9 @@ func newFSServeCommand() *cobra.Command {
 				activityCounter = &mountfs.IOActivityCounter{}
 			}
 			runtimeMemoryMaintenanceDone := startRuntimeMemoryMaintenance(ctx, filesystem)
+			namespaceMaintenanceDone := startNamespaceRetirement(ctx, filesystem, store, func() bool {
+				return resolveEnrollmentControl(flags, enrollmentInterval).Enabled
+			}, command.ErrOrStderr())
 			watcherDone := make(chan struct{})
 			go func() {
 				defer close(watcherDone)
@@ -1278,6 +1328,7 @@ func newFSServeCommand() *cobra.Command {
 					SocketPath: nativeFSKitSocket, ResourcePath: nativeFSKitResource,
 					StatusPath: service.FSKitStatusPath(nativeFSKitResource, "daemon"), MountPoint: mount,
 					Recorder:                   operationRecorder,
+					StallDiagnosticPath:        filepath.Join(store, "service", "logs", "blocked-io.txt"),
 					Activity:                   activityCounter,
 					PrewarmSharedMemoryWindows: 4,
 					OnReady:                    startEnrollment,
@@ -1294,6 +1345,7 @@ func newFSServeCommand() *cobra.Command {
 				<-storageStatusDone
 			}
 			<-runtimeMemoryMaintenanceDone
+			<-namespaceMaintenanceDone
 			<-enrollmentDone
 			var nativeWatcherErr error
 			if nativeWatcherDone != nil {
@@ -1434,7 +1486,8 @@ func reconcileManagedSessionDeletions(
 	if err != nil {
 		return nil, err
 	}
-	return reconcileManagedSessionDeletionSet(store, filesystem, canonicalNamespace, deletions, known, knownRoutes, knownPacks)
+	deleted, detachErr, cleanupErr := reconcileManagedSessionDeletionSet(store, filesystem, canonicalNamespace, deletions, known, knownRoutes, knownPacks)
+	return deleted, errors.Join(detachErr, cleanupErr)
 }
 
 func reconcileManagedSessionDeletionSet(
@@ -1445,27 +1498,43 @@ func reconcileManagedSessionDeletionSet(
 	known map[string]uint64,
 	knownRoutes map[string]string,
 	knownPacks map[string]string,
-) (map[string]struct{}, error) {
+) (map[string]struct{}, error, error) {
 	deleted := deletedSessionIDs(deletions)
-	var replayErrors []error
+	var detachErrors, cleanupErrors []error
 	for _, deletion := range deletions {
 		if err := filesystem.RemoveSession(deletion.SessionID); err != nil && !errors.Is(err, os.ErrNotExist) {
-			replayErrors = append(replayErrors, fmt.Errorf("detach deleted managed session %s: %w", deletion.SessionID, err))
+			detachErrors = append(detachErrors, fmt.Errorf("detach deleted managed session %s: %w", deletion.SessionID, err))
 		}
 		delete(known, deletion.SessionID)
 		delete(knownRoutes, deletion.SessionID)
 		delete(knownPacks, deletion.SessionID)
 		if canonicalNamespace {
 			if err := filesystem.HideDeletedSessionAt(deletion.SessionID, deletion.Route); err != nil {
-				replayErrors = append(replayErrors, err)
+				detachErrors = append(detachErrors, err)
 				continue
 			}
 		}
 		if _, err := vfs.AdvanceSessionDeletion(store, deletion); err != nil && !errors.Is(err, vfs.ErrSessionDeletionBusy) {
-			replayErrors = append(replayErrors, fmt.Errorf("replay managed session deletion %s: %w", deletion.SessionID, err))
+			cleanupErrors = append(cleanupErrors, fmt.Errorf("replay managed session deletion %s: %w", deletion.SessionID, err))
 		}
 	}
-	return deleted, errors.Join(replayErrors...)
+	return deleted, errors.Join(detachErrors...), errors.Join(cleanupErrors...)
+}
+
+func reportManagedDeletionCleanup(writer io.Writer, err error, previous *string) {
+	current := ""
+	if err != nil {
+		current = err.Error()
+	}
+	if current == *previous {
+		return
+	}
+	if current == "" {
+		_, _ = fmt.Fprintln(writer, "managed session deletion cleanup recovered")
+	} else {
+		_, _ = fmt.Fprintf(writer, "managed session deletion cleanup deferred; unrelated sessions continue to refresh: %v\n", err)
+	}
+	*previous = current
 }
 
 func reportManagedStateIssues(writer io.Writer, issues []vfs.SessionStateIssue, previous *string) {
@@ -1628,6 +1697,9 @@ func runManagedReloadLoopWithDelay(ctx context.Context, delayState managedReload
 		case <-timer.C:
 		}
 		err := load()
+		if ctx.Err() != nil {
+			return
+		}
 		report(err)
 		delay = delayState.next(err, time.Now())
 	}
@@ -1878,7 +1950,9 @@ func newFSMigrateCommand() *cobra.Command {
 			if _, err := mountfs.ValidateNativeRollout(command.Context(), sourcePath); err != nil {
 				return fmt.Errorf("native rollout is not eligible for transparent routing: %w", err)
 			}
-			shadow, err := fsctl.Shadow(command.Context(), sourcePath, view, fsctl.ShadowOptions{RandomReads: 10000, Seed: 1})
+			// Shadow compares every byte and re-hashes the source afterwards.
+			// Random-access stress belongs in filesystem tests, not every cutover.
+			shadow, err := fsctl.Shadow(command.Context(), sourcePath, view, fsctl.ShadowOptions{})
 			if err != nil {
 				return err
 			}
@@ -1899,9 +1973,10 @@ func newFSMigrateCommand() *cobra.Command {
 				if currentNative.Bytes != native.Bytes || currentNative.SHA256 != native.SHA256 {
 					return errors.New("native session changed during writer probe; migration was not applied")
 				}
-				if err := requireStorageHealth(command.Context(), store); err != nil {
-					return err
-				}
+				// This session has a complete byte-for-byte shadow proof above.
+				// Its native snapshot remains until retirement proves pack-only
+				// recovery. Auditing the whole store here repeats that work for
+				// every session in a batch without strengthening this cutover.
 				if compatibilityCanary {
 					userHome, err := os.UserHomeDir()
 					if err != nil {
@@ -2614,6 +2689,15 @@ func recoverInterruptedCanonicalMigrationWithOptions(
 	if filepath.Clean(state.NativeSnapshot.Path) != filepath.Clean(retainedPath) {
 		return false, nil
 	}
+	// Explicit filesystem names (backups and replacement inodes) are not
+	// interrupted SQLite migrations. Their durable namespace is authoritative.
+	routes, err := mountfs.ManagedNamespaceRoutes(store)
+	if err != nil {
+		return false, err
+	}
+	if _, named := routes[state.SessionID]; named {
+		return false, nil
+	}
 	deletionLock, err := storage.AcquireOperationLock(store, "session-deletions")
 	if err != nil {
 		return false, fmt.Errorf("serialize interrupted migration recovery with explicit deletion: %w", err)
@@ -2895,6 +2979,14 @@ func openFoldView(home string, store string, sessionID string) (codex.Session, f
 }
 
 func openManagedSession(ctx context.Context, store string, state vfs.SessionState) (*vfs.Session, *pack.Resolver, error) {
+	return openManagedSessionWithNamespace(ctx, store, state, false)
+}
+
+func openManagedNamespaceSession(ctx context.Context, store string, state vfs.SessionState) (*vfs.Session, *pack.Resolver, error) {
+	return openManagedSessionWithNamespace(ctx, store, state, true)
+}
+
+func openManagedSessionWithNamespace(ctx context.Context, store string, state vfs.SessionState, namespace bool) (*vfs.Session, *pack.Resolver, error) {
 	manifest, err := fold.LoadManifestPath(state.ManifestPath)
 	if err != nil {
 		return nil, nil, err
@@ -2903,7 +2995,11 @@ func openManagedSession(ctx context.Context, store string, state vfs.SessionStat
 	if err != nil {
 		return nil, nil, err
 	}
-	managed, err := vfs.OpenSession(ctx, vfs.SessionOptions{Root: store, ManifestPath: state.ManifestPath, Manifest: manifest, Reader: resolver, NativeSnapshot: state.NativeSnapshot})
+	var reader vfs.ObjectReader = resolver
+	if namespace && strings.HasPrefix(state.SessionID, "file-") {
+		reader = mountfs.NamespaceReader(store, resolver)
+	}
+	managed, err := vfs.OpenSession(ctx, vfs.SessionOptions{Root: store, ManifestPath: state.ManifestPath, Manifest: manifest, Reader: reader, NativeSnapshot: state.NativeSnapshot})
 	if err != nil {
 		_ = resolver.Close()
 		return nil, nil, err
@@ -3134,7 +3230,7 @@ func startStorageMaintenance(
 		defer close(done)
 		defer debug.FreeOSMemory()
 		result, ran, err := run(ctx, store)
-		if err != nil && !errors.Is(err, context.Canceled) {
+		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, storage.ErrManagedSessionBusy) {
 			_, _ = fmt.Fprintf(diagnostics, "storage maintenance failed: %v\n", err)
 		} else if ran && result.RetainedUnprovedCount != 0 {
 			_, _ = fmt.Fprintf(diagnostics, "storage maintenance retained %d candidate(s) (%d apparent bytes) without exact durable deletion proof\n", result.RetainedUnprovedCount, result.RetainedUnprovedApparentBytes)

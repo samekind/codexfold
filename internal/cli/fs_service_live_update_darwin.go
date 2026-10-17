@@ -47,11 +47,13 @@ func addLiveDaemonUpdateCommand(parent *cobra.Command) {
 func newFSServiceUpdateDaemonLiveCommand() *cobra.Command {
 	var definitionPath, mountPoint string
 	var apply, jsonOutput bool
+	var takeoverTimeout time.Duration
 	command := &cobra.Command{
 		Use:   "update-daemon-live <candidate>",
 		Short: "Replace only the native FSKit daemon while keeping Codex and its mount running",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(command *cobra.Command, args []string) error {
+			if takeoverTimeout <= 0 || takeoverTimeout > 2*time.Minute { return errors.New("takeover timeout must be greater than zero and no longer than 2m") }
 			candidate, err := filepath.Abs(args[0])
 			if err != nil {
 				return err
@@ -160,7 +162,7 @@ func newFSServiceUpdateDaemonLiveCommand() *cobra.Command {
 						}
 						oldDaemonSignaled = true
 					}
-					replacement, err = waitForLiveDaemon(command.Context(), definition, mount, expectedSHA, before.DaemonPID, before.SupervisorPID, mountID, liveDaemonTakeoverTimeout)
+					replacement, err = waitForLiveDaemon(command.Context(), definition, mount, expectedSHA, before.DaemonPID, before.SupervisorPID, mountID, takeoverTimeout)
 					return err
 				}
 				restore := func(expectedSHA string) error {
@@ -195,6 +197,7 @@ func newFSServiceUpdateDaemonLiveCommand() *cobra.Command {
 	addServiceDefinitionFlags(command, &definitionPath)
 	command.Flags().StringVar(&mountPoint, "mount", "", "Native FSKit mount path from the service definition")
 	command.Flags().BoolVar(&apply, "apply", false, "Replace only the daemon while preserving the active mount")
+	command.Flags().DurationVar(&takeoverTimeout, "takeover-timeout", liveDaemonTakeoverTimeout, "Maximum backend takeover wait before rollback; does not delay the ten-second outage alert")
 	command.Flags().BoolVar(&jsonOutput, "json", false, "Emit JSON output")
 	return command
 }

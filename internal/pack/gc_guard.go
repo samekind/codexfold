@@ -45,7 +45,7 @@ func (r survivingObjectReader) HasObject(ref fold.ObjectRef) bool {
 // AuthorizeGenerationRemoval proves that live manifests remain fully
 // reconstructable from loose objects and the current pack while holding every
 // writer and object mutation lock through the caller's deletion.
-func AuthorizeGenerationRemoval(ctx context.Context, storeDir string, candidate storage.GCCandidate) (storage.PackGenerationRemovalGuard, error) {
+func AuthorizeGenerationRemoval(ctx context.Context, storeDir string, candidate storage.GCCandidate) (result storage.PackGenerationRemovalGuard, runErr error) {
 	if candidate.Kind != storage.CandidatePackGeneration {
 		return nil, errors.New("pack-generation authorization requires a pack candidate")
 	}
@@ -67,6 +67,8 @@ func AuthorizeGenerationRemoval(ctx context.Context, storeDir string, candidate 
 	if err != nil {
 		return nil, fmt.Errorf("lock managed sessions before pack cleanup: %w", err)
 	}
+	ctx = managed.Context()
+	defer func() { runErr = managed.YieldError(runErr) }()
 	objectLock, err := storage.AcquireOperationLock(storeDir, "objects")
 	if err != nil {
 		_ = managed.Close()
@@ -136,7 +138,12 @@ func AuthorizeGenerationRemoval(ctx context.Context, storeDir string, candidate 
 	return guard, nil
 }
 
-func (g *generationRemovalGuard) Revalidate(ctx context.Context) error {
+func (g *generationRemovalGuard) Revalidate(ctx context.Context) (runErr error) {
+	if g == nil || g.managed == nil {
+		return errors.New("pack-generation removal guard is closed")
+	}
+	ctx = g.managed.Context()
+	defer func() { runErr = g.managed.YieldError(runErr) }()
 	if err := g.revalidateSurvivingStorage(ctx); err != nil {
 		return err
 	}
@@ -153,7 +160,12 @@ func (g *generationRemovalGuard) Revalidate(ctx context.Context) error {
 	return nil
 }
 
-func (g *generationRemovalGuard) RevalidateStaged(ctx context.Context, candidate storage.GCCandidate) error {
+func (g *generationRemovalGuard) RevalidateStaged(ctx context.Context, candidate storage.GCCandidate) (runErr error) {
+	if g == nil || g.managed == nil {
+		return errors.New("pack-generation removal guard is closed")
+	}
+	ctx = g.managed.Context()
+	defer func() { runErr = g.managed.YieldError(runErr) }()
 	if err := g.revalidateSurvivingStorage(ctx); err != nil {
 		return err
 	}
@@ -291,7 +303,7 @@ func validatePackGenerationRemovalOwnership(ctx context.Context, candidate stora
 		if filepath.Base(name) != name {
 			return fmt.Errorf("pack generation owns a nested runtime file: %s", name)
 		}
-		if err := verifyRecoveryDiskFile(root, name, identity); err != nil {
+		if err := verifyRecoveryDiskFile(ctx, root, name, identity); err != nil {
 			return fmt.Errorf("verify exact pack generation file %s: %w", name, err)
 		}
 	}

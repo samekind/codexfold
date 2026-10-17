@@ -100,7 +100,9 @@ func openSession(ctx context.Context, options SessionOptions, reserveWriter bool
 		if err != nil {
 			return nil, nil, err
 		}
-		budget = guard
+		shared := storage.SharedInventoryGuard{Guard: guard}
+		shared.Prime()
+		budget = shared
 	}
 	view, err := NewView(options.Manifest, options.Reader)
 	if err != nil {
@@ -343,6 +345,30 @@ func (s *Session) OpenWriter() (*WriteHandle, error) {
 	}
 	s.mu.Unlock()
 	return &WriteHandle{session: s, leasePath: leasePath, lease: lease}, nil
+}
+
+// OpenForegroundWriter lets a user's open preempt background reclamation.
+// Real foreground writer exclusion remains unchanged; only a live maintenance
+// registration authorizes the bounded, internal retry.
+func (s *Session) OpenForegroundWriter() (*WriteHandle, error) {
+	writer, err := s.OpenWriter()
+	if !errors.Is(err, ErrWriterBusy) {
+		return writer, err
+	}
+	store := filepath.Dir(filepath.Dir(filepath.Dir(s.directory)))
+	requested, requestErr := storage.RequestForegroundAccess(store)
+	if requestErr != nil || !requested {
+		return nil, err
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+		writer, err = s.OpenWriter()
+		if !errors.Is(err, ErrWriterBusy) {
+			return writer, err
+		}
+	}
+	return nil, err
 }
 
 func acquireWriterLease(leasePath string) (*os.File, error) {

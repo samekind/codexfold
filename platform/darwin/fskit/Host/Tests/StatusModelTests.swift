@@ -2,6 +2,86 @@ import Darwin
 import Foundation
 import XCTest
 
+final class RuntimeDiskSpaceMonitorTests: XCTestCase {
+    @MainActor
+    func testActualFullVolumeCanStillPresentAndRecoverWithoutWritingStatus() throws {
+        guard let volume = ProcessInfo.processInfo.environment["CODEXFOLD_TEST_FULL_VOLUME"],
+              volume.hasPrefix("/private/tmp/codexfold-pressure-") else { throw XCTSkip("requires the small disposable full-volume fixture") }
+        let attributes = try FileManager.default.attributesOfFileSystem(forPath: volume)
+        guard let volumeBytes = (attributes[.systemSize] as? NSNumber)?.int64Value, volumeBytes < 300 << 20 else { throw XCTSkip("not the small disposable mounted volume") }
+        let root = URL(fileURLWithPath: volume).appendingPathComponent("swift-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let filler = root.appendingPathComponent("test-only-filler")
+        FileManager.default.createFile(atPath: filler.path, contents: nil)
+        let handle = try FileHandle(forWritingTo: filler)
+        let block = Data(repeating: 0x78, count: 1 << 20)
+        var reachedFull = false
+        for _ in 0..<300 {
+            do { try handle.write(contentsOf: block) } catch { reachedFull = true; break }
+        }
+        let smallBlock = Data(repeating: 0x79, count: 4096)
+        for _ in 0..<512 {
+            do { try handle.write(contentsOf: smallBlock) } catch { break }
+        }
+        try? handle.close()
+        XCTAssertTrue(reachedFull)
+        XCTAssertLessThan(RuntimeDiskSpaceMonitor.availableBytes(at: root) ?? Int64.max, RuntimeDiskSpaceMonitor.criticalBytes)
+        XCTAssertThrowsError(try DurableAppGroupFile.write(Data("not enough space".utf8), to: root.appendingPathComponent("status.json")))
+        let start = Date()
+        var monitor = RuntimeDiskSpaceMonitor()
+        var tracker = IncidentTracker(timeout: 10)
+        let first = monitor.evaluate(availableBytes: RuntimeDiskSpaceMonitor.availableBytes(at: root), at: start)
+        _ = tracker.evaluate(frontend: nil, storagePressure: first, supervisor: nil, at: start)
+        let pressure = monitor.evaluate(availableBytes: RuntimeDiskSpaceMonitor.availableBytes(at: root), at: start.addingTimeInterval(10))
+        guard let alert = tracker.evaluate(frontend: nil, storagePressure: pressure, supervisor: nil, at: start.addingTimeInterval(10)) else { return XCTFail("no live alert when status publication is impossible") }
+        var shown = 0
+        let notifications = RecordingIncidentNotifications()
+        let presenter = IncidentWindowPresenter(appGroupURL: root, diagnosticPayload: { _ in nil }, presentWindow: { _ in shown += 1 }, notifications: notifications)
+        presenter.handle(alert)
+        XCTAssertEqual(notifications.posted.count, 1)
+        XCTAssertEqual(shown, 0)
+        try FileManager.default.removeItem(at: filler)
+        let recovered = monitor.evaluate(availableBytes: RuntimeDiskSpaceMonitor.availableBytes(at: root), at: start.addingTimeInterval(11))
+        guard case .recovered? = tracker.evaluate(frontend: nil, storagePressure: recovered, supervisor: nil, at: start.addingTimeInterval(11)) else { return XCTFail("space recovery did not clear live alert") }
+    }
+
+    func testFullDiskAlertNeedsNoStatusPublicationAndHasStableIdentity() {
+        let start = Date(timeIntervalSince1970: 10_000)
+        var monitor = RuntimeDiskSpaceMonitor()
+        var tracker = IncidentTracker(timeout: 10)
+        let first = monitor.evaluate(availableBytes: 0, at: start)
+        XCTAssertNil(tracker.evaluate(frontend: nil, storagePressure: first, supervisor: nil, at: start))
+        let later = monitor.evaluate(availableBytes: 0, at: start.addingTimeInterval(10))
+        guard case .active(let incident, let isNew)? = tracker.evaluate(frontend: nil, storagePressure: later, supervisor: nil, at: start.addingTimeInterval(10)) else { return XCTFail("disk-full alert was silenced with no writable status channel") }
+        XCTAssertTrue(isNew)
+        XCTAssertEqual(first?.incidentID, later?.incidentID)
+        XCTAssertEqual(incident.reason, L10n.text(.diskSpaceExhausted))
+        let stillLow = monitor.evaluate(availableBytes: 2 << 20, at: start.addingTimeInterval(11))
+        XCTAssertEqual(stillLow?.health, .recovering)
+        if case .active(_, let isNew)? = tracker.evaluate(frontend: nil, storagePressure: stillLow, supervisor: nil, at: start.addingTimeInterval(11)) {
+            XCTAssertFalse(isNew, "space fluctuation must update, not reopen, the existing alert")
+        }
+        let recovered = monitor.evaluate(availableBytes: 128 << 20, at: start.addingTimeInterval(12))
+        guard case .recovered? = tracker.evaluate(frontend: nil, storagePressure: recovered, supervisor: nil, at: start.addingTimeInterval(12)) else { return XCTFail("free space did not automatically recover") }
+        XCTAssertNil(monitor.evaluate(availableBytes: 128 << 20, at: start.addingTimeInterval(13)))
+    }
+
+    func testFailedSpaceProbeDoesNotClaimRecovery() {
+        let start = Date()
+        var monitor = RuntimeDiskSpaceMonitor()
+        let first = monitor.evaluate(availableBytes: 0, at: start)
+        XCTAssertNil(monitor.evaluate(availableBytes: nil, at: start.addingTimeInterval(1)))
+        XCTAssertEqual(monitor.evaluate(availableBytes: 0, at: start.addingTimeInterval(2))?.incidentID, first?.incidentID)
+    }
+
+    func testNativeProbeDoesNotNeedToCreateAFile() throws {
+        let root = FileManager.default.temporaryDirectory
+        XCTAssertNotNil(RuntimeDiskSpaceMonitor.availableBytes(at: root))
+        XCTAssertNotNil(RuntimeDiskSpaceMonitor.availableBytes(at: root.appendingPathComponent("nonexistent-\(UUID().uuidString)/child")))
+    }
+}
+
 final class CodexFoldRuntimeLocationTests: XCTestCase {
     func testDefaultRuntimeUsesAppGroupRoot() {
         let root = URL(fileURLWithPath: "/tmp/group.vip.jstar.codexfold", isDirectory: true)

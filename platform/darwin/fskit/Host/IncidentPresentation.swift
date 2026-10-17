@@ -3,6 +3,79 @@ import Darwin
 import Foundation
 import OSLog
 import SwiftUI
+import UserNotifications
+
+@MainActor
+protocol IncidentNotificationSending: AnyObject {
+    var onOpen: ((String) -> Void)? { get set }
+    func post(_ incident: FrontendIncident)
+    func remove(_ incidentID: String)
+}
+
+@MainActor
+final class SystemIncidentNotificationSender: NSObject, IncidentNotificationSending, UNUserNotificationCenterDelegate {
+    var onOpen: ((String) -> Void)?
+    private let center = UNUserNotificationCenter.current()
+    private var active = Set<String>()
+
+    override init() {
+        super.init()
+        center.delegate = self
+    }
+
+    func post(_ incident: FrontendIncident) {
+        active.insert(incident.id)
+        center.getNotificationSettings { [weak self] settings in
+            Task { @MainActor in
+                guard let self, self.active.contains(incident.id) else { return }
+                switch settings.authorizationStatus {
+                case .notDetermined:
+                    // Provisional authorization is quiet: do not replace an
+                    // unwanted fault window with a permission dialog.
+                    self.center.requestAuthorization(options: [.alert, .provisional]) { [weak self] granted, _ in
+                        Task { @MainActor in
+                            if granted { self?.submit(incident) }
+                        }
+                    }
+                case .authorized, .provisional:
+                    self.submit(incident)
+                default:
+                    break // Denied notifications never fall back to a modal window.
+                }
+            }
+        }
+    }
+
+    private func submit(_ incident: FrontendIncident) {
+        guard active.contains(incident.id) else { return }
+        let content = UNMutableNotificationContent()
+        content.title = L10n.text(.productName)
+        content.subtitle = incident.reason
+        content.body = String(incident.impact.prefix(280))
+        content.sound = nil
+        content.userInfo = ["codexfoldIncidentID": incident.id]
+        center.add(UNNotificationRequest(identifier: "codexfold-incident-" + incident.id, content: content, trigger: nil))
+    }
+
+    func remove(_ incidentID: String) {
+        active.remove(incidentID)
+        let id = "codexfold-incident-" + incidentID
+        center.removePendingNotificationRequests(withIdentifiers: [id])
+        center.removeDeliveredNotifications(withIdentifiers: [id])
+    }
+
+    nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification, withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+        completionHandler([.banner, .list])
+    }
+
+    nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse, withCompletionHandler completionHandler: @escaping () -> Void) {
+        if response.actionIdentifier == UNNotificationDefaultActionIdentifier,
+           let id = response.notification.request.content.userInfo["codexfoldIncidentID"] as? String {
+            Task { @MainActor [weak self] in self?.onOpen?(id) }
+        }
+        completionHandler()
+    }
+}
 
 @_silgen_name("flock")
 private func codexfold_flock(_ descriptor: Int32, _ operation: Int32) -> Int32
@@ -57,6 +130,14 @@ struct IncidentAcknowledgementStore {
             return false
         }
         return acknowledgement.matches(incident)
+    }
+
+    var incidentID: String? {
+        guard let data = try? DurableAppGroupFile.read(url),
+              let acknowledgement = try? JSONDecoder().decode(IncidentAcknowledgement.self, from: data) else {
+            return nil
+        }
+        return acknowledgement.incidentID
     }
 
     func acknowledge(_ incident: FrontendIncident) throws {
@@ -122,22 +203,44 @@ final class IncidentWindowPresenter: NSObject, NSWindowDelegate {
     private let localAuthorizationCapability = LocalAuthorizationCapability.current()
     private var incidentController: NSWindowController?
     private var presentedIncident: FrontendIncident?
+    private let notifications: IncidentNotificationSending?
+    private var lastNotified: IncidentAcknowledgement?
+    private var latestIncident: FrontendIncident?
 
     init(
         appGroupURL: URL,
         diagnosticPayload: @escaping (FrontendIncident) -> Data?,
-        presentWindow: ((NSWindowController) -> Void)? = nil
+        presentWindow: ((NSWindowController) -> Void)? = nil,
+        notifications: IncidentNotificationSending? = nil
     ) {
         acknowledgementStore = IncidentAcknowledgementStore(appGroupURL: appGroupURL)
         self.diagnosticPayload = diagnosticPayload
         self.presentWindow = presentWindow
+        self.notifications = notifications ?? (presentWindow == nil ? SystemIncidentNotificationSender() : nil)
+        super.init()
+        self.notifications?.onOpen = { [weak self] id in
+            guard let self, let incident = self.latestIncident, incident.id == id else { return }
+            self.present(self.incidentForPresentation(incident), isNew: true, allowAcknowledged: true)
+        }
     }
 
     func handle(_ update: IncidentUpdate) {
         switch update {
         case .active(let incident, let isNew):
-            present(incidentForPresentation(incident), isNew: isNew)
+            latestIncident = incident
+            if let notifications {
+                guard isNew, lastNotified?.matches(incident) != true, !acknowledgementStore.contains(incident) else { return }
+                lastNotified = IncidentAcknowledgement(incident: incident)
+                try? acknowledgementStore.acknowledge(incident)
+                notifications.post(incident)
+            } else {
+                present(incidentForPresentation(incident), isNew: isNew)
+            }
         case .recovered(let incident):
+            notifications?.remove(incident.id)
+            if let previous = lastNotified, previous.incidentID != incident.id { notifications?.remove(previous.incidentID) }
+            lastNotified = nil
+            latestIncident = nil
             let presented = incidentForPresentation(incident)
             acknowledgementStore.clear(matching: presented)
             presentedIncident = presented
@@ -150,6 +253,7 @@ final class IncidentWindowPresenter: NSObject, NSWindowDelegate {
     }
 
     func clearAcknowledgementAfterHealthyBaseline() {
+        if let id = acknowledgementStore.incidentID { notifications?.remove(id) }
         acknowledgementStore.clearAll()
     }
 
@@ -170,7 +274,7 @@ final class IncidentWindowPresenter: NSObject, NSWindowDelegate {
         presentedIncident = nil
     }
 
-    private func present(_ incident: FrontendIncident, isNew: Bool) {
+    private func present(_ incident: FrontendIncident, isNew: Bool, allowAcknowledged: Bool = false) {
         if let incidentController {
             presentedIncident = incident
             updateWindow(incidentController, incident: incident)
@@ -179,7 +283,7 @@ final class IncidentWindowPresenter: NSObject, NSWindowDelegate {
             }
             return
         }
-        guard isNew, !acknowledgementStore.contains(incident) else { return }
+        guard isNew, allowAcknowledged || !acknowledgementStore.contains(incident) else { return }
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 500, height: 390),
             styleMask: [.titled, .closable],
@@ -206,7 +310,6 @@ final class IncidentWindowPresenter: NSObject, NSWindowDelegate {
         controller.showWindow(nil)
         controller.window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
-        NSApp.requestUserAttention(.criticalRequest)
     }
 
     private func updateWindow(_ controller: NSWindowController, incident: FrontendIncident) {
@@ -274,24 +377,35 @@ final class IncidentWindowPresenter: NSObject, NSWindowDelegate {
 final class IncidentPresentationCoordinator {
     private let statusStore: StatusStore
     private let lease: IncidentPresentationLease
-    private let presenter: IncidentWindowPresenter
+    private let presenter: IncidentWindowPresenter?
+    private let isNotificationHost: Bool
     private var timer: Timer?
 
-    init(appGroupURL: URL, statusStore: StatusStore) {
+    init(appGroupURL: URL, statusStore: StatusStore, isNotificationHost: Bool = true) {
         self.statusStore = statusStore
         lease = IncidentPresentationLease(appGroupURL: appGroupURL)
-        presenter = IncidentWindowPresenter(
+        self.isNotificationHost = isNotificationHost
+        presenter = isNotificationHost ? IncidentWindowPresenter(
             appGroupURL: appGroupURL,
             diagnosticPayload: { [weak statusStore] incident in
                 statusStore?.diagnosticPayload(incident: incident)
             }
-        )
+        ) : nil
     }
 
     func start() {
         statusStore.onIncident = { [weak self] update in
-            guard let self, self.lease.isHeld else { return }
-            self.presenter.handle(update)
+            guard let self else { return }
+            if !self.isNotificationHost {
+                guard case .active(_, let isNew) = update, isNew,
+                      let app = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "vip.jstar.codexfold.fskitprofileprobe") else { return }
+                let configuration = NSWorkspace.OpenConfiguration()
+                configuration.activates = false
+                NSWorkspace.shared.openApplication(at: app, configuration: configuration) { _, _ in }
+                return
+            }
+            guard self.lease.isHeld else { return }
+            self.presenter?.handle(update)
         }
         attemptLease()
         let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
@@ -309,13 +423,14 @@ final class IncidentPresentationCoordinator {
     }
 
     private func attemptLease() {
+        guard isNotificationHost else { return }
         if statusStore.hasTrustedHealthyBaseline {
-            presenter.clearAcknowledgementAfterHealthyBaseline()
+            presenter?.clearAcknowledgementAfterHealthyBaseline()
         }
         let alreadyHeld = lease.isHeld
         guard lease.acquire(), !alreadyHeld else { return }
         if let incident = statusStore.currentIncident {
-            presenter.presentCurrent(incident)
+            presenter?.handle(.active(incident, isNew: true))
         }
     }
 }

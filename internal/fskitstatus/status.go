@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -205,8 +206,18 @@ func newPublisher(path string, onError func(error), write func(string, Snapshot)
 	publisher := &Publisher{updates: make(chan Snapshot, 1), done: make(chan struct{})}
 	go func() {
 		defer close(publisher.done)
+		var lastNoSpaceReport time.Time
 		for snapshot := range publisher.updates {
 			if err := write(path, snapshot); err != nil && onError != nil {
+				if errors.Is(err, syscall.ENOSPC) {
+					// Random temporary filenames make string-based deduplication
+					// ineffective. Do not consume the final free blocks on a log
+					// storm while the UI's read-only space probe explains the fault.
+					if !lastNoSpaceReport.IsZero() && time.Since(lastNoSpaceReport) < 30*time.Second {
+						continue
+					}
+					lastNoSpaceReport = time.Now()
+				}
 				onError(err)
 			}
 		}

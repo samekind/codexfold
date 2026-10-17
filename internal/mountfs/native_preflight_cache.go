@@ -34,6 +34,14 @@ type nativePreflightEntry struct {
 }
 
 func validateNativeWriterRolloutsCached(ctx context.Context, nativeRoot string) (NativePreflightReport, error) {
+	return preflightNativeWriterRollouts(ctx, nativeRoot, false)
+}
+
+// preflightNativeWriterRollouts validates every active rollout. In repair mode
+// a damaged rollout is repaired in place of failing, and anything that cannot
+// be repaired is reported as an issue instead of aborting the walk, so one bad
+// file can never keep the mount from coming up.
+func preflightNativeWriterRollouts(ctx context.Context, nativeRoot string, repair bool) (NativePreflightReport, error) {
 	root := filepath.Clean(nativeRoot)
 	activeRoot := filepath.Join(root, "sessions")
 	cachePath := filepath.Join(root, ".codexfold-native-preflight-v1.json")
@@ -43,72 +51,32 @@ func validateNativeWriterRolloutsCached(ctx context.Context, nativeRoot string) 
 
 	err := filepath.WalkDir(activeRoot, func(filePath string, directoryEntry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
+			if repair && !errors.Is(walkErr, os.ErrNotExist) && ctx.Err() == nil {
+				report.Issues = append(report.Issues, NativePreflightIssue{Path: filePath, Message: walkErr.Error()})
+				if directoryEntry != nil && directoryEntry.IsDir() {
+					return filepath.SkipDir
+				}
+				return nil
+			}
 			return walkErr
 		}
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if directoryEntry.Type()&os.ModeSymlink != 0 {
-			return fmt.Errorf("native writer preflight rejects symlink %s", filePath)
-		}
-		if directoryEntry.IsDir() {
+		if repair && !directoryEntry.IsDir() && isNativeRepairTemporary(directoryEntry.Name()) {
+			_ = os.Remove(filePath)
 			return nil
 		}
-		if !directoryEntry.Type().IsRegular() {
-			return fmt.Errorf("native writer preflight rejects non-regular file %s", filePath)
-		}
-		if strings.HasPrefix(directoryEntry.Name(), "._") || !strings.HasSuffix(directoryEntry.Name(), ".jsonl") {
+		err := preflightNativeFile(ctx, root, filePath, directoryEntry, cache, &next, &report, repair)
+		if err != nil && repair && ctx.Err() == nil {
+			// A rollout removed mid-walk is not an issue; anything else is
+			// reported and the walk continues.
+			if !errors.Is(err, os.ErrNotExist) {
+				report.Issues = append(report.Issues, NativePreflightIssue{Path: filePath, Message: err.Error()})
+			}
 			return nil
 		}
-		info, err := directoryEntry.Info()
-		if err != nil {
-			return err
-		}
-		relative, err := filepath.Rel(root, filePath)
-		if err != nil || relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
-			return fmt.Errorf("native writer preflight path escaped native root: %s", filePath)
-		}
-		key := filepath.ToSlash(relative)
-		current := nativePreflightEntry{Size: info.Size(), ModTimeNS: info.ModTime().UnixNano()}
-		report.Files++
-		report.Bytes += info.Size()
-
-		cached, exists := cache.Entries[key]
-		if exists && cached.Size == current.Size && cached.ModTimeNS == current.ModTimeNS {
-			next.Entries[key] = cached
-			report.CachedFiles++
-			return nil
-		}
-
-		var validatedBytes int64
-		incremental := exists && current.Size > cached.Size && nativePrefixMatches(filePath, cached)
-		if incremental {
-			validatedBytes, err = validateNativeJSONLFrom(ctx, filePath, cached.Size)
-		} else {
-			validatedBytes, err = validateNativeJSONL(ctx, filePath)
-		}
-		if err != nil {
-			return err
-		}
-		after, err := os.Stat(filePath)
-		if err != nil {
-			return err
-		}
-		if after.Size() != current.Size || after.ModTime().UnixNano() != current.ModTimeNS {
-			return fmt.Errorf("native writer preflight target changed during validation: %s", filePath)
-		}
-		current.HeadSHA256, current.TailSHA256, err = nativeFingerprints(filePath, current.Size)
-		if err != nil {
-			return err
-		}
-		next.Entries[key] = current
-		report.ValidatedBytes += validatedBytes
-		if incremental {
-			report.IncrementalFiles++
-		} else {
-			report.ValidatedFiles++
-		}
-		return nil
+		return err
 	})
 	if errors.Is(err, os.ErrNotExist) {
 		err = nil
@@ -117,9 +85,95 @@ func validateNativeWriterRolloutsCached(ctx context.Context, nativeRoot string) 
 		return report, err
 	}
 	if err := writeNativePreflightCache(cachePath, next, cacheBytes); err != nil {
-		return report, err
+		// A cache that cannot be saved only costs a slower next start.
+		if !repair {
+			return report, err
+		}
+		report.Issues = append(report.Issues, NativePreflightIssue{Path: cachePath, Message: err.Error()})
 	}
 	return report, nil
+}
+
+func preflightNativeFile(ctx context.Context, root string, filePath string, directoryEntry os.DirEntry, cache nativePreflightCache, next *nativePreflightCache, report *NativePreflightReport, repair bool) error {
+	if directoryEntry.Type()&os.ModeSymlink != 0 {
+		return fmt.Errorf("native writer preflight rejects symlink %s", filePath)
+	}
+	if directoryEntry.IsDir() {
+		return nil
+	}
+	if !directoryEntry.Type().IsRegular() {
+		return fmt.Errorf("native writer preflight rejects non-regular file %s", filePath)
+	}
+	if strings.HasPrefix(directoryEntry.Name(), "._") || !strings.HasSuffix(directoryEntry.Name(), ".jsonl") {
+		return nil
+	}
+	info, err := directoryEntry.Info()
+	if err != nil {
+		return err
+	}
+	relative, err := filepath.Rel(root, filePath)
+	if err != nil || relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("native writer preflight path escaped native root: %s", filePath)
+	}
+	key := filepath.ToSlash(relative)
+	current := nativePreflightEntry{Size: info.Size(), ModTimeNS: info.ModTime().UnixNano()}
+	report.Files++
+	report.Bytes += info.Size()
+
+	cached, exists := cache.Entries[key]
+	if exists && cached.Size == current.Size && cached.ModTimeNS == current.ModTimeNS {
+		next.Entries[key] = cached
+		report.CachedFiles++
+		return nil
+	}
+
+	var validatedBytes int64
+	var validatedFrom int64
+	incremental := exists && current.Size > cached.Size && nativePrefixMatches(filePath, cached)
+	if incremental {
+		validatedFrom = cached.Size
+		validatedBytes, err = validateNativeJSONLFrom(ctx, filePath, cached.Size)
+	} else {
+		validatedBytes, err = validateNativeJSONL(ctx, filePath)
+	}
+	if err != nil && repair && ctx.Err() == nil {
+		repaired, changed, repairErr := repairNativeRollout(ctx, root, filePath, validatedFrom)
+		if repairErr != nil {
+			return fmt.Errorf("%w; automatic repair failed: %v", err, repairErr)
+		}
+		if !changed {
+			return err
+		}
+		report.Repairs = append(report.Repairs, repaired)
+		if info, err = os.Stat(filePath); err != nil {
+			return err
+		}
+		current.Size, current.ModTimeNS = info.Size(), info.ModTime().UnixNano()
+		report.Bytes += current.Size - repaired.OriginalSize
+		validatedBytes, err = validateNativeJSONLFrom(ctx, filePath, validatedFrom)
+	}
+	if err != nil {
+		return err
+	}
+	after, err := os.Stat(filePath)
+	if err != nil {
+		return err
+	}
+	if after.Size() != current.Size || after.ModTime().UnixNano() != current.ModTimeNS {
+		return fmt.Errorf("native writer preflight target changed during validation: %s", filePath)
+	}
+	current.HeadSHA256, current.TailSHA256, err = nativeFingerprints(filePath, current.Size)
+	if err != nil {
+		return err
+	}
+	next.Entries[key] = current
+	report.ValidatedBytes += validatedBytes
+	if incremental {
+		report.IncrementalFiles++
+	} else {
+		report.ValidatedFiles++
+	}
+	return nil
 }
 
 func loadNativePreflightCache(path string) (nativePreflightCache, []byte, bool) {
