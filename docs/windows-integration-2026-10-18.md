@@ -10,7 +10,7 @@
 
 1. 共享文件自动合并后保留两边的行为：namespace 路径记录与 Windows 路径别名、前台维护让行、Windows 文件共享、删除证明、目录同步、状态心跳和恢复唤醒。
 2. Windows 独立折叠服务使用自己的策略，不能再只用内置 loop 的开关判断替换文件后台折叠。整合后复用 external worker 的有效策略；暂停或内置暂停确认过期时不折叠。macOS/Linux 不因此改用 Windows worker 策略。
-3. Windows 修复原生文件时通过已有共享打开入口保留 delete sharing，避免修复器自己的 reader 阻止替换。新增 Windows 实际运行测试验证旧 reader 保留旧内容、新路径读到修复内容。
+3. Windows 修复原生文件时通过已有共享打开入口保留 delete sharing，并使用 `os.Root.Rename` 的目录句柄相对替换。新增 Windows 实际运行测试验证旧 reader 保留旧内容、新路径读到修复内容。首次整合 CI 确实发现普通 `os.Rename` 在已打开目标上返回 Access denied；保留该测试并修正替换实现，没有跳过或放宽断言。
 4. Windows 可写文件由 Go 报告为 `0666`，不伪装成 Unix 的 `0600`。应急预留只在相应平台模式、固定大小、完整 magic/零填充和文件身份全部匹配时释放，未知材料仍保留。
 5. native repair 的替换完成状态不确定时保留已隔离字节，不能在 rename 可能已成功但目录同步失败后删除恢复材料。
 6. 修正两处 Go 格式；Windows CI 保持保护规则要求的 `windows-compile` 名称，同时实际执行专项测试与新接缝回归，没有删除或降低原测试断言。

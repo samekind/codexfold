@@ -337,7 +337,14 @@ func rewriteNativeRollout(ctx context.Context, filePath string, original os.File
 	if !os.SameFile(original, after) || after.Size() != original.Size() || !after.ModTime().Equal(original.ModTime()) {
 		return cleanup(fmt.Errorf("native rollout changed during repair: %s", filePath))
 	}
-	if err := os.Rename(temporary, filePath); err != nil {
+	parent, err := os.OpenRoot(directory)
+	if err != nil {
+		return cleanup(err)
+	}
+	defer parent.Close()
+	// Root.Rename uses handle-relative POSIX replacement on Windows as well,
+	// so readers that allowed delete sharing retain the old file contents.
+	if err := parent.Rename(filepath.Base(temporary), filepath.Base(filePath)); err != nil {
 		return cleanup(err)
 	}
 	return syncDirectory(directory)
