@@ -6,6 +6,21 @@ pre-1.0, so a minor version may contain compatibility changes.
 
 ## [Unreleased]
 
+### Added
+
+- Windows WinFsp drive hosting, persistent SCM folding service, native tray with
+  a WebView2 dashboard, policy controls, batch progress, measured space accounting,
+  aggregate history and diagnostics. Activation and ordinary-storage recovery
+  scripts retain the original namespace and verified recovery materials.
+- Windows resident-frontend/storage-engine separation with paused-policy and
+  open-handle checks, verified candidate images and failed-candidate rollback.
+  Legacy installations need an offline upgrade before live engine replacement;
+  frontend updates still require an offline operation.
+- Windows CI now executes the focused adapter, service, worker, tray and shared
+  integration tests in addition to compiling every package. The required check
+  keeps its existing `windows-compile` name. This is not a full Desktop GUI or
+  power-loss qualification.
+
 ### Fixed
 
 - Foreground session opens can ask registered background maintenance to yield
@@ -27,6 +42,10 @@ pre-1.0, so a minor version may contain compatibility changes.
   monitoring still works when status files cannot be written.
 - Daemon live updates accept a bounded `--takeover-timeout` for slower stores;
   the default remains nine seconds and failed takeovers retain rollback.
+- Replacement-file background folding follows the effective external-worker
+  policy on Windows, including the fresh paused-builtin acknowledgement. Native
+  repair readers allow delete sharing there, and the read reserve recognizes
+  Windows writable file modes while retaining identity and exact-content checks.
 - Canonical managed rollouts now support same-namespace backup renames and
   native temporary-file replacement used by `jstarctl codex rebind`. Durable
   names preserve backups and old readers across replacement/reload; stable

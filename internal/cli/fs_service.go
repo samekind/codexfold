@@ -208,15 +208,29 @@ func newFSServiceUpdateBinaryCommand() *cobra.Command {
 					}
 					return errors.Join(fmt.Errorf("promote filesystem service binary: %w", err), rollbackErr, cleanupErr, restartErr)
 				}
+				restoreEngineBinding := func() error { return nil }
+				if platform == service.PlatformWindows {
+					restoreEngineBinding, err = service.PrepareWindowsCoreOfflineUpdate(target)
+					if err != nil {
+						rollbackErr := update.Rollback()
+						var restartErr error
+						if rollbackErr == nil {
+							restartErr = startPlatformService(command.Context(), platform, definition, mount)
+							_ = update.Commit()
+						}
+						return errors.Join(err, rollbackErr, restartErr)
+					}
+				}
 				if err := startPlatformService(command.Context(), platform, definition, mount); err != nil {
 					_ = stopPlatformService(command.Context(), platform, definition)
+					bindingErr := restoreEngineBinding()
 					rollbackErr := update.Rollback()
 					var restartErr error
-					if rollbackErr == nil {
+					if rollbackErr == nil && bindingErr == nil {
 						restartErr = startPlatformService(command.Context(), platform, definition, mount)
 						_ = update.Commit()
 					}
-					return errors.Join(fmt.Errorf("start verified filesystem service binary: %w", err), rollbackErr, restartErr)
+					return errors.Join(fmt.Errorf("start verified filesystem service binary: %w", err), bindingErr, rollbackErr, restartErr)
 				}
 				if err := update.Commit(); err != nil {
 					return fmt.Errorf("remove filesystem binary rollback artifact: %w", err)
@@ -951,7 +965,10 @@ func startPlatformService(ctx context.Context, platform service.Platform, defini
 		if err := manager.Start(ctx, label); err != nil {
 			return err
 		}
-		if _, err := manager.WaitHealthy(ctx, label, mountPoint, 15*time.Second); err != nil {
+		// Canonical startup validates the retained native history before
+		// publishing the mount. A complete multi-gigabyte home can exceed
+		// the short timeout used for the original engine-only preview.
+		if _, err := manager.WaitHealthy(ctx, label, mountPoint, 5*time.Minute); err != nil {
 			_ = manager.Stop(ctx, label)
 			return err
 		}

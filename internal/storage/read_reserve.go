@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -67,7 +68,7 @@ func releaseReadReserveFor(directory string) bool {
 		}
 		path := filepath.Join(store, readReserveName)
 		info, err := os.Lstat(path)
-		if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0600 || info.Size() != readReserveBytes {
+		if err != nil || !info.Mode().IsRegular() || !readReserveModeMatches(info.Mode()) || info.Size() != readReserveBytes {
 			continue
 		}
 		f, err := os.Open(path)
@@ -85,4 +86,14 @@ func releaseReadReserveFor(directory string) bool {
 		return os.Remove(path) == nil
 	}
 	return false
+}
+
+func readReserveModeMatches(mode os.FileMode) bool {
+	if runtime.GOOS == "windows" {
+		// Go reports writable Windows files as 0666; Chmod(0600) does not
+		// create Unix permissions there. Identity, exact size and all content
+		// bytes remain mandatory ownership checks on every platform.
+		return mode.Perm() == 0666
+	}
+	return mode.Perm() == 0600
 }

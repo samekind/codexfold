@@ -53,7 +53,9 @@ func newFSServiceUpdateDaemonLiveCommand() *cobra.Command {
 		Short: "Replace only the native FSKit daemon while keeping Codex and its mount running",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(command *cobra.Command, args []string) error {
-			if takeoverTimeout <= 0 || takeoverTimeout > 2*time.Minute { return errors.New("takeover timeout must be greater than zero and no longer than 2m") }
+			if takeoverTimeout <= 0 || takeoverTimeout > 2*time.Minute {
+				return errors.New("takeover timeout must be greater than zero and no longer than 2m")
+			}
 			candidate, err := filepath.Abs(args[0])
 			if err != nil {
 				return err

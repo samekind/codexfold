@@ -17,6 +17,44 @@ import (
 	"github.com/samekind/codexfold/internal/vfs"
 )
 
+func TestNamespaceFoldingFollowsEffectiveExternalPolicy(t *testing.T) {
+	store := t.TempDir()
+	flags := enrollmentFlags{storeDir: store}
+	control := enroll.Control{Interval: time.Minute, StableFor: time.Hour, BatchSize: 1}
+	if err := enroll.SaveControl(enroll.ControlPath(store), control); err != nil {
+		t.Fatal(err)
+	}
+	if err := enroll.SaveProgress(enroll.ProgressPath(store), enroll.Progress{Phase: enroll.PhaseDisabled, UpdatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	control.Enabled = true
+	if err := enroll.SaveControl(enroll.WorkerControlPath(store), control); err != nil {
+		t.Fatal(err)
+	}
+	if namespaceFoldingEnabled(flags, 0, false) {
+		t.Fatal("external policy changed a platform without external-worker support")
+	}
+	if !namespaceFoldingEnabled(flags, 0, true) {
+		t.Fatal("enabled external policy stranded native replacements")
+	}
+	if err := enroll.SaveProgress(enroll.ProgressPath(store), enroll.Progress{Phase: enroll.PhaseDisabled, UpdatedAt: time.Now().Add(-time.Minute)}); err != nil {
+		t.Fatal(err)
+	}
+	if namespaceFoldingEnabled(flags, 0, true) {
+		t.Fatal("stale builtin acknowledgement enabled namespace folding")
+	}
+	if err := enroll.SaveProgress(enroll.ProgressPath(store), enroll.Progress{Phase: enroll.PhaseDisabled, UpdatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	control.Enabled = false
+	if err := enroll.SaveControl(enroll.WorkerControlPath(store), control); err != nil {
+		t.Fatal(err)
+	}
+	if namespaceFoldingEnabled(flags, 0, true) {
+		t.Fatal("paused external policy enabled namespace folding")
+	}
+}
+
 func namespaceReplacementFixture(t *testing.T) (*mountfs.Filesystem, string, string, []byte) {
 	t.Helper()
 	store, native := t.TempDir(), t.TempDir()

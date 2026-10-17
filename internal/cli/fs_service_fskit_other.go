@@ -9,7 +9,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-func addLiveDaemonUpdateCommand(*cobra.Command) {}
+func addLiveDaemonUpdateCommand(parent *cobra.Command) { addWindowsLiveDaemonUpdateCommand(parent) }
 
 func prepareFSKitAppPlatform(context.Context, string, string, bool) (fsKitAppTransaction, error) {
 	return nil, errors.New("native FSKit app installation is available only on macOS")

@@ -88,7 +88,7 @@ func publishInitialSession(ctx context.Context, options SessionOptions, view *Vi
 
 	var reservedLease *os.File
 	if reserveWriter {
-		reservedLease, err = acquireWriterLease(filepath.Join(staging, "writer.lease"))
+		reservedLease, err = acquireInitialWriterLease(staging, options.Manifest.Session.ID)
 		if err != nil {
 			return SessionState{}, nil, err
 		}

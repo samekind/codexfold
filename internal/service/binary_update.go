@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 
 	"github.com/samekind/codexfold/internal/buildid"
 )
@@ -34,7 +35,8 @@ func StageBinaryUpdate(candidate string, target string) (*BinaryUpdate, error) {
 	if err != nil {
 		return nil, err
 	}
-	if !candidateInfo.Mode().IsRegular() || candidateInfo.Mode().Perm()&0o111 == 0 {
+	// Windows does not model executability through Unix permission bits.
+	if !candidateInfo.Mode().IsRegular() || runtime.GOOS != "windows" && candidateInfo.Mode().Perm()&0o111 == 0 {
 		return nil, errors.New("candidate service binary must be a regular executable file")
 	}
 	root := filepath.Dir(target)

@@ -21,25 +21,52 @@ import (
 
 type fuseFilesystem struct {
 	fuse.FileSystemBase
-	core          *Filesystem
-	recorder      func(string)
-	mountIdentity []byte
-	statRoot      string
-	mountReady    atomic.Bool
+	core           *Filesystem
+	backend        HostBackend
+	backendBuild   func() string
+	backendHealthy func() bool
+	recorder       func(string)
+	mountIdentity  []byte
+	statRoot       string
+	mountReady     atomic.Bool
+	activity       *IOActivityCounter
 }
 
 const healthHandle = ^uint64(0) - 1
+
+func (f *fuseFilesystem) operations() HostBackend {
+	if f.backend != nil {
+		return f.backend
+	}
+	return f.core
+}
+
+func (f *fuseFilesystem) healthBytes() []byte {
+	if f.backendBuild == nil {
+		return f.mountIdentity
+	}
+	sha := f.backendBuild()
+	if !buildid.ValidSHA256(sha) {
+		return nil
+	}
+	index := strings.LastIndexByte(string(f.mountIdentity), ':')
+	return []byte(string(f.mountIdentity[:index+1]) + sha)
+}
+
+func (f *fuseFilesystem) healthy() bool {
+	return f.mountReady.Load() && (f.backendHealthy == nil || f.backendHealthy())
+}
 
 func Available() bool { return true }
 
 func (f *fuseFilesystem) Getattr(name string, stat *fuse.Stat_t, _ uint64) int {
 	if cleanPath(name) == "/"+mountid.Path {
-		if !f.mountReady.Load() {
-			f.recordResult("getattr", name, -int(syscall.ENOENT))
-			return -int(syscall.ENOENT)
+		if !f.healthy() {
+			f.recordResult("getattr", name, fuseResult(syscall.ENOENT))
+			return fuseResult(syscall.ENOENT)
 		}
 		stat.Mode = syscall.S_IFREG | 0o400
-		stat.Size = int64(len(f.mountIdentity))
+		stat.Size = int64(len(f.healthBytes()))
 		stat.Nlink = 1
 		stat.Blksize = 4096
 		stat.Blocks = (stat.Size + 511) / 512
@@ -47,10 +74,10 @@ func (f *fuseFilesystem) Getattr(name string, stat *fuse.Stat_t, _ uint64) int {
 		f.recordResult("getattr", name, 0)
 		return 0
 	}
-	attribute, errno := f.core.Getattr(name)
+	attribute, errno := f.operations().Getattr(name)
 	if errno != 0 {
-		f.recordResult("getattr", name, -int(errno))
-		return -int(errno)
+		f.recordResult("getattr", name, fuseResult(errno))
+		return fuseResult(errno)
 	}
 	stat.Mode = attribute.Mode
 	stat.Size = attribute.Size
@@ -66,9 +93,12 @@ func (f *fuseFilesystem) Getattr(name string, stat *fuse.Stat_t, _ uint64) int {
 }
 
 func (f *fuseFilesystem) Statfs(name string, stat *fuse.Statfs_t) int {
-	f.core.mu.RLock()
-	root := f.core.nativeRoot
-	f.core.mu.RUnlock()
+	root := ""
+	if f.core != nil {
+		f.core.mu.RLock()
+		root = f.core.nativeRoot
+		f.core.mu.RUnlock()
+	}
 	if root == "" {
 		root = f.statRoot
 	}
@@ -78,24 +108,24 @@ func (f *fuseFilesystem) Statfs(name string, stat *fuse.Statfs_t) int {
 }
 
 func (f *fuseFilesystem) Mknod(name string, _ uint32, _ uint64) int {
-	result := -int(syscall.ENOSYS)
+	result := fuseResult(syscall.ENOSYS)
 	f.recordResult("mknod", name, result)
 	return result
 }
 
 func (f *fuseFilesystem) Opendir(name string) (int, uint64) {
 	f.record("opendir")
-	if _, errno := f.core.ReadDir(name); errno != 0 {
-		return -int(errno), ^uint64(0)
+	if _, errno := f.operations().ReadDir(name); errno != 0 {
+		return fuseResult(errno), ^uint64(0)
 	}
 	return 0, 0
 }
 
 func (f *fuseFilesystem) Readdir(name string, fill func(string, *fuse.Stat_t, int64) bool, _ int64, _ uint64) int {
 	f.record("readdir")
-	entries, errno := f.core.ReadDir(name)
+	entries, errno := f.operations().ReadDir(name)
 	if errno != 0 {
-		return -int(errno)
+		return fuseResult(errno)
 	}
 	fill(".", nil, 0)
 	fill("..", nil, 0)
@@ -109,25 +139,31 @@ func (f *fuseFilesystem) Readdir(name string, fill func(string, *fuse.Stat_t, in
 
 func (f *fuseFilesystem) Open(name string, flags int) (int, uint64) {
 	if cleanPath(name) == "/"+mountid.Path {
-		if !f.mountReady.Load() {
-			return -int(syscall.ENOENT), ^uint64(0)
+		if !f.healthy() {
+			return fuseResult(syscall.ENOENT), ^uint64(0)
 		}
 		if flags&fuse.O_ACCMODE != fuse.O_RDONLY {
-			return -int(syscall.EPERM), ^uint64(0)
+			return fuseResult(syscall.EPERM), ^uint64(0)
 		}
 		return 0, healthHandle
 	}
 	translated := translateOpenFlags(flags)
-	handle, errno := f.core.Open(name, translated)
+	handle, errno := f.operations().Open(name, translated)
 	if errno == syscall.EBUSY && writableSession(name, flags) {
-		deadline := time.Now().Add(250 * time.Millisecond)
+		retryFor := 250 * time.Millisecond
+		if runtime.GOOS == "windows" {
+			// Recovery promotes newly discovered read-only sessions on
+			// the background loader's one-second poll.
+			retryFor = 1500 * time.Millisecond
+		}
+		deadline := time.Now().Add(retryFor)
 		for errno == syscall.EBUSY && time.Now().Before(deadline) {
 			time.Sleep(time.Millisecond)
-			handle, errno = f.core.Open(name, translated)
+			handle, errno = f.operations().Open(name, translated)
 		}
 	}
 	if errno != 0 {
-		result := -int(errno)
+		result := fuseResult(errno)
 		f.recordOpen("open", name, flags, translated, handle, result)
 		return result, ^uint64(0)
 	}
@@ -137,9 +173,9 @@ func (f *fuseFilesystem) Open(name string, flags int) (int, uint64) {
 
 func (f *fuseFilesystem) Create(name string, flags int, _ uint32) (int, uint64) {
 	translated := translateOpenFlags(flags) | os.O_CREATE
-	handle, errno := f.core.Open(name, translated)
+	handle, errno := f.operations().Open(name, translated)
 	if errno != 0 {
-		result := -int(errno)
+		result := fuseResult(errno)
 		f.recordOpen("create", name, flags, translated, handle, result)
 		return result, ^uint64(0)
 	}
@@ -169,43 +205,46 @@ func (f *fuseFilesystem) CreateEx(name string, _ uint32, info *fuse.FileInfo_t) 
 
 func (f *fuseFilesystem) Read(name string, destination []byte, offset int64, handle uint64) int {
 	if handle == healthHandle {
-		if offset < 0 || offset >= int64(len(f.mountIdentity)) {
+		identity := f.healthBytes()
+		if offset < 0 || offset >= int64(len(identity)) {
 			f.recordIO("read", name, handle, offset, len(destination), 0)
 			return 0
 		}
-		n := copy(destination, f.mountIdentity[offset:])
+		n := copy(destination, identity[offset:])
 		f.recordIO("read", name, handle, offset, len(destination), n)
 		return n
 	}
-	n, errno := f.core.Read(handle, destination, offset)
+	n, errno := f.operations().Read(handle, destination, offset)
 	if errno != 0 {
-		result := -int(errno)
+		result := fuseResult(errno)
 		f.recordIO("read", name, handle, offset, len(destination), result)
 		return result
 	}
 	f.recordIO("read", name, handle, offset, len(destination), n)
+	f.activity.recordRead(n)
 	return n
 }
 
 func (f *fuseFilesystem) Write(name string, data []byte, offset int64, handle uint64) int {
-	n, errno := f.core.Write(handle, data, offset)
+	n, errno := f.operations().Write(handle, data, offset)
 	if errno != 0 {
-		result := -int(errno)
+		result := fuseResult(errno)
 		f.recordIO("write", name, handle, offset, len(data), result)
 		return result
 	}
 	f.recordIO("write", name, handle, offset, len(data), n)
+	f.activity.recordWrite(n)
 	return n
 }
 
 func (f *fuseFilesystem) Truncate(name string, size int64, handle uint64) int {
 	var errno syscall.Errno
 	if handle == 0 || handle == ^uint64(0) {
-		errno = f.core.TruncatePath(name, size)
+		errno = f.operations().TruncatePath(name, size)
 	} else {
-		errno = f.core.Truncate(handle, size)
+		errno = f.operations().Truncate(handle, size)
 	}
-	result := -int(errno)
+	result := fuseResult(errno)
 	f.record(fmt.Sprintf("truncate kind=%s handle=%d size=%d result=%d", operationKind(name), handle, size, result))
 	return result
 }
@@ -215,7 +254,7 @@ func (f *fuseFilesystem) Flush(name string, handle uint64) int {
 		f.recordHandleResult("flush", name, handle, 0)
 		return 0
 	}
-	result := -int(f.core.Flush(handle))
+	result := fuseResult(f.operations().Flush(handle))
 	f.recordHandleResult("flush", name, handle, result)
 	return result
 }
@@ -225,7 +264,7 @@ func (f *fuseFilesystem) Fsync(name string, dataOnly bool, handle uint64) int {
 		f.record(fmt.Sprintf("fsync kind=%s handle=%d datasync=%t result=0", operationKind(name), handle, dataOnly))
 		return 0
 	}
-	result := -int(f.core.Fsync(handle))
+	result := fuseResult(f.operations().Fsync(handle))
 	f.record(fmt.Sprintf("fsync kind=%s handle=%d datasync=%t result=%d", operationKind(name), handle, dataOnly, result))
 	return result
 }
@@ -235,49 +274,49 @@ func (f *fuseFilesystem) Release(name string, handle uint64) int {
 		f.recordHandleResult("release", name, handle, 0)
 		return 0
 	}
-	result := -int(f.core.Release(handle))
+	result := fuseResult(f.operations().Release(handle))
 	f.recordHandleResult("release", name, handle, result)
 	return result
 }
 
 func (f *fuseFilesystem) Mkdir(name string, mode uint32) int {
-	result := -int(f.core.Mkdir(name, mode))
+	result := fuseResult(f.operations().Mkdir(name, mode))
 	f.recordResult("mkdir", name, result)
 	return result
 }
 
 func (f *fuseFilesystem) Rmdir(name string) int {
-	result := -int(syscall.ENOSYS)
+	result := fuseResult(syscall.ENOSYS)
 	f.recordResult("rmdir", name, result)
 	return result
 }
 
 func (f *fuseFilesystem) Link(oldName string, _ string) int {
-	result := -int(syscall.ENOSYS)
+	result := fuseResult(syscall.ENOSYS)
 	f.recordResult("link", oldName, result)
 	return result
 }
 
 func (f *fuseFilesystem) Symlink(_ string, newName string) int {
-	result := -int(syscall.ENOSYS)
+	result := fuseResult(syscall.ENOSYS)
 	f.recordResult("symlink", newName, result)
 	return result
 }
 
 func (f *fuseFilesystem) Readlink(name string) (int, string) {
-	result := -int(syscall.ENOSYS)
+	result := fuseResult(syscall.ENOSYS)
 	f.recordResult("readlink", name, result)
 	return result, ""
 }
 
 func (f *fuseFilesystem) Rename(oldName string, newName string) int {
-	result := -int(f.core.Rename(oldName, newName))
+	result := fuseResult(f.operations().Rename(oldName, newName))
 	f.recordResult("rename", oldName, result)
 	return result
 }
 
 func (f *fuseFilesystem) Unlink(name string) int {
-	result := -int(f.core.Unlink(name))
+	result := fuseResult(f.operations().Unlink(name))
 	f.recordResult("unlink", name, result)
 	return result
 }
@@ -287,11 +326,14 @@ func (f *fuseFilesystem) Access(name string, _ uint32) int {
 	if cleanPath(name) == "/"+mountid.Path {
 		return 0
 	}
-	_, errno := f.core.Getattr(name)
-	return -int(errno)
+	_, errno := f.operations().Getattr(name)
+	return fuseResult(errno)
 }
 
 func (f *fuseFilesystem) Chmod(name string, mode uint32) int {
+	if remote, ok := f.backend.(HostMetadataBackend); ok {
+		return fuseResult(remote.Metadata("chmod", name, mode, 0, time.Time{}, time.Time{}))
+	}
 	path, managed, errc := f.metadataPath(name)
 	if errc != 0 {
 		f.recordResult("chmod", name, errc)
@@ -306,6 +348,9 @@ func (f *fuseFilesystem) Chmod(name string, mode uint32) int {
 }
 
 func (f *fuseFilesystem) Chown(name string, uid uint32, gid uint32) int {
+	if remote, ok := f.backend.(HostMetadataBackend); ok {
+		return fuseResult(remote.Metadata("chown", name, uid, gid, time.Time{}, time.Time{}))
+	}
 	path, managed, errc := f.metadataPath(name)
 	if errc != 0 {
 		f.recordResult("chown", name, errc)
@@ -320,6 +365,13 @@ func (f *fuseFilesystem) Chown(name string, uid uint32, gid uint32) int {
 }
 
 func (f *fuseFilesystem) Utimens(name string, times []fuse.Timespec) int {
+	if remote, ok := f.backend.(HostMetadataBackend); ok {
+		if len(times) != 2 {
+			return fuseResult(syscall.EINVAL)
+		}
+		return fuseResult(remote.Metadata("utimens", name, 0, 0,
+			time.Unix(times[0].Sec, times[0].Nsec), time.Unix(times[1].Sec, times[1].Nsec)))
+	}
 	path, managed, errc := f.metadataPath(name)
 	if errc != 0 {
 		f.recordResult("utimens", name, errc)
@@ -328,7 +380,7 @@ func (f *fuseFilesystem) Utimens(name string, times []fuse.Timespec) int {
 	result := 0
 	if !managed {
 		if len(times) != 2 {
-			result = -int(syscall.EINVAL)
+			result = fuseResult(syscall.EINVAL)
 		} else {
 			result = setFileTimes(path, times)
 		}
@@ -383,13 +435,16 @@ func (f *fuseFilesystem) Removexattr(name string, attribute string) int {
 }
 
 func (f *fuseFilesystem) xattrPath(name string, create bool) (string, int) {
+	if f.core == nil {
+		return "", fuseResult(syscall.ENOSYS)
+	}
 	cleaned := cleanPath(name)
 	if _, _, errno := f.core.sessionForPath(cleaned); errno == 0 {
 		f.core.mu.RLock()
 		root := f.core.nativeRoot
 		f.core.mu.RUnlock()
 		if root == "" {
-			return "", -int(syscall.ENOTSUP)
+			return "", fuseResult(syscall.ENOTSUP)
 		}
 		carrier := managedXattrCarrier(root, cleaned)
 		if create {
@@ -409,7 +464,7 @@ func (f *fuseFilesystem) xattrPath(name string, create bool) (string, int) {
 	if native, ok := f.core.nativePath(cleaned); ok {
 		return native, 0
 	}
-	return "", -int(syscall.ENOENT)
+	return "", fuseResult(syscall.ENOENT)
 }
 
 func (f *fuseFilesystem) metadataPath(name string) (string, bool, int) {
@@ -420,7 +475,7 @@ func (f *fuseFilesystem) metadataPath(name string) (string, bool, int) {
 	if native, ok := f.core.nativePath(cleaned); ok {
 		return native, false, 0
 	}
-	return "", false, -int(syscall.ENOENT)
+	return "", false, fuseResult(syscall.ENOENT)
 }
 
 func unixResult(err error) int {
@@ -429,9 +484,9 @@ func unixResult(err error) int {
 	}
 	var errno syscall.Errno
 	if errors.As(err, &errno) {
-		return -int(errno)
+		return fuseResult(errno)
 	}
-	return -int(syscall.EIO)
+	return fuseResult(syscall.EIO)
 }
 
 func (f *fuseFilesystem) record(operation string) {
@@ -491,6 +546,12 @@ func translateOpenFlags(flags int) int {
 	if flags&fuse.O_EXCL != 0 {
 		translated |= os.O_EXCL
 	}
+	if runtime.GOOS == "windows" && translated&os.O_WRONLY != 0 {
+		// WinFsp may read boundary blocks through a write handle while
+		// preparing an append. Windows access checks have already approved
+		// the caller; the backing handle needs both capabilities.
+		translated = translated&^os.O_WRONLY | os.O_RDWR
+	}
 	return translated
 }
 
@@ -515,11 +576,22 @@ func mountHost(ctx context.Context, options HostOptions) (result error) {
 	if err != nil {
 		return fmt.Errorf("generate mount identity: %w", err)
 	}
+	statRoot := options.StorageRoot
+	if statRoot == "" {
+		statRoot = filepath.Dir(options.MountPoint)
+		if runtime.GOOS == "windows" && statRoot == options.MountPoint {
+			return errors.New("Windows drive mounts require a physical storage root")
+		}
+	}
 	filesystem := &fuseFilesystem{
-		core:          options.Filesystem,
-		recorder:      options.OperationRecorder,
-		mountIdentity: []byte(identity),
-		statRoot:      filepath.Dir(options.MountPoint),
+		core:           options.Filesystem,
+		backend:        options.Backend,
+		backendBuild:   options.BackendBuild,
+		backendHealthy: options.BackendHealthy,
+		recorder:       options.OperationRecorder,
+		mountIdentity:  []byte(identity),
+		statRoot:       statRoot,
+		activity:       options.Activity,
 	}
 	host := fuse.NewFileSystemHost(filesystem)
 	backing, err := prepareMountedBacking(options.MountPoint)
@@ -533,11 +605,27 @@ func mountHost(ctx context.Context, options HostOptions) (result error) {
 		}
 	}()
 	arguments := []string{"-o", "fsname=codexfold", "-o", "default_permissions", "-o", "attr_timeout=0", "-o", "entry_timeout=0", "-o", "negative_timeout=0"}
+	securityArguments, err := platformMountSecurity(options.NamespaceRoot)
+	if err != nil {
+		return err
+	}
+	arguments = append(arguments, securityArguments...)
 	if options.Foreground {
 		arguments = append(arguments, "-f")
 	}
 	if runtime.GOOS == "darwin" {
 		arguments = append(arguments, "-o", "backend=nfs", "-o", "volname=CodexFold")
+	}
+	mountTarget := platformMountTarget(options.MountPoint)
+	if runtime.GOOS == "windows" && filepath.Dir(options.MountPoint) == options.MountPoint {
+		arguments = append(arguments, "-o", "volname=CodexFold")
+		if !strings.HasPrefix(mountTarget, `\\.\`) {
+			// Foreground previews use a network drive so ordinary clients can
+			// canonicalize its paths without administrator privileges. SCM
+			// uses a Mount Manager disk drive, which also supports the NTFS
+			// junctions in the canonical session namespace.
+			arguments = append(arguments, "-o", "VolumePrefix="+windowsVolumePrefix(options.NamespaceRoot, options.MountPoint))
+		}
 	}
 	done := make(chan struct{})
 	go func() {
@@ -561,7 +649,7 @@ func mountHost(ctx context.Context, options HostOptions) (result error) {
 		}
 		policyDone <- err
 	}()
-	mounted := host.Mount(options.MountPoint, arguments)
+	mounted := host.Mount(mountTarget, arguments)
 	cancelPolicy()
 	policyErr := <-policyDone
 	backingErr := backing.Close()

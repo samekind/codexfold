@@ -15,6 +15,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/samekind/codexfold/internal/dirsync"
 )
 
 type CandidateKind string
@@ -513,7 +515,7 @@ func syncGCRootDirectory(root *os.Root, relative string) error {
 		return err
 	}
 	defer directory.Close()
-	return directory.Sync()
+	return dirsync.Sync(directory)
 }
 
 func (b *gcBuilder) add(path string, kind CandidateKind) error {
