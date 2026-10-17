@@ -13,6 +13,8 @@ import (
 	"slices"
 	"sort"
 	"time"
+
+	"github.com/samekind/codexfold/internal/dirsync"
 )
 
 const (
@@ -421,7 +423,7 @@ func syncNativeRetirementDirectory(root *os.Root, relative string) error {
 	if err != nil {
 		return err
 	}
-	if err := directory.Sync(); err != nil {
+	if err := dirsync.Sync(directory); err != nil {
 		_ = directory.Close()
 		return err
 	}

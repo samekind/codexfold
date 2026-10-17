@@ -18,23 +18,23 @@ Client version and build identity are diagnostic metadata only. Unknown or newly
 
 The requirements and release gates for normal JSONL paths backed transparently by shared storage are defined in [the transparent filesystem product contract](docs/superpowers/specs/2026-07-11-transparent-session-filesystem-design.md). No release may claim `随点随开`, transparent session access, or production-ready virtual sessions before the platform-specific gates in that contract pass.
 
-| Platform | Adapter | Evidence in this release | Readiness |
+| Platform | Adapter | Evidence in current source | Readiness |
 |---|---|---|---|
 | macOS 27 | Apple-native Swift FSKit | Historical signed build 102 real-client and native-mount matrix; current worktree requalification is partial | `fs-engine-preview` |
 | Linux | FUSE3 | Real unprivileged mount, mutation, remount, recovery, performance, and user-service lifecycle | Preview; real Codex client validation remains incomplete |
-| Windows | WinFsp | Cross-build and compile coverage | Not runtime-validated |
+| Windows | WinFsp, SCM services and native WebView2 tray | Complete local-copy Codex app-server lifecycle, exact-byte restart, persistent worker and guarded live engine replacement on an isolated mount | Tested preview flows; Desktop GUI, reboot and SYSTEM engine-split qualification remain incomplete |
 
 The transparent filesystem preview has these explicit boundaries:
 
 - macOS now targets an Apple-native Swift FSKit extension connected over a versioned Unix-domain-socket protocol to the Go CodexFold daemon. The signed 2026-07-23 build 102 App/extension and its then-current helper historically passed the isolated mounted-operation, exact-byte, cache-coherency, performance, crash/host-restart, rollback, and real Codex CLI/Desktop matrix. That evidence does not automatically transfer to the current worktree candidate.
-- Release source metadata is `0.3.0 (103)`. Build 103 compiles and passes nested signature verification, while the completed mounted and real-client matrix remains historical build 102 evidence. Changes in the current worktree require their own candidate attachment, real-client workload, restart, fault-injection, and recovery evidence.
+- FSKit source metadata is `0.4.0 (116)`. Dated local reports below identify the exact installed helper/UI subsets and their checks; historical build 102 client evidence does not automatically qualify the complete combined source.
 - The earlier synchronous FUSE-T NFS route remains historical validation evidence and a development fallback only. FUSE-T's third-party FSKit backend remains rejected after deterministic byte-loss and cache-invalidation failures; it is not the Apple-native FSKit implementation in this repository.
 - Linux FUSE3 has real unprivileged read, append, copy-on-write, truncate, archive rename, crash recovery, remount, performance, and `systemd --user` lifecycle evidence.
-- Windows has a WinFsp adapter and native Windows Service host that cross-compile, but no real Windows/WinFsp host has validated them yet.
-- The production service and production Codex home remain disabled by default. The current worktree's isolated flow has observed a real Cockpit **Start**, an isolated Desktop/app-server process chain, and an unchanged production Codex process. It has not yet attached the current CodexFold candidate, observed a real Desktop task mutation through that managed route, or completed candidate-only fault injection and recovery; `codexInstanceAcceptanceComplete`, `codexFoldCandidateAcceptanceComplete`, and `realAcceptanceComplete` therefore remain false. Promotion is blocked by that exact evidence matrix, not by a fixed observation period.
+- The Windows contributor reports complete local-copy tests with Codex 0.159.2 app-server: resume, history reads, recorder writes, fork, archive/unarchive of a compressed thread, and a separate managed deletion with physical purge. SCM stop/start preserves exact bytes and client access. A persistent SCM folding worker supports pause/resume and fresh progress; the native tray adds policy controls, 30-day aggregate history, incident details and JSON diagnostics. An isolated real WinFsp mount passed storage-engine replacement and failed-candidate rollback while preserving the frontend PID and mount nonce. A legacy installation needs one offline upgrade to enable that split. The full Desktop GUI, reboot/power loss and SYSTEM engine-split qualification remain unverified. See the [Windows preview guide](docs/windows-preview.md) for that tested revision and its limits; the combined source still needs its own target-machine checks.
+- Production routing remains opt-in. The dated macOS reports below record authorized local helper/UI updates, real mounted checks and continuity observations. The complete combined macOS/Windows source is not installed by this integration, and those subset observations do not establish a new combined-binary Desktop or fault-recovery result.
 - CodexFold recovery operates only on CodexFold-owned components. It never quits, restarts, signals, or reopens a running Codex process. On macOS the backend, supervisor, and incident helper are resident; the menu-bar App is restarted after a crash but an explicit user Quit remains a quit.
 - The native macOS menu-bar App shows current health, measured space saved, current read/write speed, compact trends, selectable 1-hour/24-hour/7-day/30-day history, and the timeline of failures that lasted at least ten seconds. A standalone menu-bar launch that has never observed or registered the file-service runtime shows an unconnected state instead of reporting a critical incident. History stores only timestamps, health, counts, byte totals, and aggregate transfer rates, never session content.
-- The current worktree validation has not installed, updated, stopped, restarted, or signaled the production CodexFold service, FSKit App/extension, or LaunchAgent set. Any exact production target requires a new explicit user authorization before an apply or lifecycle operation.
+- This source integration does not install, stop, restart or signal the running CodexFold service, FSKit App/extension or Codex clients. Production installation and lifecycle actions remain separate, explicitly authorized operations.
 
 See [the Linux FUSE3 validation](docs/validation-linux-fuse3.md) and [the macOS canary validation](docs/validation-macos-canary.md) for the evidence boundary. The default build remains storage-only; platform mounts require explicit build tags and installed host prerequisites.
 
@@ -50,6 +50,8 @@ The dated [replacement compatibility](docs/rebind-compatibility-2026-10-16.md),
 reports distinguish the exact locally installed subsets from the complete
 development source. Combining those changes does not by itself validate a new
 production binary; this source update does not reinstall the running service.
+The [Windows integration record](docs/windows-integration-2026-10-18.md) describes
+how the local fixes and Windows preview are combined without dropping either.
 
 ## Install
 

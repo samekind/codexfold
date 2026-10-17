@@ -1,0 +1,580 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data:; connect-src 'none'; base-uri 'none'; form-action 'none'">
+<title>CodexFold</title>
+<style>
+/* Independently rendered material; see docs/windows-preview.md for iOS 27 references. */
+:root{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI Variable","Segoe UI","Microsoft YaHei UI",sans-serif;color:#1a1a1a;font-size:14px;line-height:1.5;font-synthesis:none;font-optical-sizing:auto;color-scheme:light;--ink:#1a1a1a;--secondary:#727272;--blue:#006dcc;--accent:#0088ff;--orange:#a85b00;--green:#227a37;--switch-on:#34c759;--red:#bf2529;--line:rgba(0,0,0,.1);--canvas:#f2f2f7;--glass-fill:rgba(255,255,255,.32);--glass-rim:rgba(0,0,0,.075);--glass-highlight:rgba(255,255,255,.95);--glass-edge:rgba(0,0,0,.11);--glass-shadow:0 8px 18px rgba(0,0,0,.035);--control-fill:rgba(255,255,255,.28);--overlay-fill:rgba(248,248,248,.84);--hover-fill:rgba(0,0,0,.035);--selected-fill:rgba(0,0,0,.055);--track:rgba(120,120,128,.12);--frost:blur(12px) saturate(110%);--rim-shadow:inset 0 1px 0 var(--glass-highlight),inset 0 -1px 0 var(--glass-edge),inset 1px 0 0 #ffffff80,inset -1px 0 0 #ffffff80;--ease:cubic-bezier(.16,1,.3,1)}
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+html,body{height:100%;overflow:hidden}
+body{margin:0;min-width:320px;background:linear-gradient(135deg,#fff9,transparent 44%),linear-gradient(170deg,#f2f2f7,#e9e9ef 72%,#f4f4f7);background-color:var(--canvas);display:flex;flex-direction:column}
+::selection{background:#84baff55;color:var(--ink)}
+button,summary,select,input{font:inherit;color:inherit}
+button,summary,select{cursor:pointer}
+button{border:0;background:none}
+button:focus-visible,summary:focus-visible{outline:2px solid var(--blue);outline-offset:3px}
+select:focus-visible,input:focus-visible{outline:2px solid var(--blue);outline-offset:3px}
+button:disabled,select:disabled,input:disabled{cursor:default;opacity:.55}
+h1,h2,p{margin:0}
+h1{font-size:17px;font-weight:600;line-height:1.35}
+h2{font-size:16px;font-weight:600}
+svg{display:block}
+.icon{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round;flex:none}
+.glass{background:var(--glass-fill);border:1px solid var(--glass-rim);border-radius:26px;box-shadow:var(--rim-shadow),var(--glass-shadow);backdrop-filter:var(--frost) var(--refraction,blur(0px));-webkit-backdrop-filter:var(--frost) var(--refraction,blur(0px))}
+.toolbar{position:relative;flex:none;z-index:3;background:linear-gradient(to bottom,#f2f2f7c9,#f2f2f73d);backdrop-filter:blur(16px) saturate(110%);-webkit-backdrop-filter:blur(16px) saturate(110%)}
+.window-chrome{height:34px;display:flex;align-items:center;justify-content:flex-end;padding:5px 18px 0;flex:none;user-select:none}
+.window-controls{display:flex;gap:4px;align-items:center}
+.window-control{width:30px;height:26px;display:grid;place-items:center;border-radius:14px;background:var(--control-fill);border:1px solid var(--glass-rim);box-shadow:var(--rim-shadow),0 2px 5px #00000008;backdrop-filter:var(--frost) var(--refraction,blur(0px));transition:transform 120ms var(--ease),background-color 120ms ease-out}
+.window-control .icon{width:12px;height:12px;stroke-width:1.6}
+.window-control:active{transform:scale(.94)}
+.toolbar-inner{max-width:1120px;margin:auto;display:flex;align-items:center;justify-content:space-between;gap:16px;padding:16px 20px}
+.identity{display:flex;align-items:center;gap:12px;padding:10px 16px;min-width:210px;border-radius:36px}
+.status-symbol{width:36px;height:36px;display:grid;place-items:center;border-radius:50%;background:var(--control-fill);box-shadow:var(--rim-shadow);color:var(--secondary);font-size:22px;font-weight:500}
+.status-symbol .icon{width:21px;height:21px;stroke-width:1.8}
+.identity.healthy .status-symbol{color:var(--green);background:rgba(52,199,89,.08)}
+.identity.attention .status-symbol{color:#ad7b2b;background:#ad7b2b14}
+.health{color:var(--secondary);margin-top:1px}
+.toolbar-actions{display:flex;gap:8px;align-items:center}
+.button{display:inline-flex;align-items:center;justify-content:center;gap:7px;min-height:40px;padding:8px 16px;border:1px solid var(--glass-rim);border-radius:24px;background:var(--control-fill);box-shadow:var(--rim-shadow),0 3px 8px #00000008;white-space:nowrap;font-weight:500;backdrop-filter:var(--frost) var(--refraction,blur(0px));-webkit-backdrop-filter:var(--frost) var(--refraction,blur(0px));transition:transform 120ms var(--ease),box-shadow 140ms ease-out,background-color 140ms ease-out}
+.button:active{transform:scale(.97);box-shadow:var(--rim-shadow),0 1px 3px #00000012}
+.button.primary{color:var(--blue)}
+.button.icon-only{width:40px;padding:8px}
+.menu-anchor{position:relative}
+.menu{position:fixed;inset:auto;margin:0;width:250px;padding:8px;color:var(--ink);background:var(--overlay-fill);border-radius:28px;box-shadow:var(--rim-shadow),0 16px 44px #00000026;backdrop-filter:blur(24px) saturate(110%) var(--refraction,blur(0px));-webkit-backdrop-filter:blur(24px) saturate(110%) var(--refraction,blur(0px));transform-origin:top right;transition:opacity 160ms var(--ease),transform 160ms var(--ease)}
+.menu[hidden]{display:none}
+.menu button{display:block;width:100%;min-height:42px;text-align:left;padding:10px 16px;border-radius:20px}
+.menu button:active{background:var(--selected-fill)}
+.menu hr{border:0;border-top:1px solid var(--line);margin:5px}
+.content-scroll{flex:1;min-height:0;overflow-y:auto;overflow-x:hidden;overscroll-behavior:contain;scrollbar-gutter:stable;outline:none}
+.content-scroll:focus-visible{outline:2px solid var(--blue);outline-offset:-2px}
+.content-scroll::-webkit-scrollbar,dialog::-webkit-scrollbar{width:10px}
+.content-scroll::-webkit-scrollbar-track,dialog::-webkit-scrollbar-track{background:transparent}
+.content-scroll::-webkit-scrollbar-thumb,dialog::-webkit-scrollbar-thumb{background:#8e8e9377;border:3px solid transparent;border-radius:10px;background-clip:padding-box;min-height:48px}
+.content-scroll::-webkit-scrollbar-thumb:hover,dialog::-webkit-scrollbar-thumb:hover{background-color:#63636699;border-width:2px}
+.content-scroll::-webkit-scrollbar-button,dialog::-webkit-scrollbar-button{display:none;width:0;height:0}
+main{max-width:1120px;margin:auto;padding:20px;display:grid;gap:16px}
+.metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}
+.metric{padding:16px;border-radius:26px;min-height:100px}
+.metric-label{color:var(--secondary);margin-bottom:10px}
+.metric-value{font-size:25px;font-weight:600;font-variant-numeric:tabular-nums;line-height:1.2;white-space:nowrap;letter-spacing:-.5px}
+.metric:first-child .metric-value{color:var(--blue)}
+.panel{padding:18px}
+.section-heading{display:flex;align-items:center;justify-content:space-between;gap:16px}
+.secondary{color:var(--secondary)}
+.fold-row{min-height:66px}
+.fold-actions{display:flex;align-items:center;gap:16px;flex-wrap:wrap;justify-content:flex-end}
+.fold-switch{display:inline-flex;align-items:center;gap:7px;white-space:nowrap;cursor:pointer}
+.fold-switch{gap:10px}
+.fold-switch input{appearance:none;-webkit-appearance:none;position:relative;width:64px;height:28px;margin:0;border:0;border-radius:20px;background:var(--track);box-shadow:inset 0 0 0 1px #00000004;cursor:pointer;transition:background-color 160ms ease-out}
+.fold-switch input::before{content:"";position:absolute;top:2px;left:2px;width:38px;height:24px;border-radius:20px;background:#fffffff0;box-shadow:inset 0 1px 0 #fff,0 1px 3px #0000001f;transform:translateX(0);transition:transform 180ms var(--ease),width 160ms var(--ease),box-shadow 160ms ease-out,background-color 160ms ease-out}
+.fold-switch input:checked{background:var(--switch-on)}
+.fold-switch input:checked::before{transform:translateX(22px)}
+.fold-switch input:active::before{width:44px;background:#ffffff4d;box-shadow:inset 0 1px 0 #fff,inset 0 -1px 0 #00000070,inset 1px 0 0 #fff9,inset -1px 0 0 #fff9,0 2px 5px #00000024;backdrop-filter:blur(2px);transform:translateX(-1px) scale(1.05,1.28)}
+.fold-switch input:checked:active::before{transform:translateX(19px) scale(1.05,1.28)}
+.fold-progress{margin-top:14px}
+.fold-progress progress{display:block;width:100%;height:6px;accent-color:var(--accent);border:0;border-radius:8px;overflow:hidden}
+.fold-progress progress::-webkit-progress-bar{background:var(--track);box-shadow:inset 0 1px 1px #00000008;border-radius:8px}
+.fold-progress progress::-webkit-progress-value{background:var(--accent);box-shadow:inset 0 1px 0 #ffffff70;border-radius:8px}
+.progress-caption{margin-top:7px;color:var(--secondary);font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
+.settings-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));column-gap:32px;margin-top:10px}
+.setting{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:9px 0;border-bottom:1px solid var(--line);min-width:0}
+.setting select{background:var(--control-fill);border:1px solid var(--glass-rim);border-radius:20px;min-width:140px;max-width:65%;padding:7px 14px;min-height:36px;box-shadow:var(--rim-shadow),0 2px 7px #00000006;backdrop-filter:var(--frost) var(--refraction,blur(0px))}
+@supports(appearance:base-select){
+  .setting select,.setting select::picker(select){appearance:base-select}
+  .setting select{align-items:center;gap:12px}
+  .setting select::picker-icon{color:var(--secondary);transition:transform 140ms var(--ease)}
+  .setting select:open::picker-icon{transform:rotate(180deg)}
+  .setting select::picker(select){background:var(--overlay-fill);color:var(--ink);border:1px solid var(--glass-rim);border-radius:24px;padding:6px;margin-block-start:6px;box-shadow:var(--rim-shadow),0 15px 40px #00000026;backdrop-filter:blur(24px) saturate(110%);-webkit-backdrop-filter:blur(24px) saturate(110%);max-height:270px;overflow:auto;min-width:anchor-size(width)}
+  .setting option{border-radius:13px;padding:9px 11px;display:flex;align-items:center;gap:12px;cursor:pointer}
+  .setting option:checked{background:var(--selected-fill);color:var(--blue);font-weight:600}
+  .setting option:focus-visible{outline:2px solid var(--blue);outline-offset:-2px}
+  .setting option::checkmark{color:var(--blue);order:2;margin-left:auto}
+}
+.policy-message{min-height:21px;margin-top:8px;color:var(--secondary);overflow-wrap:anywhere}
+.policy-message.error,.history-warning{color:var(--red)}
+.repair-button{margin-top:8px}
+.history-note{color:var(--secondary);margin-top:10px;font-size:13px;overflow-wrap:anywhere}
+.history-note:empty{display:none}
+.incident-list{margin-top:10px}
+.incident{padding:12px 0;border-bottom:1px solid var(--line)}
+.incident:last-child{border-bottom:0}
+.incident summary{width:100%;padding:0;color:inherit}
+.incident-meta{display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-top:4px;color:var(--secondary);font-variant-numeric:tabular-nums}
+.incident-state{color:var(--red);font-weight:500}
+.incident-state.recovered{color:var(--green)}
+.incident-body{margin-top:12px;max-width:75ch}
+.incident-body p{margin-top:8px;overflow-wrap:anywhere}
+.incident-body ul{margin:8px 0 12px;padding-left:20px}
+.incident-body pre{white-space:pre-wrap;overflow-wrap:anywhere;font:13px/1.7 "Segoe UI",sans-serif;color:var(--secondary)}
+.diagnostic-message{margin-top:12px;overflow-wrap:anywhere;color:var(--secondary)}
+.diagnostic-message.error{color:var(--red)}
+.space-breakdown{margin-top:14px;border-top:1px solid var(--line);padding-top:3px}
+.space-breakdown .runtime-row{font-variant-numeric:tabular-nums}
+.space-breakdown strong{font-weight:500}
+.segmented{display:flex;gap:2px;padding:2px;border-radius:20px;background:var(--track);border:0;box-shadow:inset 0 1px 1px #00000005}
+.segmented button{padding:3px 13px;border-radius:16px;white-space:nowrap;min-height:28px;transition:transform 120ms var(--ease),background-color 140ms ease-out}
+.segmented button.selected{background:var(--control-fill);box-shadow:var(--rim-shadow),0 2px 5px #00000014;color:var(--ink);font-weight:600;backdrop-filter:var(--frost) var(--refraction,blur(0px))}
+.segmented button:active{transform:scale(.97)}
+.legend{display:flex;gap:20px;align-items:center;color:var(--secondary);margin-top:16px}
+.legend span,.rates span{display:inline-flex;align-items:center;gap:7px}
+.legend i{display:inline-block;width:18px;border-top:2px solid var(--blue)}
+.legend .original{border-top:2px dashed #9b9da3}
+#logical-line{stroke:var(--secondary)}
+#physical-line,#read-line{stroke:var(--blue)}
+#write-line{stroke:var(--orange)}
+.legend .original{border-color:var(--secondary)}
+.chart{position:relative;height:170px;margin-top:14px;background:repeating-linear-gradient(to bottom,transparent 0,transparent calc(33.333% - 1px),var(--line) calc(33.333% - 1px),var(--line) 33.333%)}
+.chart svg{width:100%;height:100%;overflow:visible}
+.chart-empty{position:absolute;inset:0;display:grid;place-items:center;color:var(--secondary)}
+.chart-empty[hidden]{display:none}
+.chart:has(.chart-empty:not([hidden])){height:90px}
+.axis{display:flex;justify-content:space-between;margin-top:8px;font-size:13px;color:var(--secondary)}
+.rates{display:flex;gap:20px;flex-wrap:wrap;color:var(--secondary);font-variant-numeric:tabular-nums}
+.rates strong{font-weight:500;color:var(--ink)}
+.rates i{width:7px;height:7px;border-radius:50%;background:var(--blue)}
+.rates .write-dot{background:var(--orange)}
+.io-chart{height:125px}
+.empty{color:var(--secondary);padding:20px 0 2px}
+.event{display:flex;gap:18px;padding-top:13px}
+.event time{color:var(--secondary);font-variant-numeric:tabular-nums}
+.runtime-rows{margin-top:12px}
+.runtime-row{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:10px 0;border-bottom:1px solid var(--line)}
+.runtime-row:last-child{border-bottom:0}
+details{margin-top:10px}
+summary{color:var(--secondary);width:fit-content;padding:5px 0;border-radius:10px}
+.detail-text{white-space:pre-wrap;overflow-wrap:anywhere;font:14px/1.8 "Segoe UI","Microsoft YaHei UI",sans-serif;color:var(--secondary);margin:12px 0 0}
+dialog{border:1px solid var(--glass-rim);border-radius:32px;background:var(--overlay-fill);box-shadow:var(--rim-shadow),0 24px 80px #00000033;padding:24px;max-width:620px;width:calc(100% - 32px);color:inherit;max-height:85vh;overflow:auto;backdrop-filter:blur(24px) saturate(110%) var(--refraction,blur(0px));-webkit-backdrop-filter:blur(24px) saturate(110%) var(--refraction,blur(0px));transition:opacity 180ms var(--ease),transform 180ms var(--ease)}
+dialog::backdrop{background:#0000002b;backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px)}
+.dialog-path{overflow-wrap:anywhere;margin-top:16px}
+.dialog-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:20px;flex-wrap:wrap}
+@starting-style{.menu:not([hidden]){opacity:0;transform:translateY(-4px) scale(.97)}dialog[open]{opacity:0;transform:translateY(6px) scale(.98)}}
+.keyboard-input .menu,.keyboard-input dialog,.keyboard-input .setting select::picker(select){transition:none}
+@media(hover:hover) and (pointer:fine){.button:hover,.window-control:hover{background-color:var(--hover-fill);box-shadow:var(--rim-shadow),0 4px 12px #00000010}.window-control.close:hover{color:var(--red)}.menu button:hover,.setting option:hover,.setting option:focus-visible{background:var(--selected-fill)}.segmented button:not(.selected):hover{background:var(--hover-fill)}}
+@media(prefers-color-scheme:dark){
+  :root{color-scheme:dark;color:#ededed;--ink:#ededed;--secondary:#b0b0b0;--blue:#54aaff;--accent:#0091ff;--orange:#ffb24d;--green:#6edb83;--switch-on:#30d158;--red:#ff696c;--line:#ffffff1f;--canvas:#000;--glass-fill:rgba(44,44,46,.32);--glass-rim:#ffffff13;--glass-highlight:#ffffff38;--glass-edge:#0000008c;--glass-shadow:0 8px 18px #00000024;--control-fill:#ffffff12;--overlay-fill:rgba(28,28,30,.87);--hover-fill:#ffffff12;--selected-fill:#ffffff14;--track:rgba(120,120,128,.32);--rim-shadow:inset 0 1px 0 var(--glass-highlight),inset 0 -1px 0 var(--glass-edge),inset 1px 0 0 #ffffff1f,inset -1px 0 0 #ffffff1f}
+  body{background:linear-gradient(135deg,#ffffff05,transparent 44%),linear-gradient(170deg,#1b1b1d,#101012 72%,#1c1c1e)}
+  .toolbar{background:linear-gradient(to bottom,#1c1c1eca,#1c1c1e3d)}
+}
+@media(max-width:560px){.settings-grid{grid-template-columns:1fr}.fold-actions{gap:10px}.section-heading{gap:10px}}
+@media(max-width:720px){
+  .metrics{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .toolbar-actions .button span{display:none}
+  .toolbar-actions .button{width:36px;padding:7px}
+  .storage-heading,.io-heading{align-items:flex-start;flex-direction:column;gap:12px}
+  .identity{min-width:0}
+  .metric-value{font-size:24px}
+}
+@media(max-width:430px){
+  main{padding:14px;gap:14px}
+  .toolbar-inner{padding:12px 14px;gap:8px}
+  .identity{padding:9px 10px;gap:8px}
+  .toolbar-actions{gap:5px}
+  .panel{padding:15px}
+  .segmented button{padding:4px 9px}
+  .rates{gap:14px}
+  .event{gap:10px;flex-wrap:wrap}
+}
+@media(max-height:700px){
+  .toolbar-inner{padding-top:10px;padding-bottom:10px}
+  main{padding-top:16px;gap:12px}
+  .metric{min-height:88px;padding:14px}
+  .metric-label{margin-bottom:8px}
+  .panel{padding:16px}
+}
+@media(prefers-reduced-motion:reduce){*,*::before,*::after{scroll-behavior:auto!important;transition:none!important;animation:none!important}.button:active,.window-control:active,.segmented button:active{transform:none}.fold-switch input:active::before{width:38px;transform:none}.fold-switch input:checked:active::before{transform:translateX(22px)}}
+@media(prefers-reduced-transparency:reduce),(prefers-contrast:more){:root{--glass-fill:#f2f2f7;--control-fill:#fff;--overlay-fill:#f8f8f8;--glass-rim:#727272;--glass-shadow:none}.glass,.button,.window-control,.setting select,.segmented button,.toolbar,dialog,.menu,.setting select::picker(select){backdrop-filter:none;-webkit-backdrop-filter:none}.toolbar{background:var(--glass-fill)}}
+@media(prefers-color-scheme:dark) and (prefers-reduced-transparency:reduce),(prefers-color-scheme:dark) and (prefers-contrast:more){:root{--glass-fill:#1c1c1e;--control-fill:#2c2c2e;--overlay-fill:#1c1c1e;--glass-rim:#8e8e93}}
+@media(forced-colors:active){.glass,.button,.segmented,.window-control,.setting select,dialog{background:Canvas;border:1px solid CanvasText;box-shadow:none;backdrop-filter:none}.chart svg{forced-color-adjust:none}.content-scroll{scrollbar-color:auto;scrollbar-width:auto}.fold-switch input{appearance:auto;width:24px;height:24px}.fold-switch input::before{display:none}.segmented button.selected{outline:2px solid Highlight}}
+</style>
+</head>
+<body>
+<svg style="position:absolute;width:0;height:0" aria-hidden="true"><defs>
+  <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 7v5h-5M4 17v-5h5"/><path d="M5.5 7a7.5 7.5 0 0 1 12-2L20 8M4 16l2.5 3a7.5 7.5 0 0 0 12-2"/></symbol>
+  <symbol id="i-diagnostic" viewBox="0 0 24 24"><path d="M14 3H5v18h14V8zM14 3v5h5M8 13h8M8 17h5"/></symbol>
+  <symbol id="i-more" viewBox="0 0 24 24"><circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/></symbol>
+  <symbol id="i-minimize" viewBox="0 0 24 24"><path d="M6 16h12"/></symbol>
+  <symbol id="i-maximize" viewBox="0 0 24 24"><rect x="5" y="5" width="14" height="14" rx="3"/></symbol>
+  <symbol id="i-close" viewBox="0 0 24 24"><path d="m7 7 10 10M17 7 7 17"/></symbol>
+  <symbol id="i-status-unknown" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M9.5 8.5a2.6 2.6 0 0 1 5 .9c0 1.8-2.5 2.2-2.5 4.1M12 17h.01"/></symbol>
+  <symbol id="i-status-healthy" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="m8 12 2.6 2.6L16 9"/></symbol>
+  <symbol id="i-status-attention" viewBox="0 0 24 24"><path d="m10.4 4.5-8 14a1.8 1.8 0 0 0 1.6 2.7h16a1.8 1.8 0 0 0 1.6-2.7l-8-14a1.8 1.8 0 0 0-3.2 0ZM12 9v5M12 17h.01"/></symbol>
+</defs></svg>
+<header class="toolbar">
+  <div class="window-chrome" id="window-chrome" aria-label="窗口标题栏">
+    <div class="window-controls">
+      <button class="window-control" data-command="window-minimize" aria-label="最小化窗口" title="最小化"><svg class="icon"><use href="#i-minimize"/></svg></button>
+      <button class="window-control" data-command="window-maximize" aria-label="最大化或还原窗口" title="最大化或还原"><svg class="icon"><use href="#i-maximize"/></svg></button>
+      <button class="window-control close" data-command="window-hide" aria-label="关闭窗口并保留托盘" title="收起到托盘"><svg class="icon"><use href="#i-close"/></svg></button>
+    </div>
+  </div>
+  <div class="toolbar-inner">
+    <div class="identity glass" id="identity">
+      <div class="status-symbol" aria-hidden="true"><svg class="icon"><use id="status-symbol" href="#i-status-unknown"/></svg></div>
+      <div><h1>CodexFold</h1><p class="health" id="health" role="status">未连接</p></div>
+    </div>
+    <div class="toolbar-actions">
+      <button class="button" data-command="refresh" aria-label="检查状态" title="检查状态"><svg class="icon"><use href="#i-refresh"/></svg><span>检查状态</span></button>
+      <button class="button primary" id="show-diagnostics" aria-label="查看诊断" title="查看诊断"><svg class="icon"><use href="#i-diagnostic"/></svg><span>查看诊断</span></button>
+      <div class="menu-anchor">
+        <button class="button icon-only" id="more" aria-label="更多操作" aria-expanded="false" aria-controls="menu"><svg class="icon"><use href="#i-more"/></svg></button>
+        <div class="menu glass" id="menu" popover="manual" hidden>
+          <button data-command="store">打开存储目录</button>
+          <button data-command="logs">文件服务日志</button>
+          <button data-command="logs-worker">自动折叠日志</button>
+          <button data-command="copy-diagnostics">复制诊断</button>
+          <button data-command="export-diagnostics">导出诊断</button>
+          <button data-command="refresh">检查状态</button>
+          <hr>
+          <button data-command="exit">退出托盘</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</header>
+<div class="content-scroll" id="content-scroll" tabindex="0" role="region" aria-label="概览内容">
+<main>
+  <section class="metrics" aria-label="空间统计">
+    <article class="metric glass"><div class="metric-label">压缩减少</div><div class="metric-value" id="saved">—</div></article>
+    <article class="metric glass"><div class="metric-label">压缩比例</div><div class="metric-value" id="saving">—</div></article>
+    <article class="metric glass"><div class="metric-label">会话数据</div><div class="metric-value" id="logical">—</div></article>
+    <article class="metric glass"><div class="metric-label">磁盘占用</div><div class="metric-value" id="physical">—</div></article>
+  </section>
+  <section class="panel glass fold-row">
+    <div class="section-heading"><h2>自动折叠</h2><div class="fold-actions"><span class="secondary" id="fold-status">未连接</span><label class="fold-switch"><input type="checkbox" role="switch" id="policy-enabled" data-policy="enabled" disabled>启用</label></div></div>
+    <div class="fold-progress"><progress id="fold-progress" max="1" aria-label="本批折叠进度" hidden></progress><p class="progress-caption" id="fold-caption">正在读取后台状态…</p></div>
+    <div class="settings-grid" aria-label="自动折叠设置">
+      <label class="setting"><span>检查间隔</span><select id="policy-interval" data-policy="interval" disabled><option value="1m0s">1 分钟</option><option value="5m0s">5 分钟</option><option value="30m0s">30 分钟</option><option value="1h0m0s">1 小时</option><option value="2h0m0s">2 小时</option></select></label>
+      <label class="setting"><span>会话空闲时间</span><select id="policy-idle" data-policy="stable_for" disabled><option value="1h0m0s">1 小时</option><option value="6h0m0s">6 小时</option><option value="24h0m0s">1 天</option></select></label>
+      <label class="setting"><span>折叠范围</span><select id="policy-scope" data-policy="archived_only" disabled><option value="true">仅归档会话</option><option value="false">归档和空闲会话</option></select></label>
+      <label class="setting"><span>每批会话数</span><select id="policy-batch" data-policy="batch_size" disabled><option value="0">自动调整</option><option value="1">1 个</option><option value="5">5 个</option><option value="10">10 个</option><option value="25">25 个</option><option value="50">50 个</option><option value="100">100 个</option><option value="200">200 个</option></select></label>
+    </div>
+    <p class="policy-message" id="policy-message" role="status"></p>
+    <button class="button repair-button" id="repair-policy" hidden>修复设置并保持暂停</button>
+    <div class="space-breakdown" aria-label="空间占用明细">
+      <div class="runtime-row"><span title="保留原件、散对象、旧版本及恢复文件；实际回收需通过校验">待回收占用</span><strong id="pending">—</strong></div>
+      <div class="runtime-row"><span id="net-label">当前净节省</span><strong id="net-saved">—</strong></div>
+    </div>
+  </section>
+  <section class="panel glass">
+    <div class="section-heading storage-heading">
+      <h2>空间变化</h2>
+      <div class="segmented" aria-label="空间图表时间范围">
+        <button data-hours="1" aria-pressed="false">1 小时</button>
+        <button data-hours="24" class="selected" aria-pressed="true">24 小时</button>
+        <button data-hours="168" aria-pressed="false">7 天</button>
+        <button data-hours="720" aria-pressed="false">30 天</button>
+      </div>
+    </div>
+    <div class="legend"><span><i class="original"></i>原始大小</span><span><i></i>当前占用</span></div>
+    <div class="chart">
+      <svg viewBox="0 0 800 170" preserveAspectRatio="none" role="img" aria-label="已记录的空间变化">
+        <path id="saving-area" fill="#3478d410"/>
+        <path id="logical-line" fill="none" stroke="#9b9da3" stroke-width="2" stroke-dasharray="5 5" vector-effect="non-scaling-stroke"/>
+        <path id="physical-line" fill="none" stroke="#3478d4" stroke-width="2" vector-effect="non-scaling-stroke"/>
+      </svg>
+      <div class="chart-empty" id="storage-empty">暂无记录</div>
+    </div>
+    <div class="axis"><span id="range-start">24 小时前</span><span>现在</span></div>
+    <p class="history-note" id="history-note"></p>
+    <p class="history-note history-warning" id="history-error" role="status"></p>
+  </section>
+  <section class="panel glass">
+    <div class="section-heading io-heading">
+      <h2>读写速度</h2>
+      <div class="rates"><span><i></i>读取 <strong id="read">—</strong></span><span><i class="write-dot"></i>写入 <strong id="write">—</strong></span></div>
+    </div>
+    <div class="chart io-chart">
+      <svg viewBox="0 0 800 125" preserveAspectRatio="none" role="img" aria-label="最近十分钟已记录的读写速度">
+        <path id="read-line" fill="none" stroke="#3478d4" stroke-width="2" vector-effect="non-scaling-stroke"/>
+        <path id="write-line" fill="none" stroke="#c98941" stroke-width="2" vector-effect="non-scaling-stroke"/>
+      </svg>
+      <div class="chart-empty" id="io-empty">暂无记录</div>
+    </div>
+    <div class="axis"><span>10 分钟前</span><span>现在</span></div>
+  </section>
+  <section class="panel glass"><h2>故障记录</h2><div class="incident-list" id="events"><p class="empty">暂无持续故障记录</p></div></section>
+  <section class="panel glass">
+    <div class="section-heading"><h2>运行状态</h2><span class="secondary" id="session-count">托管会话：—</span></div>
+    <div class="runtime-rows">
+      <div class="runtime-row"><span>文件服务</span><span class="secondary" id="daemon-state">未连接</span></div>
+      <div class="runtime-row"><span>会话管理</span><span class="secondary" id="managed-state">未连接</span></div>
+    </div>
+    <details><summary>技术详情</summary><pre class="detail-text" id="details"></pre></details>
+  </section>
+</main>
+</div>
+<dialog id="diagnostics" aria-labelledby="diagnostic-title">
+  <h2 id="diagnostic-title">诊断</h2>
+  <p class="dialog-path" id="store-path"></p>
+  <pre class="detail-text" id="diagnostic-details"></pre>
+  <p class="diagnostic-message" id="diagnostic-message" role="status">诊断包含运行状态、设置和汇总记录，不含会话内容。</p>
+  <div class="dialog-actions"><button class="button" data-command="logs-worker">查看折叠日志</button><button class="button" data-command="copy-diagnostics">复制诊断</button><button class="button primary" data-command="export-diagnostics">导出 JSON</button><button class="button" id="close-diagnostics" autofocus>关闭</button></div>
+</dialog>
+<script>
+const $ = id => document.getElementById(id);
+// Refraction affects only the captured backdrop. Text and controls stay sharp.
+const glassNS='http://www.w3.org/2000/svg', glassDefs=document.querySelector('svg defs'), glassFilters=new WeakMap();
+let glassSerial=0;
+function updateGlass(element) {
+  const bounds=element.getBoundingClientRect(), width=Math.round(bounds.width), height=Math.round(bounds.height);
+  if (!width || !height || width>1600 || height>1600) return;
+  const radius=Math.min(parseFloat(getComputedStyle(element).borderTopLeftRadius)||20,width/2,height/2);
+  let state=glassFilters.get(element);
+  const size=width+':'+height+':'+radius;
+  if(state?.size===size)return;
+  if(!state){
+    const filter=document.createElementNS(glassNS,'filter'), map=document.createElementNS(glassNS,'feImage'), lens=document.createElementNS(glassNS,'feDisplacementMap');
+    filter.id='glass-lens-'+(++glassSerial);filter.setAttribute('color-interpolation-filters','sRGB');
+    filter.setAttribute('x','0');filter.setAttribute('y','0');filter.setAttribute('width','100%');filter.setAttribute('height','100%');
+    map.setAttribute('result','rim');map.setAttribute('preserveAspectRatio','none');
+    lens.setAttribute('in','SourceGraphic');lens.setAttribute('in2','rim');lens.setAttribute('scale','10');lens.setAttribute('xChannelSelector','R');lens.setAttribute('yChannelSelector','G');
+    filter.append(map,lens);glassDefs.append(filter);state={filter,map,size:''};glassFilters.set(element,state);
+    element.style.setProperty('--refraction','url(#'+filter.id+')');
+  }
+  state.size=size;state.map.setAttribute('width',width);state.map.setAttribute('height',height);
+  const canvas=document.createElement('canvas');canvas.width=width;canvas.height=height;
+  const context=canvas.getContext('2d'), pixels=context.createImageData(width,height), data=pixels.data;
+  for(let y=0;y<height;y++)for(let x=0;x<width;x++){
+    const qx=Math.abs(x+.5-width/2)-(width/2-radius),qy=Math.abs(y+.5-height/2)-(height/2-radius);
+    const ax=Math.max(qx,0),ay=Math.max(qy,0),length=Math.hypot(ax,ay),depth=radius-length-Math.min(Math.max(qx,qy),0);
+    let nx=0,ny=0;
+    if(length){nx=ax/length*Math.sign(x+.5-width/2);ny=ay/length*Math.sign(y+.5-height/2);}
+    else if(qx>qy)nx=Math.sign(x+.5-width/2);else ny=Math.sign(y+.5-height/2);
+    const bend=depth>0&&depth<9?Math.sin(depth/9*Math.PI)*3.5:0,index=(y*width+x)*4;
+    data[index]=Math.round(128-nx*bend*25.5);data[index+1]=Math.round(128-ny*bend*25.5);data[index+2]=128;data[index+3]=255;
+  }
+  context.putImageData(pixels,0,0);state.map.setAttribute('href',canvas.toDataURL());
+}
+const glassResize=new ResizeObserver(entries=>entries.forEach(entry=>updateGlass(entry.target)));
+function observeGlass(element){glassResize.observe(element);}
+document.querySelectorAll('.glass,.button,.window-control,.setting select,.segmented button,dialog').forEach(observeGlass);
+let hours = 24, samples = [], liveIOSamples = [], lastSettings = {}, pendingPolicy = null, policySerial = 0, lastOperation = '', lastIncidentSignature = '';
+function command(action) { window.chrome?.webview?.postMessage(action); }
+function text(id, value) { if ($(id).textContent !== value) $(id).textContent = value; }
+function setSelect(id, value, label) {
+  const select = $(id), raw = String(value);
+  if (raw !== '') [...select.options].filter(option=>option.value==='').forEach(option=>option.remove());
+  if (![...select.options].some(option => option.value === raw)) select.add(new Option(label || '自定义（' + raw + '）', raw));
+  select.value = raw;
+}
+function durationLabel(raw) {
+  let seconds=0;const units={h:3600,m:60,s:1,ms:.001,us:.000001,'µs':.000001,ns:.000000001};
+  for (const match of String(raw).matchAll(/(\d+(?:\.\d+)?)(ns|us|µs|ms|s|m|h)/g)) seconds+=Number(match[1])*units[match[2]];
+  if (!seconds) return '未设置';
+  if (seconds%86400===0) return seconds/86400+' 天';
+  if (seconds%3600===0) return seconds/3600+' 小时';
+  if (seconds%60===0) return seconds/60+' 分钟';
+  return seconds+' 秒';
+}
+function updateSettings(settings) {
+  lastSettings = settings;
+  document.querySelectorAll('[data-policy]').forEach(control => { control.disabled = !!pendingPolicy || !settings.Available || !!settings.Error; });
+  $('repair-policy').hidden = !settings.Repairable;
+  $('repair-policy').disabled = !!pendingPolicy;
+  text('repair-policy',settings.Error?.startsWith('后台使用启动参数')?'建立设置并保持暂停':'修复设置并保持暂停');
+  if (pendingPolicy) return;
+  $('policy-enabled').checked = !!settings.Enabled;
+  if (!settings.Available || settings.Error) {
+    for (const id of ['policy-interval','policy-idle','policy-scope','policy-batch']) setSelect(id,'','未读取');
+  } else {
+    setSelect('policy-interval',settings.Interval,durationLabel(settings.Interval)+'（当前）');
+    setSelect('policy-idle',settings.StableFor,durationLabel(settings.StableFor)+'（当前）');
+    setSelect('policy-scope',!!settings.ArchivedOnly);
+    setSelect('policy-batch',settings.BatchSize || 0,(settings.BatchSize || 0)+' 个（当前）');
+  }
+  if (settings.Error) { text('policy-message', settings.Error); $('policy-message').classList.add('error'); }
+}
+function savePolicy(field, value) {
+  if (pendingPolicy) return;
+  const id = Date.now().toString(36) + '-' + (++policySerial).toString(36);
+  pendingPolicy = id;
+  updateSettings(lastSettings);
+  text('policy-message', '正在保存…'); $('policy-message').classList.remove('error');
+  command(JSON.stringify({action:'set-policy',id,revision:lastSettings.Revision || '',field,value}));
+}
+document.querySelectorAll('[data-policy]').forEach(control => control.addEventListener('change', () => {
+  let value = control.type === 'checkbox' ? control.checked : control.value;
+  if (control.dataset.policy === 'batch_size') value = Number(value);
+  if (control.dataset.policy === 'archived_only') value = value === 'true';
+  savePolicy(control.dataset.policy, value);
+}));
+$('repair-policy').addEventListener('click', () => savePolicy('reset', null));
+window.showOperationResult = function(result) {
+  if (result.ID === pendingPolicy) {
+    pendingPolicy = null; updateSettings(lastSettings);
+    text('policy-message', result.Message || ''); $('policy-message').classList.toggle('error', !result.OK);
+  } else if (result.ID === 'copy-diagnostics' || result.ID === 'export-diagnostics') {
+    text('diagnostic-message', result.Message || ''); $('diagnostic-message').classList.toggle('error', !result.OK);
+  }
+};
+function updateProgress(view) {
+  const progress = view.Progress, bar = $('fold-progress');
+  if (!progress || !progress.Fresh) {
+    bar.hidden = true; text('fold-caption', '等待后台提供最新进度。'); return;
+  }
+  const done = progress.CycleDone, total = progress.CycleTotal;
+  bar.hidden = !view.Settings?.Enabled;
+  if (Number.isFinite(done) && total > 0 && done >= 0 && done <= total) {
+    bar.value = done / total;
+  } else { bar.removeAttribute('value'); }
+  const parts = [];
+  if (total > 0) parts.push('本批已完成 ' + done + ' / ' + total + ' 项');
+  if (progress.WaitingKnown) parts.push('上次检查待处理 ' + progress.WaitingCount + ' 个会话');
+  if (progress.NextCheckAt) parts.push('下次检查 ' + new Date(progress.NextCheckAt).toLocaleTimeString('zh-CN', {hour12:false}));
+  if (!parts.length) parts.push(view.EnrollmentState==='正在暂停' ? '已请求暂停，等待当前操作安全退出。' : !view.Settings?.Enabled ? '自动折叠已暂停。' : progress.Phase==='checking' ? '正在检查，完成后显示本批进度。' : (view.EnrollmentState || '等待后台更新')+'。');
+  text('fold-caption', parts.join(' · '));
+}
+function duration(value) {
+  const seconds = Math.max(0, Math.floor(value / 1000));
+  if (seconds < 60) return seconds + ' 秒';
+  if (seconds < 3600) return Math.floor(seconds / 60) + ' 分 ' + seconds % 60 + ' 秒';
+  if (seconds < 86400) return Math.floor(seconds / 3600) + ' 小时 ' + Math.floor(seconds % 3600 / 60) + ' 分';
+  return Math.floor(seconds / 86400) + ' 天 ' + Math.floor(seconds % 86400 / 3600) + ' 小时';
+}
+function updateIncidents(incidents) {
+  const signature=JSON.stringify(incidents);
+  if (signature===lastIncidentSignature) {
+    $('events').querySelectorAll('[data-started]').forEach(state=>{state.textContent='持续中 · '+duration(Date.now()-Number(state.dataset.started));});return;
+  }
+  lastIncidentSignature=signature;
+  const open = new Set([...$('events').querySelectorAll('details[open]')].map(item => item.dataset.id));
+  $('events').querySelectorAll('.button').forEach(button=>{glassResize.unobserve(button);glassFilters.get(button)?.filter.remove();});
+  if (!incidents.length) { if (!$('events').querySelector('.empty')) { const p=document.createElement('p');p.className='empty';p.textContent='暂无持续故障记录';$('events').replaceChildren(p); } return; }
+  const rows = incidents.slice(0, 20).map(incident => {
+    const row=document.createElement('details'), summary=document.createElement('summary'), title=document.createElement('span'), meta=document.createElement('div'), state=document.createElement('span'), at=document.createElement('span');
+    row.className='incident';row.dataset.id=incident.id;row.open=open.has(incident.id);
+    title.textContent=incident.reason;meta.className='incident-meta';state.className='incident-state'+(incident.recovered_at?' recovered':'');
+    state.textContent=(incident.recovered_at?'已恢复':'持续中')+' · '+duration((incident.recovered_at || Date.now())-incident.started_at);
+    if (!incident.recovered_at) state.dataset.started=incident.started_at;
+    at.textContent=new Date(incident.started_at).toLocaleString('zh-CN',{hour12:false});meta.append(state,at);summary.append(title,meta);row.append(summary);
+    const body=document.createElement('div');body.className='incident-body';
+    const impact=document.createElement('p');impact.textContent=incident.impact;body.append(impact);
+    if (incident.recovered_at) { const p=document.createElement('p');p.className='secondary';p.textContent='确认恢复于 '+new Date(incident.recovered_at).toLocaleString('zh-CN',{hour12:false});body.append(p); }
+    const list=document.createElement('ul');(incident.recommendations || []).forEach(value=>{const li=document.createElement('li');li.textContent=value;list.append(li);});body.append(list);
+    if (incident.detail) { const technical=document.createElement('pre');technical.textContent=incident.detail;body.append(technical); }
+    const logs=document.createElement('button');logs.className='button';logs.textContent='查看日志';logs.addEventListener('click',()=>command(incident.source==='enrollment'?'logs-worker':'logs'));body.append(logs);row.append(body);observeGlass(logs);return row;
+  });
+  $('events').replaceChildren(...rows);
+}
+function positionMenu() {
+  const menu=$('menu'), trigger=$('more').getBoundingClientRect();
+  menu.style.left=Math.max(8,Math.min(innerWidth-menu.offsetWidth-8,trigger.right-menu.offsetWidth))+'px';
+  menu.style.top=Math.max(8,Math.min(innerHeight-menu.offsetHeight-8,trigger.bottom+10))+'px';
+}
+function showMenu() { const menu=$('menu');menu.hidden=false;if(!menu.matches(':popover-open'))menu.showPopover();positionMenu();$('more').setAttribute('aria-expanded','true'); }
+function closeMenu() { const menu=$('menu');if(menu.matches(':popover-open'))menu.hidePopover();menu.hidden=true;$('more').setAttribute('aria-expanded','false'); }
+document.querySelectorAll('[data-command]').forEach(button => button.addEventListener('click', () => {
+  command(button.dataset.command); closeMenu();
+}));
+$('more').addEventListener('click', () => {
+  if($('menu').hidden)showMenu();else closeMenu();
+});
+window.openGlassMenu = function() { showMenu();$('menu').querySelector('button').focus(); };
+window.addEventListener('resize', () => { if(!$('menu').hidden)positionMenu(); });
+$('window-chrome').addEventListener('pointerdown', event => {
+  if (event.button===0 && !event.target.closest('button')) command('window-drag');
+});
+$('window-chrome').addEventListener('dblclick', event => { if (!event.target.closest('button')) command('window-maximize'); });
+document.addEventListener('keydown', () => document.body.classList.add('keyboard-input'));
+document.addEventListener('pointerdown', () => document.body.classList.remove('keyboard-input'));
+document.addEventListener('click', event => { if (!event.target.closest('.menu-anchor')) closeMenu(); });
+$('show-diagnostics').addEventListener('click', () => { closeMenu(); $('diagnostics').showModal(); });
+$('close-diagnostics').addEventListener('click', () => $('diagnostics').close());
+document.addEventListener('keydown', event => {
+  if (event.key === 'Escape') closeMenu();
+  if (event.key === 'F5') { event.preventDefault(); command('refresh'); }
+});
+document.querySelectorAll('[data-hours]').forEach(button => button.addEventListener('click', () => {
+  hours = Number(button.dataset.hours);
+  document.querySelectorAll('[data-hours]').forEach(item => {
+    item.classList.toggle('selected', item === button);
+    item.setAttribute('aria-pressed', String(item === button));
+  });
+  $('range-start').textContent = hours < 48 ? hours + ' 小时前' : hours / 24 + ' 天前';
+  drawCharts();
+}));
+function bytes(value) {
+  if (value == null || !Number.isFinite(value)) return '—';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let i = 0;
+  while (value >= 1000 && i < units.length - 1) { value /= 1000; i++; }
+  return value.toFixed(i ? 1 : 0) + ' ' + units[i];
+}
+function coordinates(items, key, now, duration, max, height) {
+  return items.flatMap((item,index) => {
+    const point = item[key] == null ? null : [Math.max(2,Math.min(798,800*(1-(now-item.t)/duration))),height-5-item[key]/max*(height-15)];
+    const age=now-item.t, expected=age<=6*3600000?60000:age<=7*86400000?900000:3600000;
+    return index>0 && item.t-items[index-1].t>expected*2 ? [null,point] : [point];
+  });
+}
+function line(points) {
+  let previous = null;
+  return points.map(point => {
+    if (!point) { previous = null; return ''; }
+    const result = (previous ? 'L' : 'M') + point.join(',');
+    previous = point;
+    // A tiny segment makes the first real sample visible without inventing history.
+    return result + 'l0.1,0';
+  }).join(' ');
+}
+function drawCharts() {
+  const now = Date.now(), duration = hours * 3600000;
+  const storage = samples.filter(item => now - item.t <= duration);
+  const storageMax = Math.max(1, ...storage.flatMap(item => [item.l || 0, item.p || 0]));
+  const logical = coordinates(storage, 'l', now, duration, storageMax, 170);
+  const physical = coordinates(storage, 'p', now, duration, storageMax, 170);
+  $('logical-line').setAttribute('d', line(logical));
+  $('physical-line').setAttribute('d', line(physical));
+  $('storage-empty').hidden = storage.some(item => item.l != null && item.p != null);
+  const complete = storage.length > 1 && storage.every(item => item.l != null && item.p != null && item.p <= item.l) && logical.every(Boolean) && physical.every(Boolean);
+  $('saving-area').setAttribute('d', complete ? line(logical) + ' L' + physical.slice().reverse().map(point => point.join(',')).join(' L') + ' Z' : '');
+  const live = liveIOSamples.filter(item=>now-item.t<=600000);
+  const io = samples.filter(item => now-item.t<=600000 && item.t<(live[0]?.t || Infinity)).concat(live);
+  const ioMax = Math.max(1, ...io.flatMap(item => [item.r || 0, item.w || 0]));
+  $('read-line').setAttribute('d', line(coordinates(io, 'r', now, 600000, ioMax, 125)));
+  $('write-line').setAttribute('d', line(coordinates(io, 'w', now, 600000, ioMax, 125)));
+  $('io-empty').hidden = io.some(item => item.r != null || item.w != null);
+}
+window.updateStatus = function(view) {
+  $('health').textContent = view.Health;
+  $('identity').classList.toggle('healthy', view.Healthy);
+  $('identity').classList.toggle('attention', view.Health === '需要关注');
+  $('status-symbol').setAttribute('href', view.Healthy ? '#i-status-healthy' : view.Health === '需要关注' ? '#i-status-attention' : '#i-status-unknown');
+  $('details').textContent = view.Detail;
+  $('diagnostic-details').textContent = view.Detail;
+  $('store-path').textContent = view.StorePath || '';
+  $('session-count').textContent = view.Sessions;
+  $('daemon-state').textContent = view.DaemonState || '未连接';
+  $('managed-state').textContent = view.ManagedState || '未连接';
+  $('fold-status').textContent = view.EnrollmentState || '未连接';
+  updateSettings(view.Settings || {});updateProgress(view);
+  if (view.Operation && view.Operation.ID !== lastOperation) { lastOperation=view.Operation.ID;window.showOperationResult(view.Operation); }
+  $('logical').textContent = bytes(view.LogicalBytes);
+  $('physical').textContent = bytes(view.PhysicalBytes);
+  const compressedKnown = view.CompressionLogicalBytes != null && view.CompressedBytes != null;
+  const saved = compressedKnown ? Math.max(0, view.CompressionLogicalBytes - view.CompressedBytes) : null;
+  $('saved').textContent = bytes(saved);
+  $('saving').textContent = compressedKnown && view.CompressionLogicalBytes > 0 ? (saved / view.CompressionLogicalBytes * 100).toFixed(1) + '%' : '—';
+  $('pending').textContent = bytes(view.PendingBytes);
+  const known = view.LogicalBytes != null && view.PhysicalBytes != null;
+  const net = known ? view.LogicalBytes - view.PhysicalBytes : null;
+  $('net-label').textContent = net != null && net < 0 ? '暂多占' : '当前净节省';
+  $('net-saved').textContent = bytes(net == null ? null : Math.abs(net));
+  $('read').textContent = view.ReadRate == null ? '—' : bytes(view.ReadRate) + '/s';
+  $('write').textContent = view.WriteRate == null ? '—' : bytes(view.WriteRate) + '/s';
+  const now = Date.now();
+  samples = (view.HistorySamples || []).filter(item=>Number.isFinite(item.t));
+  liveIOSamples.push({t:now,r:view.ReadRate,w:view.WriteRate});liveIOSamples=liveIOSamples.filter(item=>now-item.t<=600000).slice(-600);
+  text('history-note', samples.length ? '最早记录 '+new Date(samples[0].t).toLocaleString('zh-CN',{hour12:false})+'；托盘退出期间不采样。' : '历史将从首次有效观测开始保存，最多保留 30 天。');
+  text('history-error', view.HistoryError || '');
+  drawCharts();
+  updateIncidents(view.Incidents || []);
+};
+command('ready');
+</script>
+</body>
+</html>

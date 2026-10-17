@@ -259,7 +259,7 @@ func rewriteNativeRollout(ctx context.Context, filePath string, original os.File
 		_ = os.Remove(temporary)
 		return cause
 	}
-	source, err := os.Open(filePath)
+	source, err := openNativeBacking(filePath, os.O_RDONLY, 0)
 	if err != nil {
 		return cleanup(err)
 	}

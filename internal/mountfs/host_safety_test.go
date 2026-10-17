@@ -3,6 +3,7 @@ package mountfs
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -21,6 +22,9 @@ func TestPrepareMountPointRejectsOrdinaryFiles(t *testing.T) {
 }
 
 func TestPrepareMountPointCreatesAndSealsMissingBackingDirectory(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("WinFsp requires an absent mount point")
+	}
 	mountPoint := filepath.Join(t.TempDir(), "missing", "mount")
 	if err := prepareMountPoint(mountPoint); err != nil {
 		t.Fatal(err)
@@ -35,6 +39,9 @@ func TestPrepareMountPointCreatesAndSealsMissingBackingDirectory(t *testing.T) {
 }
 
 func TestPrepareMountPointSealsEmptyBackingDirectory(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("WinFsp requires an absent mount point")
+	}
 	mountPoint := filepath.Join(t.TempDir(), "mount")
 	if err := os.MkdirAll(mountPoint, 0o700); err != nil {
 		t.Fatal(err)
@@ -63,6 +70,9 @@ func TestPrepareMountPointRejectsSymlink(t *testing.T) {
 	}
 	mountPoint := filepath.Join(root, "mount")
 	if err := os.Symlink(target, mountPoint); err != nil {
+		if runtime.GOOS == "windows" {
+			t.Skipf("symlink prerequisite unavailable: %v", err)
+		}
 		t.Fatal(err)
 	}
 

@@ -42,6 +42,37 @@ func TestWaitForCanonicalNativePassthroughRequiresMatchingFileSize(t *testing.T)
 	}
 }
 
+func TestWaitForCanonicalNamespaceRequiresHomePathVisibility(t *testing.T) {
+	root := t.TempDir()
+	home := filepath.Join(root, "home")
+	mount := filepath.Join(root, "mount")
+	native := filepath.Join(root, "native")
+	for _, base := range []string{home, mount, native} {
+		for _, namespace := range []string{"sessions", "archived_sessions"} {
+			if err := os.MkdirAll(filepath.Join(base, namespace), 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	for _, base := range []string{mount, native} {
+		if err := os.WriteFile(filepath.Join(base, "sessions", "rollout.jsonl"), []byte("history\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := waitForCanonicalNativePassthrough(context.Background(), mount, native, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if err := waitForCanonicalNamespacePassthrough(context.Background(), home, mount, native, time.Millisecond); err == nil {
+		t.Fatal("a healthy mount with an invisible canonical home passed activation")
+	}
+	if err := os.WriteFile(filepath.Join(home, "sessions", "rollout.jsonl"), []byte("history\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := waitForCanonicalNamespacePassthrough(context.Background(), home, mount, native, time.Second); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestFSNamespaceActivationRollsBackWhenPassthroughDoesNotBecomeReady(t *testing.T) {
 	root := t.TempDir()
 	home := filepath.Join(root, "home")
@@ -67,7 +98,7 @@ func TestFSNamespaceActivationRollsBackWhenPassthroughDoesNotBecomeReady(t *test
 	mountHealthProbe = func(string) error { return nil }
 	t.Cleanup(func() { mountHealthProbe = previousMountProbe })
 	previousReadiness := waitForCanonicalNamespaceActivation
-	waitForCanonicalNamespaceActivation = func(context.Context, string, string, time.Duration) error {
+	waitForCanonicalNamespaceActivation = func(context.Context, string, string, string, time.Duration) error {
 		return errors.New("mounted tree incomplete")
 	}
 	t.Cleanup(func() { waitForCanonicalNamespaceActivation = previousReadiness })

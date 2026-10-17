@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"github.com/samekind/codexfold/internal/dirsync"
 )
 
 const (
@@ -51,7 +53,7 @@ func Inspect(options Options) (Result, error) {
 		if err != nil {
 			return Result{}, fmt.Errorf("inspect %s: %w", homePath, err)
 		}
-		if info.Mode()&os.ModeSymlink != 0 {
+		if isNamespaceLink(info) {
 			target, err := os.Readlink(homePath)
 			if err != nil || filepath.Clean(target) != filepath.Join(options.Mount, name) {
 				return Result{}, fmt.Errorf("unexpected namespace link %s", homePath)
@@ -132,7 +134,7 @@ func Activate(options Options) (Result, error) {
 		if err := os.Rename(homePath, nativePath); err != nil {
 			return rollbackAfterError(options, err)
 		}
-		if err := os.Symlink(filepath.Join(options.Mount, name), homePath); err != nil {
+		if err := createNamespaceLink(filepath.Join(options.Mount, name), homePath); err != nil {
 			return rollbackAfterError(options, err)
 		}
 	}
@@ -200,7 +202,7 @@ func Recover(options Options) (Result, error) {
 	for _, name := range sessionDirectories {
 		homePath := filepath.Join(options.Home, name)
 		nativePath := filepath.Join(options.NativeRoot, name)
-		if info, err := os.Lstat(homePath); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		if info, err := os.Lstat(homePath); err == nil && isNamespaceLink(info) {
 			if err := os.Remove(homePath); err != nil {
 				return Result{}, err
 			}
@@ -327,5 +329,5 @@ func syncDirectory(path string) error {
 		return err
 	}
 	defer directory.Close()
-	return directory.Sync()
+	return dirsync.Sync(directory)
 }

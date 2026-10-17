@@ -14,6 +14,19 @@ import (
 	"github.com/samekind/codexfold/internal/vfs"
 )
 
+func namespaceFoldingEnabled(flags enrollmentFlags, interval time.Duration, allowExternal bool) bool {
+	if resolveEnrollmentControl(flags, interval).Enabled {
+		return true
+	}
+	if !allowExternal {
+		return false
+	}
+	// Windows can move the policy to its independent worker. Reuse that
+	// worker's effective policy, including the fresh paused-builtin check.
+	flags.externalWorker = true
+	return resolveEnrollmentControl(flags, interval).Enabled
+}
+
 func startNamespaceRetirement(ctx context.Context, filesystem *mountfs.Filesystem, store string, enabled func() bool, diagnostics io.Writer) <-chan struct{} {
 	done := make(chan struct{})
 	go func() {

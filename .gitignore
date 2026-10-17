@@ -11,6 +11,7 @@
 .DS_Store
 .worktrees/
 /.tmp/
+/.tmp-test-windows-runtime/
 
 # Xcode build products and derived data
 platform/darwin/fskit/build/

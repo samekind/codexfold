@@ -13,6 +13,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/samekind/codexfold/internal/dirsync"
 )
 
 const (
@@ -534,7 +536,7 @@ func syncRootDirectory(root *os.Root) error {
 	if err != nil {
 		return err
 	}
-	syncErr := directory.Sync()
+	syncErr := dirsync.Sync(directory)
 	closeErr := directory.Close()
 	return errors.Join(syncErr, closeErr)
 }
