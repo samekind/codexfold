@@ -208,31 +208,20 @@ func (r *contextReader) Read(p []byte) (int, error) {
 	return r.reader.Read(p)
 }
 
-// proveServed reads the file exactly as the mount will serve it.
+// proveServed re-encodes the stored content through the encoder the mount
+// uses and checks every byte against the marker.
 func proveServed(ctx context.Context, source *Source, marker Marker) error {
-	reader, err := source.Open(marker)
+	stream, err := source.Stream(ctx, marker)
 	if err != nil {
 		return err
 	}
-	defer reader.Close()
+	defer stream.Close()
 	hasher := sha256.New()
-	buffer := make([]byte, 1<<20)
-	var offset int64
-	for offset < marker.EncodedBytes {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		n, err := reader.ReadAt(buffer, offset)
-		_, _ = hasher.Write(buffer[:n])
-		offset += int64(n)
-		if err != nil && !errors.Is(err, io.EOF) {
-			return fmt.Errorf("re-encode folded .zst: %w", err)
-		}
-		if n == 0 {
-			break
-		}
+	n, err := io.Copy(hasher, &contextReader{ctx: ctx, reader: stream})
+	if err != nil {
+		return fmt.Errorf("re-encode folded .zst: %w", err)
 	}
-	if offset != marker.EncodedBytes || hex.EncodeToString(hasher.Sum(nil)) != marker.EncodedSHA256 {
+	if n != marker.EncodedBytes || hex.EncodeToString(hasher.Sum(nil)) != marker.EncodedSHA256 {
 		return errors.New("the store does not reproduce the original .zst bytes")
 	}
 	return nil
@@ -358,11 +347,11 @@ func Restore(ctx context.Context, source *Source, path string) error {
 	if !folded {
 		return fmt.Errorf("%s is not a folded .zst", path)
 	}
-	reader, err := source.Open(marker)
+	stream, err := source.Stream(ctx, marker)
 	if err != nil {
 		return err
 	}
-	defer reader.Close()
+	defer stream.Close()
 	file, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
 		return err
@@ -379,23 +368,26 @@ func Restore(ctx context.Context, source *Source, path string) error {
 	hasher := sha256.New()
 	buffer := make([]byte, 1<<20)
 	var offset int64
-	for offset < marker.EncodedBytes {
+	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		n, readErr := reader.ReadAt(buffer, offset)
+		n, readErr := stream.Read(buffer)
 		if n > 0 {
+			if offset+int64(n) > marker.EncodedBytes {
+				return errors.New("re-encoded .zst is longer than its marker records")
+			}
 			if _, err := file.WriteAt(buffer[:n], offset); err != nil {
 				return err
 			}
 			_, _ = hasher.Write(buffer[:n])
 			offset += int64(n)
 		}
-		if readErr != nil && !errors.Is(readErr, io.EOF) {
-			return readErr
-		}
-		if n == 0 {
+		if errors.Is(readErr, io.EOF) {
 			break
+		}
+		if readErr != nil {
+			return readErr
 		}
 	}
 	if offset != marker.EncodedBytes || hex.EncodeToString(hasher.Sum(nil)) != marker.EncodedSHA256 {

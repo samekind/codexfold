@@ -9,6 +9,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -476,5 +477,64 @@ func TestPrepareKeepsAZstThatFoldingWouldNotShrink(t *testing.T) {
 	}
 	if got, err := os.ReadFile(path); err != nil || !bytes.Equal(got, original) {
 		t.Fatalf("declined fold touched the file: %v", err)
+	}
+}
+
+func TestConcurrentOutOfOrderHandlesShareOneEncoder(t *testing.T) {
+	requireSupport(t)
+	store, native := fixture(t)
+	path := filepath.Join(native, "sessions", "rollout-c-0199aaaa-0000-7000-8000-000000000015.jsonl.zst")
+	original := writeCodexZst(t, path, rolloutContent(15, 300), time.Now().Add(-time.Hour))
+	source := NewSource(store, testPacks{})
+	defer source.Close()
+	prepared, err := Prepare(context.Background(), source, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Convert(store, prepared); err != nil {
+		t.Fatal(err)
+	}
+	before := streamsStarted.Load()
+	// The FSKit extension prefetches through several handles at once, each
+	// taking whichever block is next, so every handle sees jumps both ways.
+	const block = 64 << 10
+	blocks := (len(original) + block - 1) / block
+	order := rand.New(rand.NewSource(3)).Perm(blocks)
+	got := make([]byte, len(original))
+	var group sync.WaitGroup
+	errs := make(chan error, 4)
+	for worker := 0; worker < 4; worker++ {
+		reader, err := source.Open(prepared.Marker)
+		if err != nil {
+			t.Fatal(err)
+		}
+		group.Add(1)
+		go func(reader *Reader, worker int) {
+			defer group.Done()
+			defer reader.Close()
+			for index := worker; index < len(order); index += 4 {
+				offset := int64(order[index]) * block
+				n, err := reader.ReadAt(got[offset:min(offset+block, int64(len(got)))], offset)
+				if err != nil && err != io.EOF {
+					errs <- err
+					return
+				}
+				if n == 0 {
+					errs <- fmt.Errorf("empty read at %d", offset)
+					return
+				}
+			}
+		}(reader, worker)
+	}
+	group.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, original) {
+		t.Fatal("concurrent out-of-order reads returned different bytes")
+	}
+	if started := streamsStarted.Load() - before; started != 1 {
+		t.Fatalf("encoders started = %d, want 1", started)
 	}
 }

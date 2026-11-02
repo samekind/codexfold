@@ -6,7 +6,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/samekind/codexfold/internal/codexzstd"
 	"github.com/samekind/codexfold/internal/fold"
@@ -37,6 +40,7 @@ type Source struct {
 	loose   *fold.ObjectStore
 	mu      sync.Mutex
 	current *sharedResolver
+	streams map[string]*sharedStream
 	closed  bool
 }
 
@@ -109,6 +113,13 @@ func (s *Source) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.closed = true
+	for key, stream := range s.streams {
+		if stream.expiry != nil {
+			stream.expiry.Stop()
+		}
+		delete(s.streams, key)
+		go stream.shutdown()
+	}
 	if s.current != nil && s.current.references == 0 {
 		err := s.current.resolver.Close()
 		s.current = nil
@@ -171,8 +182,7 @@ func (s *Source) openObject(ctx context.Context, ref fold.ObjectRef, shared **sh
 	return nil, fmt.Errorf("open folded object %s: %w", ref.SHA256, lastErr)
 }
 
-// Open returns a reader of the exact original .zst bytes for marker.
-func (s *Source) Open(marker Marker) (*Reader, error) {
+func (s *Source) loadParts(marker Marker) ([]fold.Part, error) {
 	if err := marker.Validate(); err != nil {
 		return nil, err
 	}
@@ -190,65 +200,274 @@ func (s *Source) Open(marker Marker) (*Reader, error) {
 	if manifest.Source.Bytes != marker.ContentBytes || manifest.Source.SHA256 != marker.ContentSHA256 {
 		return nil, fmt.Errorf("native .zst manifest %s does not match its marker", marker.Manifest)
 	}
-	return &Reader{source: s, marker: marker, parts: manifest.Parts}, nil
+	return manifest.Parts, nil
 }
 
-// readWindowBytes keeps recently produced bytes so that slightly reordered
-// reads do not restart the encoder from the beginning of the frame.
-const readWindowBytes = 32 << 20
+// Stream re-encodes the file once from the start, for a caller that reads it
+// sequentially (a proof, a restore). It spills nothing to disk.
+func (s *Source) Stream(ctx context.Context, marker Marker) (io.ReadCloser, error) {
+	parts, err := s.loadParts(marker)
+	if err != nil {
+		return nil, err
+	}
+	return s.encode(ctx, marker, parts), nil
+}
 
-// Reader re-encodes a folded file. zstd output can only be produced from the
-// start of the frame, so a read behind the window restarts the encoder.
+func (s *Source) encode(ctx context.Context, marker Marker, parts []fold.Part) io.ReadCloser {
+	ctx, cancel := context.WithCancel(ctx)
+	output, input := io.Pipe()
+	go func() {
+		content := &contentReader{ctx: ctx, source: s, parts: parts}
+		err := codexzstd.Encode(ctx, input, content, marker.ContentBytes)
+		content.close()
+		input.CloseWithError(err)
+	}()
+	return &pipeStream{PipeReader: output, cancel: cancel}
+}
+
+type pipeStream struct {
+	*io.PipeReader
+	cancel context.CancelFunc
+}
+
+func (p *pipeStream) Close() error {
+	p.cancel()
+	return p.PipeReader.Close()
+}
+
+// Open returns a random-access reader of the exact original .zst bytes. All
+// readers of one file share one encoder: zstd output can only be produced
+// from the start of the frame, and the FSKit extension reads a file through
+// several handles at once, out of order, so a stream per handle re-encoded
+// the file from the beginning over and over.
+func (s *Source) Open(marker Marker) (*Reader, error) {
+	key, err := ManifestKey(marker.Manifest)
+	if err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	if s.streams == nil {
+		s.streams = make(map[string]*sharedStream)
+	}
+	stream := s.streams[key]
+	if stream != nil && stream.marker == marker && !stream.failed() {
+		stream.references++
+		if stream.expiry != nil {
+			stream.expiry.Stop()
+			stream.expiry = nil
+		}
+		s.mu.Unlock()
+		return &Reader{stream: stream, marker: marker}, nil
+	}
+	s.mu.Unlock()
+	parts, err := s.loadParts(marker)
+	if err != nil {
+		return nil, err
+	}
+	stream, err = s.newSharedStream(key, marker, parts)
+	if err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	if current := s.streams[key]; current != nil && current.marker == marker && !current.failed() {
+		current.references++
+		if current.expiry != nil {
+			current.expiry.Stop()
+			current.expiry = nil
+		}
+		s.mu.Unlock()
+		stream.shutdown()
+		return &Reader{stream: current, marker: marker}, nil
+	}
+	if previous := s.streams[key]; previous != nil && previous.references == 0 {
+		previous.shutdown()
+	}
+	stream.references = 1
+	s.streams[key] = stream
+	s.mu.Unlock()
+	return &Reader{stream: stream, marker: marker}, nil
+}
+
+const (
+	// A read asks the encoder for this much beyond what it needs, so the
+	// extension's next prefetch block is usually ready.
+	streamReadAhead = 8 << 20
+	streamChunk     = 256 << 10
+	// An unused stream that got this far is kept a while for a reopen; one
+	// that only produced a file's head is cheaper to redo than to keep.
+	streamKeepBytes = 4 << 20
+	streamKeepFor   = 2 * time.Minute
+)
+
+// streamsStarted counts shared encoders, for tests.
+var streamsStarted atomic.Int64
+
+// sharedStream is one encoder for one folded file, whose output is spilled
+// to an unlinked temporary file as it is produced, so every byte is encoded
+// once whatever order and handles the reads come through.
+type sharedStream struct {
+	source     *Source
+	key        string
+	marker     Marker
+	spill      *os.File
+	encoded    io.ReadCloser
+	mu         sync.Mutex
+	advanced   *sync.Cond
+	frontier   int64
+	target     int64
+	err        error
+	closed     bool
+	references int
+	expiry     *time.Timer
+}
+
+func (s *Source) newSharedStream(key string, marker Marker, parts []fold.Part) (*sharedStream, error) {
+	directory := filepath.Join(StateRoot(s.store), "spill")
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		return nil, err
+	}
+	spill, err := os.CreateTemp(directory, ".spill-*.tmp")
+	if err != nil {
+		return nil, err
+	}
+	// Unlinked at once: the space returns when the stream closes or the
+	// daemon exits, and nothing is left behind for a crash to strand.
+	_ = os.Remove(spill.Name())
+	streamsStarted.Add(1)
+	stream := &sharedStream{source: s, key: key, marker: marker, spill: spill, encoded: s.encode(context.Background(), marker, parts)}
+	stream.advanced = sync.NewCond(&stream.mu)
+	go stream.produce()
+	return stream, nil
+}
+
+func (t *sharedStream) failed() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.err != nil || t.closed
+}
+
+func (t *sharedStream) produce() {
+	buffer := make([]byte, streamChunk)
+	for {
+		t.mu.Lock()
+		for !t.closed && t.err == nil && t.frontier >= t.target && t.frontier < t.marker.EncodedBytes {
+			t.advanced.Wait()
+		}
+		if t.closed || t.err != nil || t.frontier >= t.marker.EncodedBytes {
+			t.mu.Unlock()
+			return
+		}
+		offset := t.frontier
+		t.mu.Unlock()
+
+		n, readErr := t.encoded.Read(buffer)
+		var writeErr error
+		if n > 0 {
+			_, writeErr = t.spill.WriteAt(buffer[:n], offset)
+		}
+		t.mu.Lock()
+		if writeErr == nil {
+			t.frontier += int64(n)
+		}
+		switch {
+		case writeErr != nil:
+			t.err = writeErr
+		case errors.Is(readErr, io.EOF):
+			if t.frontier != t.marker.EncodedBytes {
+				t.err = fmt.Errorf("folded .zst ended at %d of %d bytes", t.frontier, t.marker.EncodedBytes)
+			}
+		case readErr != nil:
+			t.err = readErr
+		}
+		t.advanced.Broadcast()
+		t.mu.Unlock()
+	}
+}
+
+// await returns once [0, end) is in the spill file.
+func (t *sharedStream) await(end int64) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if want := min(end+streamReadAhead, t.marker.EncodedBytes); want > t.target {
+		t.target = want
+		t.advanced.Broadcast()
+	}
+	for t.frontier < end && t.err == nil && !t.closed {
+		t.advanced.Wait()
+	}
+	if t.frontier >= end {
+		return nil
+	}
+	if t.err != nil {
+		return t.err
+	}
+	return os.ErrClosed
+}
+
+func (t *sharedStream) shutdown() {
+	t.mu.Lock()
+	if t.closed {
+		t.mu.Unlock()
+		return
+	}
+	t.closed = true
+	t.advanced.Broadcast()
+	t.mu.Unlock()
+	_ = t.encoded.Close()
+	_ = t.spill.Close()
+}
+
+// release drops one reader. A stream that produced little is closed at
+// once; a large one stays briefly for a reopen.
+func (t *sharedStream) release() {
+	s := t.source
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t.references--
+	if t.references > 0 {
+		return
+	}
+	t.mu.Lock()
+	frontier := t.frontier
+	t.mu.Unlock()
+	if frontier < streamKeepBytes || s.closed || t.failed() {
+		if s.streams[t.key] == t {
+			delete(s.streams, t.key)
+		}
+		go t.shutdown()
+		return
+	}
+	t.expiry = time.AfterFunc(streamKeepFor, func() {
+		s.mu.Lock()
+		if t.references != 0 {
+			s.mu.Unlock()
+			return
+		}
+		if s.streams[t.key] == t {
+			delete(s.streams, t.key)
+		}
+		s.mu.Unlock()
+		t.shutdown()
+	})
+}
+
+// Reader serves one open handle of a folded file.
 type Reader struct {
-	source  *Source
-	marker  Marker
-	parts   []fold.Part
-	mu      sync.Mutex
-	encoded io.ReadCloser
-	cancel  context.CancelFunc
-	// window holds encoded bytes [windowStart, windowStart+len(window)).
-	window      []byte
-	windowStart int64
-	closed      bool
+	stream *sharedStream
+	marker Marker
+	mu     sync.Mutex
+	closed bool
 }
 
 func (r *Reader) Size() int64 { return r.marker.EncodedBytes }
 
 func (r *Reader) Marker() Marker { return r.marker }
 
-func (r *Reader) position() int64 { return r.windowStart + int64(len(r.window)) }
-
-func (r *Reader) restart() {
-	r.stopEncoder()
-	ctx, cancel := context.WithCancel(context.Background())
-	output, input := io.Pipe()
-	go func() {
-		content := &contentReader{ctx: ctx, source: r.source, parts: r.parts}
-		err := codexzstd.Encode(ctx, input, content, r.marker.ContentBytes)
-		content.close()
-		input.CloseWithError(err)
-	}()
-	r.encoded = output
-	r.cancel = cancel
-	r.window = r.window[:0]
-	r.windowStart = 0
-}
-
-func (r *Reader) stopEncoder() {
-	if r.encoded != nil {
-		_ = r.encoded.Close()
-		r.encoded = nil
-	}
-	if r.cancel != nil {
-		r.cancel()
-		r.cancel = nil
-	}
-}
-
 func (r *Reader) ReadAt(destination []byte, offset int64) (int, error) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.closed {
+	closed := r.closed
+	r.mu.Unlock()
+	if closed {
 		return 0, os.ErrClosed
 	}
 	if offset < 0 {
@@ -258,50 +477,18 @@ func (r *Reader) ReadAt(destination []byte, offset int64) (int, error) {
 	if offset >= size {
 		return 0, io.EOF
 	}
-	want := int64(len(destination))
-	if remaining := size - offset; want > remaining {
-		want = remaining
-	}
-	end := offset + want
-	if r.encoded == nil || offset < r.windowStart {
-		r.restart()
-	}
-	if err := r.fill(offset, end); err != nil {
-		r.stopEncoder()
+	end := min(offset+int64(len(destination)), size)
+	if err := r.stream.await(end); err != nil {
 		return 0, err
 	}
-	n := copy(destination[:want], r.window[offset-r.windowStart:end-r.windowStart])
-	if int64(n) < int64(len(destination)) {
+	n, err := r.stream.spill.ReadAt(destination[:end-offset], offset)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return n, err
+	}
+	if n < len(destination) {
 		return n, io.EOF
 	}
 	return n, nil
-}
-
-func (r *Reader) fill(offset int64, end int64) error {
-	keep := max(int64(readWindowBytes), end-offset)
-	chunk := make([]byte, 256<<10)
-	for r.position() < end {
-		n, err := r.encoded.Read(chunk)
-		r.window = append(r.window, chunk[:n]...)
-		if excess := int64(len(r.window)) - keep; excess > 0 {
-			trim := min(excess, max(0, offset-r.windowStart))
-			if trim > 0 {
-				kept := copy(r.window, r.window[trim:])
-				r.window = r.window[:kept]
-				r.windowStart += trim
-			}
-		}
-		if errors.Is(err, io.EOF) {
-			if r.position() < end {
-				return fmt.Errorf("folded .zst ended at %d of %d bytes", r.position(), r.marker.EncodedBytes)
-			}
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 func (r *Reader) Close() error {
@@ -311,8 +498,7 @@ func (r *Reader) Close() error {
 		return nil
 	}
 	r.closed = true
-	r.stopEncoder()
-	r.window = nil
+	r.stream.release()
 	return nil
 }
 
