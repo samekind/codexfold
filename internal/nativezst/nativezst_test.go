@@ -3,6 +3,7 @@ package nativezst
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -24,18 +25,20 @@ func requireSupport(t *testing.T) {
 	}
 }
 
+// rolloutContent looks like a forked rollout: a long unique history replayed
+// further back than zstd's 2 MiB window at level 3, which per-file zstd
+// cannot share and content-defined chunking can.
 func rolloutContent(seed int64, lines int) []byte {
 	random := rand.New(rand.NewSource(seed))
-	var out bytes.Buffer
-	shared := bytes.Repeat([]byte("shared instructions that every fork repeats "), 200)
-	for line := 0; line < lines; line++ {
+	var history bytes.Buffer
+	for line := 0; line < lines || history.Len() < 2400<<10; line++ {
 		payload := make([]byte, 100+random.Intn(3000))
 		for i := range payload {
 			payload[i] = "abcdefghij klmnop"[random.Intn(17)]
 		}
-		fmt.Fprintf(&out, `{"ordinal":%d,"shared":%q,"text":%q}`+"\n", line, shared, payload)
+		fmt.Fprintf(&history, `{"ordinal":%d,"text":%q}`+"\n", line, payload)
 	}
-	return out.Bytes()
+	return append(append([]byte(nil), history.Bytes()...), history.Bytes()...)
 }
 
 // writeCodexZst writes what Codex's compression worker leaves behind.
@@ -378,7 +381,7 @@ func (testPacks) CurrentGeneration(store string) (string, error) {
 
 func (testPacks) Open(store string) (Pack, error) { return pack.Open(store, pack.OpenOptions{}) }
 
-func TestPrepareOnATightDiskPricesTheFoldExactly(t *testing.T) {
+func TestPrepareStreamsAndPricesTheFoldExactly(t *testing.T) {
 	requireSupport(t)
 	store, native := fixture(t)
 	content := rolloutContent(8, 200)
@@ -386,9 +389,6 @@ func TestPrepareOnATightDiskPricesTheFoldExactly(t *testing.T) {
 	second := filepath.Join(native, "sessions", "rollout-t2-0199aaaa-0000-7000-8000-000000000013.jsonl.zst")
 	original := writeCodexZst(t, first, content, time.Now().Add(-time.Hour))
 	writeCodexZst(t, second, content, time.Now().Add(-time.Hour))
-	previous := spaceIsTight
-	spaceIsTight = func(string, storage.Guard, int64) (bool, error) { return true, nil }
-	t.Cleanup(func() { spaceIsTight = previous })
 	source := NewSource(store, testPacks{})
 	defer source.Close()
 	one, err := Prepare(context.Background(), source, first)
@@ -449,5 +449,32 @@ func TestReclaimingGuardDigsOutOnlyWhenItFreesMore(t *testing.T) {
 	guard := reclaimingGuard{inner: fixedChecker{report: cases[0].report, err: reserve}, reclaim: 64 << 30}
 	if _, err := guard.Check(context.Background(), large); err == nil {
 		t.Error("a large fold ran below the reserve")
+	}
+}
+
+func TestPrepareKeepsAZstThatFoldingWouldNotShrink(t *testing.T) {
+	requireSupport(t)
+	store, native := fixture(t)
+	random := rand.New(rand.NewSource(9))
+	var content bytes.Buffer
+	for line := 0; line < 300; line++ {
+		payload := make([]byte, 200+random.Intn(800))
+		for i := range payload {
+			payload[i] = "abcdefghij klmnop"[random.Intn(17)]
+		}
+		fmt.Fprintf(&content, `{"ordinal":%d,"text":%q}`+"\n", line, payload)
+	}
+	path := filepath.Join(native, "sessions", "rollout-u-0199aaaa-0000-7000-8000-000000000014.jsonl.zst")
+	original := writeCodexZst(t, path, content.Bytes(), time.Now().Add(-time.Hour))
+	source := NewSource(store, testPacks{})
+	defer source.Close()
+	if _, err := Prepare(context.Background(), source, path); !errors.Is(err, ErrNotWorthwhile) {
+		t.Fatalf("unique rollout prepare = %v, want ErrNotWorthwhile", err)
+	}
+	if entries, _ := os.ReadDir(ManifestRoot(store)); len(entries) != 0 {
+		t.Fatalf("declined fold left %d manifests", len(entries))
+	}
+	if got, err := os.ReadFile(path); err != nil || !bytes.Equal(got, original) {
+		t.Fatalf("declined fold touched the file: %v", err)
 	}
 }

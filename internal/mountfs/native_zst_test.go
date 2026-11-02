@@ -3,6 +3,7 @@ package mountfs
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"os"
@@ -32,10 +33,15 @@ func foldedZstFixture(t *testing.T) (*Filesystem, *nativezst.Source, string, str
 	if err := os.MkdirAll(store, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	var content bytes.Buffer
-	for line := 0; line < 2000; line++ {
-		fmt.Fprintf(&content, `{"ordinal":%d,"text":"line %d of a compressed Codex rollout"}`+"\n", line, line*7919)
+	// A unique history replayed beyond zstd's window, as a fork does: the
+	// store folds it for less than Codex's own .zst.
+	var history bytes.Buffer
+	for line := 0; history.Len() < 2400<<10; line++ {
+		fmt.Fprintf(&history, `{"ordinal":%d,"text":"line %d of a compressed Codex rollout %x"}`+"\n", line, line*7919, sha256.Sum256([]byte(fmt.Sprint(line))))
 	}
+	var content bytes.Buffer
+	content.Write(history.Bytes())
+	content.Write(history.Bytes())
 	var encoded bytes.Buffer
 	if err := codexzstd.Encode(context.Background(), &encoded, bytes.NewReader(content.Bytes()), int64(content.Len())); err != nil {
 		t.Fatal(err)

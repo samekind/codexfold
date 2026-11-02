@@ -67,15 +67,18 @@ func Prepare(ctx context.Context, source *Source, path string) (Prepared, error)
 	}
 	defer release()
 	options := fold.FoldOptions{StoreDir: store, ExistingReader: existing}
-	if tight, err := spaceIsTight(store, guard, proof.ContentBytes); err != nil {
+	// The dry run writes nothing. It prices the fold exactly for the
+	// free-space check, and keeps a small rollout the store shares nothing
+	// with as Codex's .zst: its manifest and index would outweigh the bytes
+	// freed.
+	dry, err := foldDecoded(ctx, path, proof, key(proof), options)
+	if err != nil {
 		return Prepared{}, err
-	} else if tight {
-		dry, err := foldDecoded(ctx, path, proof, key(proof), options)
-		if err != nil {
-			return Prepared{}, err
-		}
-		options.NewBytesEstimate = max(dry.NewStoredBytes, 1)
 	}
+	if foldCost(dry) >= info.Size()*worthwhileShare/100 {
+		return Prepared{}, ErrNotWorthwhile
+	}
+	options.NewBytesEstimate = max(dry.NewStoredBytes, 1)
 
 	manifestKey := key(proof)
 	if err := os.MkdirAll(ManifestRoot(store), 0o755); err != nil {
@@ -138,17 +141,19 @@ func foldDecoded(ctx context.Context, path string, proof codexzstd.Proof, id str
 	return fold.Fold(ctx, fold.Session{ID: id, RolloutPath: path, Archived: true}, options)
 }
 
-// tightSpaceMargin is how far above the free-space reserve a fold priced at
-// its full decoded size must stay before the exact dry-run price is needed.
-const tightSpaceMargin = 2 << 30
+// ErrNotWorthwhile means folding the file would not free space: the store
+// shares too little of its content to beat Codex's own compression.
+var ErrNotWorthwhile = errors.New("folding this .zst would not save space")
 
-// spaceIsTight is a variable so tests can force the dry-run path.
-var spaceIsTight = func(store string, guard storage.Guard, contentBytes int64) (bool, error) {
-	available, err := storage.AvailableBytes(store)
-	if err != nil {
-		return false, err
-	}
-	return available < guard.Limits.FreeSpaceReserveBytes+contentBytes+tightSpaceMargin, nil
+// A fold must cost less than this share of the file it frees.
+const worthwhileShare = 80
+
+// foldCost bounds what a fold occupies once packed: its new objects, plus a
+// manifest part and pack index records for each, with the manifest stored
+// again in the pack's recovery archive.
+func foldCost(dry fold.FoldResult) int64 {
+	const perPart, perObject, fixed = 3 * 160, 256, 8 << 10
+	return dry.NewStoredBytes + int64(dry.PartCount)*perPart + int64(dry.UniqueObjects)*perObject + fixed
 }
 
 const (

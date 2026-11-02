@@ -162,7 +162,7 @@ func (z *nativeZstFolder) pass(ctx context.Context) error {
 				continue
 			}
 			z.skipped[file.Path] = nativeZstIdentity{size: file.Info.Size(), modTime: file.Info.ModTime()}
-			if !errors.Is(err, codexzstd.ErrNotReproducible) {
+			if !errors.Is(err, codexzstd.ErrNotReproducible) && !errors.Is(err, nativezst.ErrNotWorthwhile) {
 				_, _ = fmt.Fprintf(z.diagnostics, "fold Codex .zst %s: %v\n", file.Path, err)
 			}
 			continue

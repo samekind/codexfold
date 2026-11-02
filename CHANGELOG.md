@@ -35,8 +35,11 @@ pre-1.0, so a minor version may contain compatibility changes.
   the empty blocks if it cannot. All 3,623 real files reproduced byte for byte.
   On the same 3,280 sessions the store needs 12.5 GB where Codex's per-file
   zstd needs 18.2 GB, because forks and subagents repeat long prefixes.
-  Folding follows the automatic-folding policy and never runs alongside an
-  enrollment cycle. Manifests whose file Codex deleted are released only after
+  A dry run prices every file first, and a file is folded only when that
+  costs under 80% of its `.zst`: a rollout that shares nothing with the store
+  folds larger than Codex's own zstd (one real 205 MB rollout: 83.5 MB folded
+  against a 68.6 MB `.zst`), so it stays as it is. Folding follows the
+  automatic-folding policy and never runs alongside an enrollment cycle. Manifests whose file Codex deleted are released only after
   two scans fifteen minutes apart; a file that lost its marker is found again by
   inode and re-marked instead.
 - `fs native-zst status` reports folded and unfolded files. `fs native-zst
@@ -124,6 +127,9 @@ pre-1.0, so a minor version may contain compatibility changes.
     objects and the next pack). `codexfold fold --apply` measures the same way
     when space is short, and pack builds price loose objects by their
     compressed size on disk instead of their raw size.
+- Loose objects are compressed at the pack builder's level through one shared
+  encoder instead of a new encoder, with its own worker goroutines and
+  window, per object.
 - Pack builds entropy-code small blocks. `SpeedDefault` gave up on blocks whose
   only redundancy is entropy (base64 payloads, encrypted reasoning) and a 2:1
   cut-off kept other small blocks raw: 7.07 GB of a real 14.83 GB pack. Builds
