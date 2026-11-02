@@ -1,6 +1,7 @@
 package enroll
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -426,4 +427,53 @@ func TestPlannerDoesNotPriceSessionsBeyondTheBatchLimit(t *testing.T) {
 	if WaitingCount(plan) != len(sessions) {
 		t.Fatalf("waiting = %d, want %d: sessions past the limit are still waiting", WaitingCount(plan), len(sessions))
 	}
+}
+
+type thresholdBudget struct{ limit int64 }
+
+func (b thresholdBudget) Check(_ context.Context, projection storage.Projection) (storage.Assessment, error) {
+	if projection.AdditionalPersistentBytes > b.limit {
+		return storage.Assessment{}, storage.ErrBudgetExceeded
+	}
+	return storage.Assessment{}, nil
+}
+
+func TestPlannerUsesTheExactPriceWhenTheConservativeOneDoesNotFit(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now()
+	path := filepath.Join(root, "rollout-fork.jsonl")
+	if err := os.WriteFile(path, bytes.Repeat([]byte("{\"fork\":\"of an enrolled session\"}\n"), 120000), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := now.Add(-2 * time.Hour)
+	if err := os.Chtimes(path, old, old); err != nil {
+		t.Fatal(err)
+	}
+	info, _ = os.Stat(path)
+	session := codex.Session{ID: "fork", RolloutPath: path, Archived: true}
+	plan := func(price func(context.Context, codex.Session, os.FileInfo) (int64, error)) Plan {
+		t.Helper()
+		result, err := Build(context.Background(), Input{
+			Sessions: []codex.Session{session},
+			Previous: Observations{"fork": {Path: path, Size: info.Size(), ModTimeUnixNano: info.ModTime().UnixNano(), StableSinceUnixNano: now.Add(-2 * time.Hour).UnixNano()}},
+			Now:      now, Policy: Policy{StableFor: time.Hour, BatchSize: 1, ArchivedOnly: true},
+			Gates:        Gates{DoctorHealthy: true, MountHealthy: true, CanonicalNamespace: true, NamespaceActive: true, NamespaceReady: true, EnrollmentAllowed: true},
+			WriterActive: func(context.Context, codex.Session) (bool, error) { return false, nil },
+			Budget:       thresholdBudget{limit: 8 << 20},
+			Price:        price,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return result
+	}
+	assertDecisionReason(t, plan(nil), "fork", ReasonInsufficientBudget)
+	if selected := plan(func(context.Context, codex.Session, os.FileInfo) (int64, error) { return 64 << 10, nil }).Selected; len(selected) != 1 {
+		t.Fatalf("exactly priced fork not selected: %#v", selected)
+	}
+	assertDecisionReason(t, plan(func(context.Context, codex.Session, os.FileInfo) (int64, error) { return info.Size(), nil }), "fork", ReasonInsufficientBudget)
 }

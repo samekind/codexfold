@@ -20,6 +20,37 @@ pre-1.0, so a minor version may contain compatibility changes.
   integration tests in addition to compiling every package. The required check
   keeps its existing `windows-compile` name. This is not a full Desktop GUI or
   power-loss qualification.
+- Codex-compressed rollouts are folded too. Codex now compresses every rollout
+  idle for seven days to a sibling `rollout-*.jsonl.zst` (zstd level 3) and
+  deletes the `.jsonl`, which pulled sessions out of the store one by one: on
+  a real machine 1,288 managed sessions left this way, the saved figure fell
+  from 69% to 38%, and 3,623 `.zst` files held 24.2 GB that CodexFold never
+  touched. The service now folds each settled `.zst` in place: it proves that
+  libzstd 1.5.7 (the version Codex links, built in through
+  `github.com/DataDog/zstd`) re-encodes the decoded content to the file's exact
+  bytes, folds the content into the store, writes a marker attribute and
+  releases the file's data blocks with a hole punch. Path, inode, size, mode,
+  times and other attributes stay. The mount re-encodes the original bytes on
+  read, refuses writes, hides the marker, and fails with EIO rather than serve
+  the empty blocks if it cannot. All 3,623 real files reproduced byte for byte.
+  On the same 3,280 sessions the store needs 12.5 GB where Codex's per-file
+  zstd needs 18.2 GB, because forks and subagents repeat long prefixes.
+  Folding follows the automatic-folding policy and never runs alongside an
+  enrollment cycle. Manifests whose file Codex deleted are released only after
+  two scans fifteen minutes apart; a file that lost its marker is found again by
+  inode and re-marked instead.
+- `fs native-zst status` reports folded and unfolded files. `fs native-zst
+  restore --all --apply` writes the original bytes back; run it, with
+  automatic folding disabled, before installing a CodexFold build without this
+  support, which would otherwise serve the empty blocks.
+
+### Changed
+
+- The storage figures (`storage.json`, the saved percentage) now count the
+  native session tree as well as the store: logical bytes are all session
+  content, decoded, and physical bytes are everything on disk. Before, native
+  `.jsonl` and `.zst` files were left out, which hid how much space Codex's
+  sessions really used.
 
 ### Fixed
 
@@ -65,6 +96,40 @@ pre-1.0, so a minor version may contain compatibility changes.
   repaired is logged and served unchanged instead of aborting startup.
 - `fs validate-native --repair` applies the same repair by hand while the
   filesystem service is stopped. Without the flag the command stays read-only.
+- Deleting sessions now shrinks the store. Maintenance only rebuilt the pack
+  when a top-level manifest was newer than it, so a session Codex or the user
+  deleted kept its objects in the pack indefinitely. A manifest the published
+  pack still carries but the store no longer has now triggers a compacting
+  build, and nested manifests count as new.
+- Folding works on a nearly full disk. Every operation must leave the 5 GiB
+  free-space reserve at its peak, and space it frees only counts afterwards,
+  so pessimistic peaks blocked the very work that frees space:
+  - A Codex `.zst` is folded straight from its decoder instead of staging its
+    decoded content (up to 2.7 GB for one real rollout). When space is short a
+    dry run prices the fold exactly, so a file whose content the store already
+    holds costs almost nothing. Such a fold may run below the reserve, down to
+    1 GiB free, when its peak is under 64 MiB and it frees at least four times
+    that; files that do not fit yet are retried, not given up.
+  - A pack build no longer copies the whole pack when objects were dropped.
+    It rewrites only the old pack files whose dead and raw blocks make it
+    worthwhile, best payoff per copied byte first and only as many as fit the
+    free space, and hard-links the rest. A file with no live block is dropped
+    without copying anything. Dead pack bytes trigger another build once there
+    is room to make progress.
+  - Session enrollment priced every rollout at three times its raw size, so
+    on a tight disk a large session was never enrolled even when it was a
+    fork whose content the store already held. When that price does not fit,
+    the planner now asks for the exact price: a dry-run fold that writes
+    nothing, cached by file identity and pack generation, charged twice (loose
+    objects and the next pack). `codexfold fold --apply` measures the same way
+    when space is short, and pack builds price loose objects by their
+    compressed size on disk instead of their raw size.
+- Pack builds entropy-code small blocks. `SpeedDefault` gave up on blocks whose
+  only redundancy is entropy (base64 payloads, encrypted reasoning) and a 2:1
+  cut-off kept other small blocks raw: 7.07 GB of a real 14.83 GB pack. Builds
+  use `SpeedBetterCompression`, keep a block raw only when compression does not
+  shrink it, and recompress raw blocks during compaction; about 2.1 GB of that
+  pack goes away. Decoding cost is unchanged.
 
 ## [0.4.0-beta.2] - 2026-10-01
 
