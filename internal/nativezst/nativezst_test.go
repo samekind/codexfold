@@ -16,7 +16,6 @@ import (
 	"github.com/samekind/codexfold/internal/codexzstd"
 	"github.com/samekind/codexfold/internal/pack"
 	"github.com/samekind/codexfold/internal/storage"
-	"golang.org/x/sys/unix"
 )
 
 func requireSupport(t *testing.T) {
@@ -97,7 +96,7 @@ func TestFoldConvertServeAndRestore(t *testing.T) {
 	modTime := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
 	content := rolloutContent(1, 300)
 	original := writeCodexZst(t, path, content, modTime)
-	if err := unix.Setxattr(path, "com.example.kept", []byte("value"), 0); err != nil {
+	if err := setTestXattr(path, "user.example.kept", []byte("value")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -122,7 +121,7 @@ func TestFoldConvertServeAndRestore(t *testing.T) {
 		t.Fatalf("converted file still allocates %d bytes", allocated)
 	}
 	if value := make([]byte, 16); true {
-		n, err := unix.Getxattr(path, "com.example.kept", value)
+		n, err := getTestXattr(path, "user.example.kept", value)
 		if err != nil || string(value[:n]) != "value" {
 			t.Fatalf("unrelated xattr lost: %q %v", value[:n], err)
 		}
@@ -315,7 +314,7 @@ func TestSweepRepairsALostMarker(t *testing.T) {
 	if err := Convert(store, prepared); err != nil {
 		t.Fatal(err)
 	}
-	if err := unix.Removexattr(path, MarkerAttribute); err != nil {
+	if err := removeTestXattr(path, MarkerAttribute); err != nil {
 		t.Fatal(err)
 	}
 	scan, err := ScanNative(context.Background(), native)
