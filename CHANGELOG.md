@@ -136,6 +136,26 @@ pre-1.0, so a minor version may contain compatibility changes.
   use `SpeedBetterCompression`, keep a block raw only when compression does not
   shrink it, and recompress raw blocks during compaction; about 2.1 GB of that
   pack goes away. Decoding cost is unchanged.
+- Mount reads no longer fail with "Too many open files" while several folded
+  `.zst` files are read at once. The FSKit extension ran at launchd's
+  256-descriptor limit, and a folded file used about fourteen of them because
+  it was handed a shared read window that primed nine prefetch channels on
+  open. Folded files now get no shared window. The extension raises its
+  descriptor limit at start (1,200 files held open through a real mount put
+  1,438 descriptors on it without an error) and caps prefetch channels at 48
+  across all open files. The extension change needs the App build 117 install,
+  not just a daemon live update.
+- A folded `.zst` from which APFS kept a few extents allocated was re-proved
+  and re-punched every thirty seconds. It is now left alone until it changes,
+  and only bytes actually released are counted as freed.
+- A managed session's native snapshot left behind after deletion no longer
+  blocks readiness. The mount hides that path on purpose, but the canonical
+  readiness probe waited for it. As a result, automatic enrollment reported
+  `mount-warming` for every session (1,626 on a real machine) and enrolled
+  nothing, and `fs service start` failed its health gate. The probe now skips
+  the routes of deletion tombstones. A failed native FSKit start also left the
+  mount attached with no backend, so every read in it failed; it now reclaims
+  the mount the way an explicit stop does.
 
 ## [0.4.0-beta.2] - 2026-10-01
 
