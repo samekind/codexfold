@@ -19,6 +19,8 @@ func durableSync(file *os.File) error { return file.Sync() }
 
 func allocatedBytes(info os.FileInfo) int64 { return info.Size() }
 
+func metadataAllocation(os.FileInfo) int64 { return 0 }
+
 func inode(os.FileInfo) uint64 { return 0 }
 
 func fileTimes(info os.FileInfo) (time.Time, time.Time) { return info.ModTime(), info.ModTime() }

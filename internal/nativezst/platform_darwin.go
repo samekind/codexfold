@@ -52,3 +52,7 @@ func changeTime(info os.FileInfo) time.Time {
 	}
 	return time.Time{}
 }
+
+// metadataAllocation is zero: APFS does not count extended attributes in a
+// file's allocated blocks.
+func metadataAllocation(os.FileInfo) int64 { return 0 }

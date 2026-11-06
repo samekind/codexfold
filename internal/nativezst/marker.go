@@ -49,6 +49,16 @@ var (
 // AllocatedBytes is the disk space a file's data blocks occupy.
 func AllocatedBytes(info os.FileInfo) int64 { return allocatedBytes(info) }
 
+// DataReleased reports whether a hole-punched file holds no data blocks.
+// Allocation alone cannot say so on every filesystem: ext4 counts a block
+// that holds extended attributes, among them the fold marker itself, so a
+// fully punched file still reports one block there.
+func DataReleased(info os.FileInfo) bool { return dataReleased(info) }
+
+func dataReleased(info os.FileInfo) bool {
+	return allocatedBytes(info) <= metadataAllocation(info)
+}
+
 // ChangedAfter reports whether the file's metadata changed after t.
 func ChangedAfter(info os.FileInfo, t time.Time) bool { return changeTime(info).After(t) }
 

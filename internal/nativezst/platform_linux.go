@@ -34,3 +34,12 @@ func changeTime(info os.FileInfo) time.Time {
 	}
 	return time.Time{}
 }
+
+// metadataAllocation is what a file's allocation may include beyond its data:
+// ext4 and XFS count a block of extended attributes in st_blocks.
+func metadataAllocation(info os.FileInfo) int64 {
+	if stat, ok := info.Sys().(*syscall.Stat_t); ok && stat.Blksize > 0 {
+		return int64(stat.Blksize)
+	}
+	return 4096
+}

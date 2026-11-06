@@ -117,8 +117,8 @@ func TestFoldConvertServeAndRestore(t *testing.T) {
 	if !os.SameFile(before, after) || after.Size() != int64(len(original)) || !after.ModTime().Equal(modTime) || after.Mode().Perm() != 0o640 {
 		t.Fatalf("conversion changed identity: size=%d mtime=%v mode=%v", after.Size(), after.ModTime(), after.Mode())
 	}
-	if allocated := allocatedBytes(after); allocated != 0 {
-		t.Fatalf("converted file still allocates %d bytes", allocated)
+	if !dataReleased(after) {
+		t.Fatalf("converted file still allocates %d bytes", allocatedBytes(after))
 	}
 	if value := make([]byte, 16); true {
 		n, err := getTestXattr(path, "user.example.kept", value)

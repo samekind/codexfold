@@ -106,7 +106,7 @@ func (z *nativeZstFolder) pass(ctx context.Context) error {
 	var freed, stored int64
 	for _, file := range scan.Folded {
 		identity := nativeZstIdentity{size: file.Info.Size(), modTime: file.Info.ModTime()}
-		if nativezst.AllocatedBytes(file.Info) == 0 || z.skipped[file.Path] == identity {
+		if nativezst.DataReleased(file.Info) || z.skipped[file.Path] == identity {
 			continue
 		}
 		err := z.filesystem.FinishNativeZst(work, z.source, file)
@@ -124,7 +124,7 @@ func (z *nativeZstFolder) pass(ctx context.Context) error {
 				finished++
 				freed += released
 			}
-			if nativezst.AllocatedBytes(after) > 0 {
+			if !nativezst.DataReleased(after) {
 				z.skipped[file.Path] = nativeZstIdentity{size: after.Size(), modTime: after.ModTime()}
 			}
 			continue

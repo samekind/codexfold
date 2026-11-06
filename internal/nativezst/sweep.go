@@ -233,7 +233,7 @@ func repairMarker(store string, key string, scan Scan) (bool, error) {
 		return false, nil
 	}
 	file, found := scan.Unmarked[record.Inode]
-	if !found || file.Info.Size() != record.EncodedBytes || allocatedBytes(file.Info) != 0 {
+	if !found || file.Info.Size() != record.EncodedBytes || !dataReleased(file.Info) {
 		return false, nil
 	}
 	manifest, err := fold.LoadManifestPath(filepath.Join(ManifestRoot(store), key+".json"))
