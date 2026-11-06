@@ -54,6 +54,17 @@ func newFoldCommand() *cobra.Command {
 				defer recordIndex.Close()
 				options.RecordIndex = recordIndex
 			}
+			// On a nearly full disk the default price, every source byte new,
+			// rejects folds that add little. Measure what this one adds first.
+			if options.Apply && options.NewBytesEstimate == 0 {
+				if info, err := os.Stat(session.RolloutPath); err == nil && foldSpaceIsTight(options.StoreDir, info.Size()) {
+					newBytes, err := dryRunFoldBytes(command.Context(), options.StoreDir, toFoldSession(session), options)
+					if err != nil {
+						return err
+					}
+					options.NewBytesEstimate = max(newBytes, 1)
+				}
+			}
 			result, err := fold.Fold(command.Context(), toFoldSession(session), options)
 			if err != nil {
 				return err

@@ -84,6 +84,7 @@ func Build(ctx context.Context, storeDir string, options BuildOptions) (BuildRes
 	}
 	defer references.Close()
 	var packedSource *Resolver
+	var rewrite rewritePlan
 	if previousGeneration != "" {
 		packedSource, err = openGeneration(filepath.Join(storeDir, "packs", previousGeneration), -1, false)
 		if err != nil {
@@ -91,19 +92,11 @@ func Build(ctx context.Context, storeDir string, options BuildOptions) (BuildRes
 		}
 		defer packedSource.Close()
 		if options.Incremental {
-			dropped, err := hasDroppedPackedObjects(ctx, references, packedSource)
-			if err != nil {
-				return BuildResult{}, err
-			}
 			blockBytes := packedSource.index.BlockBytes
 			if packedSource.v3 != nil {
 				blockBytes = packedSource.v3.meta.BlockBytes
 			}
-			packLimit, limitErr := compactPackFileLimit(packedSource, options.PackBytes)
-			if limitErr != nil {
-				return BuildResult{}, limitErr
-			}
-			if dropped || len(packedSource.packs) >= packLimit || options.BlockBytes < blockBytes {
+			if options.BlockBytes < blockBytes {
 				options.Incremental = false
 			}
 		}
@@ -130,7 +123,26 @@ func Build(ctx context.Context, storeDir string, options BuildOptions) (BuildRes
 		if err != nil {
 			return BuildResult{}, err
 		}
-		estimatedBytes = min(estimatedBytes, incrementalBytes)
+		// Rewrite only the old pack files worth it that fit the free space:
+		// dropped objects no longer force copying the whole pack at once.
+		usage, usageErr := packFileUsage(ctx, storeDir, references, packedSource, options.BlockBytes)
+		if usageErr != nil {
+			return BuildResult{}, usageErr
+		}
+		packLimit, limitErr := compactPackFileLimit(packedSource, options.PackBytes)
+		if limitErr != nil {
+			return BuildResult{}, limitErr
+		}
+		allowance, allowanceErr := packRewriteAllowance(storeDir, incrementalBytes)
+		if allowanceErr != nil {
+			return BuildResult{}, allowanceErr
+		}
+		rewrite = choosePackRewrite(usage, allowance, packLimit, options.PackBytes, incrementalBytes)
+		if rewrite.full {
+			options.Incremental = false
+		} else {
+			estimatedBytes = min(estimatedBytes, incrementalBytes+rewrite.copyBytes)
+		}
 	}
 	storageAssessment, err := budget.Check(ctx, storage.Projection{
 		Operation:                       "pack-build",
@@ -164,8 +176,12 @@ func Build(ctx context.Context, storeDir string, options BuildOptions) (BuildRes
 	}
 	defer objectsFile.Close()
 	defer blocksFile.Close()
+	// SpeedDefault gives up on blocks whose only redundancy is entropy (base64
+	// payloads, encrypted reasoning text) and leaves them raw. SpeedBetter
+	// entropy-codes them: on a real 15 GB pack it shrank the raw blocks by 30%
+	// for a slower background build and no change to decode cost.
 	encoder, err := zstd.NewWriter(nil,
-		zstd.WithEncoderLevel(zstd.SpeedDefault),
+		zstd.WithEncoderLevel(zstd.SpeedBetterCompression),
 		zstd.WithEncoderConcurrency(1),
 		zstd.WithLowerEncoderMem(true),
 	)
@@ -220,7 +236,9 @@ func Build(ctx context.Context, storeDir string, options BuildOptions) (BuildRes
 						}
 						var name string
 						var offset int64
-						if options.Incremental {
+						storedBytes := block.StoredBytes
+						rawEncoding := block.Encoding == EncodingRaw
+						if options.Incremental && !rewrite.rewrite[block.Pack] {
 							name = imported[block.Pack]
 							if name == "" {
 								key := sha256.Sum256([]byte(previousGeneration + "/" + block.Pack))
@@ -236,6 +254,16 @@ func Build(ctx context.Context, storeDir string, options BuildOptions) (BuildRes
 							if _, err := file.ReadAt(data, block.PackOffset); err != nil {
 								return BuildResult{}, err
 							}
+							// Older generations kept compressible small blocks raw.
+							// Compaction rewrites every block anyway, so store
+							// those compressed now.
+							if rawEncoding {
+								if compressed := encoder.EncodeAll(data, nil); !keepPackBlockRaw(data, compressed) {
+									data = compressed
+									rawEncoding = false
+								}
+							}
+							storedBytes = int64(len(data))
 							var err error
 							name, offset, err = writer.write(data)
 							if err != nil {
@@ -253,15 +281,15 @@ func Build(ctx context.Context, storeDir string, options BuildOptions) (BuildRes
 							return BuildResult{}, err
 						}
 						encoding := byte(0)
-						if block.Encoding == EncodingRaw {
+						if rawEncoding {
 							encoding = 1
 						}
-						if _, err := blocksFile.Write(encodeBlockV3(blockV3Record{PackIndex: index, PackOffset: offset, StoredBytes: block.StoredBytes, RawOffset: block.RawOffset, RawBytes: block.RawBytes, Digest: digest, Encoding: encoding})); err != nil {
+						if _, err := blocksFile.Write(encodeBlockV3(blockV3Record{PackIndex: index, PackOffset: offset, StoredBytes: storedBytes, RawOffset: block.RawOffset, RawBytes: block.RawBytes, Digest: digest, Encoding: encoding})); err != nil {
 							return BuildResult{}, err
 						}
 						result.BlockCount++
 						result.RawBytes += block.RawBytes
-						result.StoredBytes += block.StoredBytes
+						result.StoredBytes += storedBytes
 					}
 					digest, err := decodeDigest(ref.SHA256)
 					if err != nil {
@@ -296,7 +324,7 @@ func Build(ctx context.Context, storeDir string, options BuildOptions) (BuildRes
 				compressed := encoder.EncodeAll(raw, nil)
 				stored := compressed
 				encoding := EncodingZstd
-				if preferRawBlock(raw, compressed) {
+				if keepPackBlockRaw(raw, compressed) {
 					stored = raw
 					encoding = EncodingRaw
 				}
@@ -451,51 +479,14 @@ func compactPackFileLimit(previous *Resolver, packBytes int64) (int, error) {
 	return max(16, int(minimum)+8), nil
 }
 
-func hasDroppedPackedObjects(ctx context.Context, references *sql.DB, previous *Resolver) (bool, error) {
-	rows, err := references.QueryContext(ctx, `select digest from pack_references order by digest`)
-	if err != nil {
-		return false, err
-	}
-	defer rows.Close()
-	var position int64
-	var previousDigest string
-	for rows.Next() {
-		if err := ctx.Err(); err != nil {
-			return false, err
-		}
-		var digest string
-		if err := rows.Scan(&digest); err != nil {
-			return false, err
-		}
-		if position >= previous.ObjectCount() {
-			continue
-		}
-		if previousDigest == "" {
-			object, err := previous.objectAt(position)
-			if err != nil {
-				return false, err
-			}
-			previousDigest = object.SHA256
-		}
-		if previousDigest < digest {
-			return true, nil
-		}
-		if previousDigest == digest {
-			position++
-			previousDigest = ""
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return false, err
-	}
-	return position < previous.ObjectCount(), nil
-}
+// keepPackBlockRaw is preferRawBlock outside tests, which swap in the old
+// cut-off to build a legacy generation.
+var keepPackBlockRaw = preferRawBlock
 
+// preferRawBlock keeps a block raw only when compression does not shrink it.
+// The old 2:1 cut-off for small blocks left 7 GB of a real 15 GB pack raw.
 func preferRawBlock(raw []byte, compressed []byte) bool {
-	if len(compressed) >= len(raw) {
-		return true
-	}
-	return len(raw) <= 16<<10 && len(compressed)*2 >= len(raw)
+	return len(compressed) >= len(raw)
 }
 
 func estimatedGenerationBytes(rawBytes int64) (int64, error) {

@@ -1,7 +1,6 @@
 package fold
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -294,18 +293,18 @@ func (s *ObjectStore) Read(ref ObjectRef) ([]byte, error) {
 	return data, nil
 }
 
+// objectEncoder is shared: EncodeAll is safe for concurrent use, while a new
+// encoder per object started worker goroutines and allocated its window for
+// every chunk. SpeedDefault left entropy-only text (base64, encrypted
+// reasoning) nearly uncompressed; SpeedBetter matches the pack builder.
+var objectEncoder = sync.OnceValues(func() (*zstd.Encoder, error) {
+	return zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedBetterCompression), zstd.WithEncoderConcurrency(1))
+})
+
 func compressObject(data []byte) ([]byte, error) {
-	var buffer bytes.Buffer
-	encoder, err := zstd.NewWriter(&buffer, zstd.WithEncoderLevel(zstd.SpeedDefault))
+	encoder, err := objectEncoder()
 	if err != nil {
 		return nil, fmt.Errorf("create zstd encoder: %w", err)
 	}
-	if _, err := encoder.Write(data); err != nil {
-		encoder.Close()
-		return nil, fmt.Errorf("compress object: %w", err)
-	}
-	if err := encoder.Close(); err != nil {
-		return nil, fmt.Errorf("close zstd encoder: %w", err)
-	}
-	return buffer.Bytes(), nil
+	return encoder.EncodeAll(data, make([]byte, 0, len(data)/2+64)), nil
 }

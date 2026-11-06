@@ -5,6 +5,7 @@ import (
 	"context"
 	cryptorand "crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -2412,4 +2413,67 @@ type rejectingChecker struct {
 func (c *rejectingChecker) Check(context.Context, storage.Projection) (storage.Assessment, error) {
 	c.Calls++
 	return storage.Assessment{}, storage.ErrBudgetExceeded
+}
+
+func TestCompactionCompressesLegacyRawBlocks(t *testing.T) {
+	root := t.TempDir()
+	random := make([]byte, 6<<10)
+	if _, err := cryptorand.Read(random); err != nil {
+		t.Fatal(err)
+	}
+	// Base64 text shrinks by roughly a quarter: below the old 2:1 cut-off,
+	// still worth compressing.
+	moderate := []byte(base64.StdEncoding.EncodeToString(random))
+	dropped := make([]byte, 4<<10)
+	if _, err := cryptorand.Read(dropped); err != nil {
+		t.Fatal(err)
+	}
+	refs := putObjects(t, root, moderate, dropped)
+	writeManifest(t, root, "keep", refs[:1])
+	writeManifest(t, root, "drop", refs[1:])
+
+	keepPackBlockRaw = func(raw []byte, compressed []byte) bool {
+		return len(compressed) >= len(raw) || (len(raw) <= 16<<10 && len(compressed)*2 >= len(raw))
+	}
+	_, err := Build(context.Background(), root, BuildOptions{})
+	keepPackBlockRaw = preferRawBlock
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := blockEncodings(t, root)[refs[0].SHA256]; got != EncodingRaw {
+		t.Fatalf("legacy build stored the moderate block as %q, want raw", got)
+	}
+	if _, err := RetireLoose(context.Background(), root, RetireLooseOptions{Apply: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(fold.ManifestPath(root, "drop")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Build(context.Background(), root, BuildOptions{Incremental: true}); err != nil {
+		t.Fatal(err)
+	}
+	if got := blockEncodings(t, root)[refs[0].SHA256]; got != EncodingZstd {
+		t.Fatalf("compaction kept the moderate block as %q, want zstd", got)
+	}
+	resolver, err := Open(root, OpenOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resolver.Close()
+	got := make([]byte, len(moderate))
+	if n, err := resolver.ReadAt(context.Background(), refs[0], got, 0); n != len(moderate) || err != nil || !bytes.Equal(got, moderate) {
+		t.Fatalf("ReadAt after recompression = %d, %v", n, err)
+	}
+}
+
+func blockEncodings(t *testing.T, root string) map[string]string {
+	t.Helper()
+	encodings := make(map[string]string)
+	for _, object := range loadCurrentIndex(t, root).Objects {
+		if len(object.Blocks) != 1 {
+			t.Fatalf("object %s blocks = %d, want 1", object.SHA256, len(object.Blocks))
+		}
+		encodings[object.SHA256] = object.Blocks[0].Encoding
+	}
+	return encodings
 }

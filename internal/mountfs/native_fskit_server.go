@@ -939,6 +939,14 @@ func (c *nativeFSKitConnection) writeOpenResponseWithOptimizedFD(response fskitp
 	if !exists || handleState.health || handleState.flags&(os.O_WRONLY|os.O_RDWR) != 0 {
 		return false, false, nil
 	}
+	// A shared window makes the extension prime up to nine prefetch channels
+	// on open, each with its own socket and window descriptor. A folded .zst
+	// is read at the encoder's pace anyway, and priming it cost the
+	// extension, capped at 256 descriptors, about fourteen per open file:
+	// a handful of concurrent readers made every mount read fail with EMFILE.
+	if c.server.filesystem.IsFoldedHandle(handleState.coreHandle) {
+		return false, false, nil
+	}
 	windowBytes := min(nativeFSKitSharedWindowBytes, int(c.server.maxPayload)-4)
 	var window *nativeSharedReadWindow
 	var windowFlag uint32
