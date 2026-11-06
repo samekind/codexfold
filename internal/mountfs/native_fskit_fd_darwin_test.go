@@ -927,3 +927,42 @@ func assertMappedNativeFDTestBytes(t *testing.T, fd int, want []byte, maximumByt
 		t.Fatal(err)
 	}
 }
+
+func TestNativeFSKitServerGivesFoldedZstNoSharedWindow(t *testing.T) {
+	filesystem, source, store, route, original := foldedZstFixture(t)
+	convertFixture(t, filesystem, source, store, route)
+	filesystem.SetNativeZstSource(source)
+	root := filepath.Dir(filesystem.nativeZstRoot())
+	client, stop := startNativeFSKitTestServer(t, filesystem, root)
+	_ = client.Close()
+	defer stop()
+	descriptor := readNativeFDTestDescriptor(t, root)
+	connection := dialNativeFDTestSocket(t, descriptor)
+	defer connection.Close()
+	callNativeFDTestHelloCapabilities(t, connection, descriptor, fskitproto.CapabilitySharedWindow|fskitproto.CapabilitySharedFileWindow)
+
+	openPayload := fskitproto.NewEncoder(128)
+	openPayload.String(route)
+	openPayload.Uint32(uint32(os.O_RDONLY))
+	openResponse := callNativeFDTestFrame(t, connection, descriptor, 2, fskitproto.OpOpen, openPayload.Data())
+	// Without a window the extension does not prime its prefetch channels.
+	if openResponse.Flags&(fskitproto.FlagSharedWindow|fskitproto.FlagSharedFileWindow|fskitproto.FlagNativeReadFD) != 0 {
+		t.Fatalf("folded open flags = %#x, want no shared window or native descriptor", openResponse.Flags)
+	}
+	decoder := fskitproto.NewDecoder(openResponse.Payload)
+	handle, err := decoder.Uint64()
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := callNativeFDTestRead(t, connection, descriptor, 3, handle, 0, 4096)
+	if response.Flags&fskitproto.FlagSharedReadFD != 0 {
+		receiveFDTestMarker(t, connection, fskitproto.SharedReadFDMarker)
+		t.Skip("shared read descriptors are covered elsewhere")
+	}
+	payload := fskitproto.NewDecoder(response.Payload)
+	count, err := payload.Uint32()
+	if err != nil || count != 4096 || len(response.Payload) != 4+4096 || !bytes.Equal(response.Payload[4:], original[:4096]) {
+		t.Fatalf("folded buffered read count=%d payload=%d err=%v", count, len(response.Payload), err)
+	}
+	callNativeFDTestHandle(t, connection, descriptor, 4, fskitproto.OpRelease, handle)
+}

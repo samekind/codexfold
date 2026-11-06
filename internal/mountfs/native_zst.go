@@ -119,3 +119,14 @@ func (f *Filesystem) FinishNativeZst(ctx context.Context, source *nativezst.Sour
 		return nativezst.FinishRelease(file.Path, file.Info)
 	})
 }
+
+// IsFoldedHandle reports whether an open handle serves a folded .zst.
+func (f *Filesystem) IsFoldedHandle(handleID uint64) bool {
+	handle, errno := f.handle(handleID)
+	if errno != 0 {
+		return false
+	}
+	handle.mu.Lock()
+	defer handle.mu.Unlock()
+	return handle.folded != nil
+}

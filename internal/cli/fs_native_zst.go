@@ -111,8 +111,22 @@ func (z *nativeZstFolder) pass(ctx context.Context) error {
 		}
 		err := z.filesystem.FinishNativeZst(work, z.source, file)
 		if err == nil {
-			finished++
-			freed += nativezst.AllocatedBytes(file.Info)
+			// APFS may keep some extents of a hole-punched file allocated, for
+			// one real 56 MB file 580 KiB, and every later pass then re-proved
+			// and re-punched it. Count only what was freed, and leave a file
+			// whose blocks did not move alone until it changes.
+			after, statErr := os.Lstat(file.Path)
+			if statErr != nil {
+				continue
+			}
+			released := nativezst.AllocatedBytes(file.Info) - nativezst.AllocatedBytes(after)
+			if released > 0 {
+				finished++
+				freed += released
+			}
+			if nativezst.AllocatedBytes(after) > 0 {
+				z.skipped[file.Path] = nativeZstIdentity{size: after.Size(), modTime: after.ModTime()}
+			}
 			continue
 		}
 		if work.Err() != nil {
