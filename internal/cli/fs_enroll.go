@@ -991,7 +991,7 @@ func buildEnrollmentPlan(ctx context.Context, flags enrollmentFlags) (enroll.Pla
 	mountHealthy := mountHealthProbe(mount) == nil
 	readiness := canonicalNamespaceReadiness{}
 	if flags.canonicalNamespace && mountHealthy {
-		readiness = enrollmentCanonicalNamespaceReadinessProbe(home, mount, nativeRoot)
+		readiness = enrollmentCanonicalNamespaceReadinessProbe(home, store, mount, nativeRoot)
 	}
 	guard, err := storage.DefaultGuard(store)
 	if err != nil {
