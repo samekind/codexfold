@@ -156,6 +156,18 @@ pre-1.0, so a minor version may contain compatibility changes.
   the routes of deletion tombstones. A failed native FSKit start also left the
   mount attached with no backend, so every read in it failed; it now reclaims
   the mount the way an explicit stop does.
+- A slow daemon reply no longer leaves the mount answering "Protocol error"
+  to every lookup. When a request timed out, the extension kept the
+  connection, read the late reply as the answer to its next request, and
+  failed that request's ID check. Recovery ignored the resulting EPROTO, so
+  every later request failed the same way until the daemon restarted. Open
+  files kept working through their own connections, which hid the fault until
+  Codex restarted and could not resolve any rollout. Any failure between
+  sending a request and consuming its reply now closes the connection, so the
+  next request recovers on a fresh one. This needs App build 118.
+- Codex-compressed rollouts (`rollout-*.jsonl.zst` recorded by Codex) are no
+  longer picked for JSONL enrollment. Validating their zstd bytes as JSONL
+  failed and aborted every enrollment cycle; the `.zst` folder handles them.
 
 ## [0.4.0-beta.2] - 2026-10-01
 
