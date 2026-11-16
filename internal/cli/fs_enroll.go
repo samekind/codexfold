@@ -584,6 +584,9 @@ func runPeriodicEnrollment(ctx context.Context, flags enrollmentFlags, interval 
 				}
 			}
 		}()
+		// Folding Codex .zst files adds manifests; one appearing between this
+		// cycle's pack build and its loose retirement fails the pack-only proof.
+		storeMaintenanceMu.Lock()
 		result, err := runServiceEnrollmentCycle(cycleCtx, cycleFlags, enrollmentApplyHooks{
 			onManagedCount: func(count int) {
 				progressMu.Lock()
@@ -607,6 +610,7 @@ func runPeriodicEnrollment(ctx context.Context, flags enrollmentFlags, interval 
 				return !resolveEnrollmentControl(flags, interval).Enabled
 			},
 		})
+		storeMaintenanceMu.Unlock()
 		cycleCancel()
 		<-watchDone
 		if report != nil {
@@ -987,7 +991,7 @@ func buildEnrollmentPlan(ctx context.Context, flags enrollmentFlags) (enroll.Pla
 	mountHealthy := mountHealthProbe(mount) == nil
 	readiness := canonicalNamespaceReadiness{}
 	if flags.canonicalNamespace && mountHealthy {
-		readiness = enrollmentCanonicalNamespaceReadinessProbe(home, mount, nativeRoot)
+		readiness = enrollmentCanonicalNamespaceReadinessProbe(home, store, mount, nativeRoot)
 	}
 	guard, err := storage.DefaultGuard(store)
 	if err != nil {
@@ -1015,6 +1019,7 @@ func buildEnrollmentPlan(ctx context.Context, flags enrollmentFlags) (enroll.Pla
 		// occurs between those decisions. Reuse one inventory for this plan;
 		// fold/pack/apply retain their fresh per-operation budget checks.
 		Budget: &storage.OnceInventoryGuard{Guard: guard},
+		Price:  enrollmentDryRunPricer(store),
 	}
 	plan, err := enroll.Build(ctx, input)
 	if err != nil || len(plan.Selected) == 0 {
@@ -1310,25 +1315,80 @@ func enrollmentHasManifestsNewerThanPack(store string) (bool, error) {
 		return false, err
 	}
 	packPresent := err == nil
-	entries, err := os.ReadDir(filepath.Join(store, "manifests"))
-	if errors.Is(err, os.ErrNotExist) {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	for _, entry := range entries {
-		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
-			continue
+	// Manifests below manifests/ (folded Codex .zst files) are live too.
+	pending := false
+	live := make(map[string]struct{})
+	err = filepath.WalkDir(filepath.Join(store, "manifests"), func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
 		}
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			return nil
+		}
+		relative, err := filepath.Rel(store, path)
+		if err != nil {
+			return err
+		}
+		live[filepath.ToSlash(relative)] = struct{}{}
 		if !packPresent {
-			return true, nil
+			pending = true
+			return nil
 		}
 		info, err := entry.Info()
 		if err != nil {
-			return false, err
+			return err
 		}
 		if info.ModTime().After(current.ModTime()) {
+			pending = true
+		}
+		return nil
+	})
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil || pending || !packPresent {
+		return pending, err
+	}
+	// A manifest the pack still carries but the store no longer has (a
+	// deleted session, a released .zst) leaves its objects in the pack until
+	// a build compacts them away. Without this nothing ever repacks after
+	// deletions alone.
+	if dropped, err := packHasDroppedManifests(store, live); err != nil || dropped {
+		return dropped, err
+	}
+	return packWasteWorthCompacting(store), nil
+}
+
+// packWasteWorthCompacting reports dead pack bytes that a build could now
+// free. On a nearly full disk a build rewrites only what fits, so the rest
+// is picked up by later cycles once space allows, not retried in vain.
+func packWasteWorthCompacting(store string) bool {
+	files, wasted, err := pack.GenerationWaste(store)
+	if err != nil || wasted < max(int64(512<<20), files/10) {
+		return false
+	}
+	limits, err := storage.LoadLimits(store)
+	if err != nil {
+		return false
+	}
+	available, err := storage.AvailableBytes(store)
+	return err == nil && available-limits.FreeSpaceReserveBytes >= 1<<30
+}
+
+func packHasDroppedManifests(store string, live map[string]struct{}) (bool, error) {
+	generation, err := pack.CurrentGeneration(store)
+	if err != nil {
+		return false, nil
+	}
+	catalog, err := pack.ReadRecoveryCatalog(filepath.Join(store, "packs", generation))
+	if err != nil {
+		return false, nil
+	}
+	for _, file := range catalog.Files {
+		if !strings.HasPrefix(file.Path, "manifests/") {
+			continue
+		}
+		if _, ok := live[file.Path]; !ok {
 			return true, nil
 		}
 	}

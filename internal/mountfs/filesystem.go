@@ -12,6 +12,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -21,6 +22,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/samekind/codexfold/internal/fskitproto"
+	"github.com/samekind/codexfold/internal/nativezst"
 	"github.com/samekind/codexfold/internal/storage"
 	"github.com/samekind/codexfold/internal/vfs"
 )
@@ -131,6 +133,8 @@ type fileHandle struct {
 	nativeAppend *nativeAppendState
 	read         *vfs.ReadHandle
 	write        *vfs.WriteHandle
+	// folded serves a Codex .zst whose data blocks were released.
+	folded       *nativezst.Reader
 	append       bool
 	appendStream bool
 	appendFloor  int64
@@ -189,6 +193,7 @@ type Filesystem struct {
 	pendingManagedUnlinks          map[string]string
 	publishingManagedDeletions     map[string]struct{}
 	deletedManagedSessions         map[string]struct{}
+	nativeZst                      *nativezst.Source
 }
 
 func New() *Filesystem {
@@ -1057,6 +1062,9 @@ func (f *Filesystem) SetAttributes(name string, request SetAttrRequest) syscall.
 }
 
 func (f *Filesystem) GetXattr(name string, attribute string) ([]byte, syscall.Errno) {
+	if attribute == nativezst.MarkerAttribute {
+		return nil, xattrMissingErrno()
+	}
 	xattrPath, managed, errno := f.xattrPath(name, false)
 	if errno != 0 {
 		return nil, errno
@@ -1074,6 +1082,9 @@ func (f *Filesystem) GetXattr(name string, attribute string) ([]byte, syscall.Er
 func (f *Filesystem) SetXattr(name string, attribute string, value []byte, policy fskitproto.XattrPolicy) syscall.Errno {
 	if attribute == "" || strings.ContainsRune(attribute, '\x00') {
 		return syscall.EINVAL
+	}
+	if attribute == nativezst.MarkerAttribute {
+		return syscall.EPERM
 	}
 	createCarrier := policy != fskitproto.XattrDelete
 	xattrPath, managed, errno := f.xattrPath(name, createCarrier)
@@ -1105,6 +1116,7 @@ func (f *Filesystem) ListXattrs(name string) ([]string, syscall.Errno) {
 		}
 		return nil, errnoFor(err)
 	}
+	attributes = slices.DeleteFunc(attributes, func(attribute string) bool { return attribute == nativezst.MarkerAttribute })
 	sort.Strings(attributes)
 	return attributes, 0
 }
@@ -1151,6 +1163,17 @@ func (f *Filesystem) Open(name string, flags int) (uint64, syscall.Errno) {
 		nativePath, ok := f.nativePath(cleanPath(name))
 		if !ok {
 			return 0, errno
+		}
+		if reader, foldedErrno, folded := f.openFoldedNative(nativePath, flags); folded {
+			if foldedErrno != 0 {
+				return 0, foldedErrno
+			}
+			f.mu.Lock()
+			handleID := f.next
+			f.next++
+			f.handles[handleID] = &fileHandle{path: cleanPath(name), nativePath: nativePath, folded: reader}
+			f.mu.Unlock()
+			return handleID, 0
 		}
 		// FUSE may split or retry one append syscall as positional writes. Keep
 		// append and truncate semantics in the transaction layer instead of the
@@ -1237,6 +1260,13 @@ func (f *Filesystem) Read(handleID uint64, destination []byte, offset int64) (in
 	}
 	handle.mu.Lock()
 	defer handle.mu.Unlock()
+	if handle.folded != nil {
+		n, err := handle.folded.ReadAt(destination, offset)
+		if err != nil && !errors.Is(err, io.EOF) {
+			return n, syscall.EIO
+		}
+		return n, 0
+	}
 	if handle.native != nil {
 		n, err := handle.nativeAppend.ReadAt(handle.native, destination, offset)
 		if err != nil && !errors.Is(err, io.EOF) {
@@ -1377,7 +1407,9 @@ func (f *Filesystem) StreamBufferedRead(handleID uint64, offset int64, length in
 	defer handle.mu.Unlock()
 
 	var size int64
-	if handle.native != nil {
+	if handle.folded != nil {
+		size = handle.folded.Size()
+	} else if handle.native != nil {
 		if handle.nativeAppend == nil {
 			return 0, syscall.EBADF
 		}
@@ -1409,7 +1441,9 @@ func (f *Filesystem) StreamBufferedRead(handleID uint64, offset int64, length in
 		need := min(len(buffer), total-n)
 		var count int
 		var readErr error
-		if handle.native != nil {
+		if handle.folded != nil {
+			count, readErr = handle.folded.ReadAt(buffer[:need], offset+int64(n))
+		} else if handle.native != nil {
 			count, readErr = handle.nativeAppend.ReadAt(handle.native, buffer[:need], offset+int64(n))
 		} else {
 			count, readErr = handle.read.ReadAt(context.Background(), buffer[:need], offset+int64(n))
@@ -1578,6 +1612,9 @@ func (f *Filesystem) TruncatePath(name string, size int64) syscall.Errno {
 	if errno != 0 {
 		if f.canonical {
 			if nativePath, ok := f.nativePath(cleanPath(name)); ok {
+				if _, folded, _ := nativezst.ReadMarker(nativePath); folded {
+					return syscall.EPERM
+				}
 				state, err := f.loadNativeAppendState(nativePath)
 				if err != nil {
 					return errnoFor(err)
@@ -1691,6 +1728,9 @@ func (f *Filesystem) Release(handleID uint64) syscall.Errno {
 	}
 	handle.mu.Lock()
 	defer handle.mu.Unlock()
+	if handle.folded != nil {
+		return errnoFor(handle.folded.Close())
+	}
 	if handle.native != nil {
 		var commitErr error
 		if handle.append {

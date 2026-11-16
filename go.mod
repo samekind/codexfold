@@ -3,6 +3,7 @@ module github.com/samekind/codexfold
 go 1.26
 
 require (
+	github.com/DataDog/zstd v1.5.7
 	github.com/Microsoft/go-winio v0.6.2
 	github.com/jchv/go-webview2 v0.0.0-20260205173254-56598839c808
 	github.com/klauspost/compress v1.19.0

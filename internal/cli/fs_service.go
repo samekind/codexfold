@@ -908,15 +908,14 @@ func startPlatformService(ctx context.Context, platform service.Platform, defini
 				_ = manager.Bootout(ctx, definitionPath)
 				return err
 			}
+			// By now the supervisor has mounted. Stopping the jobs alone leaves
+			// that mount behind with no backend, and every read in it fails;
+			// a failed start reclaims it exactly as an explicit stop does.
 			if err := waitLaunchdNativeFSKitHealthy(ctx, manager, label, definitionPath, mountPoint, nativeFSKitStartupTimeout); err != nil {
-				_ = manager.Bootout(ctx, supervisorDefinition)
-				_ = manager.Bootout(ctx, definitionPath)
-				return err
+				return errors.Join(err, stopPlatformService(ctx, service.PlatformLaunchd, definitionPath))
 			}
 			if err := verifyServiceBuild(service.PlatformLaunchd, definitionPath, mountPoint); err != nil {
-				_ = manager.Bootout(ctx, supervisorDefinition)
-				_ = manager.Bootout(ctx, definitionPath)
-				return err
+				return errors.Join(err, stopPlatformService(ctx, service.PlatformLaunchd, definitionPath))
 			}
 			return nil
 		}
@@ -1138,6 +1137,10 @@ func waitLaunchdNativeFSKitHealthy(ctx context.Context, manager service.Manager,
 	if err != nil {
 		return err
 	}
+	var hidden map[string]struct{}
+	if store, err := service.DefinitionStore(service.PlatformLaunchd, definitionPath); err == nil {
+		hidden = deletedSessionRoutes(store)
+	}
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
 	ticker := time.NewTicker(50 * time.Millisecond)
@@ -1149,7 +1152,7 @@ func waitLaunchdNativeFSKitHealthy(ctx context.Context, manager service.Manager,
 		daemon = validateLaunchdChildProcess(manager.Status(ctx, label, mountPoint), lockPaths.daemon, "daemon")
 		supervisor = validateLaunchdChildProcess(manager.Status(ctx, supervisorLabel, mountPoint), lockPaths.supervisor, "supervisor")
 		if daemon.DaemonRunning && supervisor.DaemonRunning && daemon.MountHealthy {
-			passthroughErr = probeCanonicalNativePassthrough(mountPoint, nativeRoot)
+			passthroughErr = probeCanonicalNativePassthrough(mountPoint, nativeRoot, hidden)
 			if passthroughErr == nil {
 				return nil
 			}

@@ -5073,7 +5073,7 @@ func allowFixtureMount(t *testing.T) {
 func allowEnrollmentNamespaceReadiness(t *testing.T) {
 	t.Helper()
 	previous := enrollmentCanonicalNamespaceReadinessProbe
-	enrollmentCanonicalNamespaceReadinessProbe = func(string, string, string) canonicalNamespaceReadiness {
+	enrollmentCanonicalNamespaceReadinessProbe = func(string, string, string, string) canonicalNamespaceReadiness {
 		return canonicalNamespaceReadiness{Active: true, Ready: true}
 	}
 	t.Cleanup(func() { enrollmentCanonicalNamespaceReadinessProbe = previous })
@@ -5094,15 +5094,62 @@ func TestCanonicalNativePassthroughProbeRequiresEveryNativeRoute(t *testing.T) {
 	if err := os.WriteFile(nativeFile, []byte("native\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := probeCanonicalNativePassthrough(mount, nativeRoot); err == nil {
+	if err := probeCanonicalNativePassthrough(mount, nativeRoot, nil); err == nil {
 		t.Fatal("missing mounted native route passed readiness")
 	}
 	mountedFile := filepath.Join(mount, "sessions", "2026", "07", "unmanaged.jsonl")
 	if err := os.WriteFile(mountedFile, []byte("mounted\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := probeCanonicalNativePassthrough(mount, nativeRoot); err != nil {
+	if err := probeCanonicalNativePassthrough(mount, nativeRoot, nil); err != nil {
 		t.Fatalf("complete native passthrough failed readiness: %v", err)
+	}
+}
+
+// A deleted managed session's native snapshot can stay at its route while the
+// mount hides it. Readiness must not wait for that path, or enrollment stays
+// at "mount warming" and every service start rolls back.
+func TestCanonicalNativePassthroughProbeSkipsDeletedSessionRoutes(t *testing.T) {
+	fixture := interruptedCanonicalMigrationFixture(t)
+	if err := fixture.resolver.Close(); err != nil {
+		t.Fatal(err)
+	}
+	route := "/archived_sessions/rollout-session.jsonl"
+	if _, err := vfs.PublishSessionDeletion(fixture.store, fixture.managed.State(), route); err != nil {
+		t.Fatal(err)
+	}
+	hidden := deletedSessionRoutes(fixture.store)
+	if _, ok := hidden["archived_sessions/rollout-session.jsonl"]; !ok || len(hidden) != 1 {
+		t.Fatalf("deleted routes = %#v", hidden)
+	}
+
+	root := t.TempDir()
+	mount := filepath.Join(root, "mount")
+	nativeRoot := filepath.Join(root, "native")
+	for _, base := range []string{mount, nativeRoot} {
+		for _, namespace := range []string{"sessions", "archived_sessions"} {
+			if err := os.MkdirAll(filepath.Join(base, namespace), 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := os.WriteFile(filepath.Join(nativeRoot, "archived_sessions", "rollout-session.jsonl"), []byte("leftover\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := probeCanonicalNativePassthrough(mount, nativeRoot, hidden); err != nil {
+		t.Fatalf("hidden deleted route failed readiness: %v", err)
+	}
+	if err := probeCanonicalNativePassthroughMetadata(mount, nativeRoot, true, hidden); err != nil {
+		t.Fatalf("hidden deleted route failed sized readiness: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(nativeRoot, "sessions", "other.jsonl"), []byte("visible\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := probeCanonicalNativePassthrough(mount, nativeRoot, hidden); err == nil {
+		t.Fatal("a missing route that was never deleted passed readiness")
+	}
+	if got := deletedSessionRoutes(""); got != nil {
+		t.Fatalf("empty store routes = %#v", got)
 	}
 }
 

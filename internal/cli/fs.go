@@ -21,6 +21,7 @@ import (
 
 	"github.com/samekind/codexfold/internal/cdc"
 	"github.com/samekind/codexfold/internal/codex"
+	"github.com/samekind/codexfold/internal/codexzstd"
 	"github.com/samekind/codexfold/internal/compat"
 	"github.com/samekind/codexfold/internal/enroll"
 	"github.com/samekind/codexfold/internal/fold"
@@ -28,6 +29,7 @@ import (
 	"github.com/samekind/codexfold/internal/fskitproto"
 	"github.com/samekind/codexfold/internal/fskitstatus"
 	"github.com/samekind/codexfold/internal/mountfs"
+	"github.com/samekind/codexfold/internal/nativezst"
 	"github.com/samekind/codexfold/internal/pack"
 	"github.com/samekind/codexfold/internal/scan"
 	"github.com/samekind/codexfold/internal/service"
@@ -121,6 +123,7 @@ func newFSCommand() *cobra.Command {
 	command.AddCommand(newFSStatusCommand())
 	command.AddCommand(newFSDoctorCommand())
 	command.AddCommand(newFSValidateNativeCommand())
+	command.AddCommand(newFSNativeZstCommand())
 	command.AddCommand(newFSCompatibilityCommand())
 	command.AddCommand(newFSCompatibilityImportCommand())
 	command.AddCommand(newFSBenchmarkCommand())
@@ -718,9 +721,15 @@ func newFSServeCommand() *cobra.Command {
 				}
 			}
 			filesystem := mountfs.New()
+			var nativeZstSource *nativezst.Source
 			if canonicalNamespace {
 				filesystem = mountfs.NewCanonical()
 				filesystem.SetNativeRoot(nativeRoot)
+				// Serve Codex .zst files folded into the store; a build that
+				// cannot re-encode them reports EIO, never their empty blocks.
+				nativeZstSource = nativezst.NewSource(store, storePacks{})
+				defer nativeZstSource.Close()
+				filesystem.SetNativeZstSource(nativeZstSource)
 				if err := filesystem.SetManagedStore(store); err != nil {
 					return fmt.Errorf("recover managed file names: %w", err)
 				}
@@ -1328,6 +1337,10 @@ func newFSServeCommand() *cobra.Command {
 				if runtime.GOOS == "windows" {
 					storageStatusPath = filepath.Join(store, "fs", "status", "storage.json")
 				}
+				storageScan := storage.Scan
+				if canonicalNamespace {
+					storageScan = withNativeFootprint(nativeRoot, storage.Scan)
+				}
 				storageStatusDone = startStorageStatusReporter(
 					ctx,
 					command.ErrOrStderr(),
@@ -1336,7 +1349,7 @@ func newFSServeCommand() *cobra.Command {
 					10*time.Minute,
 					storageMaintenanceDone,
 					storageStatusRefresh,
-					storage.Scan,
+					storageScan,
 					fskitstatus.Write,
 				)
 				activityCounter = &mountfs.IOActivityCounter{}
@@ -1345,6 +1358,17 @@ func newFSServeCommand() *cobra.Command {
 			namespaceMaintenanceDone := startNamespaceRetirement(ctx, filesystem, store, func() bool {
 				return namespaceFoldingEnabled(flags, enrollmentInterval, runtime.GOOS == "windows")
 			}, command.ErrOrStderr())
+			var nativeZstDone <-chan struct{}
+			if nativeZstSource != nil && codexzstd.Supported() {
+				nativeZstDone = startNativeZstFolding(ctx, filesystem, nativeZstSource, store, func() bool {
+					return namespaceFoldingEnabled(flags, enrollmentInterval, false)
+				}, func() {
+					select {
+					case storageStatusRefresh <- struct{}{}:
+					default:
+					}
+				}, command.ErrOrStderr())
+			}
 			watcherDone := make(chan struct{})
 			go func() {
 				defer close(watcherDone)
@@ -1380,6 +1404,9 @@ func newFSServeCommand() *cobra.Command {
 			}
 			<-runtimeMemoryMaintenanceDone
 			<-namespaceMaintenanceDone
+			if nativeZstDone != nil {
+				<-nativeZstDone
+			}
 			<-enrollmentDone
 			var nativeWatcherErr error
 			if nativeWatcherDone != nil {

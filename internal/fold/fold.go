@@ -36,7 +36,17 @@ type FoldOptions struct {
 	ExistingReader       ObjectReader
 	RecordIndex          DuplicateRecordIndex
 	RecordThreshold      int64
-	beforeCommit         func() error
+	// Content, when set, is folded instead of session.RolloutPath and must be
+	// exactly ContentBytes long. The caller proves its identity; RemoveSource
+	// is not allowed.
+	Content      io.Reader
+	ContentBytes int64
+	// NewBytesEstimate, when positive, prices the fold instead of assuming
+	// every source byte is new. A dry run's NewStoredBytes is exact for the
+	// same store, so a fold whose content the store already holds can run
+	// on a nearly full disk.
+	NewBytesEstimate int64
+	beforeCommit     func() error
 }
 
 type Session struct {
@@ -117,19 +127,27 @@ func Fold(ctx context.Context, session Session, options FoldOptions) (FoldResult
 		}
 	}
 
-	file, err := os.Open(session.RolloutPath)
-	if err != nil {
-		return FoldResult{}, fmt.Errorf("open rollout: %w", err)
-	}
-	fileClosed := false
-	defer func() {
-		if !fileClosed {
-			_ = file.Close()
+	var file *os.File
+	var before os.FileInfo
+	var content io.Reader
+	contentBytes := options.ContentBytes
+	if options.Content != nil {
+		if options.RemoveSource || contentBytes < 0 {
+			return FoldResult{}, errors.New("a streamed fold needs an exact size and keeps its source")
 		}
-	}()
-	before, err := file.Stat()
-	if err != nil {
-		return FoldResult{}, fmt.Errorf("stat rollout: %w", err)
+		content = options.Content
+	} else {
+		var err error
+		file, err = os.Open(session.RolloutPath)
+		if err != nil {
+			return FoldResult{}, fmt.Errorf("open rollout: %w", err)
+		}
+		defer file.Close()
+		before, err = file.Stat()
+		if err != nil {
+			return FoldResult{}, fmt.Errorf("stat rollout: %w", err)
+		}
+		content, contentBytes = file, before.Size()
 	}
 	var storageAssessment storage.Assessment
 	if options.Apply {
@@ -141,18 +159,21 @@ func Fold(ctx context.Context, session Session, options FoldOptions) (FoldResult
 			}
 			budget = guard
 		}
-		persistentBytes, err := estimateFoldStorageBytes(before.Size())
+		persistentBytes, err := estimateFoldStorageBytes(contentBytes)
+		if options.NewBytesEstimate > 0 {
+			persistentBytes, err = estimateFoldStorageBytes(options.NewBytesEstimate)
+		}
 		if err != nil {
 			return FoldResult{}, err
 		}
-		maximumObjectBytes := min(before.Size(), max(options.CDC.MaxBytes, options.MaxJSONLineBytes))
+		maximumObjectBytes := min(contentBytes, max(options.CDC.MaxBytes, options.MaxJSONLineBytes))
 		temporaryBytes, err := estimateFoldStorageBytes(maximumObjectBytes)
 		if err != nil {
 			return FoldResult{}, err
 		}
 		reclaimableBytes := int64(0)
 		if options.RemoveSource {
-			reclaimableBytes = before.Size()
+			reclaimableBytes = contentBytes
 		}
 		storageAssessment, err = budget.Check(ctx, storage.Projection{
 			Operation: "fold", AdditionalPersistentBytes: persistentBytes,
@@ -313,7 +334,7 @@ func Fold(ctx context.Context, session Session, options FoldOptions) (FoldResult
 		return chunker.Write(line[cursor:])
 	}
 
-	reader := bufio.NewReaderSize(io.LimitReader(file, before.Size()), 1024*1024)
+	reader := bufio.NewReaderSize(io.LimitReader(content, contentBytes), 1024*1024)
 	var line bytes.Buffer
 	oversized := options.Opaque
 	for {
@@ -369,10 +390,13 @@ func Fold(ctx context.Context, session Session, options FoldOptions) (FoldResult
 	}
 
 complete:
-	if err := file.Close(); err != nil {
-		return FoldResult{}, fmt.Errorf("close rollout after fold: %w", err)
+	if file != nil {
+		if err := file.Close(); err != nil {
+			return FoldResult{}, fmt.Errorf("close rollout after fold: %w", err)
+		}
+	} else if result.SourceBytes != contentBytes {
+		return FoldResult{}, fmt.Errorf("streamed fold content is %d bytes, expected %d", result.SourceBytes, contentBytes)
 	}
-	fileClosed = true
 	result.SourceSHA256 = hex.EncodeToString(sourceHash.Sum(nil))
 	manifest.Source = ManifestSource{Bytes: result.SourceBytes, SHA256: result.SourceSHA256}
 	result.PartCount = len(manifest.Parts)
@@ -386,15 +410,17 @@ complete:
 			return FoldResult{}, fmt.Errorf("before fold commit: %w", err)
 		}
 	}
-	after, err := os.Stat(session.RolloutPath)
-	if err != nil {
-		return FoldResult{}, fmt.Errorf("stat rollout after fold: %w", err)
-	}
-	if before.Size() != after.Size() || before.ModTime().UnixNano() != after.ModTime().UnixNano() || !os.SameFile(before, after) {
-		return FoldResult{}, errors.New("rollout changed during fold; manifest was not committed")
-	}
-	if err := verifyCurrentSource(session.RolloutPath, before, manifest.Source); err != nil {
-		return FoldResult{}, err
+	if file != nil {
+		after, err := os.Stat(session.RolloutPath)
+		if err != nil {
+			return FoldResult{}, fmt.Errorf("stat rollout after fold: %w", err)
+		}
+		if before.Size() != after.Size() || before.ModTime().UnixNano() != after.ModTime().UnixNano() || !os.SameFile(before, after) {
+			return FoldResult{}, errors.New("rollout changed during fold; manifest was not committed")
+		}
+		if err := verifyCurrentSource(session.RolloutPath, before, manifest.Source); err != nil {
+			return FoldResult{}, err
+		}
 	}
 	if !options.Apply {
 		return result, nil

@@ -8,8 +8,56 @@ import OSLog
 
 @main
 struct CodexFoldFSKitModule: UnaryFileSystemExtension {
+    init() {
+        CodexFoldDescriptorLimit.raise()
+    }
+
     var fileSystem: FSUnaryFileSystem & FSUnaryFileSystemOperations {
         CodexFoldFileSystem()
+    }
+}
+
+/// The extension starts with launchd's 256-descriptor soft limit. An open
+/// file can hold a daemon socket, a native or shared-window descriptor and
+/// up to nine prefetch channels with their own sockets, so a burst of
+/// concurrent readers exhausted the limit and every mount read failed with
+/// EMFILE. Raise the soft limit within the hard limit once at start.
+enum CodexFoldDescriptorLimit {
+    static let target: rlim_t = 16384
+
+    static func raise() {
+        var limit = rlimit()
+        guard getrlimit(RLIMIT_NOFILE, &limit) == 0 else { return }
+        for wanted in [min(limit.rlim_max, target), min(limit.rlim_max, rlim_t(OPEN_MAX))] where limit.rlim_cur < wanted {
+            var raised = limit
+            raised.rlim_cur = wanted
+            if setrlimit(RLIMIT_NOFILE, &raised) == 0 {
+                return
+            }
+        }
+    }
+}
+
+/// Bounds prefetch channels across every open file, so descriptor use stays
+/// fixed however many files are read at once. A file that cannot get a
+/// channel is still read through its own handle, only without prefetch.
+enum CodexFoldPrefetchBudget {
+    static let limit = 48
+    private static let lock = NSLock()
+    private static var used = 0
+
+    static func reserve() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard used < limit else { return false }
+        used += 1
+        return true
+    }
+
+    static func release() {
+        lock.lock()
+        used = max(0, used - 1)
+        lock.unlock()
     }
 }
 
@@ -148,6 +196,7 @@ private final class CodexFoldPrefetchChannel {
         }
         try? client.handleOperation(.release, handle: handle, connection: connection)
         connection.close()
+        CodexFoldPrefetchBudget.release()
     }
 
     deinit {
@@ -155,6 +204,9 @@ private final class CodexFoldPrefetchChannel {
             Darwin.close(nativeReadFD)
         }
         connection.close()
+        if !closed {
+            CodexFoldPrefetchBudget.release()
+        }
     }
 }
 
@@ -404,7 +456,7 @@ private final class CodexFoldIO {
             prefetchPoolLock.unlock()
             return channel
         }
-        guard prefetchChannelCount < maxCachedBlocks else {
+        guard prefetchChannelCount < maxCachedBlocks, CodexFoldPrefetchBudget.reserve() else {
             prefetchPoolLock.unlock()
             return nil
         }
@@ -416,6 +468,7 @@ private final class CodexFoldIO {
         do {
             binding = try client.openBinding(path, flags: O_RDONLY)
         } catch {
+            CodexFoldPrefetchBudget.release()
             releasePrefetchChannelReservation()
             throw error
         }

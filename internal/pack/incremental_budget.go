@@ -33,11 +33,19 @@ func estimateCompactedGeneration(ctx context.Context, store string, refs *sql.DB
 		if err := rows.Scan(&digest, &size); err != nil {
 			return 0, err
 		}
-		_, looseErr := os.Lstat(objects.ObjectPath(digest))
+		loose, looseErr := os.Lstat(objects.ObjectPath(digest))
 		if looseErr != nil && !errors.Is(looseErr, os.ErrNotExist) {
 			return 0, looseErr
 		}
-		if looseErr == nil || previous == nil {
+		if looseErr == nil {
+			encoded := looseEncodedEstimate(size, loose)
+			if copiedEncoded > math.MaxInt64-encoded {
+				return 0, errors.New("compacted generation projection overflow")
+			}
+			copiedEncoded += encoded
+			continue
+		}
+		if previous == nil {
 			if size < 0 || reencodedRaw > math.MaxInt64-size {
 				return 0, errors.New("compacted generation projection overflow")
 			}
@@ -112,11 +120,15 @@ func estimateIncrementalGeneration(ctx context.Context, store string, refs *sql.
 		if err != nil {
 			return 0, err
 		}
-		_, looseErr := os.Lstat(objects.ObjectPath(digest))
+		loose, looseErr := os.Lstat(objects.ObjectPath(digest))
 		if looseErr != nil && !errors.Is(looseErr, os.ErrNotExist) {
 			return 0, looseErr
 		}
-		if !found || object.RawBytes != size || looseErr == nil {
+		if looseErr == nil {
+			if err := add(looseEncodedEstimate(size, loose)); err != nil {
+				return 0, err
+			}
+		} else if !found || object.RawBytes != size {
 			if err := add(size); err != nil {
 				return 0, err
 			}
@@ -175,4 +187,20 @@ func estimateGenerationMetadata(ctx context.Context, store string, count, rawByt
 		return add(info.Size()*2 + 4096)
 	})
 	return added, err
+}
+
+// looseEncodedEstimate prices a loose object's packed blocks from its
+// compressed size on disk rather than its raw size, which overstated a build
+// of new session content about threefold and kept it from running on a
+// nearly full disk. Pack blocks use a stronger level than loose objects, so
+// a quarter more plus per-object slack is a safe bound; raw stays the cap.
+func looseEncodedEstimate(rawBytes int64, loose os.FileInfo) int64 {
+	if rawBytes < 0 {
+		return 0
+	}
+	stored := loose.Size()
+	if stored < 0 || stored > (math.MaxInt64-4096)/5*4 {
+		return rawBytes
+	}
+	return min(rawBytes, stored*5/4+4096)
 }

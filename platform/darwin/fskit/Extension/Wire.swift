@@ -1151,6 +1151,32 @@ final class WireConnection {
         guard payload.count <= maxPayload else {
             throw POSIXError(.E2BIG)
         }
+        let response: WireResponse
+        do {
+            response = try exchangeLocked(operation: operation, generation: generation, payload: payload)
+        } catch {
+            // Once a request is on the wire, a failure before its whole reply
+            // is consumed leaves the stream at an unknown position. A reply
+            // that arrives after a timeout would be read as the answer to the
+            // next request, whose ID check then fails, and so on for every
+            // request after it: the mount answered EPROTO to everything until
+            // the daemon restarted. Close the socket so later requests fail as
+            // transport errors and recover on a fresh connection, and report a
+            // reply that does not belong to this request the same way.
+            closeSocket()
+            if (error as? POSIXError)?.code == .EPROTO {
+                throw POSIXError(.ECONNRESET)
+            }
+            throw error
+        }
+        if response.status != 0 {
+            Self.closeDescriptors(response)
+            throw POSIXError(POSIXErrorCode(rawValue: response.status) ?? .EIO)
+        }
+        return response
+    }
+
+    private func exchangeLocked(operation: WireOperation, generation: UInt64, payload: Data) throws -> WireResponse {
         let currentID = requestID
         requestID &+= 1
         var header = WireWriter()
@@ -1234,12 +1260,6 @@ final class WireConnection {
             if let sharedReadFD { Darwin.close(sharedReadFD) }
             if let sharedWindowFD { Darwin.close(sharedWindowFD) }
             throw error
-        }
-        if status != 0 {
-            if let nativeReadFD { Darwin.close(nativeReadFD) }
-            if let sharedReadFD { Darwin.close(sharedReadFD) }
-            if let sharedWindowFD { Darwin.close(sharedWindowFD) }
-            throw POSIXError(POSIXErrorCode(rawValue: status) ?? .EIO)
         }
         return WireResponse(
             operation: operation,

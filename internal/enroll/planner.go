@@ -32,6 +32,7 @@ const (
 	ReasonPromotionStage     Reason = "promotion-stage-blocked"
 	ReasonInsufficientBudget Reason = "insufficient-storage-budget"
 	ReasonBatchLimit         Reason = "batch-limit"
+	ReasonCodexCompressed    Reason = "codex-compressed"
 )
 
 type Policy struct {
@@ -74,6 +75,11 @@ type Input struct {
 	Gates        Gates
 	WriterActive WriterProbe
 	Budget       storage.Checker
+	// Price, when set, returns the exact bytes folding a session would add
+	// to the store. It is asked only when the conservative price does not
+	// fit, so a nearly full disk can still take sessions whose content the
+	// store mostly holds already.
+	Price func(context.Context, codex.Session, os.FileInfo) (int64, error)
 }
 
 type Decision struct {
@@ -127,6 +133,15 @@ func Build(ctx context.Context, input Input) (Plan, error) {
 		}
 		if !safeSessionID(session.ID) || !filepath.IsAbs(session.RolloutPath) {
 			decision.Reasons = append(decision.Reasons, ReasonInvalidPath)
+			plan.Decisions = append(plan.Decisions, decision)
+			continue
+		}
+		// Codex compresses a rollout idle for a week into rollout-*.jsonl.zst
+		// and records that path. The .zst folder folds such a file in place;
+		// enrolling it would validate zstd bytes as JSONL, fail, and abort the
+		// whole cycle, which on a real machine happened on every cycle for days.
+		if strings.HasSuffix(decision.RolloutPath, ".zst") {
+			decision.Reasons = append(decision.Reasons, ReasonCodexCompressed)
 			plan.Decisions = append(plan.Decisions, decision)
 			continue
 		}
@@ -228,7 +243,15 @@ func Build(ctx context.Context, input Input) (Plan, error) {
 				if !errors.Is(err, storage.ErrBudgetExceeded) {
 					return Plan{}, err
 				}
-				decision.Reasons = append(decision.Reasons, ReasonInsufficientBudget)
+				exact, priced, err := exactEnrollmentPrice(ctx, input, session, info, selectedPersistentBytes)
+				if err != nil {
+					return Plan{}, err
+				}
+				if priced {
+					cumulative = exact
+				} else {
+					decision.Reasons = append(decision.Reasons, ReasonInsufficientBudget)
+				}
 			}
 		}
 		if len(decision.Reasons) == 0 {
@@ -274,6 +297,43 @@ func decisionCountsAsWaiting(decision Decision) bool {
 
 func safeSessionID(sessionID string) bool {
 	return sessionID != "" && sessionID != "." && sessionID != ".." && !strings.ContainsAny(sessionID, "/\\\x00")
+}
+
+// exactEnrollmentPrice retries a session that the conservative price rejected
+// with the bytes a fold would really add. Enrollment writes those bytes twice
+// at its peak, as loose objects and in the next pack, before retiring the
+// native file and the loose copies. It returns the new cumulative batch cost.
+func exactEnrollmentPrice(ctx context.Context, input Input, session codex.Session, info os.FileInfo, selected int64) (int64, bool, error) {
+	if input.Price == nil {
+		return 0, false, nil
+	}
+	newBytes, err := input.Price(ctx, session, info)
+	if err != nil {
+		return 0, false, err
+	}
+	if newBytes < 0 || newBytes > info.Size() {
+		newBytes = info.Size()
+	}
+	single, err := enrollmentPersistentBytes(newBytes)
+	if err != nil {
+		return 0, false, err
+	}
+	// enrollmentPersistentBytes prices three copies of its input; the exact
+	// path needs two.
+	single = single / 3 * 2
+	cumulative, overflow := addBytes(selected, single)
+	if overflow {
+		return 0, false, errors.New("enrollment batch byte estimate overflow")
+	}
+	if _, err := input.Budget.Check(ctx, storage.Projection{
+		Operation: "enroll:" + session.ID, AdditionalPersistentBytes: cumulative, TemporaryBytes: min(info.Size(), 64<<20),
+	}); err != nil {
+		if errors.Is(err, storage.ErrBudgetExceeded) {
+			return 0, false, nil
+		}
+		return 0, false, err
+	}
+	return cumulative, true, nil
 }
 
 func enrollmentPersistentBytes(rawBytes int64) (int64, error) {
