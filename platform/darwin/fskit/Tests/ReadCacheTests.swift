@@ -448,6 +448,183 @@ private func testConcurrentReadersRetainLease() throws {
     try require(releaseLock.withLock { releases == 1 }, "concurrent readers did not release exactly once")
 }
 
+// A minimal daemon on a Unix socket, speaking just enough of the wire protocol
+// to answer hello and ping, so a test can control when and what it replies.
+private let testWireMagic = Data([0x43, 0x46, 0x53, 0x50])
+private let testDescriptorMagic = Data([0x43, 0x46, 0x53, 0x52])
+private let testWireVersion: UInt16 = 2
+private let testGeneration: UInt64 = 7
+
+private struct TestWireRequest {
+    let operation: UInt8
+    let requestID: UInt64
+}
+
+private func readAll(_ descriptor: Int32, count: Int) -> Data? {
+    var result = Data(count: count)
+    var completed = 0
+    while completed < count {
+        let amount = result.withUnsafeMutableBytes { bytes in
+            Darwin.read(descriptor, bytes.baseAddress!.advanced(by: completed), count - completed)
+        }
+        if amount < 0 && errno == EINTR { continue }
+        guard amount > 0 else { return nil }
+        completed += amount
+    }
+    return result
+}
+
+private func readTestRequest(_ descriptor: Int32) -> TestWireRequest? {
+    guard let header = readAll(descriptor, count: 40) else { return nil }
+    var reader = WireReader(header)
+    guard (try? reader.raw(count: 4)) == testWireMagic,
+          (try? reader.uint16()) == testWireVersion,
+          (try? reader.uint8()) == 1,
+          let operation = try? reader.uint8(),
+          (try? reader.uint32()) != nil,
+          let requestID = try? reader.uint64(),
+          (try? reader.uint64()) != nil,
+          (try? reader.uint32()) != nil,
+          let length = try? reader.uint32() else {
+        return nil
+    }
+    if length > 0, readAll(descriptor, count: Int(length)) == nil {
+        return nil
+    }
+    return TestWireRequest(operation: operation, requestID: requestID)
+}
+
+private func writeTestResponse(_ descriptor: Int32, operation: UInt8, requestID: UInt64, status: UInt32 = 0, payload: Data = Data()) {
+    var writer = WireWriter()
+    writer.raw(testWireMagic)
+    writer.uint16(testWireVersion)
+    writer.uint8(2)
+    writer.uint8(operation)
+    writer.uint32(0)
+    writer.uint64(requestID)
+    writer.uint64(testGeneration)
+    writer.uint32(status)
+    writer.uint32(UInt32(payload.count))
+    writer.uint32(0)
+    writer.raw(payload)
+    let data = writer.data
+    _ = data.withUnsafeBytes { bytes in Darwin.write(descriptor, bytes.baseAddress!, data.count) }
+}
+
+private func answerTestHello(_ descriptor: Int32) -> Bool {
+    guard let hello = readTestRequest(descriptor), hello.operation == WireOperation.hello.rawValue else {
+        return false
+    }
+    var payload = WireWriter()
+    payload.uint32(1 << 20)
+    payload.uint64(1)
+    payload.uint32(0)
+    writeTestResponse(descriptor, operation: hello.operation, requestID: hello.requestID, payload: payload.data)
+    return true
+}
+
+// Runs one connection of a fake daemon. The handler gets the accepted socket
+// after hello has been answered. Returns the descriptor the client should use.
+private func startTestDaemon(_ handler: @escaping (Int32) -> Void) throws -> (WireDescriptor, () -> Void) {
+    let path = NSTemporaryDirectory() + "cfw-\(getpid())-\(UInt32.random(in: 0...UInt32.max)).sock"
+    let listener = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+    try require(listener >= 0, "test daemon socket failed")
+    var address = sockaddr_un()
+    address.sun_family = sa_family_t(AF_UNIX)
+    let pathBytes = Array(path.utf8CString)
+    try require(pathBytes.count <= MemoryLayout.size(ofValue: address.sun_path), "test socket path too long")
+    withUnsafeMutableBytes(of: &address.sun_path) { destination in
+        for (index, value) in pathBytes.enumerated() { destination[index] = UInt8(bitPattern: value) }
+    }
+    let bound = withUnsafePointer(to: &address) { pointer in
+        pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+            Darwin.bind(listener, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+        }
+    }
+    try require(bound == 0 && Darwin.listen(listener, 1) == 0, "test daemon bind failed")
+    let finished = DispatchSemaphore(value: 0)
+    Thread {
+        let connection = Darwin.accept(listener, nil, nil)
+        if connection >= 0 {
+            var noSigPipe: Int32 = 1
+            _ = setsockopt(connection, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
+            if answerTestHello(connection) { handler(connection) }
+            Darwin.close(connection)
+        }
+        finished.signal()
+    }.start()
+    var descriptor = WireWriter()
+    descriptor.raw(testDescriptorMagic)
+    descriptor.uint16(testWireVersion)
+    descriptor.uint16(0)
+    descriptor.uint64(testGeneration)
+    descriptor.string(path)
+    descriptor.bytes(Data(repeating: 0x5A, count: 16))
+    let stop = {
+        _ = finished.wait(timeout: .now() + 5)
+        Darwin.close(listener)
+        unlink(path)
+    }
+    return (try WireDescriptor(data: descriptor.data), stop)
+}
+
+private func posixCode(_ body: () throws -> Void) -> POSIXErrorCode? {
+    do {
+        try body()
+        return nil
+    } catch {
+        return (error as? POSIXError)?.code
+    }
+}
+
+// A reply that arrives after its request timed out must not be read as the
+// answer to the next request. Before, every later request on the connection
+// failed its ID check with EPROTO, which recovery does not handle, so the
+// mount answered "Protocol error" to everything until the daemon restarted.
+private func testLateReplyDoesNotPoisonTheConnection() throws {
+    let (descriptor, stop) = try startTestDaemon { connection in
+        guard let ping = readTestRequest(connection) else { return }
+        Thread.sleep(forTimeInterval: 0.4)
+        writeTestResponse(connection, operation: ping.operation, requestID: ping.requestID)
+        while readTestRequest(connection) != nil {}
+    }
+    defer { stop() }
+    let connection = try WireConnection(descriptor: descriptor, idleTimeout: 0.15)
+    defer { connection.close() }
+    try require(posixCode { _ = try connection.request(.ping) } == .ETIMEDOUT, "slow reply did not time out")
+    Thread.sleep(forTimeInterval: 0.5)
+    let next = posixCode { _ = try connection.request(.ping) }
+    try require(next != .EPROTO, "late reply poisoned the next request")
+    try require(next.map { isWireTransportError(POSIXError($0)) } == true, "request after a timeout did not fail as a transport error: \(String(describing: next))")
+}
+
+private func testMismatchedReplyIsATransportFailure() throws {
+    let (descriptor, stop) = try startTestDaemon { connection in
+        guard let ping = readTestRequest(connection) else { return }
+        writeTestResponse(connection, operation: ping.operation, requestID: ping.requestID &+ 5)
+        while readTestRequest(connection) != nil {}
+    }
+    defer { stop() }
+    let connection = try WireConnection(descriptor: descriptor, idleTimeout: 1)
+    defer { connection.close() }
+    try require(posixCode { _ = try connection.request(.ping) } == .ECONNRESET, "mismatched reply was not reported as a reset connection")
+    try require(posixCode { _ = try connection.request(.ping) } == .ENOTCONN, "desynchronized connection stayed in use")
+}
+
+private func testDaemonErrorKeepsTheConnection() throws {
+    let (descriptor, stop) = try startTestDaemon { connection in
+        guard let first = readTestRequest(connection) else { return }
+        writeTestResponse(connection, operation: first.operation, requestID: first.requestID, status: UInt32(ENOENT))
+        guard let second = readTestRequest(connection) else { return }
+        writeTestResponse(connection, operation: second.operation, requestID: second.requestID)
+    }
+    defer { stop() }
+    let connection = try WireConnection(descriptor: descriptor, idleTimeout: 1)
+    defer { connection.close() }
+    try require(posixCode { _ = try connection.request(.ping) } == .ENOENT, "daemon status was not reported")
+    try require(posixCode { _ = try connection.request(.ping) } == nil, "a daemon error closed a healthy connection")
+}
+
 @main
 private struct ReadCacheTests {
     static func main() throws {
@@ -461,6 +638,9 @@ private struct ReadCacheTests {
         try testNormalizedWriteInvalidatesOnlyWhenVisibleLayoutDiverges()
         try testEvictionWaitsForLastReader()
         try testConcurrentReadersRetainLease()
+        try testLateReplyDoesNotPoisonTheConnection()
+        try testMismatchedReplyIsATransportFailure()
+        try testDaemonErrorKeepsTheConnection()
         print("ReadCacheTests: PASS")
     }
 }

@@ -209,6 +209,35 @@ func TestPlannerDiscoversExistingNewAndForkedSessionsAcrossCycles(t *testing.T) 
 	}
 }
 
+func TestPlannerLeavesCodexCompressedRolloutsToTheZstFolder(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "rollout-2026-10-18T01-53-04-01a14afe-f142-7962-8fd7-23d16def9bae.jsonl.zst")
+	if err := os.WriteFile(path, []byte{0x28, 0xb5, 0x2f, 0xfd, 0, 0}, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Unix(10_000, 0)
+	old := now.Add(-48 * time.Hour)
+	if err := os.Chtimes(path, old, old); err != nil {
+		t.Fatal(err)
+	}
+	session := codex.Session{ID: "compressed", RolloutPath: path, Archived: true, UpdatedAt: old.Unix()}
+	input := Input{
+		Sessions: []codex.Session{session}, Now: now,
+		Previous: map[string]Observation{"compressed": {Path: path, Size: 6, ModTimeUnixNano: old.UnixNano(), StableSinceUnixNano: old.UnixNano()}},
+		Policy:   Policy{StableFor: time.Hour, BatchSize: 1},
+		Gates:    Gates{DoctorHealthy: true, MountHealthy: true, CanonicalNamespace: true, NamespaceActive: true, NamespaceReady: true, EnrollmentAllowed: true},
+		Budget:   allowingBudget{},
+	}
+	plan, err := Build(context.Background(), input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertDecisionReason(t, plan, "compressed", ReasonCodexCompressed)
+	if len(plan.Selected) != 0 {
+		t.Fatalf("a Codex-compressed rollout was selected for JSONL enrollment: %#v", plan.Selected)
+	}
+}
+
 func TestPlannerDefersMissingRoutesWhileCanonicalNamespaceWarms(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "not-visible-yet.jsonl")
 	plan, err := Build(context.Background(), Input{

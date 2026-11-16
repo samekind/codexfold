@@ -32,6 +32,7 @@ const (
 	ReasonPromotionStage     Reason = "promotion-stage-blocked"
 	ReasonInsufficientBudget Reason = "insufficient-storage-budget"
 	ReasonBatchLimit         Reason = "batch-limit"
+	ReasonCodexCompressed    Reason = "codex-compressed"
 )
 
 type Policy struct {
@@ -132,6 +133,15 @@ func Build(ctx context.Context, input Input) (Plan, error) {
 		}
 		if !safeSessionID(session.ID) || !filepath.IsAbs(session.RolloutPath) {
 			decision.Reasons = append(decision.Reasons, ReasonInvalidPath)
+			plan.Decisions = append(plan.Decisions, decision)
+			continue
+		}
+		// Codex compresses a rollout idle for a week into rollout-*.jsonl.zst
+		// and records that path. The .zst folder folds such a file in place;
+		// enrolling it would validate zstd bytes as JSONL, fail, and abort the
+		// whole cycle, which on a real machine happened on every cycle for days.
+		if strings.HasSuffix(decision.RolloutPath, ".zst") {
+			decision.Reasons = append(decision.Reasons, ReasonCodexCompressed)
 			plan.Decisions = append(plan.Decisions, decision)
 			continue
 		}
